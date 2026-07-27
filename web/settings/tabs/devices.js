@@ -142,13 +142,64 @@
   // /versions payload. The previous version of this code read the wrong field
   // and rendered nothing; the test that covered it matched the source with a
   // regex, so it passed while the panel was empty on screen.
+  // Everything an operator might type: the manufacturer, the driver's name,
+  // and the models it has been run against. tested_models is the one that
+  // matters -- you know you own an SH10RT, not that you need "Sungrow SH
+  // Hybrid Inverter".
+  function catalogHaystack(e) {
+    return [e.name, e.manufacturer, e.id, e.filename]
+      .concat(e.tested_models || [])
+      .concat(e.protocols || [])
+      .join(" ").toLowerCase();
+  }
+
+  // Proven first. Four of thirty-seven have run on customer hardware and the
+  // rest have not; alphabetical order buries that.
+  var VERIFICATION_RANK = {production: 0, beta: 1, experimental: 2};
+
+  function catalogRank(e) {
+    var rank = VERIFICATION_RANK[e.verification_status];
+    return rank === undefined ? 3 : rank;
+  }
+
+  // Every term has to match somewhere, so "sungrow hybrid" narrows rather
+  // than widens.
+  function searchCatalog(entries, query) {
+    var terms = String(query || "").trim().toLowerCase().split(/\s+/).filter(Boolean);
+    var matches = (entries || []).filter(function (e) {
+      if (terms.length === 0) return true;
+      var hay = catalogHaystack(e);
+      return terms.every(function (t) { return hay.indexOf(t) >= 0; });
+    });
+    return matches.sort(function (a, b) {
+      var byRank = catalogRank(a) - catalogRank(b);
+      if (byRank !== 0) return byRank;
+      return String(a.name || "").localeCompare(String(b.name || ""));
+    });
+  }
+
+  // Several drivers already begin with the manufacturer, which read as
+  // "CTEK CTEK Chargestorm".
+  function catalogTitle(e) {
+    var name = e.name || e.filename || e.id || "";
+    var maker = e.manufacturer || "";
+    if (!maker || name.toLowerCase().indexOf(maker.toLowerCase()) === 0) return name;
+    return maker + " " + name;
+  }
+
   S.driverVersions = {
     runningSummary: runningSummary,
     verificationLabel: verificationLabel,
     versionRows: versionRows,
     render: function (panel, driverID, body, opts) {
       return renderVersionPicker(panel, driverID, body, opts);
-    }
+    },
+    renderSource: function (panel, body) { return renderDriverSource(panel, body); },
+    unifiedDiff: function (before, after, context) { return unifiedDiff(before, after, context); },
+    suggestUpstreamURL: function (body, edited) { return suggestUpstreamURL(body, edited); },
+    maxSuggestionURL: function () { return MAX_SUGGESTION_URL; },
+    searchCatalog: function (entries, query) { return searchCatalog(entries, query); },
+    catalogTitle: function (entry) { return catalogTitle(entry); }
   };
 
   // One list of everything this driver could run, and one click to switch.
@@ -384,6 +435,314 @@
     });
   }
 
+  // The Lua that is actually running, and where it came from. Built as DOM:
+  // driver source is a file on disk that an operator may have written, and
+  // setting it as innerHTML would execute whatever is in it.
+  function renderDriverSource(panel, body) {
+    panel.textContent = "";
+
+    var header = document.createElement("div");
+    header.style.display = "flex";
+    header.style.alignItems = "center";
+    header.style.flexWrap = "wrap";
+    header.style.gap = "8px";
+    header.style.marginBottom = "6px";
+
+    var badge = document.createElement("span");
+    badge.className = "creds-badge";
+    badge.textContent = body.version ? "v" + body.version : body.filename || "driver";
+    header.appendChild(badge);
+
+    var detail = document.createElement("span");
+    detail.className = "drv-version-detail";
+    detail.textContent = [originLabel(body.source), body.filename, describeSize(body.bytes)]
+      .filter(Boolean).join(" · ");
+    header.appendChild(detail);
+
+    // The published artifact carries generated metadata the repository copy
+    // does not, so this is a link to the file's history, not to these bytes.
+    if (body.repository_url) {
+      var link = document.createElement("a");
+      link.href = body.repository_url;
+      link.target = "_blank";
+      link.rel = "noopener";
+      link.textContent = "Open in device-drivers";
+      link.style.color = "var(--accent-e)";
+      link.style.fontSize = "0.75rem";
+      header.appendChild(link);
+    }
+    panel.appendChild(header);
+
+    var pre = document.createElement("pre");
+    pre.className = "drv-source-code";
+    pre.textContent = body.lua || "";
+    panel.appendChild(pre);
+
+    var footer = document.createElement("div");
+    footer.style.alignItems = "center";
+    footer.style.display = "flex";
+    footer.style.flexWrap = "wrap";
+    footer.style.gap = "8px";
+    footer.style.marginTop = "6px";
+
+    var digest = document.createElement("span");
+    digest.className = "drv-version-detail";
+    digest.textContent = "sha256 " + String(body.sha256 || "").slice(0, 16) + "…";
+    footer.appendChild(digest);
+
+    var edit = document.createElement("button");
+    edit.type = "button";
+    edit.className = "btn-add";
+    edit.textContent = "Edit and try";
+    edit.addEventListener("click", function () {
+      renderDriverEditor(panel, body);
+    });
+    footer.appendChild(edit);
+
+    // Everything points at the repository, including from the read view: a
+    // driver that is wrong for your hardware is worth reporting even if you
+    // have not written the fix yourself.
+    appendSuggestButton(footer, body, null);
+
+    var status = document.createElement("span");
+    status.className = "drv-draft-status";
+    footer.appendChild(status);
+
+    panel.appendChild(footer);
+
+    // A draft may already be running from an earlier visit, or from another
+    // tab. The countdown belongs to the gateway, not to this page.
+    resumeDraft(panel, body, status);
+  }
+
+  // The editor is its own surface now: a driver is tens of kilobytes of Lua,
+  // and editing that in a textarea wedged into a device row is squinting, not
+  // editing. This hands it the driver and the actions, and knows nothing about
+  // how the editor is drawn.
+  function renderDriverEditor(panel, body) {
+    if (!S.openDriverEditor) {
+      panel.textContent = "The editor did not load.";
+      return;
+    }
+    var id = encodeURIComponent(body.id);
+
+    function post(path, payload) {
+      return apiFetch("/api/drivers/" + id + path, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: payload === undefined ? null : JSON.stringify(payload)
+      }).then(function (r) {
+        return r.json().then(function (b) {
+          if (!r.ok) throw new Error(b.error || "the request was refused");
+          return b;
+        });
+      });
+    }
+
+    S.openDriverEditor({
+      id: body.id,
+      filename: body.filename,
+      version: body.version,
+      bytes: body.bytes,
+      lua: body.lua,
+      sha256: body.sha256,
+      source: body.source,
+      sourceLabel: originLabel(body.source),
+      repository_url: body.repository_url
+    }, {
+      runDraft: function (lua, minutes) { return post("/draft", {lua: lua, minutes: minutes}); },
+      keepDraft: function () { return post("/draft/keep"); },
+      revertDraft: function () { return post("/draft/revert"); },
+      draftStatus: function () {
+        return apiFetch("/api/drivers/" + id + "/draft").then(function (r) { return r.json(); });
+      },
+      lint: function (lua) { return post("/lint", {lua: lua}); },
+      suggest: function (lua, say) {
+        var url = suggestUpstreamURL(body, lua);
+        if (url.length > MAX_SUGGESTION_URL) {
+          url = suggestUpstreamURL(body, "");
+          say("The driver is too large to prefill; paste it into the issue.");
+        }
+        window.open(url, "_blank", "noopener");
+      }
+    });
+  }
+
+  function resumeDraft(panel, body, status) {
+    apiFetch("/api/drivers/" + encodeURIComponent(body.id) + "/draft")
+      .then(function (r) { return r.json(); })
+      .then(function (b) {
+        if (b && b.running) showDraftRunning(panel, body, status, b.expires_at_ms);
+      })
+      .catch(function () { /* nothing is running, which is the normal case */ });
+  }
+
+  // While a draft runs, the only two things worth offering are keeping it and
+  // putting it back. Both are one click, and the clock says how long the
+  // decision stays open.
+  function showDraftRunning(panel, body, status, expiresAtMS) {
+    var host = status.parentElement || panel;
+    host.querySelectorAll(".drv-draft-action").forEach(function (el) { el.remove(); });
+
+    function tick() {
+      var left = Math.max(0, Math.round((expiresAtMS - Date.now()) / 1000));
+      if (left <= 0) {
+        status.textContent = "The draft expired and the previous driver is back.";
+        clearInterval(timer);
+        return;
+      }
+      var minutes = Math.floor(left / 60);
+      var seconds = left % 60;
+      status.textContent = "Draft running · reverts in " + minutes + ":" +
+        (seconds < 10 ? "0" : "") + seconds;
+    }
+    var timer = setInterval(tick, 1000);
+    tick();
+
+    function act(path, label, done) {
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "btn-add drv-draft-action";
+      btn.textContent = label;
+      btn.addEventListener("click", function () {
+        btn.disabled = true;
+        apiFetch("/api/drivers/" + encodeURIComponent(body.id) + "/draft/" + path, {method: "POST"})
+          .then(function (r) {
+            return r.json().then(function (b) {
+              if (!r.ok) throw new Error(b.error || "could not " + path + " the draft");
+              return b;
+            });
+          }).then(function () {
+            clearInterval(timer);
+            status.textContent = done;
+            host.querySelectorAll(".drv-draft-action").forEach(function (el) { el.remove(); });
+          }).catch(function (err) {
+            status.textContent = err.message;
+            btn.disabled = false;
+          });
+      });
+      host.insertBefore(btn, status);
+    }
+
+    act("keep", "Keep it", "Kept. This is your own file now.");
+    act("revert", "Put it back", "Reverted.");
+  }
+
+  // A line diff with a little context around each change, which is what fits
+  // in a URL and what a maintainer reads anyway.
+  //
+  // Longest-common-subsequence over lines. A driver is a few thousand lines,
+  // so the quadratic table is fine here and worth the exactness: a cheaper
+  // heuristic would drift out of alignment after the first edit and report
+  // changes that were never made.
+  function unifiedDiff(before, after, context) {
+    var a = String(before).split("\n");
+    var b = String(after).split("\n");
+    var contextLines = context === undefined ? 3 : context;
+
+    var lcs = [];
+    for (var i = 0; i <= a.length; i++) lcs.push(new Array(b.length + 1).fill(0));
+    for (var i = a.length - 1; i >= 0; i--) {
+      for (var j = b.length - 1; j >= 0; j--) {
+        lcs[i][j] = a[i] === b[j] ? lcs[i + 1][j + 1] + 1
+          : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
+      }
+    }
+
+    var ops = [];
+    var x = 0, y = 0;
+    while (x < a.length && y < b.length) {
+      if (a[x] === b[y]) { ops.push([" ", a[x]]); x++; y++; }
+      else if (lcs[x + 1][y] >= lcs[x][y + 1]) { ops.push(["-", a[x]]); x++; }
+      else { ops.push(["+", b[y]]); y++; }
+    }
+    while (x < a.length) { ops.push(["-", a[x]]); x++; }
+    while (y < b.length) { ops.push(["+", b[y]]); y++; }
+
+    // Only the changed regions, so an unchanged driver body does not fill the
+    // issue with lines nobody needs to read.
+    var keep = new Array(ops.length).fill(false);
+    ops.forEach(function (op, index) {
+      if (op[0] === " ") return;
+      for (var k = Math.max(0, index - contextLines);
+           k <= Math.min(ops.length - 1, index + contextLines); k++) {
+        keep[k] = true;
+      }
+    });
+
+    var out = [];
+    var skipping = false;
+    ops.forEach(function (op, index) {
+      if (!keep[index]) {
+        if (!skipping) { out.push("@@"); skipping = true; }
+        return;
+      }
+      skipping = false;
+      out.push(op[0] + op[1]);
+    });
+    return out.join("\n");
+  }
+
+  // Suggest the edit back to the repository the driver came from.
+  //
+  // The gateway holds no GitHub token and needs none: GitHub accepts a
+  // pre-filled issue over a URL, and the operator is already signed in to
+  // their own browser. One click opens it with the driver, the version, the
+  // hardware and the edit already written out.
+  function suggestUpstreamURL(body, edited) {
+    var title = "[" + (body.id || "driver") + "] ";
+    var lines = [
+      "What I changed and why:",
+      "",
+      "",
+      "---",
+      "Driver: " + (body.id || "") + " " + (body.version ? "v" + body.version : ""),
+      "Came from: " + originLabel(body.source),
+      "File: " + (body.filename || ""),
+      "Original sha256: " + (body.sha256 || "")
+    ];
+    if (edited && edited !== body.lua) {
+      // A diff, not the file. Drivers run to tens of kilobytes and GitHub
+      // rejects a URL past about 8k, so sending the whole file meant the code
+      // never travelled at all -- while a fix is usually a handful of lines.
+      lines.push("", "```diff", unifiedDiff(body.lua || "", edited), "```");
+    }
+    return "https://github.com/srcfl/device-drivers/issues/new" +
+      "?title=" + encodeURIComponent(title) +
+      "&body=" + encodeURIComponent(lines.join("\n"));
+  }
+
+  // GitHub rejects a URL past roughly 8k, and an edited driver is usually
+  // larger than that. Past the limit the issue is opened without the file and
+  // says so, rather than opening a page that errors.
+  var MAX_SUGGESTION_URL = 8000;
+
+  function appendSuggestButton(host, body, getEdited) {
+    var suggest = document.createElement("button");
+    suggest.type = "button";
+    suggest.className = "btn-add";
+    suggest.textContent = "Suggest to repo";
+    suggest.addEventListener("click", function () {
+      var edited = getEdited ? getEdited() : "";
+      var url = suggestUpstreamURL(body, edited);
+      var note = host.querySelector(".drv-draft-status");
+      if (url.length > MAX_SUGGESTION_URL) {
+        url = suggestUpstreamURL(body, "");
+        if (note) {
+          note.textContent = "The driver is too large to prefill; paste it into the issue.";
+        }
+      }
+      window.open(url, "_blank", "noopener");
+    });
+    host.appendChild(suggest);
+  }
+
+  function describeSize(bytes) {
+    if (typeof bytes !== "number" || bytes <= 0) return "";
+    if (bytes < 1024) return bytes + " bytes";
+    return (bytes / 1024).toFixed(1) + " kB";
+  }
+
   // Put back whatever was running before the switch. Which call does that
   // depends on what it was, not on its version number: a managed artifact of
   // the same version can sit on disk from an earlier trial, and activating
@@ -467,9 +826,17 @@
         '<label>Channel</label>' +
         '<select id="driver-catalog-channel"><option value="stable">Stable</option><option value="beta">Beta · test one driver</option></select>' +
         '</div><div>' +
-        '<label>Driver <span class="help" data-help="Pick a Lua driver from the drivers/ directory. Each driver declares its capabilities (MQTT/Modbus) + which manufacturer/model it supports.">?</span></label>' +
-        '<select id="driver-catalog-picker"><option value="">Loading catalog…</option></select>' +
-        '</div></div><div class="field-row"><div>' +
+        // You know your hardware, not which driver covers it. The catalog
+        // carries tested_models for most drivers, so searching those is what
+        // turns "I have an SH10RT" into the right answer.
+        '<label>Find your device ' + help('Search by manufacturer, model or driver name. Drivers that have run on real hardware are listed first.') + '</label>' +
+        '<input type="search" id="driver-catalog-search" placeholder="e.g. SH10RT, Ferroamp, Chargestorm" autocomplete="off">' +
+        '</div></div>' +
+        // The picker stays as the selection the rest of the form reads, but
+        // the cards are what an operator actually looks at.
+        '<select id="driver-catalog-picker" hidden><option value="">Loading catalog…</option></select>' +
+        '<div id="driver-catalog-results" class="drv-catalog-results">Loading catalog…</div>' +
+        '<div class="field-row"><div>' +
         '<label>Friendly name</label><input type="text" id="driver-catalog-name" placeholder="e.g. ferroamp-house">' +
         '</div><div id="driver-catalog-profile-wrap" hidden>' +
         '<label>Register profile ' + help('Select the register map used by this inverter. The Unit ID remains editable after the driver is added.') + '</label>' +
@@ -806,6 +1173,10 @@
           sel.innerHTML = "<option value=''>(no drivers found)</option>";
           return;
         }
+        // Nothing is chosen until the operator chooses. A select takes its
+        // first option on its own, which with cards means one sits silently
+        // outlined and Add would fetch a driver nobody asked for.
+        sel.appendChild(document.createElement("option"));
         entries.forEach(function (e) {
           var opt = document.createElement("option");
           opt.value = e.path;
@@ -822,7 +1193,81 @@
           opt.dataset.readOnly = e.read_only ? "true" : "false";
           sel.appendChild(opt);
         });
+        S.catalogEntries = entries;
+        renderCatalogCards(entries);
         syncCatalogProfilePicker();
+      }
+
+      function renderCatalogCards(entries) {
+        var host = document.getElementById("driver-catalog-results");
+        var search = document.getElementById("driver-catalog-search");
+        var picker = document.getElementById("driver-catalog-picker");
+        if (!host || !picker) return;
+
+        var query = (search && search.value || "").trim();
+        var matches = searchCatalog(entries, query);
+
+        host.textContent = "";
+        if (matches.length === 0) {
+          var empty = document.createElement("div");
+          empty.className = "drv-version-detail";
+          empty.textContent = "No driver matches “" + query + "”. " +
+            "Try the manufacturer, or the model printed on the unit.";
+          host.appendChild(empty);
+          return;
+        }
+
+        matches.forEach(function (e) {
+          host.appendChild(catalogCard(e, picker, host, entries));
+        });
+      }
+
+      function catalogCard(e, picker, host, entries) {
+        var card = document.createElement("button");
+        card.type = "button";
+        card.className = "drv-catalog-card";
+        if (picker.value === e.path) card.classList.add("is-chosen");
+
+        var title = document.createElement("div");
+        title.className = "drv-catalog-title";
+        title.textContent = catalogTitle(e);
+        card.appendChild(title);
+
+        var tags = document.createElement("div");
+        tags.className = "drv-catalog-tags";
+        (e.capabilities || []).forEach(function (cap) {
+          var tag = document.createElement("span");
+          tag.className = "drv-catalog-tag";
+          tag.textContent = cap;
+          tags.appendChild(tag);
+        });
+        var verdict = verificationLabel(e.verification_status);
+        if (verdict) {
+          var badge = document.createElement("span");
+          badge.className = "drv-catalog-tag drv-catalog-" +
+            (e.verification_status === "production" ? "proven" : "unproven");
+          badge.textContent = verdict;
+          tags.appendChild(badge);
+        }
+        card.appendChild(tags);
+
+        // The models this has actually been run against — the thing an
+        // operator can compare with the label on their own unit.
+        var models = (e.tested_models || []).slice(0, 3).join(", ");
+        var foot = document.createElement("div");
+        foot.className = "drv-catalog-foot";
+        foot.textContent = [(e.protocols || []).join(" + "), e.version ? "v" + e.version : "", models]
+          .filter(Boolean).join(" · ");
+        card.appendChild(foot);
+
+        card.addEventListener("click", function () {
+          picker.value = e.path;
+          // The rest of the form listens to the select, so tell it the value
+          // moved rather than only setting it.
+          picker.dispatchEvent(new Event("change", {bubbles: true}));
+          renderCatalogCards(entries);
+        });
+        return card;
       }
 
       apiFetch("/api/drivers/catalog").then(function (r) { return r.json(); }).then(function (data) {
@@ -873,8 +1318,14 @@
           html += ' <button class="btn-add drv-module-versions" type="button" data-driver-id="' +
             escHtml(entry.id) + '" data-source="' + escHtml(source) + '" data-running-version="' +
             escHtml(version) + '" data-logical-path="' + escHtml(entry.path) + '">Versions</button>';
+          // A driver is one Lua file and the repository is the source of
+          // truth, but from here there was no way to read the code that is
+          // running -- so a fix for someone's inverter stayed on their machine.
+          html += ' <button class="btn-add drv-module-source" type="button" data-driver-id="' +
+            escHtml(entry.id) + '">Source</button>';
           html += ' <span class="drv-module-action"></span>';
           html += '<div class="drv-module-versions-panel" style="display:none;margin-top:6px"></div>';
+          html += '<div class="drv-module-source-panel" style="display:none;margin-top:6px"></div>';
           slot.innerHTML = html;
         });
         bodyEl.querySelectorAll(".drv-module-update").forEach(function (btn) {
@@ -919,6 +1370,25 @@
                   readOnlyEl: btn.parentElement.querySelector(".drv-module-readonly")
                 });
               })
+              .catch(function (err) { panel.textContent = err.message; });
+          });
+        });
+        bodyEl.querySelectorAll(".drv-module-source").forEach(function (btn) {
+          btn.addEventListener("click", function () {
+            var panel = btn.parentElement.querySelector(".drv-module-source-panel");
+            if (!panel) return;
+            if (panel.style.display !== "none") { panel.style.display = "none"; return; }
+            panel.style.display = "block";
+            panel.textContent = "Loading source…";
+            var id = btn.dataset.driverId;
+            apiFetch("/api/drivers/" + encodeURIComponent(id) + "/source")
+              .then(function (r) {
+                return r.json().then(function (body) {
+                  if (!r.ok) throw new Error(body.error || "could not read the driver");
+                  return body;
+                });
+              })
+              .then(function (body) { renderDriverSource(panel, body); })
               .catch(function (err) { panel.textContent = err.message; });
           });
         });
@@ -1053,6 +1523,13 @@
         populateCatalogPicker(entries, "stable");
       });
 
+      // Filtering happens over the catalog already fetched, so typing costs
+      // nothing and there is no debounce to get wrong.
+      var catalogSearch = document.getElementById("driver-catalog-search");
+      if (catalogSearch) catalogSearch.addEventListener("input", function () {
+        renderCatalogCards(S.catalogEntries || []);
+      });
+
       var channelSelect = document.getElementById("driver-catalog-channel");
       if (channelSelect) channelSelect.addEventListener("change", function () {
         if (channelSelect.value === "stable") {
@@ -1096,7 +1573,17 @@
       if (btn) btn.addEventListener("click", function () {
         var sel = document.getElementById("driver-catalog-picker");
         var nameEl = document.getElementById("driver-catalog-name");
-        if (!sel || !sel.value) return;
+        if (!sel || !sel.value) {
+          // Doing nothing silently reads as a broken button.
+          var results = document.getElementById("driver-catalog-results");
+          if (results) {
+            var say = results.querySelector(".drv-catalog-hint") ||
+              results.insertBefore(document.createElement("div"), results.firstChild);
+            say.className = "drv-catalog-hint drv-version-detail";
+            say.textContent = "Pick a device above first.";
+          }
+          return;
+        }
         ctx.captureCurrentTab();
         var chosen = sel.options[sel.selectedIndex];
         var protocols = (chosen.dataset.protocols || "").split("+");
