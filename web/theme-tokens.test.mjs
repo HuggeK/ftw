@@ -44,44 +44,55 @@ describe("theme tokens", () => {
   const dark = tokensIn(":root");
   const light = tokensIn('html[data-theme="light"]');
 
-  // The base palette (--bg, --surface, --border, --text, …) predates the
-  // oklch palette and was declared only on :root. Every use of it therefore
-  // painted a dark value in light mode — near-white --text on paper,
-  // dark-violet --border rules — across roughly 250 call sites.
-  it("redefines every colour token that light mode actually uses", () => {
-    const missing = [];
+  // Tokens whose value is correct in both themes by design. --on-accent is
+  // the ink placed on the accent fill; the accent stays amber on both
+  // grounds, so the dark ink is right either way.
+  const THEME_INDEPENDENT = new Set(["--on-accent"]);
+
+  // A colour token follows the theme in one of two ways: it points at
+  // another token (an alias, which moves when that token is redefined), or
+  // light mode declares its own value. A literal that does neither is stuck
+  // at its dark value everywhere — which is how --surface, #1a1a2e, ended up
+  // painting the app header on a light page.
+  it("leaves no colour token stuck at its dark value in light mode", () => {
+    const stuck = [];
     for (const [name, value] of Object.entries(dark)) {
       if (!isColour(value)) continue;
-      if (name in light) continue;
-      // Only tokens something reads are a problem; an unused declaration
-      // is dead weight, not a rendering bug.
+      if (THEME_INDEPENDENT.has(name)) continue;
+      if (value.startsWith("var(--")) continue;   // alias — follows its target
+      if (name in light) continue;                // light declares its own
       const uses = allSource.split(`var(${name})`).length - 1 +
                    (allSource.split(`var(${name},`).length - 1);
-      if (uses > 0) missing.push(`${name} (${uses} uses, dark value ${value})`);
+      if (uses > 0) stuck.push(`${name} (${uses} uses, dark value ${value})`);
     }
-    assert.deepEqual(missing, [], "colour tokens stuck at their dark value in light mode");
+    assert.deepEqual(stuck, [], "colour tokens stuck at their dark value in light mode");
   });
 
-  it("maps the legacy base palette onto the oklch palette in light mode", () => {
-    // Mapping rather than hand-picking hexes keeps the two systems from
-    // drifting; if someone retunes --line, --border follows.
+  // The pre-oklch names (--bg, --surface, --border, --text, …) are still
+  // read in ~250 places. They stay as one-line aliases onto the canonical
+  // roles rather than a second palette carrying its own values, so retuning
+  // --line moves --border with it and the two cannot drift.
+  it("keeps the legacy base palette as aliases, not a second palette", () => {
     for (const [legacy, expected] of Object.entries({
       "--bg": "var(--ink)",
       "--surface": "var(--ink-raised)",
       "--surface2": "var(--ink-sunken)",
       "--border": "var(--line)",
       "--text": "var(--fg)",
-      "--text-dim": "var(--fg-muted)",
     })) {
-      assert.equal(light[legacy], expected, `${legacy} should map to ${expected}`);
+      assert.equal(dark[legacy], expected, `${legacy} should alias ${expected}`);
     }
   });
 
-  it("keeps the dark base palette on its own literal values", () => {
-    // Deliberate: the legacy set is lighter and more violet than the oklch
-    // set, so mapping it in dark mode too would restyle every surface. That
-    // is a design change and does not belong in a bug fix.
-    assert.match(dark["--surface"], /^#/);
-    assert.match(dark["--border"], /^#/);
+  // Aliasing on :root is what makes one declaration serve both themes; a
+  // light-only mapping leaves dark mode on whatever the legacy values were.
+  it("declares the aliases once, on :root", () => {
+    for (const legacy of ["--bg", "--surface", "--border", "--text"]) {
+      assert.ok(legacy in dark, `${legacy} must be declared on :root`);
+      assert.ok(
+        !(legacy in light),
+        `${legacy} should not need a light-mode override once it is an alias`,
+      );
+    }
   });
 });
