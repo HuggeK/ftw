@@ -80,7 +80,7 @@
         if (modbus) {
           html += '<fieldset><legend>Modbus TCP</legend>' +
             '<div class="field-row"><div>' +
-            '<label>Host ' + help('IP of the Modbus-TCP device (e.g. Sungrow inverter LAN port).') + '</label>' +
+            '<label>Host ' + help('IP or hostname of the Modbus-TCP device (e.g. Sungrow inverter LAN port). If you use a raw IP, reserve it for the device in your router\'s DHCP settings so it can\'t change.') + '</label>' +
             '<input type="text" data-path="drivers.' + idx + '.capabilities.modbus.host" value="' + escHtml(modbus.host) + '">' +
             '</div><div>' +
             '<label>Port</label><input type="number" data-path="drivers.' + idx + '.capabilities.modbus.port" value="' + (modbus.port || 502) + '">' +
@@ -145,7 +145,7 @@
           // post-render DOM edit mirrors the site-meter pattern above
           // and avoids a re-render race with the async catalog fetch.
           html += '<fieldset><legend>HTTP</legend>' +
-            '<label>Host / IP ' + help('Hostname (e.g. zap.local) or IP address of the device. mDNS names work when your OS resolver supports them; otherwise use the LAN IP.') + '</label>' +
+            '<label>Host / IP ' + help('Hostname (e.g. zap.local) or IP address of the device. Prefer the device\'s mDNS (.local) name when it broadcasts one — it survives DHCP lease changes. If you use a raw IP, reserve it for the device in your router\'s DHCP settings so it can\'t change.') + '</label>' +
             '<input type="text" data-path="drivers.' + idx + '.config.host" value="' + escHtml(lcfg.host || '') + '" placeholder="zap.local">' +
             '<div class="drv-local-creds" data-drv-lua="' + escHtml(d.lua || '') + '"' + (localCreds ? '' : ' hidden') + '>' +
               '<label style="margin-top:8px">Username ' + help('Username for the device\'s local API (HTTP Basic auth). For NIBE this is the local-API account you set up in the myUplink app.') + '</label>' +
