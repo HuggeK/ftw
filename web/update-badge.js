@@ -1262,7 +1262,8 @@
              green connection dot next door is reserved for liveness
              state; the amber dot is an actionable affordance ("update
              available, open me"). Pulsing animation stays so it reads
-             as actionable, not a static state. */
+             as actionable, not a static state — see .badge.warning
+             below for the state that is not. */
           appearance: none;
           background: transparent;
           color: var(--accent-e, #f59e0b);
@@ -1272,6 +1273,31 @@
           line-height: 1;
           padding: 0 0.3rem;
           animation: pulse 1.4s ease-in-out infinite;
+        }
+        /* The optimizer warning is a state, not an affordance: the planner
+           has fallen back to the Go solver, which frequently needs no
+           action at all. Sharing the amber pulse with the update dot got
+           it read as "an update is waiting" in the field (#690), so this
+           drops every cue that says actionable — no pulse, an outlined
+           ring instead of a filled dot, and the dimmer amber already in
+           the palette rather than a fourth hue. Motion, shape and weight
+           all differ, so the two stay apart for an operator who cannot
+           separate them by colour. */
+        .badge.warning {
+          animation: none;
+          color: var(--amber-d, #c08000);
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          box-sizing: border-box;
+          width: 1.15rem;
+          height: 1.15rem;
+          padding: 0;
+          margin: 0 0.3rem;
+          border: 1.5px solid currentColor;
+          border-radius: 50%;
+          font-size: 0.82rem;
+          font-weight: 700;
         }
         @keyframes pulse {
           0%, 100% { opacity: 1; }
