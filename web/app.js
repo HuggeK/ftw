@@ -223,7 +223,10 @@
   const batW = $("bat-w");
   const batDir = $("bat-dir");
   const batSoc = $("bat-soc");
-  const connStatus = $("conn-status");
+  // The header's status light lives inside <ftw-update-badge> so one slot
+  // decides what the corner says — connection, updates and optimizer
+  // health used to be separate elements hiding each other with CSS.
+  const updateBadge = document.querySelector("ftw-update-badge");
   const overviewHealth = $("overview-health");
   const overviewHealthLabel = $("overview-health-label");
   const driversGrid = $("drivers-grid");
@@ -2427,15 +2430,18 @@
   }
 
   function setConnected(ok) {
+    // update-badge.js is deferred, so on the first tick or two the element
+    // may not have upgraded yet and the method is absent. Polling re-asserts
+    // this every cycle and the component defaults to connected, which is
+    // what the old #conn-status markup shipped as.
+    if (updateBadge && typeof updateBadge.setConnected === "function") {
+      updateBadge.setConnected(ok);
+    }
     if (ok) {
-      connStatus.className = "conn-status connected";
-      connStatus.title = "Connected";
       if (overviewHealth) overviewHealth.classList.add("is-connected");
       if (overviewHealthLabel) overviewHealthLabel.textContent = "Live";
       // render() will update lastUpdate with timestamp
     } else {
-      connStatus.className = "conn-status disconnected";
-      connStatus.title = "Disconnected";
       if (overviewHealth) overviewHealth.classList.remove("is-connected");
       if (overviewHealthLabel) overviewHealthLabel.textContent = "Connection lost";
       lastUpdate.textContent = "Connection lost";
