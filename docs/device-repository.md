@@ -38,7 +38,7 @@ driver is unavailable.
 | `beta` | `https://github.com/srcfl/ftw/releases/download/drivers-beta/manifest.json` |
 | `stable` | `https://github.com/srcfl/ftw/releases/download/drivers-stable/manifest.json` |
 
-Changes to `drivers/` on master publish beta automatically. Stable is an
+Changes to [`drivers/`](../drivers/) on master publish beta automatically. Stable is an
 explicit workflow promotion. There is no edge driver channel.
 
 Each signed channel manifest carries prior versions in `history`. Old release
@@ -73,6 +73,7 @@ go run ./cmd/ftw-driver-repository check-versions \
 ```
 
 Maintainer publishing and verification are implemented by
-`go/cmd/ftw-driver-repository` and
-`.github/workflows/drivers-release.yml`; those sources are authoritative for
+[`go/cmd/ftw-driver-repository`](../go/cmd/ftw-driver-repository) and
+[`.github/workflows/drivers-release.yml`](../.github/workflows/drivers-release.yml);
+those sources are authoritative for
 flags, key configuration and artifact ordering.

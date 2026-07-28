@@ -7,11 +7,13 @@ drivers and an optional Python/CVXPY optimizer.
 
 The repository has three explicit modules:
 
-- **Core** — `go/cmd/ftw`, `go/internal` and `web`. Core owns state,
-  telemetry, control, safety, API and UI.
-- **Drivers** — `drivers/*.lua`, hosted by `go/internal/drivers`. Drivers own
+- **Core** — [`go/cmd/ftw`](go/cmd/ftw), [`go/internal`](go/internal) and
+  [`web`](web). Core owns state, telemetry, control, safety, API and UI.
+- **Drivers** — [`drivers/*.lua`](drivers/), hosted by
+  [`go/internal/drivers`](go/internal/drivers). Drivers own
   vendor protocols and are the only place power signs are converted.
-- **Optimizer** — `optimizer`, behind the contract in `go/internal/mpc`.
+- **Optimizer** — [`optimizer`](optimizer), behind the contract in
+  [`go/internal/mpc`](go/internal/mpc).
   It proposes plans; core validates them and retains a Go fallback.
 
 Keep new functionality in core unless it has a narrow versioned contract,
@@ -30,11 +32,12 @@ Read [docs/architecture.md](docs/architecture.md) for the system map and
 - A failed/stale driver receives its autonomous default mode.
 - Every clamp protects a quantified hardware or control risk.
 - Persistent device state is keyed by stable hardware identity, not a YAML name.
-- SQLite queries stay in `go/internal/state`.
+- SQLite queries stay in [`go/internal/state`](go/internal/state).
 
 ## Drivers
 
-`go/internal/drivers/lua.go` is the source of truth for the Lua host API.
+[`go/internal/drivers/lua.go`](go/internal/drivers/lua.go) is the source of
+truth for the Lua host API.
 Every driver implements `driver_init`, `driver_poll`, `driver_command` and a
 safe `driver_default_mode`; `driver_cleanup` is optional. Declare catalog
 metadata in the driver's `DRIVER` block and request only required capabilities.
@@ -49,7 +52,7 @@ Drivers are hot-editable and ship without a compilation step. See
 - Prefer explicit mutexes and simple ownership over clever atomics.
 - Keep packages cohesive; depend on narrow interfaces.
 - Put tests beside Go code as `_test.go`.
-- Keep full-stack tests in `go/test/e2e`.
+- Keep full-stack tests in [`go/test/e2e`](go/test/e2e).
 - Treat code, types, tests and driver metadata as the detailed documentation.
 - Add prose only for architecture, safety invariants or operator steps the code
   cannot explain.
@@ -72,8 +75,9 @@ Lua drivers have syntax and contract checks in the Go test suite.
 ## Releases
 
 Changesets drive versioning. Every user-visible code change needs a
-`.changeset/*.md` entry; documentation- and CI-only changes are auto-exempt.
-Do not edit `package.json` version or `CHANGELOG.md` manually.
+[`.changeset/*.md`](.changeset/) entry; documentation- and CI-only changes are
+auto-exempt. Do not edit [`package.json`](package.json) version or
+[`CHANGELOG.md`](CHANGELOG.md) manually.
 
 Only two release channels exist:
 
@@ -88,15 +92,15 @@ independently but follow the same beta-to-stable progression. See
 
 | Concern | Source |
 |---|---|
-| Process wiring and control tick | `go/cmd/ftw/main.go` |
-| Configuration schema | `go/internal/config`, `config.example.yaml` |
-| HTTP routes | `go/internal/api/api.go` |
-| Lua host and registry | `go/internal/drivers` |
-| Safety/control | `go/internal/control`, `go/internal/telemetry` |
-| Persistence | `go/internal/state` |
-| Planner contract/fallback | `go/internal/mpc` |
-| Optional optimizer | `optimizer` |
-| Driver catalog | `DRIVER` blocks in `drivers/*.lua` |
+| Process wiring and control tick | [`go/cmd/ftw/main.go`](go/cmd/ftw/main.go) |
+| Configuration schema | [`go/internal/config`](go/internal/config), [`config.example.yaml`](config.example.yaml) |
+| HTTP routes | [`go/internal/api/api.go`](go/internal/api/api.go) |
+| Lua host and registry | [`go/internal/drivers`](go/internal/drivers) |
+| Safety/control | [`go/internal/control`](go/internal/control), [`go/internal/telemetry`](go/internal/telemetry) |
+| Persistence | [`go/internal/state`](go/internal/state) |
+| Planner contract/fallback | [`go/internal/mpc`](go/internal/mpc) |
+| Optional optimizer | [`optimizer`](optimizer) |
+| Driver catalog | `DRIVER` blocks in [`drivers/*.lua`](drivers/) |
 
 When behavior looks wrong, inspect the source and its tests before adding a new
 document. Keep [docs/](docs/) small and current.

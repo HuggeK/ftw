@@ -91,8 +91,8 @@ workflows.
 
 ## Configuration
 
-`config.example.yaml` and the validation types in `go/internal/config` are
-the configuration reference. Copy the example for a native development setup:
+[`config.example.yaml`](config.example.yaml) and the validation types in
+[`go/internal/config`](go/internal/config) are the configuration reference. Copy the example for a native development setup:
 
 ```bash
 cp config.local.example.yaml config.local.yaml
@@ -139,8 +139,8 @@ metadata are the detailed reference.
 - [Home Assistant](docs/ha-integration.md)
 - [CalDAV](docs/caldav-integration.md)
 
-Other files under `docs/` are focused installation or external-integration
-guides.
+Other files under [`docs/`](docs/) are focused installation or
+external-integration guides.
 
 ## Contributing
 

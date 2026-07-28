@@ -4,8 +4,8 @@ Drivers are the hardware boundary. A driver translates one vendor protocol to
 FTW's site convention and runs in its own capability-scoped Lua 5.1 VM. No Go
 build is needed.
 
-Start from the closest existing file in `drivers/`, not from a generic
-template.
+Start from the closest existing file in [`drivers/`](../drivers/), not from a
+generic template.
 
 ## Metadata
 
@@ -81,7 +81,8 @@ the driver is a bug.
 
 ## Host capabilities
 
-`go/internal/drivers/lua.go` is the complete, current host API. It exposes
+[`go/internal/drivers/lua.go`](../go/internal/drivers/lua.go) is the complete,
+current host API. It exposes
 telemetry, diagnostic metrics, identity, time/JSON helpers and capability-gated
 MQTT, Modbus, HTTP, WebSocket and raw TCP operations.
 
@@ -117,7 +118,7 @@ not belong in structured meter/PV/battery/EV telemetry.
 5. Implement and test default mode before enabling automatic dispatch.
 6. Add configuration example only when the integration needs non-obvious
    operator input.
-7. Add Go-hosted Lua tests beside `go/internal/drivers`.
+7. Add Go-hosted Lua tests beside [`go/internal/drivers`](../go/internal/drivers).
 
 Useful checks:
 

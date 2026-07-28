@@ -22,8 +22,8 @@ and charge one another. Recovery happens only after fresh telemetry arrives.
 
 Source and executable specification:
 
-- `go/internal/telemetry`
-- the control tick in `go/cmd/ftw/main.go`
+- [`go/internal/telemetry`](../go/internal/telemetry)
+- the control tick in [`go/cmd/ftw/main.go`](../go/cmd/ftw/main.go)
 - watchdog and stale-meter tests beside those packages
 
 ## Dispatch limits
@@ -44,8 +44,9 @@ The reactive fuse saver may bypass normal slew limiting because preventing a
 fuse trip is the higher-priority quantified risk. It must still respect
 available battery energy and hardware power capability.
 
-The implementation and tests in `go/internal/control` are authoritative.
-Planner-side limits in `go/internal/mpc` reduce infeasible plans but do not
+The implementation and tests in [`go/internal/control`](../go/internal/control)
+are authoritative. Planner-side limits in [`go/internal/mpc`](../go/internal/mpc)
+reduce infeasible plans but do not
 replace runtime enforcement.
 
 ## Planner and model containment

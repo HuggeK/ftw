@@ -1,6 +1,6 @@
 # MyUplink OAuth setup
 
-`drivers/myuplink.lua` reads heat-pump telemetry from MyUplink. It is
+[`drivers/myuplink.lua`](../drivers/myuplink.lua) reads heat-pump telemetry from MyUplink. It is
 read-only: the driver does not call control endpoints.
 
 ## Register the app
@@ -45,4 +45,4 @@ driver persists the replacement through `host.persist_secret`.
 | No heat-pump card | Wait for the first poll, then verify parameter IDs in the driver header. |
 
 Common NIBE defaults and per-model override names live next to the mapping in
-`drivers/myuplink.lua`; that file is the reference.
+[`drivers/myuplink.lua`](../drivers/myuplink.lua); that file is the reference.

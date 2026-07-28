@@ -15,7 +15,7 @@ curl -fsSL https://raw.githubusercontent.com/srcfl/ftw/master/scripts/install.sh
 The default directory is `~/ftw`; persistent data is under `~/ftw/data`.
 Open `http://<host>:8080/setup` on the LAN.
 
-Use `docker-compose.macos.yml` on macOS because Linux host networking is not
+Use [`docker-compose.macos.yml`](../docker-compose.macos.yml) on macOS because Linux host networking is not
 available through Docker Desktop. Existing installations must follow
 [upgrade-from-legacy.md](upgrade-from-legacy.md), not the fresh installer.
 
@@ -61,14 +61,15 @@ changing ownership or deleting any SQLite sidecar files.
 
 ## Configuration
 
-`config.example.yaml` and `go/internal/config` define the current schema.
+[`config.example.yaml`](../config.example.yaml) and
+[`go/internal/config`](../go/internal/config) define the current schema.
 Edits are validated before application. A rejected hot reload leaves the
 previous live configuration intact.
 
 Driver set and most control values reload live. Listener addresses, state
 paths and some integration transports are startup bindings; restart after
 changing them. When unsure, inspect the restart classification in
-`go/internal/config/restart_required.go`.
+[`go/internal/config/restart_required.go`](../go/internal/config/restart_required.go).
 
 ## Logs and health
 
@@ -124,7 +125,8 @@ driver configuration.
 
 ### Configuration rejected
 
-Read the validation error, compare with `config.example.yaml`, fix the file and
+Read the validation error, compare with
+[`config.example.yaml`](../config.example.yaml), fix the file and
 save again. Do not delete `state.db` to resolve a YAML error.
 
 ### Port already in use
@@ -139,7 +141,8 @@ Stop the conflicting service or change the configured API port, then restart.
 
 `make build-arm64` and `make build-amd64` produce static Core and `ftw-backup`
 binaries.
-`deploy/ftw.service` is the reference systemd unit. A conventional layout is:
+[`deploy/ftw.service`](../deploy/ftw.service) is the reference systemd unit. A
+conventional layout is:
 
 ```text
 /opt/ftw/                 binary, web, bundled drivers, optional optimizer

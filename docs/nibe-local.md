@@ -1,8 +1,9 @@
 # NIBE S-series — Local REST API driver
 
-`drivers/nibe_local.lua` reads a NIBE S-series heat pump (S735, S1255, S1155,
+[`drivers/nibe_local.lua`](../drivers/nibe_local.lua) reads a NIBE S-series heat pump (S735, S1255, S1155,
 S320, …) directly over your LAN through the pump's **Local REST API**. It is
-the on-prem twin of the MyUplink cloud driver (`drivers/myuplink.lua`): same
+the on-prem twin of the MyUplink cloud driver
+([`drivers/myuplink.lua`](../drivers/myuplink.lua)): same
 `hp_*` telemetry, no cloud account, no OAuth, no internet round-trip.
 
 It is **read-only**. The pump is left in `aidMode: off` and the driver issues
@@ -80,7 +81,7 @@ profile map keyed by the device's `firmwareId`/model reported by
 `GET /api/v1/devices` — the generic S-series default below is verified on the
 S735 and, because the S-series shares the core register ids, covers the whole
 family. To support a model that genuinely renumbers a headline, add an entry to
-`PROFILES` in `drivers/nibe_local.lua`. You can always override any id per
+`PROFILES` in [`drivers/nibe_local.lua`](../drivers/nibe_local.lua). You can always override any id per
 instance via `param_power_id`, `param_hw_temp_id`, `param_indoor_temp_id`,
 `param_outdoor_temp_id`, etc. in `config` (override > profile > default):
 
@@ -130,7 +131,8 @@ thermal/load models consume `hp_power_w` etc. as twins.
 ## Testing
 
 A live integration test exercises the driver against a real pump
-(`go/internal/drivers/nibe_local_test.go`, `TestNibeLocalLive`), skipped unless
+([`go/internal/drivers/nibe_local_test.go`](../go/internal/drivers/nibe_local_test.go),
+`TestNibeLocalLive`), skipped unless
 `NIBE_LIVE=1`:
 
 ```bash
