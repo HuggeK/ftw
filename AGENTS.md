@@ -84,6 +84,29 @@ stay out of the repository; `.github/check-no-planning-docs.sh` enforces
 this. Commit the change, its tests and a changeset; put the reasoning in the
 PR description, where it is read during review and then archived.
 
+## Documentation follows the change
+
+A change a user can see — anything carrying a changeset — is finished in three
+places, not one. Code, then:
+
+- **The documents in here that describe what you touched.** Find them rather
+  than guessing: `git grep -l -F -e <path> -- README.md docs/` returns the
+  prose that was describing the thing you just changed. One that names your
+  path and did not move with you is the next reader's wrong answer.
+- **The website, [`srcfl/ftw-web`](https://github.com/srcfl/ftw-web).** It is
+  a separate repository holding one `index.html`, and it is the only
+  description of FTW that anyone who has not cloned this repository reads. A
+  new capability, a changed install path or a newly driven device belongs
+  there in a sentence a person deciding whether to run FTW would care about —
+  not a summary of the diff. Open that pull request in the same sitting and
+  link the two together.
+
+`.github/check-docs-follow-change.sh` reports both on every pull request, plus
+website links into this repository that stopped resolving. It never fails the
+merge, so it is on you to read it. When a change genuinely does not reach the
+website, write `no-website-change` in the PR description: the check goes quiet
+and the decision is on the record instead of in your head.
+
 ## Build and test
 
 ```bash

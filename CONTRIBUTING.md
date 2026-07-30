@@ -11,18 +11,35 @@ repository, [`srcfl/ftw-web`](https://github.com/srcfl/ftw-web). Landing-page
 copy, install instructions and other site content are edited there, not in this
 repo — open a pull request against `srcfl/ftw-web` for website changes.
 
-The traffic runs the other way too: the site deep-links into this repository, a
-README anchor behind each install button, `docs/` pages, the raw
-`scripts/install.sh` URL. Renaming a heading or moving one of those files breaks
-the site quietly, so the `repo hygiene` workflow resolves every one of those
-links on each pull request and warns when one stops resolving. It never fails
-the merge — the fix belongs in `srcfl/ftw-web`, and the warning exists so that
-pull request gets opened while you still know what replaced what. The same
-report is available locally:
+That does not make the website somebody else's problem. A change that a user can
+see is finished in three places: the code, the documentation in this repository,
+and the description of FTW that people read before they ever clone it.
+
+- **Here.** Update the documents that describe what you changed. A document that
+  names the path you touched and did not change with it is the next reader's
+  wrong answer.
+- **There.** If the change alters what FTW does, how it installs, or which
+  hardware it drives, open a pull request against `srcfl/ftw-web` saying what it
+  means for somebody deciding whether to run FTW — not what it does in the code.
+  A capability described only under `docs/` exists for people who already cloned
+  the repository, which is nobody who is still deciding to.
+- **Both directions.** The site also deep-links into this repository: a README
+  anchor behind each install button, `docs/` pages, the raw `scripts/install.sh`
+  URL it tells people to pipe into bash. Renaming a heading breaks those quietly,
+  because GitHub drops a fragment it cannot find instead of erroring.
+
+The `repo hygiene` workflow reports all of that on every pull request: links that
+stopped resolving, an install command that no longer matches this README, and —
+for any change carrying a changeset — the documents that describe what you
+touched and the website sections that make promises about it. It never fails the
+merge. When a change genuinely does not reach the website, write
+`no-website-change` in the pull request description and that part goes quiet.
+
+The same report is available locally:
 
 ```bash
-.github/check-web-links.sh
-WEB_SITE_FILE=../ftw-web/index.html .github/check-web-links.sh
+.github/check-docs-follow-change.sh
+WEB_SITE_FILE=../ftw-web/index.html .github/check-docs-follow-change.sh
 ```
 
 ## License of contributions
