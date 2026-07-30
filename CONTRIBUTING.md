@@ -11,6 +11,20 @@ repository, [`srcfl/ftw-web`](https://github.com/srcfl/ftw-web). Landing-page
 copy, install instructions and other site content are edited there, not in this
 repo — open a pull request against `srcfl/ftw-web` for website changes.
 
+The traffic runs the other way too: the site deep-links into this repository, a
+README anchor behind each install button, `docs/` pages, the raw
+`scripts/install.sh` URL. Renaming a heading or moving one of those files breaks
+the site quietly, so the `repo hygiene` workflow resolves every one of those
+links on each pull request and warns when one stops resolving. It never fails
+the merge — the fix belongs in `srcfl/ftw-web`, and the warning exists so that
+pull request gets opened while you still know what replaced what. The same
+report is available locally:
+
+```bash
+.github/check-web-links.sh
+WEB_SITE_FILE=../ftw-web/index.html .github/check-web-links.sh
+```
+
 ## License of contributions
 
 This project is licensed under the **Apache License, Version 2.0** (see

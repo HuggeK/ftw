@@ -21,3 +21,45 @@ jobs:
         env:
           PLANNING_DOCS_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: .github/check-no-planning-docs.sh
+
+  website-links:
+    name: the website still links somewhere
+    runs-on: ubuntu-latest
+    # Deliberately advisory. srcfl/ftw-web is where the fix goes, this job only
+    # knows the link broke, and a contributor without commit rights over there
+    # must not be stuck. It warns and writes a summary; it never fails the PR.
+    # .github/check-web-links.sh explains which links rotted to earn it.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Resolve the website's links into this repository
+        env:
+          WEB_LINKS_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+
+          set +e
+          report="$(.github/check-web-links.sh 2>&1)"
+          status=$?
+          set -e
+
+          echo "${report}"
+
+          {
+            echo "### Website links into this repository"
+            echo
+            echo '```'
+            echo "${report}"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          # A workflow-command annotation is one line, so it points at the
+          # summary rather than trying to carry the report.
+          case "${status}" in
+            0) ;;
+            1) echo "::warning title=srcfl/ftw-web needs a pull request::the website links into this repository that no longer resolve — see this job's summary" ;;
+            *) echo "::warning title=website links were not checked::the check could not run (exit ${status}) — see this job's summary" ;;
+          esac
