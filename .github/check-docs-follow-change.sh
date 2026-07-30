@@ -30,9 +30,10 @@
 #
 # It never fails the merge. Some of what it reports is a judgement call about a
 # repository one over, and a check that blocks on a judgement call gets
-# satisfied rather than read. Write "no-website-change" in the pull request
-# description when a change genuinely does not reach the site, and that section
-# goes quiet with the decision recorded where review can see it.
+# satisfied rather than read. Put "no-website-change" on a line of its own in
+# the pull request description when a change genuinely does not reach the site,
+# and that section goes quiet with the decision recorded where review can see
+# it.
 #
 # Run it the way CI does, or against a local checkout of the site:
 #
@@ -118,8 +119,13 @@ if [ -n "${changed}" ]; then
   done <<<"${changed}"
 fi
 
+# The marker has to sit on a line of its own, optionally bulleted, ticked or
+# followed by a reason. A pull request that merely mentions "no-website-change"
+# mid-sentence -- this check's own description does -- is discussing the escape
+# hatch, not taking it.
 website_opt_out=""
-if printf '%s' "${PR_BODY}" | grep -qiF 'no-website-change'; then
+if printf '%s\n' "${PR_BODY}" |
+  grep -qiE '^[[:space:]]*([-*+][[:space:]]*)?(\[[ xX]\][[:space:]]*)?`?no-website-change`?[[:space:]]*([:-][^|]*)?$'; then
   website_opt_out="yes"
 fi
 

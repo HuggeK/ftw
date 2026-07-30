@@ -104,8 +104,8 @@ places, not one. Code, then:
 `.github/check-docs-follow-change.sh` reports both on every pull request, plus
 website links into this repository that stopped resolving. It never fails the
 merge, so it is on you to read it. When a change genuinely does not reach the
-website, write `no-website-change` in the PR description: the check goes quiet
-and the decision is on the record instead of in your head.
+website, put `no-website-change` on a line of its own in the PR description: the
+check goes quiet and the decision is on the record instead of in your head.
 
 ## Build and test
 

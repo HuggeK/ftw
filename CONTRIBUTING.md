@@ -32,8 +32,9 @@ The `repo hygiene` workflow reports all of that on every pull request: links tha
 stopped resolving, an install command that no longer matches this README, and —
 for any change carrying a changeset — the documents that describe what you
 touched and the website sections that make promises about it. It never fails the
-merge. When a change genuinely does not reach the website, write
-`no-website-change` in the pull request description and that part goes quiet.
+merge. When a change genuinely does not reach the website, put
+`no-website-change` on a line of its own in the pull request description and
+that part goes quiet.
 
 The same report is available locally:
 
