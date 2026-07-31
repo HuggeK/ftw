@@ -65,6 +65,7 @@ import (
 	"github.com/srcfl/ftw/go/internal/proxy"
 	"github.com/srcfl/ftw/go/internal/pvmodel"
 	"github.com/srcfl/ftw/go/internal/pvperf"
+	"github.com/srcfl/ftw/go/internal/roofmodel"
 	"github.com/srcfl/ftw/go/internal/selftune"
 	"github.com/srcfl/ftw/go/internal/selfupdate"
 	"github.com/srcfl/ftw/go/internal/state"
@@ -1210,6 +1211,10 @@ func main() {
 	// PV scoring. Nil when the site has no PV geometry to score against. This is
 	// read-only with respect to control: it only fetches weather data and writes
 	// the irradiance_history + pv_performance_daily tables.
+	// Optional roof-geometry module: nil unless explicitly enabled, and
+	// stateless — it only runs when an operator asks for a derive.
+	roofModelSvc := roofmodel.FromConfig(cfg.RoofModel)
+
 	pvPerfSvc := pvperf.FromConfig(cfg.Weather, ratedPVW, st,
 		"ftw/"+Version+" github.com/srcfl/ftw")
 	if pvPerfSvc != nil {
@@ -2590,6 +2595,7 @@ func main() {
 		Prices:           priceSvc,
 		Forecast:         forecastSvc,
 		PVPerf:           pvPerfSvc,
+		RoofModel:        roofModelSvc,
 		MPC:              mpcSvc,
 		PlannerPrefs:     plannerPrefs,
 		PVModel:          pvSvc,
