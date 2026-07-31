@@ -29,6 +29,7 @@ import (
 
 	"github.com/srcfl/ftw/go/internal/config"
 	"github.com/srcfl/ftw/go/internal/state"
+	"github.com/srcfl/ftw/go/internal/sunpos"
 )
 
 // Provider is implemented by each weather source.
@@ -243,10 +244,16 @@ func EstimatePVW(lat, lon float64, t time.Time, cloudPct *float64, ratedW float6
 
 // Service wraps a provider + store + scheduler for forecasts.
 type Service struct {
-	Provider   Provider
-	Store      *state.Store
-	Lat, Lon   float64
-	RatedPVW   float64 // total rated PV across all arrays (used for estimate)
+	Provider Provider
+	Store    *state.Store
+	Lat, Lon float64
+	RatedPVW float64 // total rated PV across all arrays (used for estimate)
+
+	// Arrays holds per-plane geometry (tilt/azimuth/kWp) mirrored from the
+	// weather config. When set, a radiation-bearing provider's horizontal
+	// GHI is projected onto each plane via sunpos and summed, instead of the
+	// orientation-blind flat rated×(W/m²/1000) estimate. Empty → flat estimate.
+	Arrays []Array
 
 	stop chan struct{}
 	done chan struct{}
@@ -286,10 +293,21 @@ func FromConfig(cfg *config.Weather, ratedPVW float64, st *state.Store, userAgen
 	default:
 		return nil
 	}
+	// Mirror per-plane geometry for the POA path. Shared across all
+	// providers: forecast_solar already applies geometry server-side (so
+	// this stays unused there), but open_meteo / STRÅNG-style GHI providers
+	// use it to project irradiance onto each plane in fetchAndStore.
+	var arrays []Array
+	for _, a := range cfg.PVArrays {
+		if a.KWp > 0 {
+			arrays = append(arrays, Array{TiltDeg: a.TiltDeg, AzimuthDeg: a.AzimuthDeg, KWp: a.KWp})
+		}
+	}
 	return &Service{
 		Provider: p, Store: st,
 		Lat: cfg.Latitude, Lon: cfg.Longitude,
 		RatedPVW: ratedPVW,
+		Arrays:   arrays,
 		stop:     make(chan struct{}),
 		done:     make(chan struct{}),
 	}
@@ -341,7 +359,11 @@ func (s *Service) fetchAndStore(ctx context.Context) {
 		switch {
 		case r.PVWEstimated != nil:
 			pvW = *r.PVWEstimated
+		case r.SolarWm2 != nil && len(s.Arrays) > 0:
+			// Orientation-aware: project GHI onto each configured plane and sum.
+			pvW = poaPVWattsFromGHI(s.Lat, s.Lon, r.HourStart, *r.SolarWm2, s.Arrays)
 		case r.SolarWm2 != nil && s.RatedPVW > 0:
+			// No geometry configured — flat, orientation-blind estimate.
 			pvW = s.RatedPVW * (*r.SolarWm2) / 1000.0
 		default:
 			pvW = EstimatePVW(s.Lat, s.Lon, r.HourStart, r.CloudCoverPct, s.RatedPVW)
@@ -363,6 +385,25 @@ func (s *Service) fetchAndStore(ctx context.Context) {
 		return
 	}
 	slog.Info("forecast fetched", "count", len(points), "provider", s.Provider.Name())
+}
+
+// poaPVWattsFromGHI converts a global-horizontal irradiance (W/m², positive)
+// into expected DC PV output (W, positive) by projecting it onto each
+// configured array's plane via sunpos and scaling by nameplate. This is the
+// orientation-aware replacement for the flat rated×(W/m²/1000) estimate; it
+// is used whenever the provider supplies GHI and the site has per-plane
+// geometry. Returns 0 when the sun is down or no arrays produce output.
+func poaPVWattsFromGHI(lat, lon float64, t time.Time, ghiWm2 float64, arrays []Array) float64 {
+	var total float64
+	for _, a := range arrays {
+		if a.KWp <= 0 {
+			continue
+		}
+		poa := sunpos.POAFromGHI(t, lat, lon, ghiWm2, a.TiltDeg, a.AzimuthDeg)
+		// kWp×1000 = nameplate W at STC (1000 W/m²); scale by POA/1000.
+		total += a.KWp * 1000.0 * (poa / 1000.0)
+	}
+	return total
 }
 
 // Load returns forecasts in [sinceMs, untilMs].

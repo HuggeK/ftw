@@ -247,3 +247,97 @@ func TestFromConfigBuildsMetNo(t *testing.T) {
 	if s.Lat != 59 { t.Errorf("lat: %f", s.Lat) }
 	if s.RatedPVW != 10000 { t.Errorf("rated: %f", s.RatedPVW) }
 }
+
+func TestFromConfigPopulatesArrays(t *testing.T) {
+	st, _ := state.Open(filepath.Join(t.TempDir(), "t.db"))
+	defer st.Close()
+	cfg := &config.Weather{
+		Provider: "open_meteo", Latitude: 59, Longitude: 18,
+		PVArrays: []config.PVArray{
+			{Name: "south", KWp: 6, TiltDeg: 35, AzimuthDeg: 180},
+			{Name: "east", KWp: 4, TiltDeg: 30, AzimuthDeg: 90},
+			{Name: "empty", KWp: 0, TiltDeg: 10, AzimuthDeg: 200}, // skipped (kWp 0)
+		},
+	}
+	s := FromConfig(cfg, 10000, st, "ua")
+	if s == nil { t.Fatal("expected service") }
+	if len(s.Arrays) != 2 {
+		t.Fatalf("expected 2 arrays (kWp>0 only), got %d", len(s.Arrays))
+	}
+	if s.Arrays[0].KWp != 6 || s.Arrays[1].AzimuthDeg != 90 {
+		t.Errorf("array geometry mismatch: %+v", s.Arrays)
+	}
+}
+
+// ---- POA-per-array (orientation-aware) estimate ----
+
+func TestPOAPVWattsSumsArrays(t *testing.T) {
+	tt := time.Date(2026, 6, 21, 11, 0, 0, 0, time.UTC)
+	one := poaPVWattsFromGHI(59.3293, 18.0686, tt, 700, []Array{{TiltDeg: 35, AzimuthDeg: 180, KWp: 5}})
+	two := poaPVWattsFromGHI(59.3293, 18.0686, tt, 700, []Array{
+		{TiltDeg: 35, AzimuthDeg: 180, KWp: 5},
+		{TiltDeg: 35, AzimuthDeg: 180, KWp: 5},
+	})
+	if one <= 0 {
+		t.Fatalf("expected positive POA watts, got %.1f", one)
+	}
+	if math.Abs(two-2*one) > 1e-6 {
+		t.Errorf("two identical arrays should double output: one=%.2f two=%.2f", one, two)
+	}
+}
+
+func TestPOAPVWattsZeroAtNight(t *testing.T) {
+	tt := time.Date(2026, 12, 21, 23, 0, 0, 0, time.UTC)
+	w := poaPVWattsFromGHI(59.3293, 18.0686, tt, 500, []Array{{TiltDeg: 35, AzimuthDeg: 180, KWp: 10}})
+	if w != 0 {
+		t.Errorf("night POA watts should be 0, got %.2f", w)
+	}
+}
+
+// End-to-end: with per-plane geometry, a GHI-bearing provider's stored PV
+// estimate comes from the POA path and differs from the flat rated×GHI/1000.
+func TestServicePOAPathDiffersFromFlat(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := map[string]any{
+			"hourly": map[string]any{
+				"time":                []string{"2026-06-21T11:00"},
+				"shortwave_radiation": []float64{700},
+				"cloud_cover":         []float64{5},
+				"temperature_2m":      []float64{20},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+
+	st, _ := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	defer st.Close()
+
+	p := NewOpenMeteo()
+	p.BaseURL = srv.URL
+	s := &Service{
+		Provider: p, Store: st, Lat: 59.3293, Lon: 18.0686, RatedPVW: 10000,
+		Arrays: []Array{{TiltDeg: 35, AzimuthDeg: 180, KWp: 10}},
+	}
+	s.fetchAndStore(context.Background())
+
+	tt := time.Date(2026, 6, 21, 11, 0, 0, 0, time.UTC)
+	rows, err := st.LoadForecasts(tt.UnixMilli(), tt.Add(time.Hour).UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].PVWEstimated == nil {
+		t.Fatalf("expected 1 forecast with PV estimate, got %+v", rows)
+	}
+	got := *rows[0].PVWEstimated
+	flat := 10000 * 700.0 / 1000.0 // orientation-blind estimate = 7000 W
+	want := poaPVWattsFromGHI(59.3293, 18.0686, tt, 700, s.Arrays)
+	if math.Abs(got-want) > 1.0 {
+		t.Errorf("service should use POA path: got %.1f want %.1f", got, want)
+	}
+	if math.Abs(got-flat) < 1.0 {
+		t.Errorf("POA estimate should differ from flat %.0f, got %.1f", flat, got)
+	}
+	t.Logf("POA-per-array estimate %.0fW vs flat %.0fW", got, flat)
+}
