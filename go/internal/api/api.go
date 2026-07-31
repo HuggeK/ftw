@@ -206,6 +206,12 @@ type Server struct {
 	savingsCacheMu sync.Mutex
 	savingsCache   map[string]daySavings
 
+	// controlHolds is the one operator setting in force per driver, with the
+	// timer that ends it. Process-lifetime only, deliberately: a restart
+	// should leave no device held by a setting nobody remembers making.
+	controlHoldMu sync.Mutex
+	controlHolds  map[string]*controlHold
+
 	versionUpdateMu sync.Mutex
 	driverUpdateMu  sync.Mutex
 	backupMu        sync.Mutex
@@ -277,7 +283,9 @@ func (s *Server) routes() {
 	s.handle("GET  /api/drivers/{name}/logs", s.handleDriverLogs)
 	s.handle("GET  /api/logs", s.handleGlobalLogs)
 	s.handle("GET  /api/support/dump", s.handleSupportDump)
-	s.handle("GET  /api/support/report", s.handleSupportReport)
+		s.handle("GET  /api/support/report", s.handleSupportReport)
+		s.handle("POST   /api/drivers/{name}/control", s.handleDriverControl)
+		s.handle("DELETE /api/drivers/{name}/control", s.handleDriverControlRelease)
 	s.handle("POST /api/drivers/{name}/restart", s.handleDriverRestart)
 	s.handle("POST /api/drivers/{name}/disable", s.handleDriverDisable)
 	s.handle("POST /api/drivers/{name}/enable", s.handleDriverEnable)

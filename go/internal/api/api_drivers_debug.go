@@ -35,9 +35,10 @@ type driverDetailResp struct {
 	Metrics  []telemetry.MetricSnapshot `json:"metrics"`
 	Identity driverIdentityDTO          `json:"identity"`
 	// Controls are what this driver says an operator may command. Absent
-	// for every driver that only reports. Nothing sends them yet — this is
-	// the description, not the path.
+	// for every driver that only reports.
 	Controls []drivers.CatalogControl `json:"controls,omitempty"`
+	// Hold is the operator setting in force, if any, and when it ends.
+	Hold *controlHold `json:"hold,omitempty"`
 }
 
 type readingDTO struct {
@@ -106,6 +107,7 @@ func (s *Server) handleDriverDetail(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	resp.Controls = s.driverControls(name)
+	resp.Hold = s.activeControlHold(name)
 	writeJSON(w, 200, resp)
 }
 
