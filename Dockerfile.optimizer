@@ -1,11 +1,28 @@
 # Independently releasable FTW mathematical optimizer.
-FROM python:3.12-slim-bookworm AS build
+#
+# This image does NOT share a base with core and the updater, and cannot.
+# Measured, not assumed, on python:3.12-alpine:
+#
+#   pip install --only-binary=:all: cvxpy==1.9.2
+#     → "Could not find a version that satisfies the requirement
+#        cvxpy==1.9.2 (from versions: 0.4.10)"
+#
+# CVXPY publishes no musllinux wheels — 0.4.10 is the newest that exists — and
+# clarabel, osqp and ecos have none either. numpy, scipy and highspy do. Falling
+# back to source builds means compiling a Rust solver and two C++ solvers on
+# every release, for arm64 under emulation as well; attempted, and it fails in
+# sparsediffpy's build backend before it even reaches them.
+#
+# So the stack runs two bases by necessity. What is fixed here is the suite:
+# bookworm is oldstable, so this moves to trixie to match core's security
+# cadence even though the layers stay separate.
+FROM python:3.12-slim-trixie AS build
 
 COPY optimizer/ /src/optimizer/
 RUN python -m venv /opt/venv && \
     /opt/venv/bin/pip install --no-cache-dir /src/optimizer
 
-FROM python:3.12-slim-bookworm
+FROM python:3.12-slim-trixie
 
 ARG VERSION=dev
 ARG BUILD_SHA=""

@@ -28,12 +28,29 @@ RUN cd go && \
     -o /out/ftw-updater ./cmd/ftw-updater
 
 # --- Runtime ---------------------------------------------------------------
-# docker:27-cli bundles the `docker` binary + `docker compose` plugin +
-# ca-certificates + tzdata, which is exactly what we need to execute
-# compose pulls against the host daemon.
-FROM docker:27-cli
+# The same alpine:3.22 rootfs as Dockerfile, so core and the sidecar share one
+# base layer: a host pulls it once instead of twice, and there is one suite to
+# track for both.
+#
+# This was docker:27-cli. That image is alpine-based too, but it is a
+# *different* alpine — its own base layer, its own upgrade cadence — so it
+# shared nothing with core in practice.
+#
+# The docker CLI and the compose plugin are copied straight out of the official
+# CLI image instead: same upstream artifact, version pinned explicitly, and no
+# package repository added. Both are statically linked Go binaries (verified:
+# musl's loader reports "Not a valid dynamic program", and both run correctly
+# once copied), so nothing here depends on which libc the base ships.
+FROM alpine:3.22
 
-# Compose pull hits GHCR over TLS; docker:cli already bundles ca-certs.
+# docker:27-cli bundled these; on a bare base they have to be asked for.
+# Compose pull hits GHCR over TLS.
+RUN apk add --no-cache ca-certificates tzdata
+
+COPY --from=docker:27-cli /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=docker:27-cli /usr/local/libexec/docker/cli-plugins/docker-compose \
+                          /usr/local/libexec/docker/cli-plugins/docker-compose
+
 COPY --from=builder /out/ftw-updater /usr/local/bin/ftw-updater
 COPY LICENSE NOTICE /usr/share/doc/ftw/
 

@@ -36,10 +36,24 @@ RUN cd go && \
     go build -trimpath -ldflags="-s -w -X main.Version=${VERSION}" \
     -o /out/ftw-backup ./cmd/ftw-backup
 # --- Runtime ---------------------------------------------------------------
+# alpine:3.22, and Dockerfile.updater now uses the same tag, so the two images
+# a host runs side by side share one base layer instead of pulling two.
+#
+# The binary is CGO_ENABLED=0 and fully static, so this picks the image's
+# *userland*, not a libc the process depends on. That is why the choice is
+# reversible and why it has no bearing on .local resolution — see
+# go/internal/mdnsresolve.
+#
+# Dockerfile.optimizer cannot join this base: CVXPY publishes no musllinux
+# wheels at all, so see the note there before trying to unify the third image.
 FROM alpine:3.22
 
 # HTTPS integrations and timezone-aware price/plan windows need these at
 # runtime. BusyBox wget provides the health check without adding Python/curl.
+#
+# tzdata is belt-and-braces now: the binary also embeds the zoneinfo database
+# (see the time/tzdata import in cmd/ftw). Without either, time.Local silently
+# degrades to UTC and mis-times price and plan windows with no error at all.
 RUN apk add --no-cache ca-certificates tzdata
 
 # Image layout:

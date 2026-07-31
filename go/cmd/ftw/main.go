@@ -24,6 +24,13 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	// Embed the zoneinfo database in the binary. Production code uses
+	// time.Local, which silently falls back to UTC when the runtime has no
+	// zoneinfo tree — no error, no log line, just price windows and plan
+	// boundaries an hour or two out. The system database still wins when it is
+	// present; this only removes the silent-failure mode if a base image ever
+	// stops shipping tzdata.
+	_ "time/tzdata"
 
 	"github.com/srcfl/ftw/go/internal/api"
 	"github.com/srcfl/ftw/go/internal/arp"
