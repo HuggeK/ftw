@@ -72,6 +72,15 @@ def main(argv: list[str] | None = None) -> int:
         default=3006,
         help="CRS of the search bbox: 3006 for Lantmäteriet, 4326 per the STAC spec",
     )
+    p.add_argument(
+        "--vostok",
+        default="",
+        help=(
+            "path to a vostok binary for shadow-aware irradiance. vostok is a "
+            "separate GPL-3.0 tool that FTW never bundles or installs; omit this "
+            "and shading is simply not evaluated."
+        ),
+    )
     args = p.parse_args(argv)
     credentials = Credentials(args.username, args.password)
 
@@ -99,6 +108,7 @@ def main(argv: list[str] | None = None) -> int:
                 radius_m=args.radius_m,
                 packing_factor=args.packing_factor,
                 module_w_per_m2=args.module_w_per_m2,
+                vostok_binary=args.vostok or None,
                 building_id=args.building_id or None,
                 base_url=args.stac_base_url,
                 buildings_collection=args.buildings_collection,
