@@ -7,7 +7,11 @@
 // fetch per driver); steady-state polling then only touches the heat-pump
 // drivers, avoiding unnecessary work every 30 seconds.
 //
-// See docs/myuplink-oauth.md. No control here — telemetry only.
+// See docs/myuplink-oauth.md.
+//
+// Control is rendered only for a driver that declares one (/api/drivers/{name}
+// → controls). Nothing here knows a driver by name: a pump that declares
+// nothing shows telemetry and no buttons, exactly as before.
 
 (function () {
   'use strict';
@@ -125,6 +129,23 @@
       '.ftw-hp-legend{display:flex;gap:14px;flex-wrap:wrap}',
       '.ftw-hp-chartsub{font-family:var(--sans);font-size:0.72rem;color:var(--fg-muted);margin:-2px 0 6px}',
       '.ftw-hp-asof{font-family:var(--mono);font-size:0.62rem;letter-spacing:0.04em;color:var(--fg-muted);margin:-4px 0 10px}',
+      // Control row. Held vs Auto is carried by the text and the weight of the
+      // value, never by colour alone — the palette's green/red pair is not
+      // separable under deuteranopia.
+      '.ftw-hpc{border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin:0 0 12px}',
+      '.ftw-hpc-row{display:flex;align-items:center;gap:8px}',
+      '.ftw-hpc-label{font-family:var(--mono);font-size:0.66rem;text-transform:uppercase;letter-spacing:0.06em;color:var(--fg-muted);flex:0 0 auto}',
+      '.ftw-hpc-state{flex:1 1 auto;display:flex;align-items:baseline;gap:6px;min-width:0}',
+      '.ftw-hpc-value{font-family:var(--mono);font-size:0.95rem;font-weight:600;color:var(--fg)}',
+      '.ftw-hpc-until{font-family:var(--mono);font-size:0.62rem;color:var(--fg-muted);white-space:nowrap}',
+      '.ftw-hpc-auto{font-family:var(--mono);font-size:0.8rem;color:var(--fg-muted)}',
+      '.ftw-hpc-btn{width:30px;height:30px;flex:0 0 auto;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--fg);font-size:1rem;line-height:1;cursor:pointer;font-family:var(--mono)}',
+      '.ftw-hpc-btn:hover:not(:disabled){border-color:var(--fg-muted)}',
+      '.ftw-hpc-btn:disabled{opacity:0.35;cursor:default}',
+      '.ftw-hpc-release{flex:0 0 auto;border:1px solid var(--border);border-radius:6px;background:transparent;color:var(--fg-muted);font-family:var(--mono);font-size:0.62rem;text-transform:uppercase;letter-spacing:0.06em;padding:6px 8px;cursor:pointer}',
+      '.ftw-hpc-release:hover:not(:disabled){color:var(--fg);border-color:var(--fg-muted)}',
+      '.ftw-hpc-note{font-family:var(--sans);font-size:0.68rem;color:var(--fg-muted);margin-top:6px}',
+      '.ftw-hpc-err{font-family:var(--sans);font-size:0.68rem;color:var(--fg);margin-top:6px}',
       '.ftw-hp-leg{font-family:var(--mono);font-size:0.62rem;text-transform:uppercase;letter-spacing:0.06em;color:var(--fg-muted);display:inline-flex;align-items:center;gap:4px}',
       '.ftw-hp-leg-dot{width:8px;height:8px;border-radius:2px;display:inline-block}',
       '.ftw-hp-erow{display:grid;grid-template-columns:1fr auto auto;gap:7px 18px;align-items:baseline}',
@@ -363,6 +384,7 @@
       '<div class="ftw-hp-head"><span class="ftw-hp-name">' + escapeHtml(name) + '</span>' +
       '<span class="ftw-hp-more">All signals →</span></div>' +
       asof +
+      controlBlock(name, detail) +
       groups +
       energyPeriodsBlock(energy) +
       tempChartBlock(temps) +
@@ -374,6 +396,142 @@
     return String(s).replace(/[&<>"']/g, function (c) {
       return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
     });
+  }
+
+  // ---- Control: one declared command per pump ----
+  //
+  // Rendered from what the driver declares (/api/drivers/{name} → controls),
+  // so a pump that declares nothing shows nothing and this file never learns
+  // a driver's name. Stepper buttons rather than a slider or a number field:
+  // the whole card is re-rendered every 30 s, and a control holding input
+  // state would lose a half-typed value on every refresh.
+  //
+  // Only number controls render today, which is what a heat curve offset is.
+  // A boolean would want a different shape and no driver declares one yet.
+  function firstNumberControl(detail) {
+    var controls = (detail && detail.controls) || [];
+    for (var i = 0; i < controls.length; i++) {
+      if (controls[i] && controls[i].input && controls[i].input.type === 'number') return controls[i];
+    }
+    return null;
+  }
+
+  function fmtHoldUntil(ms) {
+    if (!ms) return '';
+    return new Date(ms).toLocaleTimeString('en-US', {
+      hour: '2-digit', minute: '2-digit', hour12: false,
+    });
+  }
+
+  // Signed, because an offset's sign is its whole meaning: +1 is warmer,
+  // -1 is cooler, and "1" would be ambiguous.
+  function fmtOffsetValue(v, unit) {
+    var sign = v > 0 ? '+' : '';
+    return sign + String(v) + (unit ? ' ' + unit : '');
+  }
+
+  function controlBlock(name, detail) {
+    var control = firstNumberControl(detail);
+    if (!control) return '';
+    var input = control.input || {};
+    var hold = (detail && detail.hold && detail.hold.control === control.id) ? detail.hold : null;
+    var held = hold && typeof hold.value === 'number';
+    var step = typeof input.step === 'number' && input.step > 0 ? input.step : 1;
+    var value = held ? hold.value : 0;
+
+    // Without a hold the driver is running its own default. Saying "Auto" is
+    // the honest answer: nothing here knows what offset the pump has settled
+    // on internally, and printing 0 would claim knowledge we do not have.
+    var state = held
+      ? '<span class="ftw-hpc-value">' + escapeHtml(fmtOffsetValue(hold.value, input.unit)) + '</span>' +
+        '<span class="ftw-hpc-until">until ' + escapeHtml(fmtHoldUntil(hold.expires_at_ms)) + '</span>'
+      : '<span class="ftw-hpc-auto">Auto</span>';
+
+    var atMin = held && typeof input.min === 'number' && value <= input.min;
+    var atMax = held && typeof input.max === 'number' && value >= input.max;
+    var btn = function (delta, label, disabled) {
+      return '<button type="button" class="ftw-hpc-btn" data-hpc-driver="' + escapeHtml(name) + '"' +
+        ' data-hpc-control="' + escapeHtml(control.id) + '"' +
+        ' data-hpc-value="' + escapeHtml(String(clampControl(value + delta, input))) + '"' +
+        (disabled ? ' disabled' : '') +
+        ' aria-label="' + escapeHtml(label + ' ' + (control.label || control.id)) + '">' +
+        escapeHtml(label === 'Lower' ? '−' : '+') + '</button>';
+    };
+
+    return '<div class="ftw-hpc">' +
+      '<div class="ftw-hpc-row">' +
+      '<span class="ftw-hpc-label">' + escapeHtml(control.label || control.id) + '</span>' +
+      '<span class="ftw-hpc-state">' + state + '</span>' +
+      btn(-step, 'Lower', atMin) +
+      btn(step, 'Raise', atMax) +
+      (held
+        ? '<button type="button" class="ftw-hpc-release" data-hpc-release="' + escapeHtml(name) + '">Release</button>'
+        : '') +
+      '</div>' +
+      (control.evidence === 'readback'
+        ? ''
+        : '<div class="ftw-hpc-note">The pump does not confirm this setting — FTW cannot tell whether it took.</div>') +
+      '<div class="ftw-hpc-err" hidden></div>' +
+      '</div>';
+  }
+
+  function clampControl(v, input) {
+    if (typeof input.min === 'number' && v < input.min) v = input.min;
+    if (typeof input.max === 'number' && v > input.max) v = input.max;
+    // Steps are commonly fractional (0.5 °C); rounding here keeps 0.30000000000000004
+    // out of both the button label and the request body.
+    return Math.round(v * 1000) / 1000;
+  }
+
+  function controlError(el, message) {
+    var box = el.closest('.ftw-hpc') && el.closest('.ftw-hpc').querySelector('.ftw-hpc-err');
+    if (!box) return;
+    box.textContent = message;
+    box.hidden = false;
+  }
+
+  function sendControl(el, name, control, value) {
+    el.disabled = true;
+    apiFetch('/api/drivers/' + encodeURIComponent(name) + '/control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ control: control, value: value }),
+    }).then(function (r) {
+      return r.json().then(function (body) {
+        if (!r.ok) throw new Error(body && body.error ? body.error : 'request failed');
+        return body;
+      });
+    }).then(function () {
+      refreshAfterControl();
+    }).catch(function (err) {
+      el.disabled = false;
+      controlError(el, String(err.message || err));
+    });
+  }
+
+  function releaseControl(el, name) {
+    el.disabled = true;
+    apiFetch('/api/drivers/' + encodeURIComponent(name) + '/control', { method: 'DELETE' })
+      .then(function (r) {
+        return r.json().then(function (body) {
+          if (!r.ok) throw new Error(body && body.error ? body.error : 'request failed');
+          return body;
+        });
+      })
+      .then(function () { refreshAfterControl(); })
+      .catch(function (err) {
+        el.disabled = false;
+        controlError(el, String(err.message || err));
+      });
+  }
+
+  // refresh() drops the call if one is already running, which for the 30 s
+  // timer is right and here is not: the operator just pressed a button and
+  // has to see the result. Retry once shortly after, which is long enough for
+  // an in-flight cycle to finish.
+  function refreshAfterControl() {
+    if (!refreshInFlight) { refresh(); return; }
+    setTimeout(refresh, 400);
   }
 
   // The live values are cheap and refresh every 30 s. Month/year history is
@@ -619,6 +777,23 @@
     // The ? help icons explain a metric in place (native tooltip) — a click on
     // one must NOT navigate into the all-signals detail.
     if (e.target.closest && e.target.closest('.ftw-hp-i')) return;
+    // Commanding the pump is not navigating to its signals. The card is the
+    // button, so every control click has to stop here or the detail view
+    // opens over the thing the operator just pressed.
+    var step = e.target.closest && e.target.closest('.ftw-hpc-btn');
+    if (step) {
+      e.stopPropagation();
+      sendControl(step, step.dataset.hpcDriver, step.dataset.hpcControl,
+        parseFloat(step.dataset.hpcValue));
+      return;
+    }
+    var release = e.target.closest && e.target.closest('.ftw-hpc-release');
+    if (release) {
+      e.stopPropagation();
+      releaseControl(release, release.dataset.hpcRelease);
+      return;
+    }
+    if (e.target.closest && e.target.closest('.ftw-hpc')) return;
     var card = e.target.closest && e.target.closest('.ftw-hp-clickable');
     if (card && card.dataset.hpDriver) openDetail(card.dataset.hpDriver);
   }
