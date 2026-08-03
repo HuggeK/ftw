@@ -21,6 +21,15 @@ the signed driver channel, stays off without `write.solar_pv: true` plus
 `capabilities.http.allow_write: true`, and needs a core with
 `host.http_patch`.
 
+Once a driver that declares that path is installed (`write_capabilities` in
+its `DRIVER` block), **Settings → Devices** grows a *Solar PV surplus feed*
+panel on it: one switch and the maximum surplus to report. The switch sets
+both gates together, because either alone does nothing, and the feed stays
+off until the maximum is above 0 — that ceiling is what bounds every value
+FTW can send. A driver that declares no write path gets no panel. What the
+pump needs at its own end — menu 7.5.15 set to read/write, Solar PV input on
+— cannot be checked from FTW, so the panel states it.
+
 **Decommissioning a write-enabled setup.** Every automatic safeguard around
 the feed (dead-man's switch, default-mode clear, startup orphan sweep) runs
 inside FTW — none of them can fire once FTW is gone, and the pump's own

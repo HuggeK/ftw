@@ -37,6 +37,15 @@ version, host API and `read_only` value must agree with the signed package. Do
 not duplicate the catalog in Markdown. Executable or public metadata changes
 require one public package version bump.
 
+A driver with an opt-in write path names it in `write_capabilities` — e.g.
+`write_capabilities = { "solar_pv" }` for a driver that feeds a heat pump's
+own solar-surplus input. The Settings UI offers a switch for a path it
+recognises and nothing for a driver that declares none, so a write stays
+unreachable until the driver itself says it has one. Declaring a path is not
+enabling it: the switch is off until an operator turns it on, and the host
+capability it needs (`capabilities.http.allow_write`) is still a separate
+grant.
+
 ## Lifecycle
 
 ```lua
