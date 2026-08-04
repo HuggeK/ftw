@@ -37,6 +37,7 @@ const controlProbeLua = `DRIVER = {
 
 local applied   = nil
 local defaulted = 0
+local startup_default = true
 
 function driver_init(config)
     host.set_make("Probe")
@@ -60,6 +61,11 @@ function driver_command(action, power_w, cmd)
 end
 
 function driver_default_mode()
+    if startup_default then
+        startup_default = false
+        applied = 0
+        return true
+    end
     defaulted = defaulted + 1
     applied   = 0
 end
@@ -116,6 +122,7 @@ const controlSafetyProbeLua = `DRIVER = {
 
 local applied   = nil
 local defaulted = 0
+local startup_default = true
 
 function driver_init(config)
     host.set_make("Probe safety")
@@ -142,6 +149,11 @@ function driver_command(action, power_w, cmd)
 end
 
 function driver_default_mode()
+    if startup_default then
+        startup_default = false
+        applied = 0
+        return true
+    end
     defaulted = defaulted + 1
     host.emit_metric("default_started", defaulted, "n")
     host.sleep(200)
@@ -160,6 +172,7 @@ const controlRecoveryProbeLua = `DRIVER = {
 
 local applied = nil
 local defaults = 0
+local startup_default = true
 
 function driver_init(config)
     host.set_make("Probe recovery")
@@ -180,6 +193,11 @@ function driver_command(action, power_w, cmd)
 end
 
 function driver_default_mode()
+    if startup_default then
+        startup_default = false
+        applied = 0
+        return true
+    end
     defaults = defaults + 1
     host.emit_metric("default_attempt", defaults, "n")
     if defaults == 1 then return false end

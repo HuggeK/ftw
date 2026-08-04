@@ -27,5 +27,7 @@ rather than a 200 for a command the Lua silently ignored.
 Every hold ends by itself, and ending means calling the driver's own
 `driver_default_mode` rather than writing a value Core invented: only the
 driver knows what neutral is. Default 4 h, maximum 24 h, and nothing survives a
-restart. An offset left behind by a browser tab that closed is a house heated
-wrong for weeks.
+restart. On process start or driver re-add, a legacy driver must also confirm
+that default before control opens; a failed confirmation keeps control blocked
+and retries with a bounded backoff. An offset left behind by a browser tab that
+closed is a house heated wrong for weeks.

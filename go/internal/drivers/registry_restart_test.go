@@ -261,6 +261,153 @@ end
 	waitRegistryMetric(t, tel, "d1", "command_called", 1)
 }
 
+func TestFreshRegistryBlocksLegacyControlUntilStartupDefault(t *testing.T) {
+	src := `
+local defaults = 0
+local fail_first_default = false
+function driver_init(config)
+    if config ~= nil and config.process == "new" then
+        fail_first_default = true
+    end
+    host.set_poll_interval(1000)
+end
+function driver_poll() return 1000 end
+function driver_command(action, w, cmd)
+    host.emit_metric("command_called", 1)
+    return true
+end
+function driver_default_mode()
+    defaults = defaults + 1
+    host.emit_metric("default_attempt", defaults)
+    if fail_first_default and defaults == 1 then return false end
+end
+`
+	path := writeTestDriver(t, src)
+	tel := telemetry.NewStore()
+
+	// The first process may have crossed the driver boundary before it
+	// stopped. RemoveProbe models that loss of in-memory recovery state: it
+	// tears down the old runtime without sending another default.
+	old := NewRegistry(tel)
+	oldCfg := config.Driver{
+		Name:   "d1",
+		Lua:    path,
+		Config: map[string]any{"process": "old"},
+	}
+	if err := old.Add(context.Background(), oldCfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := old.Send(context.Background(), "d1", []byte(`{"action":"set"}`)); err != nil {
+		t.Fatalf("old process control = %v", err)
+	}
+	waitRegistryMetric(t, tel, "d1", "command_called", 1)
+	old.RemoveProbe("d1")
+
+	fresh := NewRegistry(tel)
+	freshCfg := config.Driver{
+		Name:   "d1",
+		Lua:    path,
+		Config: map[string]any{"process": "new"},
+	}
+	if err := fresh.Add(context.Background(), freshCfg); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { fresh.remove("d1", true) })
+
+	status, ok := fresh.ControlStatus("d1")
+	if !ok || !status.Blocked || !status.RecoveryPending || status.DefaultConfirmed {
+		t.Fatalf("fresh process opened control before startup default: status=%+v, running=%v", status, ok)
+	}
+	if err := fresh.Send(context.Background(), "d1", []byte(`{"action":"set"}`)); !errors.Is(err, ErrControlBlocked) {
+		t.Fatalf("control during startup-default recovery = %v, want ErrControlBlocked", err)
+	}
+
+	waitRegistryMetric(t, tel, "d1", "default_attempt", 2)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		status, ok = fresh.ControlStatus("d1")
+		if ok && !status.Blocked && status.DefaultConfirmed && !status.RecoveryPending {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !ok || status.Blocked || !status.DefaultConfirmed || status.RecoveryPending {
+		t.Fatalf("fresh process status after startup-default recovery = %+v, running=%v", status, ok)
+	}
+	if err := fresh.Send(context.Background(), "d1", []byte(`{"action":"set"}`)); err != nil {
+		t.Fatalf("control after confirmed startup default = %v", err)
+	}
+	waitRegistryMetric(t, tel, "d1", "command_called", 1)
+}
+
+func TestFreshRegistryConfirmsSuccessfulLegacyStartupDefault(t *testing.T) {
+	src := `
+function driver_init(config)
+    host.set_poll_interval(1000)
+end
+function driver_poll() return 1000 end
+function driver_command(action, w, cmd)
+    host.emit_metric("command_called", 1)
+    return true
+end
+function driver_default_mode()
+    host.emit_metric("startup_default", 1)
+end
+`
+	path := writeTestDriver(t, src)
+	tel := telemetry.NewStore()
+	r := NewRegistry(tel)
+	cfg := config.Driver{Name: "d1", Lua: path}
+	if err := r.Add(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { r.remove("d1", true) })
+
+	status, ok := r.ControlStatus("d1")
+	if !ok || status.Blocked || !status.DefaultConfirmed || status.RecoveryPending {
+		t.Fatalf("legacy control opened without confirmed startup default: status=%+v, running=%v", status, ok)
+	}
+	waitRegistryMetric(t, tel, "d1", "startup_default", 1)
+	if err := r.Send(context.Background(), "d1", []byte(`{"action":"set"}`)); err != nil {
+		t.Fatalf("control after successful startup default = %v", err)
+	}
+	waitRegistryMetric(t, tel, "d1", "command_called", 1)
+}
+
+func TestObserveOnlySkipsStartupDefaultAndRejectsControl(t *testing.T) {
+	src := `
+function driver_init(config)
+    host.set_poll_interval(1000)
+end
+function driver_poll() return 1000 end
+function driver_command(action, w, cmd)
+    host.emit_metric("command_called", 1)
+    return true
+end
+function driver_default_mode()
+    host.emit_metric("startup_default", 1)
+end
+`
+	path := writeTestDriver(t, src)
+	tel := telemetry.NewStore()
+	r := NewRegistry(tel)
+	cfg := config.Driver{Name: "d1", Lua: path, ObserveOnly: true}
+	if err := r.Add(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { r.remove("d1", true) })
+
+	if err := r.Send(context.Background(), "d1", []byte(`{"action":"set"}`)); !errors.Is(err, ErrObserveOnly) {
+		t.Fatalf("observe_only Send = %v, want ErrObserveOnly", err)
+	}
+	if _, _, ok := tel.LatestMetric("d1", "startup_default"); ok {
+		t.Fatal("observe_only Add invoked driver_default_mode")
+	}
+	if _, _, ok := tel.LatestMetric("d1", "command_called"); ok {
+		t.Fatal("observe_only Send reached driver_command")
+	}
+}
+
 func waitRegistryMetric(t *testing.T, tel *telemetry.Store, driver, metric string, want float64) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -276,12 +423,17 @@ func waitRegistryMetric(t *testing.T, tel *telemetry.Store, driver, metric strin
 
 func TestRegistryCancelsLegacyCommandOnRestartAndShutdown(t *testing.T) {
 	src := `
+local command_count = 0
 function driver_init(config)
+    if config ~= nil and config.phase == "restart" then
+        command_count = 1
+    end
     host.set_poll_interval(1000)
 end
 function driver_poll() return 1000 end
 function driver_command(action, w, cmd)
-    host.emit_metric("command_started", 1)
+    command_count = command_count + 1
+    host.emit_metric("command_started", command_count)
     while true do end
 end
 function driver_default_mode()
@@ -289,7 +441,7 @@ function driver_default_mode()
 end
 `
 	path := writeTestDriver(t, src)
-	cfg := config.Driver{Name: "d1", Lua: path}
+	cfg := config.Driver{Name: "d1", Lua: path, Config: map[string]any{"phase": "initial"}}
 	tel := telemetry.NewStore()
 	r := NewRegistry(tel)
 	if err := r.Add(context.Background(), cfg); err != nil {
@@ -303,7 +455,9 @@ end
 	waitRegistryMetric(t, tel, "d1", "command_started", 1)
 
 	restartDone := make(chan error, 1)
-	go func() { restartDone <- r.Restart(context.Background(), cfg) }()
+	restartCfg := cfg
+	restartCfg.Config = map[string]any{"phase": "restart"}
+	go func() { restartDone <- r.Restart(context.Background(), restartCfg) }()
 	select {
 	case err := <-restartDone:
 		if err != nil {
@@ -322,7 +476,7 @@ end
 	go func() {
 		commandDone <- r.Send(context.Background(), "d1", []byte(`{"action":"loop"}`))
 	}()
-	waitRegistryMetric(t, tel, "d1", "command_started", 1)
+	waitRegistryMetric(t, tel, "d1", "command_started", 2)
 	shutdownDone := make(chan struct{})
 	go func() {
 		r.ShutdownAll()

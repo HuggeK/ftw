@@ -352,9 +352,28 @@ type driverCmd struct {
 	state   *commandState
 }
 
-// Add spawns a driver. Returns error if the driver config is invalid or
-// the Lua script can't be loaded.
+// Add spawns an operational driver. Before a legacy driver becomes
+// controllable, it must confirm its autonomous default once for this
+// process. A failed default leaves the driver registered but blocked so the
+// recovery loop can retry without opening a control window.
 func (r *Registry) Add(ctx context.Context, cfg config.Driver) error {
+	return r.add(ctx, cfg, true)
+}
+
+// AddProbe spawns a short-lived, read-only probe. Probes must not write a
+// device's default mode during connection testing, and Send rejects them via
+// the observe-only flag on the private config copy.
+func (r *Registry) AddProbe(ctx context.Context, cfg config.Driver) error {
+	cfg.ObserveOnly = true
+	return r.add(ctx, cfg, false)
+}
+
+// add is the shared driver construction path. startupDefault is false only
+// for connection probes; operational drivers use the startup safety gate.
+func (r *Registry) add(ctx context.Context, cfg config.Driver, startupDefault bool) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	r.mu.Lock()
 	if _, exists := r.rec[cfg.Name]; exists {
 		r.mu.Unlock()
@@ -494,13 +513,22 @@ func (r *Registry) Add(ctx context.Context, cfg config.Driver) error {
 		drv.Cleanup(ctx)
 		return fmt.Errorf("driver_init: %w", err)
 	}
-	if policy != nil && policy.IsControlV2() {
+	if startupDefault && !cfg.ObserveOnly && policy != nil && policy.IsControlV2() {
 		v2 := drv.(controlV2Runtime)
 		result, defaultErr := v2.DefaultModeV2(ctx, newControlID("default"), "host_start", time.Now())
 		r.recordCommandResult(cfg.Name, result)
 		if defaultErr != nil {
 			drv.Cleanup(ctx)
 			return fmt.Errorf("driver_default_mode_v2 on startup: %w", defaultErr)
+		}
+	}
+	var startupDefaultErr error
+	if startupDefault && !cfg.ObserveOnly && (policy == nil || !policy.IsControlV2()) {
+		defaultCtx, cancel := context.WithTimeout(ctx, defaultRecoveryTimeout)
+		startupDefaultErr = drv.DefaultMode(defaultCtx)
+		cancel()
+		if startupDefaultErr != nil {
+			slog.Error("driver failed to confirm autonomous default at startup; control remains blocked", "name", cfg.Name, "err", startupDefaultErr)
 		}
 	}
 
@@ -520,16 +548,27 @@ func (r *Registry) Add(ctx context.Context, cfg config.Driver) error {
 	r.nextGeneration++
 	rd.generation = r.nextGeneration
 	inheritsRecovery := r.recoveryRequired[cfg.Name]
-	if policy != nil && policy.IsControlV2() {
+	if startupDefault && !cfg.ObserveOnly && policy != nil && policy.IsControlV2() {
 		rd.defaultConfirmed = true
 		// The v2 startup default above is a confirmed recovery for a
 		// replacement generation. It does not need the legacy retry path.
 		if inheritsRecovery {
 			delete(r.recoveryRequired, cfg.Name)
 		}
+	} else if startupDefault && !cfg.ObserveOnly && (policy == nil || !policy.IsControlV2()) {
+		if startupDefaultErr == nil {
+			rd.defaultConfirmed = true
+			if inheritsRecovery {
+				delete(r.recoveryRequired, cfg.Name)
+			}
+		} else {
+			rd.controlBlocked = true
+			rd.defaultConfirmed = false
+			rd.recoveryPending = true
+		}
 	} else if inheritsRecovery {
-		// Legacy drivers have no host-owned startup default call. Keep the
-		// new generation unavailable until its run loop confirms one.
+		// A replacement that cannot run a startup default (observe_only or a
+		// probe) remains unavailable if its predecessor left a lifecycle gate.
 		rd.controlBlocked = true
 		rd.defaultConfirmed = false
 		rd.recoveryPending = true

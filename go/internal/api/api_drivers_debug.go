@@ -277,7 +277,7 @@ func (s *Server) handleDriverTest(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
 	defer cancel()
 	started := time.Now()
-	if err := reg.Add(ctx, cfg); err != nil {
+	if err := reg.AddProbe(ctx, cfg); err != nil {
 		writeJSON(w, 200, driverProbeResp{
 			Name:      displayName,
 			OK:        false,
