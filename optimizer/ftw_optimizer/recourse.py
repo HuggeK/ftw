@@ -11,6 +11,7 @@ import numpy as np
 from . import SCHEMA_VERSION
 from .model import (
     OPTIMAL_STATUSES,
+    _canonicalize_storage_payload,
     _export_price,
     _mode,
     _solver_options,
@@ -38,6 +39,7 @@ def solve_storage_recourse(payload: dict[str, Any]) -> dict[str, Any]:
     its shared first-stage action is intended for execution before replanning.
     """
 
+    payload = _canonicalize_storage_payload(payload)
     started = time.perf_counter()
     settings = require_dict(payload.get("settings", {}), "settings")
     if require_list(payload.get("flex_loads", []), "flex_loads"):

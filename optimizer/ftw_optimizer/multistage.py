@@ -14,6 +14,8 @@ from . import SCHEMA_VERSION
 from .model import (
     OPTIMAL_STATUSES,
     ReplayConsistencyError,
+    _STORAGE_INITIAL_ABOVE_MAXIMUM_KEY,
+    _canonicalize_storage_payload,
     _export_price,
     _mode,
     _solver_options,
@@ -343,6 +345,7 @@ def clear_multistage_cache() -> None:
 
 
 def _prepare(payload: dict[str, Any]) -> PreparedMultistage:
+    payload = _canonicalize_storage_payload(payload)
     settings = require_dict(payload.get("settings", {}), "settings")
     if require_list(payload.get("flex_loads", []), "flex_loads"):
         raise ProtocolError("multistage shadow does not yet support flex_loads")
@@ -603,6 +606,8 @@ def _cache_key(prepared: PreparedMultistage) -> tuple[Any, ...]:
             float(spec["capacity_wh"]),
             float(spec.get("min_energy_wh", 0)),
             float(spec.get("max_energy_wh", spec["capacity_wh"])),
+            float(spec["initial_energy_wh"]),
+            bool(spec.get(_STORAGE_INITIAL_ABOVE_MAXIMUM_KEY, False)),
             float(spec.get("max_charge_w", 0)),
             float(spec.get("max_discharge_w", 0)),
             float(spec.get("charge_efficiency", 0.95)),

@@ -2,4 +2,4 @@
 "ftw": patch
 ---
 
-Keep optimizer storage plans replay-consistent when a battery starts above its configured maximum state of charge, including solver-scale numeric noise at that boundary.
+Canonicalize solver-scale state-of-charge noise to the exact operating maximum before building optimizer models, while keeping storage plans replay-consistent when a battery starts above its configured maximum.

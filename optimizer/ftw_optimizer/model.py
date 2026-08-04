@@ -48,11 +48,13 @@ class ReplayConsistencyError(RuntimeError):
 _REPLAY_TOLERANCE_FRACTION = 0.0002
 _REPLAY_TOLERANCE_MIN_WH = 1.0
 _STORAGE_NUMERIC_TOLERANCE_WH = 1e-6
+_STORAGE_INITIAL_ABOVE_MAXIMUM_KEY = "_optimizer_initial_above_maximum"
 
 
 def _storage_starts_above_maximum(storages: Any) -> bool:
     return any(
-        float(spec["initial_energy_wh"])
+        bool(spec.get(_STORAGE_INITIAL_ABOVE_MAXIMUM_KEY, False))
+        or float(spec["initial_energy_wh"])
         > float(spec.get("max_energy_wh", spec["capacity_wh"]))
         for spec in storages
     )
@@ -90,7 +92,9 @@ def _normalize_storage_specs(
             model_maximum, capacity
         ):
             model_maximum = capacity
-        initial_above_maximum = initial > model_maximum
+        initial_above_maximum = bool(
+            spec.get(_STORAGE_INITIAL_ABOVE_MAXIMUM_KEY, False)
+        ) or initial > model_maximum
         model_initial = initial
         if initial_above_maximum and _within_storage_numeric_tolerance(
             initial, model_maximum
@@ -102,9 +106,20 @@ def _normalize_storage_specs(
             model_spec["max_energy_wh"] = model_maximum
         if model_initial != initial:
             model_spec["initial_energy_wh"] = model_initial
+        model_spec[_STORAGE_INITIAL_ABOVE_MAXIMUM_KEY] = initial_above_maximum
         normalized.append(model_spec)
         starts_above_maximum.append(initial_above_maximum)
     return tuple(normalized), tuple(starts_above_maximum)
+
+
+def _canonicalize_storage_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalize storage state once before any policy or scenario builder runs."""
+    storage_specs, _ = _normalize_storage_specs(
+        require_list(payload.get("storages", []), "storages")
+    )
+    canonical = dict(payload)
+    canonical["storages"] = [dict(spec) for spec in storage_specs]
+    return canonical
 
 
 def _storage_replay_tolerance_wh(spec: dict[str, Any]) -> float:
@@ -223,6 +238,7 @@ def _solver_options(settings: dict[str, Any], solver: str) -> dict[str, Any]:
 
 
 def solve(payload: dict[str, Any]) -> dict[str, Any]:
+    payload = _canonicalize_storage_payload(payload)
     settings = require_dict(payload.get("settings", {}), "settings")
     commercial = require_dict(
         payload.get("commercial_constraints", {}),

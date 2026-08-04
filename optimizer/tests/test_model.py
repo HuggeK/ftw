@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import copy
 import math
+import threading
 
 import numpy as np
 import pytest
 
 from ftw_optimizer.multistage import clear_multistage_cache
+from ftw_optimizer.model import _canonicalize_storage_payload
 from ftw_optimizer.scenario_tree import (
     Scenario,
     build_scenario_tree,
@@ -853,22 +855,61 @@ def _multistage_soc_boundary_request(initial_energy_wh: float, backend: str) -> 
     return request
 
 
-@pytest.mark.parametrize("backend", ["auto", "cvxpy"])
-@pytest.mark.parametrize(
-    "delta",
-    [0.1e-6, 0.25e-6, 0.5e-6, 0.99e-6, 1e-6],
-)
-def test_multistage_normalizes_tiny_initial_over_maximum(
-    backend: str, delta: float
-) -> None:
+_MULTISTAGE_SOC_BOUNDARY_DELTAS = (0.1e-6, 0.25e-6, 0.5e-6, 0.99e-6, 1e-6)
+
+
+def _assert_multistage_soc_boundary_case(backend: str, delta: float) -> None:
     request = _multistage_soc_boundary_request(9500 + delta, backend)
-    clear_multistage_cache()
+    canonical = _canonicalize_storage_payload(request)
+    storage = canonical["storages"][0]
+    assert storage["initial_energy_wh"] == storage["max_energy_wh"] == 9500.0
 
     response = handle(request)
 
     assert response["ok"], response
     assert response["solver"]["formulation"] == "multistage-milp"
     assert_storage_replays(request, response)
+
+
+@pytest.mark.parametrize("backend", ["auto", "cvxpy"])
+@pytest.mark.parametrize(
+    "delta",
+    _MULTISTAGE_SOC_BOUNDARY_DELTAS,
+)
+def test_multistage_normalizes_tiny_initial_over_maximum(
+    backend: str, delta: float
+) -> None:
+    clear_multistage_cache()
+    _assert_multistage_soc_boundary_case(backend, delta)
+
+
+@pytest.mark.parametrize("backend", ["auto", "cvxpy"])
+def test_multistage_soc_boundary_grid_is_deterministic(backend: str) -> None:
+    clear_multistage_cache()
+    for _ in range(4):
+        for delta in _MULTISTAGE_SOC_BOUNDARY_DELTAS:
+            _assert_multistage_soc_boundary_case(backend, delta)
+
+
+def _burn_cpu(stop: threading.Event) -> None:
+    while not stop.is_set():
+        sum(value * value for value in range(20_000))
+
+
+def test_multistage_soc_boundary_grid_survives_cpu_load() -> None:
+    clear_multistage_cache()
+    stop = threading.Event()
+    worker = threading.Thread(target=_burn_cpu, args=(stop,))
+    worker.start()
+    try:
+        for _ in range(2):
+            for backend in ("auto", "cvxpy"):
+                for delta in _MULTISTAGE_SOC_BOUNDARY_DELTAS:
+                    _assert_multistage_soc_boundary_case(backend, delta)
+    finally:
+        stop.set()
+        worker.join(timeout=5)
+    assert not worker.is_alive()
 
 
 @pytest.mark.parametrize("backend", ["auto", "cvxpy"])
