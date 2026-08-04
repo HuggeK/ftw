@@ -368,6 +368,14 @@ func (r *Registry) AddProbe(ctx context.Context, cfg config.Driver) error {
 	return r.add(ctx, cfg, false)
 }
 
+func legacyDriverDeclaresControls(path string) (bool, error) {
+	entry, err := ParseCatalogFile(path)
+	if err != nil {
+		return false, err
+	}
+	return len(entry.Controls) > 0, nil
+}
+
 // add is the shared driver construction path. startupDefault is false only
 // for connection probes; operational drivers use the startup safety gate.
 func (r *Registry) add(ctx context.Context, cfg config.Driver, startupDefault bool) error {
@@ -480,6 +488,17 @@ func (r *Registry) add(ctx context.Context, cfg config.Driver, startupDefault bo
 	luaDrv, err := NewLuaDriverWithPolicy(cfg.Lua, env, policy)
 	if err != nil {
 		return fmt.Errorf("load lua: %w", err)
+	}
+	if !cfg.ObserveOnly && (policy == nil || !policy.IsControlV2()) {
+		declaresControls, catalogErr := legacyDriverDeclaresControls(cfg.Lua)
+		if catalogErr != nil {
+			luaDrv.CleanupContext(ctx)
+			return fmt.Errorf("validate legacy driver controls: %w", catalogErr)
+		}
+		if declaresControls && !luaDrv.hasEntrypoint("driver_default_mode") {
+			luaDrv.CleanupContext(ctx)
+			return fmt.Errorf("driver %q declares operator controls but is missing required driver_default_mode", cfg.Name)
+		}
 	}
 	var drv driverRuntime = &luaRuntime{LuaDriver: luaDrv}
 
@@ -1010,46 +1029,60 @@ func (r *Registry) remove(name string, skipDefault bool) {
 // Send dispatches a command JSON blob to a specific driver. Blocks until the
 // driver's runLoop processes it or ctx expires.
 func (r *Registry) Send(ctx context.Context, name string, payload []byte) error {
+	_, err := r.SendWithGeneration(ctx, name, payload)
+	return err
+}
+
+// SendWithGeneration dispatches a command to the concrete running driver that
+// was selected for this call and returns that instance's generation. Selecting
+// the instance and recording its generation under the registry lock prevents a
+// caller from pairing a command sent to a replacement with an older status
+// snapshot.
+func (r *Registry) SendWithGeneration(ctx context.Context, name string, payload []byte) (uint64, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return 0, err
 	}
 	r.mu.Lock()
 	rd, ok := r.rec[name]
+	generation := uint64(0)
+	if ok {
+		generation = rd.generation
+	}
 	r.mu.Unlock()
 	if !ok {
-		return fmt.Errorf("driver %q not found", name)
+		return 0, fmt.Errorf("driver %q not found", name)
 	}
 	if rd.cfg.ObserveOnly {
-		return ErrObserveOnly
+		return generation, ErrObserveOnly
 	}
 	if rd.controlIsBlocked() {
-		return ErrControlBlocked
+		return generation, ErrControlBlocked
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return generation, err
 	}
 	resCh := make(chan error, 1)
 	state := &commandState{}
 	select {
 	case rd.cmdCh <- driverCmd{kind: "command", ctx: ctx, payload: payload, result: resCh, state: state}:
 	case <-ctx.Done():
-		return ctx.Err()
+		return generation, ctx.Err()
 	}
 	select {
 	case err := <-resCh:
-		return err
+		return generation, err
 	case <-ctx.Done():
 		err, started, completed := state.snapshot()
 		if completed {
-			return err
+			return generation, err
 		}
 		if started {
-			return &commandMayHaveRunError{cause: ctx.Err()}
+			return generation, &commandMayHaveRunError{cause: ctx.Err()}
 		}
-		return ctx.Err()
+		return generation, ctx.Err()
 	}
 }
 

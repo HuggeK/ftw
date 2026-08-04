@@ -206,6 +206,47 @@ function driver_default_mode()
 end
 `
 
+const controlExpiryRecoveryProbeLua = `DRIVER = {
+  id      = "probe_expiry_recovery",
+  name    = "Probe expiry recovery",
+  version = "1.0.0",
+  controls = {
+    { id = "set_offset", input = { type = "number", min = -3, max = 3 } },
+  },
+}
+
+local applied = nil
+local defaults = 0
+local startup_default = true
+
+function driver_init(config)
+    host.set_poll_interval(100)
+end
+
+function driver_poll()
+    if applied ~= nil then host.emit_metric("applied", applied, "n") end
+    return 100
+end
+
+function driver_command(action, power_w, cmd)
+    applied = tonumber(cmd and (cmd.value or cmd.offset))
+    return true
+end
+
+function driver_default_mode()
+    if startup_default then
+        startup_default = false
+        applied = 0
+        return true
+    end
+    defaults = defaults + 1
+    host.emit_metric("default_attempt", defaults, "n")
+    if defaults == 1 then return false end
+    if defaults == 2 then host.sleep(500) end
+    applied = 0
+end
+`
+
 func controlServer(t *testing.T) (*Server, *telemetry.Store) {
 	return controlServerWithLua(t, controlProbeLua)
 }
@@ -386,6 +427,136 @@ func TestDriverControlHoldExpiresIntoDefault(t *testing.T) {
 	waitMetric(t, tel, "heat", "defaulted", 1)
 	if hold := srv.activeControlHold("heat"); hold != nil {
 		t.Errorf("hold survived expiry: %+v", hold)
+	}
+}
+
+// The request may be paused after validation while a lifecycle reload swaps
+// the running instance. The hold must use the generation that received the
+// command, so expiry defaults that instance instead of discarding the hold as
+// stale.
+func TestDriverControlBindsHoldToRestartedGeneration(t *testing.T) {
+	srv, tel := controlServer(t)
+	cfg := srv.deps.Cfg.Drivers[0]
+	oldStatus, ok := srv.deps.Registry.ControlStatus("heat")
+	if !ok {
+		t.Fatal("driver is not running before generation race")
+	}
+
+	paused := make(chan struct{})
+	resume := make(chan struct{})
+	var pauseOnce sync.Once
+	srv.beforeDriverControlSend = func() {
+		pauseOnce.Do(func() {
+			close(paused)
+			<-resume
+		})
+	}
+
+	postDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		postDone <- post(t, srv, "/api/drivers/heat/control",
+			`{"control":"set_offset","value":2,"duration_s":600}`)
+	}()
+	select {
+	case <-paused:
+	case <-time.After(time.Second):
+		t.Fatal("control request did not reach the pre-send pause")
+	}
+
+	if err := srv.deps.Registry.Restart(context.Background(), cfg); err != nil {
+		t.Fatalf("restart during control dispatch = %v", err)
+	}
+	newStatus, ok := srv.deps.Registry.ControlStatus("heat")
+	if !ok {
+		t.Fatal("replacement driver is not running")
+	}
+	if newStatus.Generation == oldStatus.Generation {
+		t.Fatalf("restart kept generation %d", newStatus.Generation)
+	}
+	close(resume)
+
+	var rec *httptest.ResponseRecorder
+	select {
+	case rec = <-postDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("control request did not finish after restart")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST after restart race = %d, body %s", rec.Code, rec.Body.String())
+	}
+	waitMetric(t, tel, "heat", "applied", 2)
+	hold := srv.activeControlHold("heat")
+	if hold == nil {
+		t.Fatal("control request did not create a hold")
+	}
+	if hold.Generation != newStatus.Generation {
+		t.Fatalf("hold generation = %d, want replacement generation %d", hold.Generation, newStatus.Generation)
+	}
+
+	state := srv.peekControlState("heat")
+	if state == nil {
+		t.Fatal("control state disappeared before expiry")
+	}
+	state.mu.Lock()
+	fired := state.hold
+	state.mu.Unlock()
+	if err := srv.expireControlHold("heat", state, fired); err != nil {
+		t.Fatalf("expiry after generation-bound command = %v", err)
+	}
+	waitMetric(t, tel, "heat", "defaulted", 1)
+	waitMetric(t, tel, "heat", "applied", 0)
+	if got := srv.activeControlHold("heat"); got != nil {
+		t.Fatalf("hold survived successful expiry: %+v", got)
+	}
+}
+
+func TestDriverControlExpiryDefaultFailureBlocksUntilRecovery(t *testing.T) {
+	srv, _ := controlServerWithLua(t, controlExpiryRecoveryProbeLua)
+
+	if rec := post(t, srv, "/api/drivers/heat/control",
+		`{"control":"set_offset","value":2,"duration_s":600}`); rec.Code != http.StatusOK {
+		t.Fatalf("POST = %d, body %s", rec.Code, rec.Body.String())
+	}
+	state := srv.peekControlState("heat")
+	if state == nil {
+		t.Fatal("missing control state")
+	}
+	state.mu.Lock()
+	hold := state.hold
+	state.mu.Unlock()
+	if hold == nil {
+		t.Fatal("missing control hold")
+	}
+
+	if err := srv.expireControlHold("heat", state, hold); err == nil {
+		t.Fatal("expiry hid a failed default")
+	}
+	if got := srv.activeControlHold("heat"); got != nil {
+		t.Fatalf("failed expiry left hold active: %+v", got)
+	}
+	status, ok := srv.deps.Registry.ControlStatus("heat")
+	if !ok || !status.Blocked || !status.RecoveryPending || status.DefaultConfirmed {
+		t.Fatalf("status after failed expiry default = %+v, running=%v", status, ok)
+	}
+	if rec := post(t, srv, "/api/drivers/heat/control",
+		`{"control":"set_offset","value":3,"duration_s":600}`); rec.Code != http.StatusConflict {
+		t.Fatalf("control during expiry recovery = %d, body %s", rec.Code, rec.Body.String())
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		status, ok = srv.deps.Registry.ControlStatus("heat")
+		if ok && !status.Blocked && status.DefaultConfirmed && !status.RecoveryPending {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !ok || status.Blocked || !status.DefaultConfirmed || status.RecoveryPending {
+		t.Fatalf("status after expiry default recovery = %+v, running=%v", status, ok)
+	}
+	if rec := post(t, srv, "/api/drivers/heat/control",
+		`{"control":"set_offset","value":3,"duration_s":600}`); rec.Code != http.StatusOK {
+		t.Fatalf("control after expiry default recovery = %d, body %s", rec.Code, rec.Body.String())
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -372,6 +373,68 @@ end
 		t.Fatalf("control after successful startup default = %v", err)
 	}
 	waitRegistryMetric(t, tel, "d1", "command_called", 1)
+}
+
+func TestLegacyControlDriverRequiresDefaultMode(t *testing.T) {
+	src := `
+DRIVER = {
+    id = "control_without_default",
+    controls = {
+        { id = "set_offset", input = { type = "number", min = -3, max = 3 } },
+    },
+}
+function driver_init(config) host.set_poll_interval(1000) end
+function driver_poll() return 1000 end
+function driver_command(action, w, cmd) return true end
+`
+	path := writeTestDriver(t, src)
+	r := NewRegistry(telemetry.NewStore())
+	err := r.Add(context.Background(), config.Driver{Name: "d1", Lua: path})
+	if err == nil {
+		t.Fatal("control-capable legacy driver without driver_default_mode was accepted")
+	}
+	if !strings.Contains(err.Error(), "driver_default_mode") {
+		t.Fatalf("missing-default error = %v, want driver_default_mode", err)
+	}
+	if _, ok := r.ControlStatus("d1"); ok {
+		t.Fatal("driver without driver_default_mode was registered")
+	}
+}
+
+func TestLegacyNoControlDriverMayOmitDefaultMode(t *testing.T) {
+	path := writeTestDriver(t, `
+function driver_init(config) host.set_poll_interval(1000) end
+function driver_poll() return 1000 end
+function driver_command(action, w, cmd) return true end
+`)
+	r := NewRegistry(telemetry.NewStore())
+	if err := r.Add(context.Background(), config.Driver{Name: "d1", Lua: path}); err != nil {
+		t.Fatalf("reporting-only legacy driver without default = %v", err)
+	}
+	t.Cleanup(func() { r.Remove("d1") })
+}
+
+func TestObserveOnlyControlDriverMayOmitDefaultMode(t *testing.T) {
+	src := `
+DRIVER = {
+    id = "observe_only_control",
+    controls = {
+        { id = "set_offset", input = { type = "number", min = -3, max = 3 } },
+    },
+}
+function driver_init(config) host.set_poll_interval(1000) end
+function driver_poll() return 1000 end
+function driver_command(action, w, cmd) return true end
+`
+	path := writeTestDriver(t, src)
+	r := NewRegistry(telemetry.NewStore())
+	if err := r.Add(context.Background(), config.Driver{Name: "d1", Lua: path, ObserveOnly: true}); err != nil {
+		t.Fatalf("observe-only legacy driver without default = %v", err)
+	}
+	t.Cleanup(func() { r.Remove("d1") })
+	if err := r.Send(context.Background(), "d1", []byte(`{"action":"set_offset","value":2}`)); !errors.Is(err, ErrObserveOnly) {
+		t.Fatalf("observe-only control = %v, want ErrObserveOnly", err)
+	}
 }
 
 func TestObserveOnlySkipsStartupDefaultAndRejectsControl(t *testing.T) {

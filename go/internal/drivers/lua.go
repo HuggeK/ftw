@@ -564,6 +564,17 @@ func (d *LuaDriver) DefaultModeContext(ctx context.Context) error {
 	return d.call(ctx, "driver_default_mode")
 }
 
+// hasEntrypoint reports whether the loaded driver defines a callable global.
+// Missing lifecycle hooks remain optional for reporting-only drivers, so the
+// registry uses this only when it has already established that an operator
+// control declaration makes the default hook a safety requirement.
+func (d *LuaDriver) hasEntrypoint(name string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	_, ok := d.L.GetGlobal(name).(*lua.LFunction)
+	return ok
+}
+
 // call is a convenience for parameter-less void-returning lifecycle funcs.
 func (d *LuaDriver) call(ctx context.Context, name string) error {
 	d.mu.Lock()

@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"net/http"
 	"sync"
@@ -109,21 +110,6 @@ func (s *Server) handleDriverControl(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 503, map[string]string{"error": "driver registry not available"})
 		return
 	}
-	status, ok := s.deps.Registry.ControlStatus(name)
-	if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "driver not running"})
-		return
-	}
-	if status.Blocked {
-		writeJSON(w, http.StatusConflict, map[string]any{
-			"error":             drivers.ErrControlBlocked.Error(),
-			"control_blocked":   true,
-			"default_confirmed": false,
-			"recovery_pending":  status.RecoveryPending,
-		})
-		return
-	}
-
 	applied, err := decodeControlValue(req.Value, control.Input)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -151,16 +137,22 @@ func (s *Server) handleDriverControl(w http.ResponseWriter, r *http.Request) {
 		seconds = maxControlHoldSeconds
 	}
 
-	// Reserve the hold before dispatch. Registry.Send can return after the
-	// request is canceled even while the driver is still applying the command;
-	// the reservation guarantees that an ambiguous result still has a bounded
-	// safety path. The per-driver lock also keeps expiry/default from racing a
-	// replacement command.
+	// Allow lifecycle tests to pause at the same boundary as a real request.
+	// The registry lookup happens after this hook, so a restart here cannot make
+	// the request carry a stale generation into the hold.
+	if s.beforeDriverControlSend != nil {
+		s.beforeDriverControlSend()
+	}
+
+	// Keep command dispatch and hold transitions under one per-driver lock.
+	// Registry.SendWithGeneration selects the concrete running instance and
+	// returns its generation, so expiry can never pair a new command with an
+	// old status snapshot.
 	state := s.controlState(name)
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	hold := s.armControlHoldLocked(name, state, control.ID, applied, status.Generation, time.Duration(seconds)*time.Second)
-	if err := s.deps.Registry.Send(r.Context(), name, body); err != nil {
+	generation, err := s.deps.Registry.SendWithGeneration(r.Context(), name, body)
+	if err != nil {
 		s.clearControlHoldLocked(state)
 		if errors.Is(err, drivers.ErrObserveOnly) {
 			writeJSON(w, http.StatusForbidden, map[string]any{
@@ -170,17 +162,23 @@ func (s *Server) handleDriverControl(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if errors.Is(err, drivers.ErrControlBlocked) {
+			status, _ := s.deps.Registry.ControlStatus(name)
 			writeJSON(w, http.StatusConflict, map[string]any{
 				"error":             err.Error(),
 				"control_blocked":   true,
 				"default_confirmed": false,
-				"recovery_pending":  true,
+				"recovery_pending":  status.RecoveryPending,
 			})
+			return
+		}
+		if _, running := s.deps.Registry.ControlStatus(name); !running {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "driver not running"})
 			return
 		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	hold := s.armControlHoldLocked(name, state, control.ID, applied, generation, time.Duration(seconds)*time.Second)
 
 	writeJSON(w, 200, map[string]any{
 		"control":       control.ID,
@@ -275,7 +273,11 @@ func (s *Server) armControlHoldLocked(name string, state *controlDriverState, co
 		ExpiresAt:  time.Now().Add(d).UnixMilli(),
 		Generation: generation,
 	}
-	hold.timer = time.AfterFunc(d, func() { s.expireControlHold(name, state, hold) })
+	hold.timer = time.AfterFunc(d, func() {
+		if err := s.expireControlHold(name, state, hold); err != nil {
+			slog.Error("control hold expiry default failed; registry recovery gate remains active", "driver", name, "err", err)
+		}
+	})
 	state.hold = hold
 	return hold
 }
@@ -291,26 +293,26 @@ func (s *Server) clearControlHoldLocked(state *controlDriverState) {
 // first: a hold that was replaced or released already had its timer stopped,
 // but a timer that had begun firing cannot be stopped, and defaulting a
 // driver that an operator has just set again is the one wrong answer here.
-func (s *Server) expireControlHold(name string, state *controlDriverState, fired *controlHold) {
+func (s *Server) expireControlHold(name string, state *controlDriverState, fired *controlHold) error {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	if state.hold != fired {
-		return
+		return nil
 	}
-	if s.deps.Registry == nil {
+	if s.deps == nil || s.deps.Registry == nil {
 		s.clearControlHoldLocked(state)
-		return
+		return errors.New("driver registry not available")
 	}
 	status, ok := s.deps.Registry.ControlStatus(name)
 	if !ok || status.Generation != fired.Generation {
 		// A stopped generation must never default a replacement instance.
 		s.clearControlHoldLocked(state)
-		return
+		return nil
 	}
 	s.clearControlHoldLocked(state)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_ = s.sendDefaultLocked(ctx, name)
+	return s.sendDefaultLocked(ctx, name)
 }
 
 // SendDriverDefault is the shared safety path for watchdogs and API release.

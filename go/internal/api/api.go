@@ -212,6 +212,12 @@ type Server struct {
 	controlStateMu sync.Mutex
 	controlStates  map[string]*controlDriverState
 
+	// beforeDriverControlSend is a package-test seam for reproducing a
+	// lifecycle change between request validation and registry dispatch. It is
+	// nil in production; SendWithGeneration still binds every real dispatch to
+	// the selected running generation.
+	beforeDriverControlSend func()
+
 	versionUpdateMu sync.Mutex
 	driverUpdateMu  sync.Mutex
 	backupMu        sync.Mutex
