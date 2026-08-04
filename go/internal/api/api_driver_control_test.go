@@ -64,11 +64,99 @@ function driver_default_mode()
 end
 `
 
+const controlTypesProbeLua = `DRIVER = {
+  id      = "probe_types",
+  name    = "Probe types",
+  version = "1.0.0",
+  controls = {
+    { id = "set_boost", input = { type = "boolean" } },
+    { id = "set_mode", input = { type = "string" } },
+  },
+}
+
+local applied = 0
+
+function driver_init(config)
+    host.set_make("Probe types")
+    host.set_poll_interval(100)
+end
+
+function driver_poll()
+    host.emit_metric("applied", applied, "n")
+    return 100
+end
+
+function driver_command(action, power_w, cmd)
+    if action == "set_boost" then
+        if cmd.value == true then applied = 1 else applied = 2 end
+        return true
+    end
+    if action == "set_mode" then
+        if cmd.value == "eco" then applied = 3 else applied = 4 end
+        return true
+    end
+    return false
+end
+
+function driver_default_mode()
+    applied = 0
+end
+`
+
+const controlSafetyProbeLua = `DRIVER = {
+  id      = "probe_safety",
+  name    = "Probe safety",
+  version = "1.0.0",
+  controls = {
+    { id = "set_offset", input = { type = "number", min = -3, max = 3 } },
+    { id = "set_offset_fail", input = { type = "number", min = -3, max = 3 } },
+  },
+}
+
+local applied   = nil
+local defaulted = 0
+
+function driver_init(config)
+    host.set_make("Probe safety")
+    host.set_poll_interval(100)
+end
+
+function driver_poll()
+    if applied ~= nil then host.emit_metric("applied", applied, "n") end
+    host.emit_metric("defaulted", defaulted, "n")
+    return 100
+end
+
+function driver_command(action, power_w, cmd)
+    if action == "set_offset" then
+        applied = tonumber(cmd.value)
+        return true
+    end
+    if action == "set_offset_fail" then
+        applied = tonumber(cmd.value)
+        host.sleep(100)
+        return false
+    end
+    return false
+end
+
+function driver_default_mode()
+    defaulted = defaulted + 1
+    host.emit_metric("default_started", defaulted, "n")
+    host.sleep(200)
+    applied = 0
+end
+`
+
 func controlServer(t *testing.T) (*Server, *telemetry.Store) {
+	return controlServerWithLua(t, controlProbeLua)
+}
+
+func controlServerWithLua(t *testing.T, source string) (*Server, *telemetry.Store) {
 	t.Helper()
 	dir := t.TempDir()
 	lua := filepath.Join(dir, "probe.lua")
-	if err := os.WriteFile(lua, []byte(controlProbeLua), 0o600); err != nil {
+	if err := os.WriteFile(lua, []byte(source), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	tel := telemetry.NewStore()
@@ -165,6 +253,28 @@ func TestDriverControlRejectsUndeclared(t *testing.T) {
 	}
 }
 
+func TestDriverControlPreservesDeclaredBooleanAndStringValues(t *testing.T) {
+	srv, tel := controlServerWithLua(t, controlTypesProbeLua)
+
+	if rec := post(t, srv, "/api/drivers/heat/control",
+		`{"control":"set_boost","value":true,"duration_s":600}`); rec.Code != http.StatusOK {
+		t.Fatalf("boolean POST = %d, body %s", rec.Code, rec.Body.String())
+	}
+	waitMetric(t, tel, "heat", "applied", 1)
+	if hold := srv.activeControlHold("heat"); hold == nil || hold.Value != true {
+		t.Fatalf("boolean hold = %+v, want true", hold)
+	}
+
+	if rec := post(t, srv, "/api/drivers/heat/control",
+		`{"control":"set_mode","value":"eco","duration_s":600}`); rec.Code != http.StatusOK {
+		t.Fatalf("string POST = %d, body %s", rec.Code, rec.Body.String())
+	}
+	waitMetric(t, tel, "heat", "applied", 3)
+	if hold := srv.activeControlHold("heat"); hold == nil || hold.Value != "eco" {
+		t.Fatalf("string hold = %+v, want eco", hold)
+	}
+}
+
 func TestDriverControlHoldIsVisibleAndReleasable(t *testing.T) {
 	srv, tel := controlServer(t)
 
@@ -182,7 +292,8 @@ func TestDriverControlHoldIsVisibleAndReleasable(t *testing.T) {
 	if detail.Hold == nil || detail.Hold.Control != "set_offset" {
 		t.Fatalf("hold = %+v, want set_offset", detail.Hold)
 	}
-	if detail.Hold.Value == nil || *detail.Hold.Value != 2 {
+	value, ok := detail.Hold.Value.(float64)
+	if !ok || value != 2 {
 		t.Errorf("hold value = %v, want 2", detail.Hold.Value)
 	}
 
@@ -239,4 +350,73 @@ func TestDriverControlReplacingHoldCancelsTheOldTimer(t *testing.T) {
 	if got, _, ok := tel.LatestMetric("heat", "applied"); !ok || got != -2 {
 		t.Errorf("applied = %v, want -2 to survive", got)
 	}
+}
+
+func TestDriverControlAmbiguousCommandRestoresDefault(t *testing.T) {
+	srv, tel := controlServerWithLua(t, controlSafetyProbeLua)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPost, "/api/drivers/heat/control", strings.NewReader(
+		`{"control":"set_offset_fail","value":2,"duration_s":600}`)).WithContext(ctx)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("ambiguous POST = %d, body %s", rec.Code, rec.Body.String())
+	}
+	waitMetric(t, tel, "heat", "defaulted", 1)
+	if hold := srv.activeControlHold("heat"); hold != nil {
+		t.Fatalf("ambiguous command left hold active: %+v", hold)
+	}
+	waitMetric(t, tel, "heat", "applied", 0)
+}
+
+func TestDriverControlDefaultPathClearsHold(t *testing.T) {
+	srv, tel := controlServerWithLua(t, controlSafetyProbeLua)
+
+	if rec := post(t, srv, "/api/drivers/heat/control",
+		`{"control":"set_offset","value":2,"duration_s":600}`); rec.Code != http.StatusOK {
+		t.Fatalf("POST = %d, body %s", rec.Code, rec.Body.String())
+	}
+	if err := srv.SendDriverDefault(context.Background(), "heat"); err != nil {
+		t.Fatalf("SendDriverDefault = %v", err)
+	}
+	if hold := srv.activeControlHold("heat"); hold != nil {
+		t.Fatalf("default path left hold active: %+v", hold)
+	}
+	waitMetric(t, tel, "heat", "defaulted", 1)
+}
+
+// Expiry must hold the per-driver lock through the actual default command.
+// Otherwise a replacement can be sent after the old hold is deleted but
+// before its default reaches the device, and the old default wins last.
+func TestDriverControlSerializesExpiryAndReplacement(t *testing.T) {
+	srv, tel := controlServerWithLua(t, controlSafetyProbeLua)
+
+	if rec := post(t, srv, "/api/drivers/heat/control",
+		`{"control":"set_offset","value":1,"duration_s":600}`); rec.Code != http.StatusOK {
+		t.Fatalf("POST = %d, body %s", rec.Code, rec.Body.String())
+	}
+	state := srv.controlState("heat")
+	state.mu.Lock()
+	hold := state.hold
+	state.mu.Unlock()
+	if hold == nil {
+		t.Fatal("missing hold")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		srv.expireControlHold("heat", state, hold)
+		close(done)
+	}()
+	waitMetric(t, tel, "heat", "default_started", 1)
+
+	if rec := post(t, srv, "/api/drivers/heat/control",
+		`{"control":"set_offset","value":-2,"duration_s":600}`); rec.Code != http.StatusOK {
+		t.Fatalf("replacement POST = %d, body %s", rec.Code, rec.Body.String())
+	}
+	<-done
+	waitMetric(t, tel, "heat", "applied", -2)
 }

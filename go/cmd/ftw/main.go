@@ -2442,7 +2442,7 @@ func main() {
 				if !tr.Online {
 					slog.Warn("driver telemetry stale — marking offline + reverting to autonomous",
 						"name", tr.Name, "timeout", watchdogTimeout)
-					sendDriverDefault(ctx, reg, tr.Name, "watchdog", observeOnlySnap)
+					sendDriverDefault(ctx, srv, tr.Name, "watchdog", observeOnlySnap)
 					watchdogDefaulted[tr.Name] = struct{}{}
 					bus.Publish(events.DriverLost{Driver: tr.Name, At: time.Now()})
 				} else {
@@ -2488,7 +2488,7 @@ func main() {
 				if _, alreadyDefaulted := watchdogDefaulted[name]; alreadyDefaulted {
 					continue
 				}
-				sendDriverDefault(ctx, reg, name, freshness.Reason, observeOnlySnap)
+				sendDriverDefault(ctx, srv, name, freshness.Reason, observeOnlySnap)
 			}
 
 			// Loadpoint observation and schedule rolling stay live while the
@@ -2967,13 +2967,13 @@ func registerAllDevices(st *state.Store, reg *drivers.Registry) {
 
 const driverDefaultTimeout = 2 * time.Second
 
-func sendDriverDefault(ctx context.Context, reg *drivers.Registry, name, reason string, observeOnly map[string]bool) {
+func sendDriverDefault(ctx context.Context, srv *api.Server, name, reason string, observeOnly map[string]bool) {
 	if observeOnly[name] {
 		return
 	}
 	cmdCtx, cancel := context.WithTimeout(ctx, driverDefaultTimeout)
 	defer cancel()
-	if err := reg.SendDefault(cmdCtx, name); err != nil {
+	if err := srv.SendDriverDefault(cmdCtx, name); err != nil {
 		slog.Warn("driver default command failed",
 			"name", name, "reason", reason, "timeout", driverDefaultTimeout, "err", err)
 	}
