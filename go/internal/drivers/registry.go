@@ -99,6 +99,16 @@ type Registry struct {
 	recoveryRequired map[string]bool
 	nextGeneration   uint64
 	lifecycleHook    func(name string)
+	lifecycleMu      sync.Mutex
+	lifecycleGates   map[string]*lifecycleGate
+}
+
+// lifecycleGate serializes every lifecycle transition for one driver name.
+// The reference count lets unused gates leave the map, while an acquire that
+// races the final release still keeps the same gate alive until it owns it.
+type lifecycleGate struct {
+	mu   sync.Mutex
+	refs int
 }
 
 // NewRegistry builds a driver registry.
@@ -107,6 +117,32 @@ func NewRegistry(tel *telemetry.Store) *Registry {
 		tel:              tel,
 		rec:              map[string]*runningDriver{},
 		recoveryRequired: map[string]bool{},
+		lifecycleGates:   map[string]*lifecycleGate{},
+	}
+}
+
+func (r *Registry) acquireLifecycle(name string) func() {
+	r.lifecycleMu.Lock()
+	if r.lifecycleGates == nil {
+		r.lifecycleGates = make(map[string]*lifecycleGate)
+	}
+	gate := r.lifecycleGates[name]
+	if gate == nil {
+		gate = &lifecycleGate{}
+		r.lifecycleGates[name] = gate
+	}
+	gate.refs++
+	r.lifecycleMu.Unlock()
+
+	gate.mu.Lock()
+	return func() {
+		gate.mu.Unlock()
+		r.lifecycleMu.Lock()
+		gate.refs--
+		if gate.refs == 0 && r.lifecycleGates[name] == gate {
+			delete(r.lifecycleGates, name)
+		}
+		r.lifecycleMu.Unlock()
 	}
 }
 
@@ -357,6 +393,8 @@ type driverCmd struct {
 // process. A failed default leaves the driver registered but blocked so the
 // recovery loop can retry without opening a control window.
 func (r *Registry) Add(ctx context.Context, cfg config.Driver) error {
+	release := r.acquireLifecycle(cfg.Name)
+	defer release()
 	return r.add(ctx, cfg, true)
 }
 
@@ -365,6 +403,8 @@ func (r *Registry) Add(ctx context.Context, cfg config.Driver) error {
 // the observe-only flag on the private config copy.
 func (r *Registry) AddProbe(ctx context.Context, cfg config.Driver) error {
 	cfg.ObserveOnly = true
+	release := r.acquireLifecycle(cfg.Name)
+	defer release()
 	return r.add(ctx, cfg, false)
 }
 
@@ -376,8 +416,9 @@ func legacyDriverDeclaresControls(path string) (bool, error) {
 	return len(entry.Controls) > 0, nil
 }
 
-// add is the shared driver construction path. startupDefault is false only
-// for connection probes; operational drivers use the startup safety gate.
+// add is the shared driver construction path. The caller must hold the
+// lifecycle gate for cfg.Name. startupDefault is false only for connection
+// probes; operational drivers use the startup safety gate.
 func (r *Registry) add(ctx context.Context, cfg config.Driver, startupDefault bool) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -977,6 +1018,15 @@ func (r *Registry) clearRecoveryRequired(name string, rd *runningDriver) {
 }
 
 func (r *Registry) remove(name string, skipDefault bool) {
+	release := r.acquireLifecycle(name)
+	defer release()
+	r.removeLocked(name, skipDefault)
+}
+
+// removeLocked stops a driver while its per-name lifecycle gate is held. This
+// lets Restart and Reload keep the old generation and its replacement in one
+// serialized transition instead of opening an Add/Remove gap.
+func (r *Registry) removeLocked(name string, skipDefault bool) {
 	r.mu.Lock()
 	rd, ok := r.rec[name]
 	if !ok {
@@ -1182,43 +1232,56 @@ func (r *Registry) Reload(ctx context.Context, newDrivers []config.Driver, troub
 	r.mu.Lock()
 	troubleshootingChanged := r.troubleshootingMode != troubleshootingMode
 	r.troubleshootingMode = troubleshootingMode
-	oldNames := make(map[string]bool, len(r.rec))
 	oldCfgs := make(map[string]config.Driver, len(r.rec))
 	for n, rd := range r.rec {
-		oldNames[n] = true
 		oldCfgs[n] = rd.cfg
 	}
 	r.mu.Unlock()
 
-	newNames := make(map[string]bool, len(active))
-	for _, d := range active {
-		newNames[d.Name] = true
-	}
-
-	// Remove or restart
+	// Remove or restart. Keep the same name gate through the whole transition;
+	// otherwise an Add can register between Remove and the replacement Add.
 	for n, old := range oldCfgs {
 		newCfg, stillThere := findDriver(active, n)
+		requiresRestart := stillThere && (troubleshootingChanged || !sameDriverConfig(old, newCfg))
 		if !stillThere {
-			r.Remove(n)
-		} else if troubleshootingChanged {
-			slog.Info("driver troubleshooting mode changed, restarting", "name", n, "enabled", troubleshootingMode)
-			r.Remove(n)
-		} else if !sameDriverConfig(old, newCfg) {
-			slog.Info("driver config changed, restarting", "name", n)
-			r.Remove(n)
+			release := r.acquireLifecycle(n)
+			r.removeLocked(n, false)
+			release()
+		} else if requiresRestart {
+			if troubleshootingChanged {
+				slog.Info("driver troubleshooting mode changed, restarting", "name", n, "enabled", troubleshootingMode)
+			} else {
+				slog.Info("driver config changed, restarting", "name", n)
+			}
+			release := r.acquireLifecycle(n)
+			r.removeLocked(n, false)
+			if err := r.add(ctx, newCfg, true); err != nil {
+				slog.Warn("reload driver failed", "name", n, "err", err)
+			}
+			release()
 		}
 	}
 	// Add new
 	for _, d := range active {
+		release := r.acquireLifecycle(d.Name)
 		r.mu.Lock()
-		_, exists := r.rec[d.Name]
-		r.mu.Unlock()
+		current, exists := r.rec[d.Name]
+		var currentCfg config.Driver
 		if exists {
+			currentCfg = current.cfg
+		}
+		r.mu.Unlock()
+		if exists && !troubleshootingChanged && sameDriverConfig(currentCfg, d) {
+			release()
 			continue
 		}
-		if err := r.Add(ctx, d); err != nil {
+		if exists {
+			r.removeLocked(d.Name, false)
+		}
+		if err := r.add(ctx, d, true); err != nil {
 			slog.Warn("add driver failed", "name", d.Name, "err", err)
 		}
+		release()
 	}
 }
 
@@ -1226,17 +1289,21 @@ func (r *Registry) Reload(ctx context.Context, newDrivers []config.Driver, troub
 // If cfg.Disabled is true, this is a no-op after the stop. Used by the API
 // restart endpoint so the driver picks up fresh credentials / re-auths.
 func (r *Registry) Restart(ctx context.Context, cfg config.Driver) error {
-	r.Remove(cfg.Name)
+	release := r.acquireLifecycle(cfg.Name)
+	defer release()
+	r.removeLocked(cfg.Name, false)
 	if cfg.Disabled {
 		return nil
 	}
-	return r.Add(ctx, cfg)
+	return r.add(ctx, cfg, true)
 }
 
 // Restart a driver by name using whatever cfg it was last started with.
 // Returns an error if the driver isn't running (use Restart with a cfg
 // to spawn from scratch).
 func (r *Registry) RestartByName(ctx context.Context, name string) error {
+	release := r.acquireLifecycle(name)
+	defer release()
 	r.mu.Lock()
 	rd, ok := r.rec[name]
 	r.mu.Unlock()
@@ -1244,7 +1311,11 @@ func (r *Registry) RestartByName(ctx context.Context, name string) error {
 		return fmt.Errorf("driver %q not running", name)
 	}
 	cfg := rd.cfg
-	return r.Restart(ctx, cfg)
+	r.removeLocked(name, false)
+	if cfg.Disabled {
+		return nil
+	}
+	return r.add(ctx, cfg, true)
 }
 
 // PollInterval returns the currently requested cadence for a running driver.

@@ -262,6 +262,344 @@ end
 	waitRegistryMetric(t, tel, "d1", "command_called", 1)
 }
 
+const concurrentLifecycleDriver = `DRIVER = {
+  id = "concurrent_lifecycle",
+  name = "Concurrent lifecycle",
+  version = "1.0.0",
+  controls = {
+    { id = "set_offset", input = { type = "number", min = -3, max = 3 } },
+  },
+}
+
+local instance = "unknown"
+
+function driver_init(config)
+    instance = config and config.instance or "unknown"
+    host.set_poll_interval(1000)
+end
+
+function driver_poll() return 1000 end
+
+function driver_command(action, w, cmd)
+    if action == "set_offset" then
+        host.emit_metric("applied_" .. instance, tonumber(cmd.value or cmd.offset))
+        return true
+    end
+    return false
+end
+
+function driver_default_mode()
+    host.emit_metric("defaulted_" .. instance, 1)
+end
+`
+
+func concurrentLifecycleConfig(path, name, instance string) config.Driver {
+	return config.Driver{
+		Name: name,
+		Lua:  path,
+		Config: map[string]any{
+			"instance": instance,
+		},
+		Capabilities: config.Capabilities{
+			MQTT: &config.MQTTConfig{Host: "localhost", Port: 1883},
+		},
+	}
+}
+
+func TestConcurrentAddSameNameHasSingleOwner(t *testing.T) {
+	path := writeTestDriver(t, concurrentLifecycleDriver)
+	tel := telemetry.NewStore()
+	r := NewRegistry(tel)
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	var factoryCalls atomic.Int32
+	r.MQTTFactory = func(name string, c *config.MQTTConfig) (MQTTCap, error) {
+		factoryCalls.Add(1)
+		entered <- struct{}{}
+		<-release
+		return &mockMQTT{}, nil
+	}
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }); r.ShutdownAll() })
+
+	results := make(chan error, 2)
+	go func() { results <- r.Add(context.Background(), concurrentLifecycleConfig(path, "d1", "A")) }()
+	go func() { results <- r.Add(context.Background(), concurrentLifecycleConfig(path, "d1", "B")) }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("first Add did not reach initialization")
+	}
+	releaseOnce.Do(func() { close(release) })
+
+	successes := 0
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-results:
+			if err == nil {
+				successes++
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("concurrent Add did not finish")
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("concurrent Add successes = %d, want exactly one", successes)
+	}
+	if got := factoryCalls.Load(); got != 1 {
+		t.Fatalf("MQTT factory calls = %d, want one owner", got)
+	}
+
+	r.mu.Lock()
+	rd := r.rec["d1"]
+	var winner string
+	if rd != nil {
+		winner, _ = rd.cfg.Config["instance"].(string)
+	}
+	r.mu.Unlock()
+	if rd == nil || winner == "" {
+		t.Fatal("successful Add left no current generation")
+	}
+	if err := r.Send(context.Background(), "d1", []byte(`{"action":"set_offset","value":2}`)); err != nil {
+		t.Fatalf("control on winning generation = %v", err)
+	}
+	waitRegistryMetric(t, tel, "d1", "applied_"+winner, 2)
+	loser := "A"
+	if winner == loser {
+		loser = "B"
+	}
+	if _, _, ok := tel.LatestMetric("d1", "applied_"+loser); ok {
+		t.Fatalf("orphan generation %s accepted a command", loser)
+	}
+}
+
+func TestAddWaitsForInFlightAddBeforeRemove(t *testing.T) {
+	path := writeTestDriver(t, concurrentLifecycleDriver)
+	r := NewRegistry(telemetry.NewStore())
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	r.MQTTFactory = func(name string, c *config.MQTTConfig) (MQTTCap, error) {
+		entered <- struct{}{}
+		<-release
+		return &mockMQTT{}, nil
+	}
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }); r.ShutdownAll() })
+
+	addDone := make(chan error, 1)
+	go func() {
+		addDone <- r.Add(context.Background(), concurrentLifecycleConfig(path, "d1", "A"))
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("Add did not reach initialization")
+	}
+	removeDone := make(chan struct{})
+	go func() {
+		r.Remove("d1")
+		close(removeDone)
+	}()
+	select {
+	case <-removeDone:
+		releaseOnce.Do(func() { close(release) })
+		t.Fatal("Remove returned before the in-flight Add completed")
+	case <-time.After(100 * time.Millisecond):
+	}
+	releaseOnce.Do(func() { close(release) })
+	if err := <-addDone; err != nil {
+		t.Fatalf("Add = %v", err)
+	}
+	select {
+	case <-removeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Remove did not finish after Add")
+	}
+	if _, ok := r.ControlStatus("d1"); ok {
+		t.Fatal("Remove left the Add-owned generation registered")
+	}
+}
+
+func TestAddWaitsForInFlightAddBeforeRestart(t *testing.T) {
+	path := writeTestDriver(t, concurrentLifecycleDriver)
+	r := NewRegistry(telemetry.NewStore())
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var factoryCalls atomic.Int32
+	r.MQTTFactory = func(name string, c *config.MQTTConfig) (MQTTCap, error) {
+		if factoryCalls.Add(1) == 1 {
+			entered <- struct{}{}
+			<-release
+		}
+		return &mockMQTT{}, nil
+	}
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }); r.ShutdownAll() })
+
+	addDone := make(chan error, 1)
+	go func() {
+		addDone <- r.Add(context.Background(), concurrentLifecycleConfig(path, "d1", "A"))
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("Add did not reach initialization")
+	}
+	restartDone := make(chan error, 1)
+	go func() {
+		restartDone <- r.Restart(context.Background(), concurrentLifecycleConfig(path, "d1", "restart"))
+	}()
+	select {
+	case <-restartDone:
+		releaseOnce.Do(func() { close(release) })
+		t.Fatal("Restart returned before the in-flight Add completed")
+	case <-time.After(100 * time.Millisecond):
+	}
+	releaseOnce.Do(func() { close(release) })
+	if err := <-addDone; err != nil {
+		t.Fatalf("Add = %v", err)
+	}
+	select {
+	case err := <-restartDone:
+		if err != nil {
+			t.Fatalf("Restart = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Restart did not finish after Add")
+	}
+	r.mu.Lock()
+	rd := r.rec["d1"]
+	var instance string
+	if rd != nil {
+		instance, _ = rd.cfg.Config["instance"].(string)
+	}
+	r.mu.Unlock()
+	if instance != "restart" {
+		t.Fatalf("current generation instance = %q, want restart", instance)
+	}
+}
+
+func TestReloadWaitsForInFlightAddBeforeReplacement(t *testing.T) {
+	path := writeTestDriver(t, concurrentLifecycleDriver)
+	r := NewRegistry(telemetry.NewStore())
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var factoryCalls atomic.Int32
+	r.MQTTFactory = func(name string, c *config.MQTTConfig) (MQTTCap, error) {
+		if factoryCalls.Add(1) == 1 {
+			entered <- struct{}{}
+			<-release
+		}
+		return &mockMQTT{}, nil
+	}
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }); r.ShutdownAll() })
+
+	addDone := make(chan error, 1)
+	go func() {
+		addDone <- r.Add(context.Background(), concurrentLifecycleConfig(path, "d1", "A"))
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("Add did not reach initialization")
+	}
+	reloadDone := make(chan struct{})
+	go func() {
+		r.Reload(context.Background(), []config.Driver{
+			concurrentLifecycleConfig(path, "d1", "reload"),
+		}, false)
+		close(reloadDone)
+	}()
+	select {
+	case <-reloadDone:
+		releaseOnce.Do(func() { close(release) })
+		t.Fatal("Reload returned before the in-flight Add completed")
+	case <-time.After(100 * time.Millisecond):
+	}
+	releaseOnce.Do(func() { close(release) })
+	if err := <-addDone; err != nil {
+		t.Fatalf("Add = %v", err)
+	}
+	select {
+	case <-reloadDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Reload did not finish after Add")
+	}
+	r.mu.Lock()
+	rd := r.rec["d1"]
+	var instance string
+	if rd != nil {
+		instance, _ = rd.cfg.Config["instance"].(string)
+	}
+	r.mu.Unlock()
+	if instance != "reload" {
+		t.Fatalf("current generation instance = %q, want reload", instance)
+	}
+}
+
+func TestFailedAddReleasesNameReservation(t *testing.T) {
+	path := writeTestDriver(t, `
+function driver_init(config)
+    if config ~= nil and config.fail == true then error("intentional init failure") end
+    host.set_poll_interval(1000)
+end
+function driver_poll() return 1000 end
+function driver_command(action, w, cmd) return true end
+function driver_default_mode() end
+`)
+	r := NewRegistry(telemetry.NewStore())
+	failing := config.Driver{Name: "d1", Lua: path, Config: map[string]any{"fail": true}}
+	if err := r.Add(context.Background(), failing); err == nil {
+		t.Fatal("failing Add unexpectedly succeeded")
+	}
+	completed := make(chan error, 1)
+	go func() {
+		completed <- r.Add(context.Background(), config.Driver{Name: "d1", Lua: path})
+	}()
+	select {
+	case err := <-completed:
+		if err != nil {
+			t.Fatalf("Add after failed initialization = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("name reservation was not released after failed initialization")
+	}
+	t.Cleanup(r.ShutdownAll)
+}
+
+func TestDifferentNamesCanInitializeInParallel(t *testing.T) {
+	path := writeTestDriver(t, concurrentLifecycleDriver)
+	r := NewRegistry(telemetry.NewStore())
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	r.MQTTFactory = func(name string, c *config.MQTTConfig) (MQTTCap, error) {
+		entered <- struct{}{}
+		<-release
+		return &mockMQTT{}, nil
+	}
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }); r.ShutdownAll() })
+
+	results := make(chan error, 2)
+	go func() { results <- r.Add(context.Background(), concurrentLifecycleConfig(path, "d1", "one")) }()
+	go func() { results <- r.Add(context.Background(), concurrentLifecycleConfig(path, "d2", "two")) }()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-entered:
+		case <-time.After(time.Second):
+			releaseOnce.Do(func() { close(release) })
+			t.Fatal("different driver names did not initialize in parallel")
+		}
+	}
+	releaseOnce.Do(func() { close(release) })
+	for i := 0; i < 2; i++ {
+		if err := <-results; err != nil {
+			t.Fatalf("parallel Add = %v", err)
+		}
+	}
+}
+
 func TestFreshRegistryBlocksLegacyControlUntilStartupDefault(t *testing.T) {
 	src := `
 local defaults = 0
