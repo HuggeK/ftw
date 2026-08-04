@@ -24,6 +24,7 @@
   var HISTORY_REFRESH_MS = 300000;    // long TS queries refresh at most every 5 min
   var historyCache = Object.create(null);
   var refreshInFlight = false;
+  var refreshQueued = false;
 
   function apiFetch(path, opts) {
     return fetch(path, opts);
@@ -139,6 +140,7 @@
       '.ftw-hpc-value{font-family:var(--mono);font-size:0.95rem;font-weight:600;color:var(--fg)}',
       '.ftw-hpc-until{font-family:var(--mono);font-size:0.62rem;color:var(--fg-muted);white-space:nowrap}',
       '.ftw-hpc-auto{font-family:var(--mono);font-size:0.8rem;color:var(--fg-muted)}',
+      '.ftw-hpc-observed{font-family:var(--mono);font-size:0.72rem;color:var(--fg-muted);white-space:nowrap}',
       '.ftw-hpc-btn{width:30px;height:30px;flex:0 0 auto;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--fg);font-size:1rem;line-height:1;cursor:pointer;font-family:var(--mono)}',
       '.ftw-hpc-btn:hover:not(:disabled){border-color:var(--fg-muted)}',
       '.ftw-hpc-btn:disabled{opacity:0.35;cursor:default}',
@@ -430,6 +432,23 @@
     return sign + String(v) + (unit ? ' ' + unit : '');
   }
 
+  // A control value is an absolute setting. When no hold is active, use the
+  // driver's latest offset telemetry as the starting point; zero is not a
+  // safe default because the driver may have a non-zero autonomous offset.
+  function observedControlValue(detail, control) {
+    if (!detail || !control || control.id !== 'set_heat_curve_offset') return null;
+    var metrics = detail.metrics || [];
+    var preferred = ['hp_z1_heat_offset', 'hp_heating_offset_climate_system_1'];
+    for (var i = 0; i < preferred.length; i++) {
+      for (var j = 0; j < metrics.length; j++) {
+        if (metrics[j] && metrics[j].name === preferred[i] && Number.isFinite(metrics[j].value)) {
+          return metrics[j].value;
+        }
+      }
+    }
+    return null;
+  }
+
   function controlBlock(name, detail) {
     var control = firstNumberControl(detail);
     if (!control) return '';
@@ -437,26 +456,38 @@
     var hold = (detail && detail.hold && detail.hold.control === control.id) ? detail.hold : null;
     var held = hold && typeof hold.value === 'number';
     var step = typeof input.step === 'number' && input.step > 0 ? input.step : 1;
-    var value = held ? hold.value : 0;
+    var observed = observedControlValue(detail, control);
+    var value = held ? hold.value : observed;
+    var canAdjust = typeof value === 'number' && Number.isFinite(value);
 
     // Without a hold the driver is running its own default. Saying "Auto" is
-    // the honest answer: nothing here knows what offset the pump has settled
-    // on internally, and printing 0 would claim knowledge we do not have.
+    // still the state label, but the current telemetry value anchors the next
+    // absolute command. Without it, the buttons stay disabled rather than
+    // guessing a starting point.
     var state = held
       ? '<span class="ftw-hpc-value">' + escapeHtml(fmtOffsetValue(hold.value, input.unit)) + '</span>' +
         '<span class="ftw-hpc-until">until ' + escapeHtml(fmtHoldUntil(hold.expires_at_ms)) + '</span>'
-      : '<span class="ftw-hpc-auto">Auto</span>';
+      : '<span class="ftw-hpc-auto">Auto</span>' +
+        (canAdjust ? '<span class="ftw-hpc-observed">current ' + escapeHtml(fmtOffsetValue(value, input.unit)) + '</span>' : '');
 
-    var atMin = held && typeof input.min === 'number' && value <= input.min;
-    var atMax = held && typeof input.max === 'number' && value >= input.max;
+    var atMin = canAdjust && typeof input.min === 'number' && value <= input.min;
+    var atMax = canAdjust && typeof input.max === 'number' && value >= input.max;
     var btn = function (delta, label, disabled) {
+      var target = canAdjust ? clampControl(value + delta, input) : null;
       return '<button type="button" class="ftw-hpc-btn" data-hpc-driver="' + escapeHtml(name) + '"' +
         ' data-hpc-control="' + escapeHtml(control.id) + '"' +
-        ' data-hpc-value="' + escapeHtml(String(clampControl(value + delta, input))) + '"' +
-        (disabled ? ' disabled' : '') +
+        (canAdjust ? ' data-hpc-value="' + escapeHtml(String(target)) + '"' : '') +
+        (!canAdjust || disabled ? ' disabled' : '') +
         ' aria-label="' + escapeHtml(label + ' ' + (control.label || control.id)) + '">' +
         escapeHtml(label === 'Lower' ? '−' : '+') + '</button>';
     };
+
+    var note = !canAdjust && !held
+      ? '<div class="ftw-hpc-note">Current offset unavailable — controls wait for telemetry instead of assuming 0.</div>'
+      : '';
+    note += control.evidence === 'readback'
+      ? ''
+      : '<div class="ftw-hpc-note">The pump does not confirm this setting — FTW cannot tell whether it took.</div>';
 
     return '<div class="ftw-hpc">' +
       '<div class="ftw-hpc-row">' +
@@ -468,9 +499,7 @@
         ? '<button type="button" class="ftw-hpc-release" data-hpc-release="' + escapeHtml(name) + '">Release</button>'
         : '') +
       '</div>' +
-      (control.evidence === 'readback'
-        ? ''
-        : '<div class="ftw-hpc-note">The pump does not confirm this setting — FTW cannot tell whether it took.</div>') +
+      note +
       '<div class="ftw-hpc-err" hidden></div>' +
       '</div>';
   }
@@ -525,13 +554,11 @@
       });
   }
 
-  // refresh() drops the call if one is already running, which for the 30 s
-  // timer is right and here is not: the operator just pressed a button and
-  // has to see the result. Retry once shortly after, which is long enough for
-  // an in-flight cycle to finish.
+  // refresh() queues one follow-up when a cycle is already running. This is
+  // needed after a control response: a fixed-delay retry can also land inside
+  // a long history cycle and get dropped again.
   function refreshAfterControl() {
-    if (!refreshInFlight) { refresh(); return; }
-    setTimeout(refresh, 400);
+    refresh();
   }
 
   // The live values are cheap and refresh every 30 s. Month/year history is
@@ -570,7 +597,7 @@
     var section = document.getElementById('heating-section');
     var grid = document.getElementById('heating-grid');
     if (!section || !grid) return;
-    if (refreshInFlight) return;
+    if (refreshInFlight) { refreshQueued = true; return; }
     refreshInFlight = true;
 
     // Re-run discovery on first call, then periodically — so a heat-pump
@@ -609,10 +636,18 @@
         }).join('');
       });
     }).then(function () {
-      refreshInFlight = false;
+      finishRefresh();
     }, function () {
-      refreshInFlight = false;
+      finishRefresh();
     });
+  }
+
+  function finishRefresh() {
+    refreshInFlight = false;
+    if (refreshQueued) {
+      refreshQueued = false;
+      refresh();
+    }
   }
 
   // ---- Detail drill-in: all points grouped by unit ----

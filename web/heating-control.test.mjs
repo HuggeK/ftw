@@ -1,8 +1,36 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import vm from 'node:vm';
 
 const source = readFileSync(new URL('./heating.js', import.meta.url), 'utf8');
+
+function loadHeatingHarness(overrides = {}) {
+  const section = { hidden: false };
+  const grid = { innerHTML: '' };
+  const context = {
+    document: {
+      readyState: 'loading',
+      addEventListener() {},
+      head: { appendChild() {} },
+      createElement() { return {}; },
+      getElementById(id) {
+        if (id === 'heating-section') return section;
+        if (id === 'heating-grid') return grid;
+        return null;
+      },
+    },
+    fetch: overrides.fetch || (() => Promise.resolve({ json: () => Promise.resolve({}) })),
+    console,
+  };
+  const instrumented = source.replace(
+    '  if (document.readyState === \'loading\') {',
+    '  globalThis.__ftwHeatingTest = { controlBlock, refresh };\n\n  if (document.readyState === \'loading\') {'
+  );
+  assert.notEqual(instrumented, source, 'heating test hook anchor moved');
+  vm.runInNewContext(instrumented, context);
+  return { api: context.__ftwHeatingTest, section, grid };
+}
 
 // These guard the invariants that break silently. The behaviour itself was
 // verified against a running FTW and a probe driver: pressing + drove the
@@ -42,6 +70,61 @@ test('commanding the pump does not navigate into its signals', () => {
 
 test('no hold reads as Auto rather than a number we do not know', () => {
   assert.match(source, /ftw-hpc-auto">Auto</);
+  assert.match(source, /observedControlValue\(detail, control\)/);
+  assert.match(source, /var value = held \? hold\.value : observed;/);
+  assert.match(source, /controls wait for telemetry instead of assuming 0/);
+});
+
+test('an absolute step starts from reported offset telemetry', () => {
+  assert.match(source, /hp_z1_heat_offset/);
+  assert.match(source, /hp_heating_offset_climate_system_1/);
+  assert.match(source, /clampControl\(value \+ delta, input\)/);
+  assert.match(source, /!canAdjust \|\| disabled/);
+});
+
+test('the rendered absolute step uses the live offset and disables without it', () => {
+  const { api } = loadHeatingHarness();
+  const detail = {
+    controls: [{ id: 'set_heat_curve_offset', label: 'Curve offset', evidence: 'readback', input: { type: 'number', min: -3, max: 3, step: 1, unit: '°C' } }],
+    metrics: [{ name: 'hp_z1_heat_offset', value: 2 }],
+  };
+  const anchored = api.controlBlock('heat', detail);
+  assert.match(anchored, /current \+2 °C/);
+  assert.match(anchored, /data-hpc-value="3"/);
+
+  const unknown = api.controlBlock('heat', { ...detail, metrics: [] });
+  assert.match(unknown, /Current offset unavailable/);
+  assert.match(unknown, /class="ftw-hpc-btn"[^>]*disabled/);
+  assert.doesNotMatch(unknown, /data-hpc-value=/);
+});
+
+test('a refresh requested during an active cycle runs after it settles', async () => {
+  let releaseFirst;
+  let calls = 0;
+  const detailCalls = [];
+  const first = new Promise((resolve) => { releaseFirst = resolve; });
+  const { api } = loadHeatingHarness({
+    fetch(path) {
+      calls += 1;
+      if (calls === 1) return first;
+      if (path === '/api/drivers/heat') {
+        detailCalls.push(path);
+        return Promise.resolve({ json: () => Promise.resolve({ metrics: [{ name: 'hp_power_w', value: 1 }] }) });
+      }
+      return Promise.resolve({ json: () => Promise.resolve({ points: [] }) });
+    },
+  });
+
+  api.refresh();
+  api.refresh();
+  assert.equal(calls, 1, 'second request should queue while the first is active');
+  releaseFirst({ json: () => Promise.resolve({ heat: {} }) });
+  for (let i = 0; i < 20 && detailCalls.length < 2; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  // The first cycle fetches the detail once for discovery and once for the
+  // render; the queued cycle adds the third detail fetch.
+  assert.equal(detailCalls.length, 3, 'queued request should run after the first cycle');
 });
 
 test('held state is carried by text and weight, not by colour alone', () => {
@@ -58,10 +141,10 @@ test('a driver that cannot confirm its writes says so in the UI', () => {
 });
 
 test('the operator sees the result of a press even mid-refresh', () => {
-  // refresh() drops overlapping calls, which is right for the 30 s timer and
-  // wrong immediately after a button press.
+  // A refresh requested during a long cycle must run after that cycle settles.
   assert.match(source, /function refreshAfterControl\(\)/);
-  assert.match(source, /if \(!refreshInFlight\) \{ refresh\(\); return; \}/);
+  assert.match(source, /if \(refreshInFlight\) \{ refreshQueued = true; return; \}/);
+  assert.match(source, /if \(refreshQueued\) \{[\s\S]{0,80}refreshQueued = false;[\s\S]{0,80}refresh\(\);/);
 });
 
 test('stepper buttons rather than an input that a re-render would clear', () => {
