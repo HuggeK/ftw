@@ -458,26 +458,30 @@ func pollStatus(client *http.Client, endpoint string, timeout time.Duration, wan
 }
 
 func fetchStatus(ctx context.Context, client *http.Client, endpoint string) (map[string]any, error) {
+	var status map[string]any
+	if err := fetchJSON(ctx, client, endpoint, &status); err != nil {
+		return nil, err
+	}
+	return status, nil
+}
+
+func fetchJSON(ctx context.Context, client *http.Client, endpoint string, v any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	resp, err := client.Do(req)
 	if err != nil {
 		if resp != nil && resp.Body != nil {
 			_ = resp.Body.Close()
 		}
-		return nil, err
+		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("status request returned %s", resp.Status)
+		return fmt.Errorf("JSON request returned %s", resp.Status)
 	}
-	var status map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
-		return nil, err
-	}
-	return status, nil
+	return json.NewDecoder(resp.Body).Decode(v)
 }
 
 // statusSummary renders the fields a stuck wait needs in its failure message:
@@ -560,6 +564,43 @@ func TestPollStatusCancelsBlockedRequestAtDeadline(t *testing.T) {
 	}
 }
 
+func TestFetchJSONCancelsBlockedRequestAtDeadline(t *testing.T) {
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+		close(canceled)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	var status map[string]any
+	err := fetchJSON(ctx, http.DefaultClient, srv.URL, &status)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("fetchJSON returned nil error for a blocked request")
+	}
+	if elapsed > time.Second {
+		t.Fatalf("blocked JSON request took %s to time out", elapsed)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("test server did not receive the JSON request")
+	}
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("test server did not observe request context cancellation")
+	}
+	if !strings.Contains(err.Error(), "context deadline exceeded") {
+		t.Fatalf("timeout error = %q, want context deadline error", err)
+	}
+}
+
 func (s *stack) Close() {
 	close(s.stopCtl)
 	s.ctlWg.Wait()
@@ -625,13 +666,12 @@ func closeBroker(t *testing.T, mb *mqttserver.Server, baseline int) {
 
 func (s *stack) baseURL() string { return fmt.Sprintf("http://127.0.0.1:%d", s.apiPort) }
 
+const oneShotJSONTimeout = 5 * time.Second
+
 func (s *stack) getJSON(path string, v any) {
-	resp, err := http.Get(s.baseURL() + path)
-	if err != nil {
-		s.t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), oneShotJSONTimeout)
+	defer cancel()
+	if err := fetchJSON(ctx, http.DefaultClient, s.baseURL()+path, v); err != nil {
 		s.t.Fatal(err)
 	}
 }
