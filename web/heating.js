@@ -23,8 +23,10 @@
   var DISCOVER_EVERY_MS = 300000;     // re-scan for newly-added heat pumps (5 min)
   var HISTORY_REFRESH_MS = 300000;    // long TS queries refresh at most every 5 min
   var historyCache = Object.create(null);
+  var controlInFlight = Object.create(null);
   var refreshInFlight = false;
   var refreshQueued = false;
+  var refreshWaiters = [];
 
   function apiFetch(path, opts) {
     return fetch(path, opts);
@@ -449,6 +451,37 @@
     return null;
   }
 
+  function controlKey(name, control) {
+    return String(name) + '\u0000' + String(control);
+  }
+
+  function syncControlElements(name, control) {
+    var grid = document.getElementById('heating-grid');
+    if (!grid || !grid.querySelectorAll) return;
+    var nodes = grid.querySelectorAll('.ftw-hpc-btn, .ftw-hpc-release');
+    var key = controlKey(name, control);
+    var inFlight = !!controlInFlight[key];
+    for (var i = 0; i < nodes.length; i++) {
+      var node = nodes[i];
+      var nodeName = node.dataset && (node.dataset.hpcDriver || node.dataset.hpcRelease);
+      if (nodeName !== name || !node.dataset || node.dataset.hpcControl !== control) continue;
+      node.disabled = inFlight || node.dataset.hpcEnabled !== 'true';
+    }
+  }
+
+  function beginControl(name, control) {
+    var key = controlKey(name, control);
+    if (controlInFlight[key]) return false;
+    controlInFlight[key] = true;
+    syncControlElements(name, control);
+    return true;
+  }
+
+  function endControl(name, control) {
+    delete controlInFlight[controlKey(name, control)];
+    syncControlElements(name, control);
+  }
+
   function controlBlock(name, detail) {
     var control = firstNumberControl(detail);
     if (!control) return '';
@@ -457,8 +490,9 @@
     var held = hold && typeof hold.value === 'number';
     var step = typeof input.step === 'number' && input.step > 0 ? input.step : 1;
     var observed = observedControlValue(detail, control);
-    var value = held ? hold.value : observed;
-    var canAdjust = typeof value === 'number' && Number.isFinite(value);
+    var value = observed;
+    var canAdjust = typeof observed === 'number' && Number.isFinite(observed);
+    var inFlight = !!controlInFlight[controlKey(name, control.id)];
 
     // Without a hold the driver is running its own default. Saying "Auto" is
     // still the state label, but the current telemetry value anchors the next
@@ -474,15 +508,17 @@
     var atMax = canAdjust && typeof input.max === 'number' && value >= input.max;
     var btn = function (delta, label, disabled) {
       var target = canAdjust ? clampControl(value + delta, input) : null;
+      var enabled = canAdjust && !disabled;
       return '<button type="button" class="ftw-hpc-btn" data-hpc-driver="' + escapeHtml(name) + '"' +
         ' data-hpc-control="' + escapeHtml(control.id) + '"' +
-        (canAdjust ? ' data-hpc-value="' + escapeHtml(String(target)) + '"' : '') +
-        (!canAdjust || disabled ? ' disabled' : '') +
+        (enabled ? ' data-hpc-value="' + escapeHtml(String(target)) + '"' : '') +
+        ' data-hpc-enabled="' + (enabled ? 'true' : 'false') + '"' +
+        (!enabled || inFlight ? ' disabled' : '') +
         ' aria-label="' + escapeHtml(label + ' ' + (control.label || control.id)) + '">' +
         escapeHtml(label === 'Lower' ? '−' : '+') + '</button>';
     };
 
-    var note = !canAdjust && !held
+    var note = !canAdjust
       ? '<div class="ftw-hpc-note">Current offset unavailable — controls wait for telemetry instead of assuming 0.</div>'
       : '';
     note += control.evidence === 'readback'
@@ -496,7 +532,9 @@
       btn(-step, 'Lower', atMin) +
       btn(step, 'Raise', atMax) +
       (held
-        ? '<button type="button" class="ftw-hpc-release" data-hpc-release="' + escapeHtml(name) + '">Release</button>'
+        ? '<button type="button" class="ftw-hpc-release" data-hpc-release="' + escapeHtml(name) + '"' +
+          ' data-hpc-control="' + escapeHtml(control.id) + '" data-hpc-enabled="true"' +
+          (inFlight ? ' disabled' : '') + '>Release</button>'
         : '') +
       '</div>' +
       note +
@@ -520,37 +558,52 @@
   }
 
   function sendControl(el, name, control, value) {
-    el.disabled = true;
-    apiFetch('/api/drivers/' + encodeURIComponent(name) + '/control', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ control: control, value: value }),
-    }).then(function (r) {
+    if (!beginControl(name, control)) return;
+    var request;
+    try {
+      request = apiFetch('/api/drivers/' + encodeURIComponent(name) + '/control', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ control: control, value: value }),
+      });
+    } catch (err) {
+      try { controlError(el, String(err.message || err)); } finally { endControl(name, control); }
+      return;
+    }
+    Promise.resolve(request).then(function (r) {
       return r.json().then(function (body) {
         if (!r.ok) throw new Error(body && body.error ? body.error : 'request failed');
         return body;
       });
     }).then(function () {
-      refreshAfterControl();
+      return refreshAfterControl();
+    }).then(function () {
+      endControl(name, control);
     }).catch(function (err) {
-      el.disabled = false;
-      controlError(el, String(err.message || err));
+      try { controlError(el, String(err.message || err)); } finally { endControl(name, control); }
     });
   }
 
-  function releaseControl(el, name) {
-    el.disabled = true;
-    apiFetch('/api/drivers/' + encodeURIComponent(name) + '/control', { method: 'DELETE' })
+  function releaseControl(el, name, control) {
+    if (!beginControl(name, control)) return;
+    var request;
+    try {
+      request = apiFetch('/api/drivers/' + encodeURIComponent(name) + '/control', { method: 'DELETE' });
+    } catch (err) {
+      try { controlError(el, String(err.message || err)); } finally { endControl(name, control); }
+      return;
+    }
+    Promise.resolve(request)
       .then(function (r) {
         return r.json().then(function (body) {
           if (!r.ok) throw new Error(body && body.error ? body.error : 'request failed');
           return body;
         });
       })
-      .then(function () { refreshAfterControl(); })
+      .then(function () { return refreshAfterControl(); })
+      .then(function () { endControl(name, control); })
       .catch(function (err) {
-        el.disabled = false;
-        controlError(el, String(err.message || err));
+        try { controlError(el, String(err.message || err)); } finally { endControl(name, control); }
       });
   }
 
@@ -558,7 +611,7 @@
   // needed after a control response: a fixed-delay retry can also land inside
   // a long history cycle and get dropped again.
   function refreshAfterControl() {
-    refresh();
+    return refresh();
   }
 
   // The live values are cheap and refresh every 30 s. Month/year history is
@@ -596,8 +649,11 @@
   function refresh() {
     var section = document.getElementById('heating-section');
     var grid = document.getElementById('heating-grid');
-    if (!section || !grid) return;
-    if (refreshInFlight) { refreshQueued = true; return; }
+    if (!section || !grid) return Promise.resolve();
+    if (refreshInFlight) {
+      refreshQueued = true;
+      return new Promise(function (resolve) { refreshWaiters.push(resolve); });
+    }
     refreshInFlight = true;
 
     // Re-run discovery on first call, then periodically — so a heat-pump
@@ -612,41 +668,48 @@
       ? discover().then(function (names) { heatPumpDrivers = names; lastDiscoverMs = nowMs; return names; })
       : Promise.resolve(heatPumpDrivers);
 
-    ready.then(function (names) {
-      if (!names || names.length === 0) {
-        section.hidden = true;
-        return;
-      }
-      // Refresh live detail every cycle; reuse bounded-age history.
-      return Promise.all(names.map(function (n) {
-        return Promise.all([
-          fetchJSON('/api/drivers/' + encodeURIComponent(n)),
-          fetchPumpHistory(n),
-        ]).then(function (parts) {
-          var h = parts[1] || {};
-          return { name: n, detail: parts[0], temps: h.temps, energy: h.energy, power: h.power };
+    return new Promise(function (resolve) {
+      ready.then(function (names) {
+        if (!names || names.length === 0) {
+          section.hidden = true;
+          return;
+        }
+        // Refresh live detail every cycle; reuse bounded-age history.
+        return Promise.all(names.map(function (n) {
+          return Promise.all([
+            fetchJSON('/api/drivers/' + encodeURIComponent(n)),
+            fetchPumpHistory(n),
+          ]).then(function (parts) {
+            var h = parts[1] || {};
+            return { name: n, detail: parts[0], temps: h.temps, energy: h.energy, power: h.power };
+          });
+        })).then(function (pumps) {
+          var live = pumps.filter(function (p) { return p.detail && isHeatPump(p.detail); });
+          if (live.length === 0) { section.hidden = true; return; }
+          injectStyles();
+          section.hidden = false;
+          grid.innerHTML = live.map(function (p) {
+            return renderPump(p.name, p.detail, p.temps, p.energy, p.power);
+          }).join('');
         });
-      })).then(function (pumps) {
-        var live = pumps.filter(function (p) { return p.detail && isHeatPump(p.detail); });
-        if (live.length === 0) { section.hidden = true; return; }
-        injectStyles();
-        section.hidden = false;
-        grid.innerHTML = live.map(function (p) {
-          return renderPump(p.name, p.detail, p.temps, p.energy, p.power);
-        }).join('');
+      }).then(function () {
+        finishRefresh(resolve);
+      }, function () {
+        finishRefresh(resolve);
       });
-    }).then(function () {
-      finishRefresh();
-    }, function () {
-      finishRefresh();
     });
   }
 
-  function finishRefresh() {
+  function finishRefresh(resolve) {
     refreshInFlight = false;
+    resolve();
     if (refreshQueued) {
       refreshQueued = false;
-      refresh();
+      var waiters = refreshWaiters;
+      refreshWaiters = [];
+      refresh().then(function () {
+        waiters.forEach(function (waiter) { waiter(); });
+      });
     }
   }
 
@@ -825,7 +888,7 @@
     var release = e.target.closest && e.target.closest('.ftw-hpc-release');
     if (release) {
       e.stopPropagation();
-      releaseControl(release, release.dataset.hpcRelease);
+      releaseControl(release, release.dataset.hpcRelease, release.dataset.hpcControl);
       return;
     }
     if (e.target.closest && e.target.closest('.ftw-hpc')) return;

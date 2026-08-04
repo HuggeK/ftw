@@ -15,8 +15,8 @@ test('all-signals view does not fetch one history series per NIBE point', () => 
 });
 
 test('overlapping dashboard refreshes queue one follow-up cycle', () => {
-  assert.match(source, /if \(refreshInFlight\) \{ refreshQueued = true; return; \}/);
+  assert.match(source, /if \(refreshInFlight\) \{[\s\S]{0,120}refreshQueued = true;[\s\S]{0,120}refreshWaiters\.push/);
   assert.match(source, /var refreshQueued = false;/);
-  assert.match(source, /function finishRefresh\(\)/);
+  assert.match(source, /function finishRefresh\(resolve\)/);
   assert.match(source, /refreshInFlight = false;/);
 });
