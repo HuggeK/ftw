@@ -192,8 +192,11 @@ func POAFromComponents(sun Position, ghi, dhi, panelTiltDeg, panelAzDeg float64)
 // Use this for radiation providers that expose shortwave/GHI but not diffuse
 // (e.g. Open-Meteo shortwave_radiation, or SMHI STRÅNG global-only windows).
 func POAFromGHI(t time.Time, lat, lon, ghi, panelTiltDeg, panelAzDeg float64) float64 {
+	if math.IsNaN(ghi) || math.IsInf(ghi, 0) || ghi <= 0 {
+		return 0
+	}
 	sun := At(t, lat, lon)
-	if sun.ZenithDeg >= 90 || ghi <= 0 {
+	if sun.ZenithDeg >= 90 {
 		return 0
 	}
 	cosZ := math.Cos(sun.ZenithDeg * math.Pi / 180)

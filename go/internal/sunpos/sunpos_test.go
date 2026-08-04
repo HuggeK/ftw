@@ -142,6 +142,27 @@ func TestPOAFromGHIFlatApproxGHI(t *testing.T) {
 	}
 }
 
+func TestPOAFromGHINonFiniteOrNonPositiveGHIIsZero(t *testing.T) {
+	when := time.Date(2026, 6, 21, 11, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name string
+		ghi  float64
+	}{
+		{name: "NaN", ghi: math.NaN()},
+		{name: "positive infinity", ghi: math.Inf(1)},
+		{name: "negative infinity", ghi: math.Inf(-1)},
+		{name: "negative", ghi: -1},
+		{name: "zero", ghi: 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := POAFromGHI(when, 59.33, 18.07, tc.ghi, 35, 180); got != 0 {
+				t.Errorf("POAFromGHI(%v) = %v, want 0", tc.ghi, got)
+			}
+		})
+	}
+}
+
 // Night → zero from both measured-irradiance variants regardless of input.
 func TestPOAVariantsZeroAtNight(t *testing.T) {
 	tt := time.Date(2026, 12, 21, 23, 0, 0, 0, time.UTC)
