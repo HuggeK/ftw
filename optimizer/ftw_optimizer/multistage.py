@@ -353,7 +353,6 @@ def _prepare(payload: dict[str, Any]) -> PreparedMultistage:
     unsafe_meter_split = bool(
         np.any(effective_import < effective_export - 1e-9)
     )
-    storage_discrete = force_milp or (formulation == "auto" and unsafe_cycle)
     meter_discrete = force_milp or (
         formulation == "auto" and unsafe_meter_split
     )
@@ -410,6 +409,16 @@ def _prepare(payload: dict[str, Any]) -> PreparedMultistage:
     _validate_storages(storage_specs, n)
     if not storage_specs:
         raise ProtocolError("multistage shadow requires at least one storage")
+    storage_above_max = any(
+        float(spec["initial_energy_wh"])
+        > float(spec.get("max_energy_wh", spec["capacity_wh"])) + 1e-6
+        for spec in storage_specs
+    )
+    storage_discrete = (
+        force_milp
+        or storage_above_max
+        or (formulation == "auto" and unsafe_cycle)
+    )
 
     max_site_power = max(
         1000.0,

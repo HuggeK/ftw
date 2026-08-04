@@ -98,6 +98,14 @@ def solve_direct_highs(
     prepare_ms: float,
     decomposition: str,
 ) -> dict[str, Any]:
+    if any(
+        float(spec["initial_energy_wh"])
+        > float(spec.get("max_energy_wh", spec["capacity_wh"])) + 1e-6
+        for spec in prepared.storages
+    ):
+        raise DirectHighsError(
+            "direct HiGHS path requires storage starts at or below the operating maximum"
+        )
     if prepared.discrete or prepared.unsafe_cycle or prepared.unsafe_meter_split:
         raise DirectHighsError("direct HiGHS path requires a cycle-safe continuous tariff")
     build_started = time.perf_counter()
@@ -419,6 +427,13 @@ def _response(
     base_index = next((i for i, scenario in enumerate(scenarios) if scenario.id == "base"), 0)
     base = scenarios[base_index]
     base_vars = scenario_vars[base_index]
+    for scenario in scenario_vars:
+        for charges, discharges in zip(scenario.charge, scenario.discharge):
+            for charge_index, discharge_index in zip(charges, discharges):
+                if min(solution[charge_index], solution[discharge_index]) > 1e-6:
+                    raise DirectHighsError(
+                        "HiGHS returned simultaneous storage charge and discharge"
+                    )
     total_capacity = sum(float(spec["capacity_wh"]) for spec in prepared.storages)
     initial_total = sum(float(spec["initial_energy_wh"]) for spec in prepared.storages)
     actions: list[dict[str, Any]] = []

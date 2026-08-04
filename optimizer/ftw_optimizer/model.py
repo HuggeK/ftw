@@ -315,7 +315,8 @@ def solve(payload: dict[str, Any]) -> dict[str, Any]:
         # starts have zero recovery allowance, preserving hard min/max bounds.
         service_slack += cp.sum(lower_recovery[1:] + upper_recovery[1:]) / (capacity * n)
         unsafe_cycle = bool(np.any(eff_import < 0)) or pv_charge_bonus_ore > 0
-        if force_milp or (formulation == "auto" and unsafe_cycle):
+        initial_above_max = initial > max_energy + 1e-6
+        if force_milp or initial_above_max or (formulation == "auto" and unsafe_cycle):
             direction = cp.Variable(n, boolean=True, name=f"storage_{i}_charge_mode")
             constraints += [charge <= max_charge * direction, discharge <= max_discharge * (1 - direction)]
             discrete = True

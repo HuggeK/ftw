@@ -722,11 +722,40 @@ def test_storage_below_minimum_recovers_without_worsening() -> None:
     assert energies[-1] >= 1000 - 0.01
 
 
-def test_storage_above_maximum_recovers_without_worsening() -> None:
-    request = base_request()
-    request["storages"][0]["initial_energy_wh"] = 9800
-    response = handle(request)
-    assert response["ok"], response
-    energies = [action["storage_energy_wh"]["home"] for action in response["plan"]["actions"]]
-    assert energies[0] <= 9800 + 1e-5
-    assert energies[-1] <= 9500 + 1e-5
+def test_storage_above_maximum_replays_without_simultaneous_energy_loss() -> None:
+    expected_formulations = {
+        "shared": "milp",
+        "recourse": "stochastic-recourse-milp",
+        "multistage": "multistage-milp",
+    }
+    for scenario_policy in ("shared", "recourse", "multistage"):
+        for formulation in ("auto", "relaxed"):
+            request = base_request()
+            request["request_id"] = f"soc-above-max-{scenario_policy}-{formulation}"
+            request["settings"]["formulation"] = formulation
+            if scenario_policy != "shared":
+                request["settings"]["scenario_policy"] = scenario_policy
+            request["storages"][0]["initial_energy_wh"] = 9800
+
+            response = handle(request)
+
+            assert response["ok"], response
+            assert response["solver"]["formulation"] == expected_formulations[scenario_policy]
+            energy_wh = request["storages"][0]["initial_energy_wh"]
+            storage = request["storages"][0]
+            for slot, action in zip(request["slots"], response["plan"]["actions"]):
+                power_w = action["storage_power_w"]["home"]
+                previous_energy_wh = energy_wh
+                dt_h = slot["len_min"] / 60.0
+                if power_w >= 0:
+                    energy_wh += power_w * dt_h * storage["charge_efficiency"]
+                else:
+                    energy_wh += power_w * dt_h / storage["discharge_efficiency"]
+                assert math.isclose(
+                    action["storage_energy_wh"]["home"],
+                    energy_wh,
+                    abs_tol=0.1,
+                )
+                if abs(power_w) <= 1e-6:
+                    assert action["storage_energy_wh"]["home"] >= previous_energy_wh - 0.1
+            assert energy_wh <= storage["max_energy_wh"] + 0.1

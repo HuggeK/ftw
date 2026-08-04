@@ -177,7 +177,8 @@ def solve_storage_recourse(payload: dict[str, Any]) -> dict[str, Any]:
                 upper_recovery[1:] <= upper_recovery[:-1],
             ]
             scenario_service += cp.sum(lower_recovery[1:] + upper_recovery[1:]) / (capacity * n)
-            if force_milp or (formulation == "auto" and unsafe_cycle):
+            initial_above_max = initial > max_energy + 1e-6
+            if force_milp or initial_above_max or (formulation == "auto" and unsafe_cycle):
                 direction = cp.Variable(n, boolean=True, name=f"scenario_{si}_storage_{i}_charge_mode")
                 constraints += [charge <= max_charge * direction, discharge <= max_discharge * (1 - direction)]
                 discrete = True
