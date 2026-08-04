@@ -17,7 +17,7 @@ from .model import (
     _export_price,
     _mode,
     _solver_options,
-    _storage_starts_above_maximum,
+    _normalize_storage_specs,
     _validate_storage_replay,
 )
 from .protocol import ProtocolError, finite_number, positive_number, require_dict, require_list
@@ -436,14 +436,13 @@ def _prepare(payload: dict[str, Any]) -> PreparedMultistage:
         tree.branch_slots,
     )
 
-    storage_specs = tuple(
-        require_dict(raw, f"storages[{i}]")
-        for i, raw in enumerate(require_list(payload.get("storages", []), "storages"))
+    storage_specs, storage_above_maximum = _normalize_storage_specs(
+        require_list(payload.get("storages", []), "storages")
     )
     _validate_storages(storage_specs, n)
     if not storage_specs:
         raise ProtocolError("multistage shadow requires at least one storage")
-    storage_above_max = _storage_starts_above_maximum(storage_specs)
+    storage_above_max = any(storage_above_maximum)
     storage_discrete = (
         force_milp
         or storage_above_max

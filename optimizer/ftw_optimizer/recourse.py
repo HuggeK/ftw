@@ -14,7 +14,7 @@ from .model import (
     _export_price,
     _mode,
     _solver_options,
-    _storage_starts_above_maximum,
+    _normalize_storage_specs,
     _validate_storage_replay,
     _vector,
 )
@@ -108,10 +108,9 @@ def solve_storage_recourse(payload: dict[str, Any]) -> dict[str, Any]:
     force_milp = formulation == "milp"
     constraints: list[cp.Constraint] = []
     discrete = False
-    storage_specs = [
-        require_dict(raw, f"storages[{i}]")
-        for i, raw in enumerate(require_list(payload.get("storages", []), "storages"))
-    ]
+    storage_specs, storage_above_maximum = _normalize_storage_specs(
+        require_list(payload.get("storages", []), "storages")
+    )
     asset_ids: set[str] = set()
     for i, spec in enumerate(storage_specs):
         asset_id = spec.get("id")
@@ -185,7 +184,7 @@ def solve_storage_recourse(payload: dict[str, Any]) -> dict[str, Any]:
                 upper_recovery[1:] <= upper_recovery[:-1],
             ]
             scenario_service += cp.sum(lower_recovery[1:] + upper_recovery[1:]) / (capacity * n)
-            initial_above_max = _storage_starts_above_maximum([spec])
+            initial_above_max = storage_above_maximum[i]
             if force_milp or initial_above_max or (formulation == "auto" and unsafe_cycle):
                 direction = cp.Variable(n, boolean=True, name=f"scenario_{si}_storage_{i}_charge_mode")
                 constraints += [charge <= max_charge * direction, discharge <= max_discharge * (1 - direction)]

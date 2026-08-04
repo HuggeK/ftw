@@ -47,6 +47,7 @@ class ReplayConsistencyError(RuntimeError):
 
 _REPLAY_TOLERANCE_FRACTION = 0.0002
 _REPLAY_TOLERANCE_MIN_WH = 1.0
+_STORAGE_NUMERIC_TOLERANCE_WH = 1e-6
 
 
 def _storage_starts_above_maximum(storages: Any) -> bool:
@@ -55,6 +56,55 @@ def _storage_starts_above_maximum(storages: Any) -> bool:
         > float(spec.get("max_energy_wh", spec["capacity_wh"]))
         for spec in storages
     )
+
+
+def _within_storage_numeric_tolerance(value: float, bound: float) -> bool:
+    """Accept one micro-Wh of decimal input plus float representation error."""
+    return value - bound <= _STORAGE_NUMERIC_TOLERANCE_WH + max(
+        math.ulp(value), math.ulp(bound)
+    )
+
+
+def _normalize_storage_specs(
+    storages: Any,
+) -> tuple[tuple[dict[str, Any], ...], tuple[bool, ...]]:
+    """Clamp only solver-scale bound noise and retain the original guard signal."""
+    normalized: list[dict[str, Any]] = []
+    starts_above_maximum: list[bool] = []
+    for i, raw in enumerate(storages):
+        spec = require_dict(raw, f"storages[{i}]")
+        capacity = positive_number(spec.get("capacity_wh"), f"storages[{i}].capacity_wh")
+        minimum = finite_number(spec.get("min_energy_wh", 0), f"storages[{i}].min_energy_wh")
+        maximum = finite_number(
+            spec.get("max_energy_wh", capacity), f"storages[{i}].max_energy_wh"
+        )
+        initial = finite_number(spec.get("initial_energy_wh"), f"storages[{i}].initial_energy_wh")
+        if not (
+            0 <= minimum <= maximum <= capacity + _STORAGE_NUMERIC_TOLERANCE_WH
+            and 0 <= initial <= capacity + _STORAGE_NUMERIC_TOLERANCE_WH
+        ):
+            raise ProtocolError(f"storages[{i}] energy bounds are inconsistent")
+
+        model_maximum = maximum
+        if model_maximum > capacity and _within_storage_numeric_tolerance(
+            model_maximum, capacity
+        ):
+            model_maximum = capacity
+        initial_above_maximum = initial > model_maximum
+        model_initial = initial
+        if initial_above_maximum and _within_storage_numeric_tolerance(
+            initial, model_maximum
+        ):
+            model_initial = model_maximum
+
+        model_spec = dict(spec)
+        if model_maximum != maximum:
+            model_spec["max_energy_wh"] = model_maximum
+        if model_initial != initial:
+            model_spec["initial_energy_wh"] = model_initial
+        normalized.append(model_spec)
+        starts_above_maximum.append(initial_above_maximum)
+    return tuple(normalized), tuple(starts_above_maximum)
 
 
 def _storage_replay_tolerance_wh(spec: dict[str, Any]) -> float:
@@ -337,13 +387,15 @@ def solve(payload: dict[str, Any]) -> dict[str, Any]:
     constraints: list[cp.Constraint] = []
     discrete = False
 
+    storage_specs, storage_above_maximum = _normalize_storage_specs(
+        require_list(payload.get("storages", []), "storages")
+    )
     storages: list[StorageVars] = []
     asset_ids: set[str] = set()
     total_charge: cp.Expression = cp.Constant(np.zeros(n))
     total_discharge: cp.Expression = cp.Constant(np.zeros(n))
     service_slack: cp.Expression = cp.Constant(0.0)
-    for i, raw in enumerate(require_list(payload.get("storages", []), "storages")):
-        spec = require_dict(raw, f"storages[{i}]")
+    for i, spec in enumerate(storage_specs):
         asset_id = spec.get("id")
         if not isinstance(asset_id, str) or not asset_id or asset_id in asset_ids:
             raise ProtocolError(f"storages[{i}].id must be non-empty and unique")
@@ -388,7 +440,7 @@ def solve(payload: dict[str, Any]) -> dict[str, Any]:
         # starts have zero recovery allowance, preserving hard min/max bounds.
         service_slack += cp.sum(lower_recovery[1:] + upper_recovery[1:]) / (capacity * n)
         unsafe_cycle = bool(np.any(eff_import < 0)) or pv_charge_bonus_ore > 0
-        initial_above_max = _storage_starts_above_maximum([spec])
+        initial_above_max = storage_above_maximum[i]
         if force_milp or initial_above_max or (formulation == "auto" and unsafe_cycle):
             direction = cp.Variable(n, boolean=True, name=f"storage_{i}_charge_mode")
             constraints += [charge <= max_charge * direction, discharge <= max_discharge * (1 - direction)]
