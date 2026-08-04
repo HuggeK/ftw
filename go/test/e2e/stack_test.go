@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -400,33 +401,83 @@ func setupStack(t *testing.T) *stack {
 func (s *stack) waitForStatus(what string, timeout time.Duration, want func(map[string]any) bool) map[string]any {
 	s.t.Helper()
 	start := time.Now()
-	deadline := start.Add(timeout)
-	var last map[string]any
-	for {
-		resp, err := http.Get(s.baseURL() + "/api/status")
-		if err == nil {
-			var status map[string]any
-			decErr := json.NewDecoder(resp.Body).Decode(&status)
-			resp.Body.Close()
-			if decErr == nil {
-				last = status
-				if want(status) {
-					// Logging what each wait actually cost keeps the
-					// deadlines honest: when the stack gets slower, the
-					// numbers move here first, well before a timeout.
-					s.t.Logf("waited %s for %s", time.Since(start).Round(10*time.Millisecond), what)
-					return status
-				}
-			}
-		} else if resp != nil {
-			resp.Body.Close()
-		}
-		if !time.Now().Before(deadline) {
-			s.t.Fatalf("timed out after %s waiting for %s; last status: %s",
-				timeout, what, statusSummary(last))
-		}
-		time.Sleep(100 * time.Millisecond)
+	status, err := pollStatus(http.DefaultClient, s.baseURL()+"/api/status", timeout, want)
+	if err != nil {
+		s.t.Fatalf("timed out after %s waiting for %s: %v", timeout, what, err)
 	}
+	s.t.Logf("waited %s for %s", time.Since(start).Round(10*time.Millisecond), what)
+	return status
+}
+
+type statusPollError struct {
+	lastStatus     map[string]any
+	requestErrors  int
+	lastRequestErr error
+}
+
+func (e *statusPollError) Error() string {
+	if e.lastRequestErr == nil {
+		return fmt.Sprintf("last status: %s; status request errors: none", statusSummary(e.lastStatus))
+	}
+	return fmt.Sprintf("last status: %s; status request errors: %d (last: %v)",
+		statusSummary(e.lastStatus), e.requestErrors, e.lastRequestErr)
+}
+
+func pollStatus(client *http.Client, endpoint string, timeout time.Duration, want func(map[string]any) bool) (map[string]any, error) {
+	deadline := time.Now().Add(timeout)
+	var last map[string]any
+	var requestErrors int
+	var lastRequestErr error
+	for {
+		if !time.Now().Before(deadline) {
+			return nil, &statusPollError{lastStatus: last, requestErrors: requestErrors, lastRequestErr: lastRequestErr}
+		}
+		ctx, cancel := context.WithDeadline(context.Background(), deadline)
+		status, err := fetchStatus(ctx, client, endpoint)
+		cancel()
+		if err == nil {
+			last = status
+			if want(status) {
+				return status, nil
+			}
+		} else {
+			requestErrors++
+			lastRequestErr = err
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, &statusPollError{lastStatus: last, requestErrors: requestErrors, lastRequestErr: lastRequestErr}
+		}
+		pause := 100 * time.Millisecond
+		if remaining < pause {
+			pause = remaining
+		}
+		timer := time.NewTimer(pause)
+		<-timer.C
+	}
+}
+
+func fetchStatus(ctx context.Context, client *http.Client, endpoint string) (map[string]any, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("status request returned %s", resp.Status)
+	}
+	var status map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		return nil, err
+	}
+	return status, nil
 }
 
 // statusSummary renders the fields a stuck wait needs in its failure message:
@@ -465,6 +516,48 @@ func (s *stack) waitForPV(timeout time.Duration) {
 			pv, ok := status["pv_w"].(float64)
 			return ok && pv != 0
 		})
+}
+
+func TestPollStatusCancelsBlockedRequestAtDeadline(t *testing.T) {
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+		close(canceled)
+	}))
+	defer srv.Close()
+
+	start := time.Now()
+	_, err := pollStatus(http.DefaultClient, srv.URL, 100*time.Millisecond,
+		func(map[string]any) bool { return false })
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("pollStatus returned nil error for a blocked request")
+	}
+	if elapsed > time.Second {
+		t.Fatalf("blocked status request took %s to time out", elapsed)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("test server did not receive the status request")
+	}
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("test server did not observe request context cancellation")
+	}
+	pollErr, ok := err.(*statusPollError)
+	if !ok {
+		t.Fatalf("error type = %T, want *statusPollError", err)
+	}
+	if pollErr.requestErrors != 1 {
+		t.Fatalf("request errors = %d, want 1", pollErr.requestErrors)
+	}
+	if !strings.Contains(err.Error(), "context deadline exceeded") {
+		t.Fatalf("timeout error = %q, want context deadline summary", err)
+	}
 }
 
 func (s *stack) Close() {
