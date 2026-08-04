@@ -22,10 +22,28 @@ var (
 	// ErrControlBlocked is returned until the driver's autonomous default has
 	// completed successfully after an ambiguous or failed control command.
 	ErrControlBlocked = errors.New("driver control is blocked until autonomous default is confirmed")
+	// ErrCommandMayHaveRun is returned when the caller canceled while the
+	// driver command had already started but its final result was not yet
+	// available. The registry restores the driver's default independently.
+	ErrCommandMayHaveRun = errors.New("driver command may have run")
 	// ErrObserveOnly is returned when a configured telemetry-only driver is
 	// reached through a generic command path instead of the API guard.
 	ErrObserveOnly = errors.New("driver is observe_only and cannot be controlled")
 )
+
+type commandMayHaveRunError struct {
+	cause error
+}
+
+func (e *commandMayHaveRunError) Error() string {
+	return fmt.Sprintf("%s: %v", ErrCommandMayHaveRun, e.cause)
+}
+
+func (e *commandMayHaveRunError) Unwrap() error { return e.cause }
+
+func (e *commandMayHaveRunError) Is(target error) bool {
+	return target == ErrCommandMayHaveRun
+}
 
 const (
 	defaultRecoveryTimeout = 5 * time.Second
@@ -76,17 +94,19 @@ type Registry struct {
 	// A nil sink keeps tests and legacy setups simple.
 	CommandResultSink func(driverName string, result DriverCommandResultV1)
 
-	mu             sync.Mutex
-	rec            map[string]*runningDriver
-	nextGeneration uint64
-	lifecycleHook  func(name string)
+	mu               sync.Mutex
+	rec              map[string]*runningDriver
+	recoveryRequired map[string]bool
+	nextGeneration   uint64
+	lifecycleHook    func(name string)
 }
 
 // NewRegistry builds a driver registry.
 func NewRegistry(tel *telemetry.Store) *Registry {
 	return &Registry{
-		tel: tel,
-		rec: map[string]*runningDriver{},
+		tel:              tel,
+		rec:              map[string]*runningDriver{},
+		recoveryRequired: map[string]bool{},
 	}
 }
 
@@ -171,20 +191,22 @@ func driverInitConfigJSON(cfg config.Driver, troubleshootingMode bool) []byte {
 }
 
 type runningDriver struct {
-	driver           driverRuntime
-	env              *HostEnv
-	cfg              config.Driver
-	policy           *RuntimePolicy
-	leaseExpiresAt   time.Time
-	generation       uint64
-	statusMu         sync.RWMutex
-	controlBlocked   bool
-	defaultConfirmed bool
-	recoveryPending  bool
-	activeMu         sync.Mutex
-	activeCancel     context.CancelFunc
-	lifecycleCtx     context.Context
-	lifecycleCancel  context.CancelFunc
+	driver             driverRuntime
+	env                *HostEnv
+	cfg                config.Driver
+	policy             *RuntimePolicy
+	leaseExpiresAt     time.Time
+	generation         uint64
+	statusMu           sync.RWMutex
+	controlBlocked     bool
+	defaultConfirmed   bool
+	recoveryPending    bool
+	activeMu           sync.Mutex
+	activeCancel       context.CancelFunc
+	lifecycleCtx       context.Context
+	lifecycleCancel    context.CancelFunc
+	shutdownMu         sync.Mutex
+	shutdownDefaultErr error
 	// Poll loop coordination
 	cmdCh chan driverCmd
 	stop  chan bool
@@ -268,11 +290,66 @@ func (rd *runningDriver) cancelLifecycle() {
 	}
 }
 
+func (rd *runningDriver) setShutdownDefaultError(err error) {
+	rd.shutdownMu.Lock()
+	rd.shutdownDefaultErr = err
+	rd.shutdownMu.Unlock()
+}
+
+func (rd *runningDriver) shutdownDefaultFailed() bool {
+	rd.shutdownMu.Lock()
+	failed := rd.shutdownDefaultErr != nil
+	rd.shutdownMu.Unlock()
+	return failed
+}
+
+type commandState struct {
+	mu        sync.Mutex
+	started   bool
+	completed bool
+	err       error
+}
+
+func (s *commandState) markStarted() {
+	s.mu.Lock()
+	s.started = true
+	s.mu.Unlock()
+}
+
+func (s *commandState) finish(err error) {
+	s.mu.Lock()
+	s.completed = true
+	s.err = err
+	s.mu.Unlock()
+}
+
+func (s *commandState) snapshot() (err error, started, completed bool) {
+	s.mu.Lock()
+	err, started, completed = s.err, s.started, s.completed
+	s.mu.Unlock()
+	return err, started, completed
+}
+
+func commandContextError(requestCtx, executionCtx context.Context) error {
+	if requestCtx != nil {
+		if err := requestCtx.Err(); err != nil {
+			return err
+		}
+	}
+	if executionCtx != nil {
+		if err := executionCtx.Err(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 type driverCmd struct {
 	kind    string
 	ctx     context.Context
 	payload []byte
 	result  chan error
+	state   *commandState
 }
 
 // Add spawns a driver. Returns error if the driver config is invalid or
@@ -442,8 +519,20 @@ func (r *Registry) Add(ctx context.Context, cfg config.Driver) error {
 	r.mu.Lock()
 	r.nextGeneration++
 	rd.generation = r.nextGeneration
+	inheritsRecovery := r.recoveryRequired[cfg.Name]
 	if policy != nil && policy.IsControlV2() {
 		rd.defaultConfirmed = true
+		// The v2 startup default above is a confirmed recovery for a
+		// replacement generation. It does not need the legacy retry path.
+		if inheritsRecovery {
+			delete(r.recoveryRequired, cfg.Name)
+		}
+	} else if inheritsRecovery {
+		// Legacy drivers have no host-owned startup default call. Keep the
+		// new generation unavailable until its run loop confirms one.
+		rd.controlBlocked = true
+		rd.defaultConfirmed = false
+		rd.recoveryPending = true
 	}
 	r.rec[cfg.Name] = rd
 	r.mu.Unlock()
@@ -542,6 +631,9 @@ func (r *Registry) runLoop(rd *runningDriver) {
 		}
 	}
 	defer clearRecoveryTimer()
+	if rd.controlIsBlocked() {
+		scheduleRecovery()
+	}
 	attemptDefault := func(reason string) error {
 		defaultCtx, cancel := context.WithTimeout(context.Background(), defaultRecoveryTimeout)
 		defaultErr := r.defaultDriver(defaultCtx, rd, reason)
@@ -553,23 +645,27 @@ func (r *Registry) runLoop(rd *runningDriver) {
 		rd.markDefaultConfirmed()
 		clearLease()
 		clearRecoveryTimer()
+		r.clearRecoveryRequired(rd.cfg.Name, rd)
 		return nil
 	}
 	restoreAfterCommand := func(commandErr error) error {
 		clearLease()
 		defaultErr := attemptDefault("command_failed")
+		commandOutcome := &commandMayHaveRunError{cause: commandErr}
 		if defaultErr != nil {
-			return errors.Join(commandErr, fmt.Errorf("%w: restore default after ambiguous command: %v", ErrControlBlocked, defaultErr))
+			return errors.Join(commandOutcome, fmt.Errorf("%w: restore default after ambiguous command: %v", ErrControlBlocked, defaultErr))
 		}
-		return commandErr
+		return commandOutcome
 	}
 	for {
 		select {
 		case skipDefault := <-rd.stop:
 			if !skipDefault {
 				shutdownCtx, cancel := context.WithTimeout(context.Background(), defaultRecoveryTimeout)
-				if err := r.defaultDriver(shutdownCtx, rd, "host_shutdown"); err != nil {
-					slog.Error("driver failed to enter default mode during shutdown", "name", rd.cfg.Name, "err", err)
+				defaultErr := r.defaultDriver(shutdownCtx, rd, "host_shutdown")
+				rd.setShutdownDefaultError(defaultErr)
+				if defaultErr != nil {
+					slog.Error("driver failed to enter default mode during shutdown", "name", rd.cfg.Name, "err", defaultErr)
 				}
 				cancel()
 			}
@@ -608,12 +704,22 @@ func (r *Registry) runLoop(rd *runningDriver) {
 					err = ErrControlBlocked
 					break
 				}
+				if cancelErr := cmdCtx.Err(); cancelErr != nil {
+					err = cancelErr
+					break
+				}
+				if cmd.state != nil {
+					cmd.state.markStarted()
+				}
 				commandCtx, finishCommand := rd.beginCommand(cmdCtx)
 				if rd.policy != nil && rd.policy.IsControlV2() {
 					var result DriverCommandResultV1
 					var leaseExpiresAt time.Time
 					result, leaseExpiresAt, err = r.dispatchV2Command(commandCtx, rd, cmd.payload)
 					r.recordCommandResult(rd.cfg.Name, result)
+					if err == nil {
+						err = commandContextError(cmdCtx, commandCtx)
+					}
 					if err == nil && result.Status == "applied" && result.DeviceState == "controlled" {
 						armLease(leaseExpiresAt)
 						rd.markCommandApplied()
@@ -626,6 +732,9 @@ func (r *Registry) runLoop(rd *runningDriver) {
 					}
 				} else {
 					err = rd.driver.Command(commandCtx, cmd.payload)
+					if err == nil {
+						err = commandContextError(cmdCtx, commandCtx)
+					}
 					if err != nil {
 						err = restoreAfterCommand(err)
 					} else {
@@ -639,9 +748,13 @@ func (r *Registry) runLoop(rd *runningDriver) {
 					clearLease()
 					rd.markDefaultConfirmed()
 					clearRecoveryTimer()
+					r.clearRecoveryRequired(rd.cfg.Name, rd)
 				} else {
 					scheduleRecovery()
 				}
+			}
+			if cmd.state != nil {
+				cmd.state.finish(err)
 			}
 			if cmd.result != nil {
 				cmd.result <- err
@@ -791,12 +904,35 @@ func (r *Registry) RemoveProbe(name string) {
 	r.remove(name, true)
 }
 
+// clearRecoveryRequired removes the name-level lifecycle gate only when the
+// generation that confirmed default is still the current one. If a new
+// generation was added while the old one was shutting down, that replacement
+// must keep its own recovery gate and retry.
+func (r *Registry) clearRecoveryRequired(name string, rd *runningDriver) {
+	r.mu.Lock()
+	if current, ok := r.rec[name]; ok && current != rd {
+		r.mu.Unlock()
+		return
+	}
+	delete(r.recoveryRequired, name)
+	r.mu.Unlock()
+}
+
 func (r *Registry) remove(name string, skipDefault bool) {
 	r.mu.Lock()
 	rd, ok := r.rec[name]
 	if !ok {
 		r.mu.Unlock()
 		return
+	}
+	if !skipDefault {
+		if r.recoveryRequired == nil {
+			r.recoveryRequired = make(map[string]bool)
+		}
+		// Gate a replacement before the old generation is canceled. A
+		// concurrent Add must not become controllable while shutdown default
+		// is still unknown.
+		r.recoveryRequired[name] = true
 	}
 	delete(r.rec, name)
 	hook := r.lifecycleHook
@@ -811,6 +947,21 @@ func (r *Registry) remove(name string, skipDefault bool) {
 	}
 	rd.stop <- skipDefault
 	<-rd.done
+	if !skipDefault {
+		if rd.shutdownDefaultFailed() {
+			// A recovery timer may have succeeded while shutdown was
+			// waiting. The shutdown result is the final lifecycle boundary,
+			// so reassert the gate if that default failed.
+			r.mu.Lock()
+			if r.recoveryRequired == nil {
+				r.recoveryRequired = make(map[string]bool)
+			}
+			r.recoveryRequired[name] = true
+			r.mu.Unlock()
+		} else {
+			r.clearRecoveryRequired(name, rd)
+		}
+	}
 	if r.tel != nil {
 		r.tel.Remove(name)
 	}
@@ -822,6 +973,9 @@ func (r *Registry) remove(name string, skipDefault bool) {
 func (r *Registry) Send(ctx context.Context, name string, payload []byte) error {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	r.mu.Lock()
 	rd, ok := r.rec[name]
@@ -835,9 +989,13 @@ func (r *Registry) Send(ctx context.Context, name string, payload []byte) error 
 	if rd.controlIsBlocked() {
 		return ErrControlBlocked
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	resCh := make(chan error, 1)
+	state := &commandState{}
 	select {
-	case rd.cmdCh <- driverCmd{kind: "command", ctx: ctx, payload: payload, result: resCh}:
+	case rd.cmdCh <- driverCmd{kind: "command", ctx: ctx, payload: payload, result: resCh, state: state}:
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -845,6 +1003,13 @@ func (r *Registry) Send(ctx context.Context, name string, payload []byte) error 
 	case err := <-resCh:
 		return err
 	case <-ctx.Done():
+		err, started, completed := state.snapshot()
+		if completed {
+			return err
+		}
+		if started {
+			return &commandMayHaveRunError{cause: ctx.Err()}
+		}
 		return ctx.Err()
 	}
 }

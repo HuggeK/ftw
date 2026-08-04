@@ -93,6 +93,34 @@ func (r *ctxAwareRuntime) DefaultMode(ctx context.Context) error {
 func (r *ctxAwareRuntime) Cleanup(ctx context.Context) error { return nil }
 func (r *ctxAwareRuntime) Env() *HostEnv                     { return r.env }
 
+type cancelAfterStartRuntime struct {
+	env         *HostEnv
+	started     chan struct{}
+	sideEffect  chan struct{}
+	defaulted   chan struct{}
+	startOnce   sync.Once
+	effectOnce  sync.Once
+	defaultOnce sync.Once
+}
+
+func (r *cancelAfterStartRuntime) Init(ctx context.Context, configJSON []byte) error { return nil }
+func (r *cancelAfterStartRuntime) Poll(ctx context.Context) (time.Duration, error) {
+	return time.Hour, nil
+}
+func (r *cancelAfterStartRuntime) Command(ctx context.Context, cmdJSON []byte) error {
+	r.startOnce.Do(func() { close(r.started) })
+	// The command has crossed the driver boundary and may have written hardware.
+	r.effectOnce.Do(func() { close(r.sideEffect) })
+	<-ctx.Done()
+	return nil
+}
+func (r *cancelAfterStartRuntime) DefaultMode(ctx context.Context) error {
+	r.defaultOnce.Do(func() { close(r.defaulted) })
+	return nil
+}
+func (r *cancelAfterStartRuntime) Cleanup(ctx context.Context) error { return nil }
+func (r *cancelAfterStartRuntime) Env() *HostEnv                     { return r.env }
+
 func TestSendDefaultPassesCallerContextToRuntime(t *testing.T) {
 	tel := telemetry.NewStore()
 	r := NewRegistry(tel)
@@ -123,6 +151,114 @@ func TestSendDefaultPassesCallerContextToRuntime(t *testing.T) {
 		t.Fatal("runtime DefaultMode was not called")
 	}
 	r.remove("d1", true)
+}
+
+func TestRegistryCancelAfterCommandStartedRestoresDefault(t *testing.T) {
+	tel := telemetry.NewStore()
+	r := NewRegistry(tel)
+	rt := &cancelAfterStartRuntime{
+		env:        NewHostEnv("d1", tel),
+		started:    make(chan struct{}),
+		sideEffect: make(chan struct{}),
+		defaulted:  make(chan struct{}),
+	}
+	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
+	rd := &runningDriver{
+		driver:          rt,
+		env:             rt.env,
+		cfg:             config.Driver{Name: "d1"},
+		lifecycleCtx:    lifecycleCtx,
+		lifecycleCancel: lifecycleCancel,
+		cmdCh:           make(chan driverCmd, 1),
+		stop:            make(chan bool, 1),
+		done:            make(chan struct{}),
+	}
+	r.mu.Lock()
+	r.nextGeneration++
+	rd.generation = r.nextGeneration
+	r.rec["d1"] = rd
+	r.mu.Unlock()
+	go r.runLoop(rd)
+	t.Cleanup(func() { r.remove("d1", true) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	commandDone := make(chan error, 1)
+	go func() { commandDone <- r.Send(ctx, "d1", []byte(`{"action":"set"}`)) }()
+	select {
+	case <-rt.started:
+	case <-time.After(time.Second):
+		t.Fatal("command did not start")
+	}
+	select {
+	case <-rt.sideEffect:
+	case <-time.After(time.Second):
+		t.Fatal("command did not cross the driver boundary")
+	}
+	cancel()
+	select {
+	case err := <-commandDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Send after started-command cancel = %v, want context canceled", err)
+		}
+		if !errors.Is(err, ErrCommandMayHaveRun) {
+			t.Fatalf("Send after started-command cancel = %v, want may-have-run outcome", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Send did not return after caller cancellation")
+	}
+	select {
+	case <-rt.defaulted:
+	case <-time.After(time.Second):
+		t.Fatal("started command did not trigger autonomous default")
+	}
+}
+
+func TestRegistryRestartDefaultFailureBlocksNewGeneration(t *testing.T) {
+	src := `
+local defaults = 0
+function driver_init(config)
+    host.set_poll_interval(1000)
+end
+function driver_poll() return 1000 end
+function driver_command(action, w, cmd)
+    host.emit_metric("command_called", 1)
+    return true
+end
+function driver_default_mode()
+    defaults = defaults + 1
+    host.emit_metric("default_attempt", defaults)
+    if defaults == 1 then return false end
+end
+`
+	path := writeTestDriver(t, src)
+	cfg := config.Driver{Name: "d1", Lua: path}
+	tel := telemetry.NewStore()
+	r := NewRegistry(tel)
+	if err := r.Add(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { r.remove("d1", true) })
+
+	if err := r.Restart(context.Background(), cfg); err != nil {
+		t.Fatalf("restart = %v", err)
+	}
+	status, ok := r.ControlStatus("d1")
+	if !ok || !status.Blocked || !status.RecoveryPending {
+		t.Fatalf("new generation status after failed restart default = %+v, running=%v", status, ok)
+	}
+	if err := r.Send(context.Background(), "d1", []byte(`{"action":"set"}`)); !errors.Is(err, ErrControlBlocked) {
+		t.Fatalf("control after failed restart default = %v, want ErrControlBlocked", err)
+	}
+
+	waitRegistryMetric(t, tel, "d1", "default_attempt", 2)
+	status, ok = r.ControlStatus("d1")
+	if !ok || status.Blocked || !status.DefaultConfirmed || status.RecoveryPending {
+		t.Fatalf("new generation status after recovery = %+v, running=%v", status, ok)
+	}
+	if err := r.Send(context.Background(), "d1", []byte(`{"action":"set"}`)); err != nil {
+		t.Fatalf("control after confirmed recovery = %v", err)
+	}
+	waitRegistryMetric(t, tel, "d1", "command_called", 1)
 }
 
 func waitRegistryMetric(t *testing.T, tel *telemetry.Store, driver, metric string, want float64) {
