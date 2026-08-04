@@ -9,7 +9,15 @@ import cvxpy as cp
 import numpy as np
 
 from . import SCHEMA_VERSION
-from .model import OPTIMAL_STATUSES, _export_price, _mode, _solver_options, _vector
+from .model import (
+    OPTIMAL_STATUSES,
+    _export_price,
+    _mode,
+    _solver_options,
+    _storage_starts_above_maximum,
+    _validate_storage_replay,
+    _vector,
+)
 from .protocol import ProtocolError, finite_number, positive_number, require_dict, require_list
 
 
@@ -177,7 +185,7 @@ def solve_storage_recourse(payload: dict[str, Any]) -> dict[str, Any]:
                 upper_recovery[1:] <= upper_recovery[:-1],
             ]
             scenario_service += cp.sum(lower_recovery[1:] + upper_recovery[1:]) / (capacity * n)
-            initial_above_max = initial > max_energy + 1e-6
+            initial_above_max = _storage_starts_above_maximum([spec])
             if force_milp or initial_above_max or (formulation == "auto" and unsafe_cycle):
                 direction = cp.Variable(n, boolean=True, name=f"scenario_{si}_storage_{i}_charge_mode")
                 constraints += [charge <= max_charge * direction, discharge <= max_discharge * (1 - direction)]
@@ -371,6 +379,7 @@ def solve_storage_recourse(payload: dict[str, Any]) -> dict[str, Any]:
                 mip_gap = float(value)
                 break
     solve_ms = (time.perf_counter() - started) * 1000.0
+    _validate_storage_replay(actions, slots, storage_specs)
     return {
         "schema_version": SCHEMA_VERSION,
         "request_id": str(payload["request_id"]),

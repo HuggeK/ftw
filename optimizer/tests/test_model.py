@@ -150,6 +150,28 @@ def base_request() -> dict:
     }
 
 
+def assert_storage_replays(request: dict, response: dict, tolerance_wh: float = 2.1) -> None:
+    energies = {
+        str(spec["id"]): float(spec["initial_energy_wh"])
+        for spec in request["storages"]
+    }
+    for slot, action in zip(request["slots"], response["plan"]["actions"]):
+        dt_h = slot["len_min"] / 60.0
+        for spec in request["storages"]:
+            storage_id = str(spec["id"])
+            power = action["storage_power_w"][storage_id]
+            previous = energies[storage_id]
+            if power >= 0:
+                replayed = previous + power * dt_h * spec["charge_efficiency"]
+            else:
+                replayed = previous + power * dt_h / spec["discharge_efficiency"]
+            reported = action["storage_energy_wh"][storage_id]
+            assert math.isclose(reported, replayed, abs_tol=tolerance_wh)
+            if abs(power) <= 1e-3:
+                assert reported >= previous - tolerance_wh
+            energies[storage_id] = replayed
+
+
 def test_arbitrage_moves_energy_from_cheap_to_expensive_slot() -> None:
     response = handle(base_request())
     assert response["ok"], response
@@ -759,3 +781,63 @@ def test_storage_above_maximum_replays_without_simultaneous_energy_loss() -> Non
                 if abs(power_w) <= 1e-6:
                     assert action["storage_energy_wh"]["home"] >= previous_energy_wh - 0.1
             assert energy_wh <= storage["max_energy_wh"] + 0.1
+
+
+def test_storage_just_above_maximum_uses_replay_safe_guard() -> None:
+    expected_formulations = {
+        "shared": "milp",
+        "recourse": "stochastic-recourse-milp",
+        "multistage": "multistage-milp",
+    }
+    for delta in (0.5e-6, 1e-6):
+        for scenario_policy in ("shared", "recourse", "multistage"):
+            request = base_request()
+            request["request_id"] = f"soc-just-above-max-{scenario_policy}-{delta}"
+            request["settings"].update(
+                {"mode": "cheap_charge", "formulation": "relaxed"}
+            )
+            if scenario_policy != "shared":
+                request["settings"]["scenario_policy"] = scenario_policy
+            request["storages"][0]["initial_energy_wh"] = 9500 + delta
+
+            response = handle(request)
+
+            assert response["ok"], response
+            assert response["solver"]["formulation"] == expected_formulations[scenario_policy]
+            assert_storage_replays(request, response)
+
+
+def test_multistage_auto_retries_with_storage_guard_after_direct_cycle(monkeypatch) -> None:
+    from ftw_optimizer import direct_highs
+
+    clear_multistage_cache()
+    request = base_request()
+    request["settings"].update(
+        {
+            "mode": "passive_arbitrage",
+            "formulation": "relaxed",
+            "scenario_policy": "multistage",
+            "multistage_backend": "auto",
+        }
+    )
+    request["storages"][0]["initial_energy_wh"] = 2000
+
+    def reject_simultaneous_cycle(*args, **kwargs):
+        raise direct_highs.DirectHighsError(
+            "HiGHS returned simultaneous storage charge and discharge"
+        )
+
+    monkeypatch.setattr(direct_highs, "solve_direct_highs", reject_simultaneous_cycle)
+    response = handle(request)
+
+    assert response["ok"], response
+    assert response["solver"]["formulation"] == "multistage-milp"
+    assert "simultaneous" in response["solver"]["fallback_reason"]
+    assert_storage_replays(request, response)
+
+    cvxpy_request = copy.deepcopy(request)
+    cvxpy_request["request_id"] = "multistage-cvxpy-replay-guard"
+    cvxpy_request["settings"]["multistage_backend"] = "cvxpy"
+    cvxpy_response = handle(cvxpy_request)
+    assert cvxpy_response["ok"], cvxpy_response
+    assert_storage_replays(cvxpy_request, cvxpy_response)

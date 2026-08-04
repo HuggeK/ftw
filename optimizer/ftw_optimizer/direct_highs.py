@@ -9,7 +9,7 @@ import highspy
 import numpy as np
 
 from . import SCHEMA_VERSION
-from .model import _solver_options
+from .model import _solver_options, _storage_starts_above_maximum
 from .protocol import finite_number
 
 if TYPE_CHECKING:
@@ -98,11 +98,7 @@ def solve_direct_highs(
     prepare_ms: float,
     decomposition: str,
 ) -> dict[str, Any]:
-    if any(
-        float(spec["initial_energy_wh"])
-        > float(spec.get("max_energy_wh", spec["capacity_wh"])) + 1e-6
-        for spec in prepared.storages
-    ):
+    if _storage_starts_above_maximum(prepared.storages):
         raise DirectHighsError(
             "direct HiGHS path requires storage starts at or below the operating maximum"
         )

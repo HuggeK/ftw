@@ -41,6 +41,79 @@ class ThermalVars:
     upper_slack: cp.Variable
 
 
+class ReplayConsistencyError(RuntimeError):
+    """The reported storage state cannot be replayed from reported power."""
+
+
+_REPLAY_TOLERANCE_FRACTION = 0.0002
+_REPLAY_TOLERANCE_MIN_WH = 1.0
+
+
+def _storage_starts_above_maximum(storages: Any) -> bool:
+    return any(
+        float(spec["initial_energy_wh"])
+        > float(spec.get("max_energy_wh", spec["capacity_wh"]))
+        for spec in storages
+    )
+
+
+def _storage_replay_tolerance_wh(spec: dict[str, Any]) -> float:
+    return max(
+        _REPLAY_TOLERANCE_MIN_WH,
+        float(spec["capacity_wh"]) * _REPLAY_TOLERANCE_FRACTION,
+    )
+
+
+def _validate_storage_replay(
+    actions: list[dict[str, Any]],
+    slots: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    storages: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+) -> None:
+    if len(actions) != len(slots):
+        raise ReplayConsistencyError(
+            f"action count {len(actions)} does not match slot count {len(slots)}"
+        )
+    energy = {
+        str(spec["id"]): float(spec["initial_energy_wh"]) for spec in storages
+    }
+    for slot_index, (slot, action) in enumerate(zip(slots, actions)):
+        dt_h = float(slot["len_min"]) / 60.0
+        storage_power = action.get("storage_power_w", {})
+        storage_energy = action.get("storage_energy_wh", {})
+        for spec in storages:
+            storage_id = str(spec["id"])
+            if storage_id not in storage_power or storage_id not in storage_energy:
+                raise ReplayConsistencyError(
+                    f"slot {slot_index} storage {storage_id} output is missing"
+                )
+            power = float(storage_power[storage_id])
+            reported = float(storage_energy[storage_id])
+            if not math.isfinite(power) or not math.isfinite(reported):
+                raise ReplayConsistencyError(
+                    f"slot {slot_index} storage {storage_id} output is non-finite"
+                )
+            if power >= 0:
+                replayed = energy[storage_id] + power * dt_h * float(
+                    spec.get("charge_efficiency", 0.95)
+                )
+            else:
+                replayed = energy[storage_id] + power * dt_h / float(
+                    spec.get("discharge_efficiency", 0.95)
+                )
+            tolerance = _storage_replay_tolerance_wh(spec)
+            if (
+                replayed < -tolerance
+                or replayed > float(spec["capacity_wh"]) + tolerance
+                or abs(reported - replayed) > tolerance
+            ):
+                raise ReplayConsistencyError(
+                    f"slot {slot_index} storage {storage_id} energy "
+                    f"{reported:.6f} is inconsistent with replay "
+                    f"{replayed:.6f} (tolerance {tolerance:.6f})"
+                )
+            energy[storage_id] = replayed
+
+
 def _vector(value: Any, n: int, field: str) -> np.ndarray:
     items = require_list(value, field)
     if len(items) != n:
@@ -315,7 +388,7 @@ def solve(payload: dict[str, Any]) -> dict[str, Any]:
         # starts have zero recovery allowance, preserving hard min/max bounds.
         service_slack += cp.sum(lower_recovery[1:] + upper_recovery[1:]) / (capacity * n)
         unsafe_cycle = bool(np.any(eff_import < 0)) or pv_charge_bonus_ore > 0
-        initial_above_max = initial > max_energy + 1e-6
+        initial_above_max = _storage_starts_above_maximum([spec])
         if force_milp or initial_above_max or (formulation == "auto" and unsafe_cycle):
             direction = cp.Variable(n, boolean=True, name=f"storage_{i}_charge_mode")
             constraints += [charge <= max_charge * direction, discharge <= max_discharge * (1 - direction)]
@@ -818,6 +891,7 @@ def solve(payload: dict[str, Any]) -> dict[str, Any]:
                 mip_gap = float(value)
                 break
     solve_ms = (time.perf_counter() - started) * 1000.0
+    _validate_storage_replay(actions, slots, [storage.spec for storage in storages])
     return {
         "schema_version": SCHEMA_VERSION,
         "request_id": str(payload["request_id"]),
