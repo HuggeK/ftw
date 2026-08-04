@@ -738,7 +738,113 @@ func TestDriverControlDefaultPathClearsHold(t *testing.T) {
 	if hold := srv.activeControlHold("heat"); hold != nil {
 		t.Fatalf("default path left hold active: %+v", hold)
 	}
+	if state := srv.peekControlState("heat"); state == nil {
+		t.Fatal("default path removed the existing control state")
+	}
 	waitMetric(t, tel, "heat", "defaulted", 1)
+}
+
+func TestSendDriverDefaultDoesNotRecreateStateAfterRemove(t *testing.T) {
+	srv, _ := controlServer(t)
+	srv.controlState("heat")
+
+	paused := make(chan struct{})
+	resume := make(chan struct{})
+	srv.beforeDriverDefaultStateLock = func() {
+		close(paused)
+		<-resume
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		result <- srv.SendDriverDefault(context.Background(), "heat")
+	}()
+	select {
+	case <-paused:
+	case <-time.After(time.Second):
+		t.Fatal("SendDriverDefault did not reach the state-lock seam")
+	}
+
+	removed := make(chan struct{})
+	go func() {
+		srv.deps.Registry.RemoveProbe("heat")
+		close(removed)
+	}()
+	select {
+	case <-removed:
+	case <-time.After(time.Second):
+		close(resume)
+		t.Fatal("RemoveProbe deadlocked behind SendDriverDefault")
+	}
+	if state := srv.peekControlState("heat"); state != nil {
+		t.Fatalf("removed driver still has control state before default resumes: %p", state)
+	}
+	close(resume)
+
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("SendDriverDefault succeeded for removed driver")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SendDriverDefault did not finish after lifecycle removal")
+	}
+	if state := srv.peekControlState("heat"); state != nil {
+		t.Fatalf("default path recreated removed control state: %p", state)
+	}
+}
+
+func TestSendDriverDefaultDoesNotAccumulateRemovedStates(t *testing.T) {
+	srv, _ := controlServer(t)
+	srv.controlState("heat")
+	base := srv.deps.Cfg.Drivers[0]
+
+	for i := 0; i < 64; i++ {
+		name := "removed-" + strconv.Itoa(i)
+		cfg := base
+		cfg.Name = name
+		if err := srv.deps.Registry.Add(context.Background(), cfg); err != nil {
+			t.Fatalf("add %s: %v", name, err)
+		}
+		srv.controlState(name)
+
+		paused := make(chan struct{})
+		resume := make(chan struct{})
+		srv.beforeDriverDefaultStateLock = func() {
+			close(paused)
+			<-resume
+		}
+		result := make(chan error, 1)
+		go func() {
+			result <- srv.SendDriverDefault(context.Background(), name)
+		}()
+		select {
+		case <-paused:
+		case <-time.After(time.Second):
+			close(resume)
+			t.Fatalf("SendDriverDefault(%s) did not reach the state-lock seam", name)
+		}
+		srv.deps.Registry.RemoveProbe(name)
+		close(resume)
+		select {
+		case err := <-result:
+			if err == nil {
+				t.Fatalf("SendDriverDefault(%s) succeeded after removal", name)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("SendDriverDefault(%s) did not finish", name)
+		}
+		srv.beforeDriverDefaultStateLock = nil
+		if state := srv.peekControlState(name); state != nil {
+			t.Fatalf("removed driver %s left a control state", name)
+		}
+	}
+
+	srv.controlStateMu.Lock()
+	defer srv.controlStateMu.Unlock()
+	if got := len(srv.controlStates); got != 1 {
+		t.Fatalf("control state map has %d entries after removed names, want only heat", got)
+	}
 }
 
 // Expiry must hold the per-driver lock through the actual default command.

@@ -286,6 +286,21 @@ func (s *Server) lockControlState(name string, beforeStateLock func()) *controlD
 	return state
 }
 
+// lockExistingControlState serializes access to a state that already exists
+// without creating one for a driver that may have been removed concurrently.
+// Lifecycle invalidation uses the same controlStateMu -> state.mu order.
+func (s *Server) lockExistingControlState(name string) (*controlDriverState, bool) {
+	s.controlStateMu.Lock()
+	state := s.controlStates[name]
+	if state == nil {
+		s.controlStateMu.Unlock()
+		return nil, false
+	}
+	state.mu.Lock()
+	s.controlStateMu.Unlock()
+	return state, true
+}
+
 func (s *Server) armControlHoldLocked(name string, state *controlDriverState, control string, value any, generation uint64, d time.Duration) *controlHold {
 	s.clearControlHoldLocked(state)
 	hold := &controlHold{
@@ -347,9 +362,13 @@ func (s *Server) SendDriverDefault(ctx context.Context, name string) error {
 	if _, ok := s.deps.Registry.ControlStatus(name); !ok {
 		return fmt.Errorf("driver %q not found", name)
 	}
-	state := s.lockControlState(name, nil)
-	defer state.mu.Unlock()
-	s.clearControlHoldLocked(state)
+	if s.beforeDriverDefaultStateLock != nil {
+		s.beforeDriverDefaultStateLock()
+	}
+	if state, ok := s.lockExistingControlState(name); ok {
+		defer state.mu.Unlock()
+		s.clearControlHoldLocked(state)
+	}
 	return s.sendDefaultLocked(ctx, name)
 }
 
