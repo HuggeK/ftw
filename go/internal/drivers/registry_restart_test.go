@@ -125,6 +125,85 @@ func TestSendDefaultPassesCallerContextToRuntime(t *testing.T) {
 	r.remove("d1", true)
 }
 
+func waitRegistryMetric(t *testing.T, tel *telemetry.Store, driver, metric string, want float64) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if got, _, ok := tel.LatestMetric(driver, metric); ok && got == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	got, _, ok := tel.LatestMetric(driver, metric)
+	t.Fatalf("%s/%s = %v/%v, want %v", driver, metric, got, ok, want)
+}
+
+func TestRegistryCancelsLegacyCommandOnRestartAndShutdown(t *testing.T) {
+	src := `
+function driver_init(config)
+    host.set_poll_interval(1000)
+end
+function driver_poll() return 1000 end
+function driver_command(action, w, cmd)
+    host.emit_metric("command_started", 1)
+    while true do end
+end
+function driver_default_mode()
+    host.emit_metric("default_called", 1)
+end
+`
+	path := writeTestDriver(t, src)
+	cfg := config.Driver{Name: "d1", Lua: path}
+	tel := telemetry.NewStore()
+	r := NewRegistry(tel)
+	if err := r.Add(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	commandDone := make(chan error, 1)
+	go func() {
+		commandDone <- r.Send(context.Background(), "d1", []byte(`{"action":"loop"}`))
+	}()
+	waitRegistryMetric(t, tel, "d1", "command_started", 1)
+
+	restartDone := make(chan error, 1)
+	go func() { restartDone <- r.Restart(context.Background(), cfg) }()
+	select {
+	case err := <-restartDone:
+		if err != nil {
+			t.Fatalf("restart = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("restart waited for a legacy Lua command that should have been cancelled")
+	}
+	select {
+	case <-commandDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled command did not return")
+	}
+
+	commandDone = make(chan error, 1)
+	go func() {
+		commandDone <- r.Send(context.Background(), "d1", []byte(`{"action":"loop"}`))
+	}()
+	waitRegistryMetric(t, tel, "d1", "command_started", 1)
+	shutdownDone := make(chan struct{})
+	go func() {
+		r.ShutdownAll()
+		close(shutdownDone)
+	}()
+	select {
+	case <-shutdownDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown waited for a legacy Lua command that should have been cancelled")
+	}
+	select {
+	case <-commandDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown-cancelled command did not return")
+	}
+}
+
 // Reset all — used to test a series of adds / removes in the same
 // registry without the mocks carrying state across calls.
 func writeTestDriver(t *testing.T, src string) string {

@@ -237,6 +237,11 @@ func New(deps *Deps) *Server {
 		controlStates: make(map[string]*controlDriverState),
 		drafts:        newDriverDrafts(),
 	}
+	if deps.Registry != nil {
+		// Registry removal is the lifecycle boundary for a driver generation.
+		// Clear the API hold before a replacement instance can be added.
+		deps.Registry.SetLifecycleHook(s.clearDriverControl)
+	}
 	s.routes()
 	// A draft's timer died with the previous process, so anything left behind
 	// goes back now. What runs after a restart should be the driver that was

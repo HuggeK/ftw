@@ -23,7 +23,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"math"
 	"net/http"
 	"sync"
@@ -50,9 +49,10 @@ type controlDriverState struct {
 // controlHold is one active operator setting. The timer is what releases it;
 // the fields are what the UI shows meanwhile.
 type controlHold struct {
-	Control   string `json:"control"`
-	Value     any    `json:"value,omitempty"`
-	ExpiresAt int64  `json:"expires_at_ms"`
+	Control    string `json:"control"`
+	Value      any    `json:"value,omitempty"`
+	ExpiresAt  int64  `json:"expires_at_ms"`
+	Generation uint64 `json:"-"`
 
 	timer *time.Timer
 }
@@ -81,6 +81,13 @@ func (s *Server) handleDriverControl(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": "invalid request"})
 		return
 	}
+	if cfg, ok := s.configuredDriver(name); ok && cfg.ObserveOnly {
+		writeJSON(w, http.StatusForbidden, map[string]any{
+			"error":        "driver is observe_only and cannot be controlled",
+			"observe_only": true,
+		})
+		return
+	}
 
 	declared := s.driverControls(name)
 	if len(declared) == 0 {
@@ -100,6 +107,20 @@ func (s *Server) handleDriverControl(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.deps.Registry == nil {
 		writeJSON(w, 503, map[string]string{"error": "driver registry not available"})
+		return
+	}
+	status, ok := s.deps.Registry.ControlStatus(name)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "driver not running"})
+		return
+	}
+	if status.Blocked {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":             drivers.ErrControlBlocked.Error(),
+			"control_blocked":   true,
+			"default_confirmed": false,
+			"recovery_pending":  status.RecoveryPending,
+		})
 		return
 	}
 
@@ -138,15 +159,24 @@ func (s *Server) handleDriverControl(w http.ResponseWriter, r *http.Request) {
 	state := s.controlState(name)
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	hold := s.armControlHoldLocked(name, state, control.ID, applied, time.Duration(seconds)*time.Second)
+	hold := s.armControlHoldLocked(name, state, control.ID, applied, status.Generation, time.Duration(seconds)*time.Second)
 	if err := s.deps.Registry.Send(r.Context(), name, body); err != nil {
 		s.clearControlHoldLocked(state)
-		defaultCtx, cancel := context.WithTimeout(context.Background(), controlDefaultTimeout)
-		defaultErr := s.sendDefaultLocked(defaultCtx, name)
-		cancel()
-		if defaultErr != nil {
-			err = errors.Join(err, fmt.Errorf("restore default after ambiguous command: %w", defaultErr))
-			slog.Error("ambiguous driver control could not restore default", "driver", name, "err", defaultErr)
+		if errors.Is(err, drivers.ErrObserveOnly) {
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"error":        err.Error(),
+				"observe_only": true,
+			})
+			return
+		}
+		if errors.Is(err, drivers.ErrControlBlocked) {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":             err.Error(),
+				"control_blocked":   true,
+				"default_confirmed": false,
+				"recovery_pending":  true,
+			})
+			return
 		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -237,12 +267,13 @@ func (s *Server) controlState(name string) *controlDriverState {
 	return state
 }
 
-func (s *Server) armControlHoldLocked(name string, state *controlDriverState, control string, value any, d time.Duration) *controlHold {
+func (s *Server) armControlHoldLocked(name string, state *controlDriverState, control string, value any, generation uint64, d time.Duration) *controlHold {
 	s.clearControlHoldLocked(state)
 	hold := &controlHold{
-		Control:   control,
-		Value:     value,
-		ExpiresAt: time.Now().Add(d).UnixMilli(),
+		Control:    control,
+		Value:      value,
+		ExpiresAt:  time.Now().Add(d).UnixMilli(),
+		Generation: generation,
 	}
 	hold.timer = time.AfterFunc(d, func() { s.expireControlHold(name, state, hold) })
 	state.hold = hold
@@ -266,15 +297,20 @@ func (s *Server) expireControlHold(name string, state *controlDriverState, fired
 	if state.hold != fired {
 		return
 	}
+	if s.deps.Registry == nil {
+		s.clearControlHoldLocked(state)
+		return
+	}
+	status, ok := s.deps.Registry.ControlStatus(name)
+	if !ok || status.Generation != fired.Generation {
+		// A stopped generation must never default a replacement instance.
+		s.clearControlHoldLocked(state)
+		return
+	}
 	s.clearControlHoldLocked(state)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := s.sendDefaultLocked(ctx, name); err != nil {
-		// Nothing to retry into: the driver is gone, wedged, or already in
-		// its default. Log rather than reschedule, so a dead driver does not
-		// leave a timer firing every ten seconds for the process lifetime.
-		slog.Warn("control hold expiry failed", "driver", name, "err", err)
-	}
+	_ = s.sendDefaultLocked(ctx, name)
 }
 
 // SendDriverDefault is the shared safety path for watchdogs and API release.
@@ -282,6 +318,12 @@ func (s *Server) expireControlHold(name string, state *controlDriverState, fired
 // command dispatch, then sends the driver's own default with a bounded
 // context. A caller without a deadline gets the 10-second safety deadline.
 func (s *Server) SendDriverDefault(ctx context.Context, name string) error {
+	if s.deps == nil || s.deps.Registry == nil {
+		return errors.New("driver registry not available")
+	}
+	if _, ok := s.deps.Registry.ControlStatus(name); !ok {
+		return fmt.Errorf("driver %q not found", name)
+	}
 	state := s.controlState(name)
 	state.mu.Lock()
 	defer state.mu.Unlock()
@@ -305,13 +347,55 @@ func (s *Server) sendDefaultLocked(ctx context.Context, name string) error {
 }
 
 func (s *Server) activeControlHold(name string) *controlHold {
-	state := s.controlState(name)
+	state := s.peekControlState(name)
+	if state == nil {
+		return nil
+	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	if state.hold == nil {
 		return nil
 	}
+	if s.deps == nil || s.deps.Registry == nil {
+		s.clearControlHoldLocked(state)
+		return nil
+	}
+	status, ok := s.deps.Registry.ControlStatus(name)
+	if !ok || status.Generation != state.hold.Generation {
+		s.clearControlHoldLocked(state)
+		return nil
+	}
 	hold := *state.hold
 	hold.timer = nil
 	return &hold
+}
+
+func (s *Server) peekControlState(name string) *controlDriverState {
+	s.controlStateMu.Lock()
+	state := s.controlStates[name]
+	s.controlStateMu.Unlock()
+	return state
+}
+
+// clearDriverControl is called by Registry before a driver generation is
+// removed. It stops the old timer and drops the map entry so a re-added driver
+// cannot inherit an operator hold from the previous instance.
+func (s *Server) clearDriverControl(name string) {
+	s.clearDriverControlState(name, nil)
+}
+
+func (s *Server) clearDriverControlState(name string, expected *controlDriverState) {
+	s.controlStateMu.Lock()
+	state := s.controlStates[name]
+	if expected != nil && state != expected {
+		s.controlStateMu.Unlock()
+		return
+	}
+	delete(s.controlStates, name)
+	s.controlStateMu.Unlock()
+	if state != nil {
+		state.mu.Lock()
+		s.clearControlHoldLocked(state)
+		state.mu.Unlock()
+	}
 }

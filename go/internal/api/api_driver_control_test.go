@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -148,11 +149,54 @@ function driver_default_mode()
 end
 `
 
+const controlRecoveryProbeLua = `DRIVER = {
+  id      = "probe_recovery",
+  name    = "Probe recovery",
+  version = "1.0.0",
+  controls = {
+    { id = "set_offset", input = { type = "number", min = -3, max = 3 } },
+  },
+}
+
+local applied = nil
+local defaults = 0
+
+function driver_init(config)
+    host.set_make("Probe recovery")
+    host.set_poll_interval(100)
+end
+
+function driver_poll()
+    if applied ~= nil then host.emit_metric("applied", applied, "n") end
+    host.emit_metric("defaulted", defaults, "n")
+    return 100
+end
+
+function driver_command(action, power_w, cmd)
+    applied = tonumber(cmd and (cmd.value or cmd.offset))
+    host.emit_metric("command_applied", applied, "n")
+    if defaults < 2 then return false end
+    return true
+end
+
+function driver_default_mode()
+    defaults = defaults + 1
+    host.emit_metric("default_attempt", defaults, "n")
+    if defaults == 1 then return false end
+    if defaults == 2 then host.sleep(500) end
+    applied = 0
+end
+`
+
 func controlServer(t *testing.T) (*Server, *telemetry.Store) {
 	return controlServerWithLua(t, controlProbeLua)
 }
 
 func controlServerWithLua(t *testing.T, source string) (*Server, *telemetry.Store) {
+	return controlServerWithLuaConfig(t, source, config.Driver{Name: "heat"})
+}
+
+func controlServerWithLuaConfig(t *testing.T, source string, cfg config.Driver) (*Server, *telemetry.Store) {
 	t.Helper()
 	dir := t.TempDir()
 	lua := filepath.Join(dir, "probe.lua")
@@ -161,7 +205,7 @@ func controlServerWithLua(t *testing.T, source string) (*Server, *telemetry.Stor
 	}
 	tel := telemetry.NewStore()
 	reg := drivers.NewRegistry(tel)
-	cfg := config.Driver{Name: "heat", Lua: lua}
+	cfg.Lua = lua
 	if err := reg.Add(context.Background(), cfg); err != nil {
 		t.Fatalf("add driver: %v", err)
 	}
@@ -419,4 +463,165 @@ func TestDriverControlSerializesExpiryAndReplacement(t *testing.T) {
 	}
 	<-done
 	waitMetric(t, tel, "heat", "applied", -2)
+}
+
+func TestDriverControlRejectsObserveOnlyWithoutSending(t *testing.T) {
+	srv, tel := controlServerWithLuaConfig(t, controlProbeLua, config.Driver{
+		Name:        "heat",
+		ObserveOnly: true,
+	})
+
+	rec := post(t, srv, "/api/drivers/heat/control",
+		`{"control":"set_offset","value":2,"duration_s":600}`)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("observe_only POST = %d, body %s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["observe_only"] != true {
+		t.Fatalf("observe_only response = %v", body)
+	}
+	if _, _, ok := tel.LatestMetric("heat", "applied"); ok {
+		t.Fatal("observe_only control reached the driver")
+	}
+	if err := srv.deps.Registry.Send(context.Background(), "heat", []byte(`{"action":"set_offset","value":2}`)); err != drivers.ErrObserveOnly {
+		t.Fatalf("direct observe_only Send = %v, want %v", err, drivers.ErrObserveOnly)
+	}
+}
+
+func TestDriverControlBlocksUntilDefaultRecovery(t *testing.T) {
+	srv, tel := controlServerWithLua(t, controlRecoveryProbeLua)
+
+	rec := post(t, srv, "/api/drivers/heat/control",
+		`{"control":"set_offset","value":2,"duration_s":600}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("partial-effect POST = %d, body %s", rec.Code, rec.Body.String())
+	}
+	var blockedBody map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &blockedBody); err != nil {
+		t.Fatal(err)
+	}
+	if blockedBody["control_blocked"] != true || blockedBody["default_confirmed"] != false {
+		t.Fatalf("partial-effect safety response = %v", blockedBody)
+	}
+	waitMetric(t, tel, "heat", "command_applied", 2)
+	waitMetric(t, tel, "heat", "default_attempt", 1)
+
+	status, ok := srv.deps.Registry.ControlStatus("heat")
+	if !ok || !status.Blocked || !status.RecoveryPending || status.DefaultConfirmed {
+		t.Fatalf("control status after failed default = %+v, running=%v", status, ok)
+	}
+	rec = post(t, srv, "/api/drivers/heat/control",
+		`{"control":"set_offset","value":3,"duration_s":600}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("POST while default recovery is pending = %d, body %s", rec.Code, rec.Body.String())
+	}
+
+	detail := driverDetail(t, srv, "heat")
+	if detail.ControlState.State != "default_recovery" || !detail.ControlState.Blocked ||
+		detail.ControlState.DefaultConfirmed || !detail.ControlState.RecoveryPending {
+		t.Fatalf("recovery control state = %+v", detail.ControlState)
+	}
+
+	waitMetric(t, tel, "heat", "default_attempt", 2)
+	waitMetric(t, tel, "heat", "defaulted", 2)
+	status, ok = srv.deps.Registry.ControlStatus("heat")
+	if !ok || status.Blocked || !status.DefaultConfirmed || status.RecoveryPending {
+		t.Fatalf("control status after recovery = %+v, running=%v", status, ok)
+	}
+	rec = post(t, srv, "/api/drivers/heat/control",
+		`{"control":"set_offset","value":3,"duration_s":600}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST after default recovery = %d, body %s", rec.Code, rec.Body.String())
+	}
+	waitMetric(t, tel, "heat", "applied", 3)
+}
+
+func TestDriverControlClearsHoldAcrossLifecycle(t *testing.T) {
+	srv, tel := controlServer(t)
+	cfg := srv.deps.Cfg.Drivers[0]
+
+	rec := post(t, srv, "/api/drivers/heat/control",
+		`{"control":"set_offset","value":2,"duration_s":600}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("initial POST = %d, body %s", rec.Code, rec.Body.String())
+	}
+	waitMetric(t, tel, "heat", "applied", 2)
+	oldState := srv.peekControlState("heat")
+	if oldState == nil {
+		t.Fatal("initial control state is missing")
+	}
+	oldState.mu.Lock()
+	oldHold := oldState.hold
+	oldState.mu.Unlock()
+	if oldHold == nil {
+		t.Fatal("initial control hold is missing")
+	}
+
+	if err := srv.deps.Registry.Restart(context.Background(), cfg); err != nil {
+		t.Fatalf("restart = %v", err)
+	}
+	if got := srv.activeControlHold("heat"); got != nil {
+		t.Fatalf("hold survived restart: %+v", got)
+	}
+	if got := srv.peekControlState("heat"); got != nil {
+		t.Fatal("control state map entry survived restart")
+	}
+	if got := driverDetail(t, srv, "heat"); got.Hold != nil {
+		t.Fatalf("GET after restart exposed old hold: %+v", got.Hold)
+	}
+
+	rec = post(t, srv, "/api/drivers/heat/control",
+		`{"control":"set_offset","value":-2,"duration_s":600}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST after restart = %d, body %s", rec.Code, rec.Body.String())
+	}
+	waitMetric(t, tel, "heat", "applied", -2)
+	// Simulate a timer callback that was already in flight when the old
+	// generation was removed. It must not default the new instance.
+	srv.expireControlHold("heat", oldState, oldHold)
+	time.Sleep(250 * time.Millisecond)
+	if got, _, ok := tel.LatestMetric("heat", "defaulted"); !ok || got != 0 {
+		t.Fatalf("old timer changed the replacement: defaulted=%v/%v", got, ok)
+	}
+	if got, _, ok := tel.LatestMetric("heat", "applied"); !ok || got != -2 {
+		t.Fatalf("replacement applied value = %v/%v, want -2", got, ok)
+	}
+
+	disabled := cfg
+	disabled.Disabled = true
+	srv.deps.Registry.Reload(context.Background(), []config.Driver{disabled}, false)
+	if got := srv.peekControlState("heat"); got != nil {
+		t.Fatal("control state map entry survived disable")
+	}
+	if got := driverDetail(t, srv, "heat"); got.Hold != nil {
+		t.Fatalf("GET while disabled exposed a hold: %+v", got.Hold)
+	}
+
+	srv.deps.Registry.Reload(context.Background(), []config.Driver{cfg}, false)
+	if got := srv.peekControlState("heat"); got != nil {
+		t.Fatal("control state map entry survived re-add")
+	}
+	if got := driverDetail(t, srv, "heat"); got.Hold != nil {
+		t.Fatalf("GET after re-add exposed an old hold: %+v", got.Hold)
+	}
+}
+
+func TestDriverDetailUnknownNamesDoNotCreateControlState(t *testing.T) {
+	srv, _ := controlServer(t)
+	for i := 0; i < 1000; i++ {
+		name := "missing-" + strconv.Itoa(i)
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/drivers/"+name, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d, body %s", name, rec.Code, rec.Body.String())
+		}
+	}
+	srv.controlStateMu.Lock()
+	defer srv.controlStateMu.Unlock()
+	if got := len(srv.controlStates); got != 0 {
+		t.Fatalf("unknown GETs created %d control states", got)
+	}
 }

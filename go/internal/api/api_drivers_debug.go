@@ -39,6 +39,16 @@ type driverDetailResp struct {
 	Controls []drivers.CatalogControl `json:"controls,omitempty"`
 	// Hold is the operator setting in force, if any, and when it ends.
 	Hold *controlHold `json:"hold,omitempty"`
+	// ControlState says whether Core has confirmed autonomous default mode.
+	// It must not call a failed default safe or settled.
+	ControlState driverControlStateResp `json:"control_state"`
+}
+
+type driverControlStateResp struct {
+	State            string `json:"state"`
+	Blocked          bool   `json:"blocked"`
+	DefaultConfirmed bool   `json:"default_confirmed"`
+	RecoveryPending  bool   `json:"recovery_pending"`
 }
 
 type readingDTO struct {
@@ -108,7 +118,33 @@ func (s *Server) handleDriverDetail(w http.ResponseWriter, r *http.Request) {
 	}
 	resp.Controls = s.driverControls(name)
 	resp.Hold = s.activeControlHold(name)
+	resp.ControlState = s.driverControlState(name, resp.Hold)
 	writeJSON(w, 200, resp)
+}
+
+func (s *Server) driverControlState(name string, hold *controlHold) driverControlStateResp {
+	if s.deps == nil || s.deps.Registry == nil {
+		return driverControlStateResp{State: "unknown"}
+	}
+	status, ok := s.deps.Registry.ControlStatus(name)
+	if !ok {
+		return driverControlStateResp{State: "unknown"}
+	}
+	state := "unknown"
+	switch {
+	case status.Blocked:
+		state = "default_recovery"
+	case hold != nil:
+		state = "held"
+	case status.DefaultConfirmed:
+		state = "default_confirmed"
+	}
+	return driverControlStateResp{
+		State:            state,
+		Blocked:          status.Blocked,
+		DefaultConfirmed: status.DefaultConfirmed,
+		RecoveryPending:  status.RecoveryPending,
+	}
 }
 
 // driverControls returns the controls the configured driver `name` declares.
@@ -119,25 +155,11 @@ func (s *Server) handleDriverDetail(w http.ResponseWriter, r *http.Request) {
 // failure belongs in the catalog endpoint, where an operator is looking at
 // driver files, not here.
 func (s *Server) driverControls(name string) []drivers.CatalogControl {
-	if s.deps.Cfg == nil {
+	cfg, ok := s.configuredDriver(name)
+	if !ok || cfg.Lua == "" {
 		return nil
 	}
-	lua := ""
-	if s.deps.CfgMu != nil {
-		s.deps.CfgMu.RLock()
-	}
-	for _, d := range s.deps.Cfg.Drivers {
-		if d.Name == name {
-			lua = d.Lua
-			break
-		}
-	}
-	if s.deps.CfgMu != nil {
-		s.deps.CfgMu.RUnlock()
-	}
-	if lua == "" {
-		return nil
-	}
+	lua := cfg.Lua
 	// Config.ResolveDriverPaths normally makes lua absolute. Read that exact
 	// file first when it is available: a local overlay may contain the same
 	// filename as a deliberately selected managed or bundled driver.
@@ -158,6 +180,22 @@ func (s *Server) driverControls(name string) []drivers.CatalogControl {
 		return nil
 	}
 	return drivers.ControlsForDriver(entries, lua)
+}
+
+func (s *Server) configuredDriver(name string) (config.Driver, bool) {
+	if s.deps == nil || s.deps.Cfg == nil {
+		return config.Driver{}, false
+	}
+	if s.deps.CfgMu != nil {
+		s.deps.CfgMu.RLock()
+		defer s.deps.CfgMu.RUnlock()
+	}
+	for _, d := range s.deps.Cfg.Drivers {
+		if d.Name == name {
+			return d, true
+		}
+	}
+	return config.Driver{}, false
 }
 
 // POST /api/drivers/test — start one short-lived driver instance from the
