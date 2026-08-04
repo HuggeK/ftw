@@ -574,6 +574,42 @@ batteries:
 	}
 }
 
+func TestPVArrayGeometryDistinguishesMissingFromZero(t *testing.T) {
+	yaml := minimalYAML + `
+weather:
+  provider: open_meteo
+  latitude: 59.3293
+  longitude: 18.0686
+  pv_arrays:
+    - name: partial
+      kwp: 10
+      tilt_deg: 35
+    - name: north flat
+      kwp: 5
+      tilt_deg: 0
+      azimuth_deg: 0
+`
+	c, err := Parse([]byte(yaml), "/tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Weather == nil || len(c.Weather.PVArrays) != 2 {
+		t.Fatalf("weather arrays missing: %+v", c.Weather)
+	}
+	partial := c.Weather.PVArrays[0]
+	if partial.AzimuthDeg != nil {
+		t.Fatalf("omitted azimuth should remain nil, got %v", *partial.AzimuthDeg)
+	}
+	if _, _, _, ok := partial.CompleteGeometry(); ok {
+		t.Fatal("partial geometry must not be treated as a north-facing array")
+	}
+	northFlat := c.Weather.PVArrays[1]
+	tilt, azimuth, kwp, ok := northFlat.CompleteGeometry()
+	if !ok || tilt != 0 || azimuth != 0 || kwp != 5 {
+		t.Fatalf("explicit zero geometry should remain valid: tilt=%v azimuth=%v kwp=%v ok=%v", tilt, azimuth, kwp, ok)
+	}
+}
+
 func TestSiteMeterDriverReturnsName(t *testing.T) {
 	c, err := Parse([]byte(minimalYAML), ".")
 	if err != nil {
