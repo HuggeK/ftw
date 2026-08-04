@@ -417,6 +417,10 @@ type State struct {
 	LastDispatch         *time.Time
 	PrevTargets          map[string]float64
 
+	// clock is nil in production. Tests may set it to keep a dispatch
+	// scenario on one instant even when the test runner is delayed.
+	clock func() time.Time
+
 	LastTargets []DispatchTarget
 
 	// Cascade toggle — set by main.go based on whether models exist
@@ -589,10 +593,10 @@ type State struct {
 	FuseHoldMaxChargeW    float64
 	FuseHoldUntil         time.Time
 
-	// ManualHold pins the aggregate battery setpoint to a fixed power
-	// for a bounded duration, bypassing both the active manual mode
-	// and the MPC. Hot-installed via POST /api/battery/manual_hold;
-	// auto-expires. Zero ExpiresAt means inactive.
+	// ManualHold pins the battery pool or one battery to a fixed power
+	// for a bounded duration, bypassing both the active manual mode and
+	// the MPC. Hot-installed via POST /api/battery/manual_hold; it is
+	// never persisted and auto-expires. Zero ExpiresAt means inactive.
 	//
 	// Site sign convention: PowerW > 0 = charge, < 0 = discharge,
 	// 0 = idle. SoC clamps, slew, and the fuse guard still apply on
@@ -600,6 +604,10 @@ type State struct {
 	// Mutated under the same outer ctrlMu that protects the rest of
 	// State; no internal mutex.
 	ManualHold BatteryManualHold
+	// BatteryHoldTargetValid checks that a scoped hold still points at
+	// the same live hardware. Core wires this to driver health, battery
+	// telemetry, and the hardware identity reported by the driver.
+	BatteryHoldTargetValid func(driver, deviceID string) bool
 
 	// ManualPVHold pins a PV curtail cap for a bounded duration,
 	// overriding whatever the planner's slot directive says about
@@ -612,15 +620,17 @@ type State struct {
 }
 
 // BatteryManualHold is the full payload of a battery manual override.
-// See State.ManualHold for invariants.
+// Driver empty keeps the pool behavior. A scoped hold must also carry
+// DeviceID so a reused driver name cannot move it to other hardware.
 type BatteryManualHold struct {
+	Driver    string
+	DeviceID  string
 	PowerW    float64
 	ExpiresAt time.Time
 }
 
-// SetBatteryManualHold installs a manual override on the aggregate
-// battery setpoint. Caller must hold the outer ctrlMu. A zero
-// ExpiresAt clears any active hold (same as ClearBatteryManualHold).
+// SetBatteryManualHold installs a manual override. Caller must hold the
+// outer ctrlMu. A zero ExpiresAt clears any active hold.
 func (s *State) SetBatteryManualHold(h BatteryManualHold) {
 	if h.ExpiresAt.IsZero() {
 		s.ManualHold = BatteryManualHold{}
@@ -970,6 +980,16 @@ func NewState(gridTargetW, gridToleranceW float64, siteMeter string) *State {
 	}
 }
 
+// now is the only wall-clock read in this package. Production leaves clock
+// nil and gets time.Now(); a test may pin one instant so a scheduler pause
+// between building a scenario and dispatching it cannot move a target.
+func (s *State) now() time.Time {
+	if s != nil && s.clock != nil {
+		return s.clock()
+	}
+	return time.Now()
+}
+
 // SetGridTarget updates both the state and the PI setpoint.
 func (s *State) SetGridTarget(w float64) {
 	s.GridTargetW = w
@@ -1069,7 +1089,7 @@ func ComputeDispatch(
 	// from this data. The point is to measure first, decide whether a
 	// cap is warranted later.
 	{
-		now := time.Now()
+		now := state.now()
 		var liveBatTotal float64
 		for name := range driverCapacities {
 			if r := store.Get(name, telemetry.DerBattery); r != nil {
@@ -1153,7 +1173,16 @@ func ComputeDispatch(
 	// pre-processing, the idle/charge short-circuits, the holdoff timer,
 	// and the deadband. Falls through to distribute → slew → SoC clamp
 	// → fuse guard so safety bounds still apply.
-	manualHold, manualHoldActive := state.GetBatteryManualHold(time.Now())
+	manualHold, manualHoldActive := state.GetBatteryManualHold(state.now())
+	if manualHoldActive && manualHold.Driver != "" {
+		valid := manualHold.DeviceID != "" && state.BatteryHoldTargetValid != nil &&
+			state.BatteryHoldTargetValid(manualHold.Driver, manualHold.DeviceID)
+		if !valid {
+			state.ClearBatteryManualHold()
+			manualHold = BatteryManualHold{}
+			manualHoldActive = false
+		}
+	}
 	if manualHoldActive {
 		// Reset PI + slot accumulators so reverting to a planner mode
 		// after the hold expires doesn't read stale state — same reset
@@ -1172,14 +1201,14 @@ func ComputeDispatch(
 		// Already handled — leave effectiveMode at ModeSelfConsumption.
 	case state.Mode == ModePlannerSelf:
 		effectiveMode = ModeSelfConsumption
-		decision := preparePlannerSelf(state, time.Now())
+		decision := preparePlannerSelf(state, state.now())
 		plannerSelfIdleGate = decision.idleGate
 		plannerSelfExportSurplusGate = decision.exportSurplusGate
 		plannerSelfNoChargeStalePlan = decision.noChargeOnStalePlan
 	case state.Mode.IsPlannerMode():
 		// planner_cheap / planner_arbitrage.
 		if state.UseEnergyDispatch && state.SlotDirective != nil {
-			if dir, ok := state.SlotDirective(time.Now()); ok {
+			if dir, ok := state.SlotDirective(state.now()); ok {
 				currentDirective = dir
 				// planner_arbitrage and planner_passive_arbitrage idle slots: skip the energy path and
 				// fall through to reactive PI (same as planner_self does always).
@@ -1270,7 +1299,7 @@ func ComputeDispatch(
 			var gridW float64
 			ok := false
 			if state.PlanTarget != nil {
-				modeStr, gridW, ok = state.PlanTarget(time.Now())
+				modeStr, gridW, ok = state.PlanTarget(state.now())
 			}
 			if ok {
 				effectiveMode = Mode(modeStr)
@@ -1302,7 +1331,7 @@ func ComputeDispatch(
 		// model loop all depend on this being accurate.
 		state.LastTargets = out
 		if out != nil {
-			now := time.Now()
+			now := state.now()
 			state.LastDispatch = &now
 		}
 		return out
@@ -1319,7 +1348,7 @@ func ComputeDispatch(
 	// setpoint and expects immediate effect, not a 5 s wait. The fuse
 	// guard at the end of the cycle still protects the site.
 	if !manualHoldActive && state.LastDispatch != nil {
-		elapsed := time.Since(*state.LastDispatch).Seconds()
+		elapsed := state.now().Sub(*state.LastDispatch).Seconds()
 		if elapsed < float64(state.MinDispatchIntervalS) {
 			// Holdoff suppresses normal re-dispatch, but the
 			// fuse-saver overrides — an overflow can't wait 5 s for
@@ -1330,7 +1359,7 @@ func ComputeDispatch(
 				// consumers (status/history/learner) see the
 				// commanded discharge.
 				state.LastTargets = out
-				now := time.Now()
+				now := state.now()
 				state.LastDispatch = &now
 			}
 			return out
@@ -1480,7 +1509,7 @@ func ComputeDispatch(
 		// over this slot". Derive the instantaneous power needed to hit the
 		// remaining energy in the remaining time, then pass (target - currentTotal)
 		// as the correction the existing distributors expect.
-		now := time.Now()
+		now := state.now()
 		// Slot rollover: new slot → reset the delivered accumulator.
 		if !currentDirective.SlotStart.Equal(state.currentDirective.SlotStart) {
 			state.currentDirective = currentDirective
@@ -1997,7 +2026,7 @@ func ComputeDispatch(
 				threshold = 100
 			}
 			chargeCeiling := unexpectedIdleExportBeyondPlanW(surplus, currentDirective, threshold)
-			remainingS := currentDirective.SlotEnd.Sub(time.Now()).Seconds()
+			remainingS := currentDirective.SlotEnd.Sub(state.now()).Seconds()
 			headroomW := pvSurplusAbsorbHeadroomW(onlineBats, arbitrageFamilyIdleAbsorbCapPct, remainingS)
 			if chargeCeiling > headroomW {
 				chargeCeiling = headroomW
@@ -2092,13 +2121,17 @@ func ComputeDispatch(
 
 	// ---- Distribute across batteries ----
 	var raw []DispatchTarget
-	switch effectiveMode {
-	case ModeSelfConsumption, ModePeakShaving:
-		raw = distributeProportional(onlineBats, totalCorrection, groupPV)
-	case ModePriority:
-		raw = distributePriority(onlineBats, totalCorrection, state.PriorityOrder)
-	case ModeWeighted:
-		raw = distributeWeighted(onlineBats, totalCorrection, state.Weights)
+	if manualHoldActive && manualHold.Driver != "" {
+		raw = distributeScopedManualHold(onlineBats, manualHold.Driver, currentTotal+totalCorrection)
+	} else {
+		switch effectiveMode {
+		case ModeSelfConsumption, ModePeakShaving:
+			raw = distributeProportional(onlineBats, totalCorrection, groupPV)
+		case ModePriority:
+			raw = distributePriority(onlineBats, totalCorrection, state.PriorityOrder)
+		case ModeWeighted:
+			raw = distributeWeighted(onlineBats, totalCorrection, state.Weights)
+		}
 	}
 
 	// ---- Slew rate limit per driver ----
@@ -2133,7 +2166,8 @@ func ComputeDispatch(
 		// A direct move to 0 W is safe here: it only removes battery load /
 		// discharge, and the fuse overflow guard below can still force
 		// discharge if the site actually needs it.
-		if (plannerSelfExportSurplusGate ||
+		scopedSiblingStanddown := manualHoldActive && manualHold.Driver != "" && raw[i].Driver != manualHold.Driver
+		if (plannerSelfExportSurplusGate || scopedSiblingStanddown ||
 			(manualHoldActive && math.Abs(manualHold.PowerW) < 1)) &&
 			math.Abs(raw[i].TargetW) < 1 {
 			raw[i].TargetW = 0
@@ -2296,7 +2330,7 @@ func recordDispatchTargets(targets []DispatchTarget, state *State, updatePrevTar
 		return
 	}
 	if recordDispatch {
-		now := time.Now()
+		now := state.now()
 		state.LastDispatch = &now
 	}
 	if updatePrevTargets {
@@ -2497,7 +2531,7 @@ func ComputePVCurtail(state *State, store *telemetry.Store) []CurtailTarget {
 		return nil
 	}
 
-	now := time.Now()
+	now := state.now()
 
 	// Operator-installed manual hold takes precedence over the planner
 	// directive. Driver-scoped → cap only that driver. Site-aggregate
@@ -2828,6 +2862,19 @@ func liveCurtailLimitW(state *State, store *telemetry.Store) (float64, bool) {
 	}
 
 	return liveLoadW + batHeadroomW + evReserveW, true
+}
+
+func distributeScopedManualHold(bats []batteryInfo, driver string, powerW float64) []DispatchTarget {
+	out := make([]DispatchTarget, 0, len(bats))
+	for _, b := range bats {
+		targetW := 0.0
+		if b.driver == driver {
+			targetW = powerW
+		}
+		clamped, wasClamped := clampWithSoC(targetW, b)
+		out = append(out, DispatchTarget{Driver: b.driver, TargetW: clamped, Clamped: wasClamped})
+	}
+	return out
 }
 
 // distributeProportional splits the total desired battery power across the
@@ -3209,7 +3256,7 @@ func planHasNonDischargeIntent(state *State) bool {
 	const idleWh = 50.0
 	const idleGridW = 100.0
 	if state.SlotDirective != nil {
-		if dir, ok := state.SlotDirective(time.Now()); ok {
+		if dir, ok := state.SlotDirective(state.now()); ok {
 			// For passive_arbitrage: only block reactive discharge when the
 			// plan slot has explicit charge intent. Idle and discharge slots
 			// get no non-discharge block — reactive discharge may cover load.
@@ -3236,7 +3283,7 @@ func planHasNonDischargeIntent(state *State) bool {
 		}
 	}
 	if state.PlanTarget != nil {
-		if modeStr, gridW, ok := state.PlanTarget(time.Now()); ok {
+		if modeStr, gridW, ok := state.PlanTarget(state.now()); ok {
 			switch Mode(modeStr) {
 			case ModeCharge:
 				return true
@@ -3481,7 +3528,7 @@ func applyFuseGuard(targets []DispatchTarget, store *telemetry.Store, state *Sta
 	// the planner can't ramp back through the boundary on the next
 	// tick. Window is refreshed every time the clamp fires, so the
 	// hold persists as long as the planner keeps trying to push past.
-	now := time.Now()
+	now := state.now()
 	if state.FuseHoldUntil.After(now) {
 		if state.FuseHoldMaxDischargeW > 0 {
 			var totalDischarge float64
@@ -3775,7 +3822,7 @@ func planSignIntent(state *State) int {
 	const idleWh = 50.0     // a near-zero per-slot energy is idle, not signed
 	const idleGridW = 100.0 // matches mpc.IdleGateThresholdW for sign decisions
 	if state.SlotDirective != nil {
-		if dir, ok := state.SlotDirective(time.Now()); ok {
+		if dir, ok := state.SlotDirective(state.now()); ok {
 			if dir.BatteryEnergyWh > idleWh {
 				// A charge-from-PV-surplus slot has no hard charge commitment
 				// (see coverLoadChargeSlot) — report idle intent so the sign
@@ -3792,7 +3839,7 @@ func planSignIntent(state *State) int {
 		}
 	}
 	if state.PlanTarget != nil {
-		if modeStr, gridW, ok := state.PlanTarget(time.Now()); ok {
+		if modeStr, gridW, ok := state.PlanTarget(state.now()); ok {
 			switch Mode(modeStr) {
 			case ModeCharge:
 				return +1
