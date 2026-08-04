@@ -978,9 +978,10 @@ type Weather struct {
 	// predictions when each plane is described separately than when
 	// everything is averaged into a single tilt/azimuth.
 	//
-	// When set, PVArrays overrides the legacy single-array fields.
-	// Providers that can't use site geometry (met_no, open_meteo)
-	// ignore this entirely and just use PVRatedW.
+	// When set, PVArrays overrides the legacy single-array fields for
+	// geometry-aware providers. GHI providers such as open_meteo project
+	// radiation onto these planes; incomplete entries are ignored and the
+	// provider falls back to its flat estimate.
 	PVArrays []PVArray `yaml:"pv_arrays,omitempty" json:"pv_arrays,omitempty"`
 
 	// HeatingWPerDegC adds load proportional to max(18°C − outdoor_temp, 0).
@@ -995,10 +996,27 @@ type Weather struct {
 // + east roof + garage) with different tilt/azimuth. The sum of all
 // KWp values should match the total PV nameplate at the site.
 type PVArray struct {
-	Name       string  `yaml:"name,omitempty" json:"name,omitempty"`
-	KWp        float64 `yaml:"kwp" json:"kwp"`
-	TiltDeg    float64 `yaml:"tilt_deg" json:"tilt_deg"`
-	AzimuthDeg float64 `yaml:"azimuth_deg" json:"azimuth_deg"`
+	Name       string   `yaml:"name,omitempty" json:"name,omitempty"`
+	KWp        float64  `yaml:"kwp" json:"kwp"`
+	TiltDeg    *float64 `yaml:"tilt_deg" json:"tilt_deg"`
+	AzimuthDeg *float64 `yaml:"azimuth_deg" json:"azimuth_deg"`
+}
+
+// CompleteGeometry returns one usable PV plane. Tilt and azimuth are
+// pointers so an omitted field cannot be confused with a valid 0° value.
+// Invalid or partial entries are intentionally not fatal: callers use the
+// flat forecast path when no complete plane remains.
+func (a PVArray) CompleteGeometry() (tiltDeg, azimuthDeg, kWp float64, ok bool) {
+	if a.KWp <= 0 || math.IsNaN(a.KWp) || math.IsInf(a.KWp, 0) ||
+		a.TiltDeg == nil || a.AzimuthDeg == nil {
+		return 0, 0, 0, false
+	}
+	tiltDeg, azimuthDeg = *a.TiltDeg, *a.AzimuthDeg
+	if math.IsNaN(tiltDeg) || math.IsInf(tiltDeg, 0) || tiltDeg < 0 || tiltDeg > 90 ||
+		math.IsNaN(azimuthDeg) || math.IsInf(azimuthDeg, 0) || azimuthDeg < 0 || azimuthDeg > 360 {
+		return 0, 0, 0, false
+	}
+	return tiltDeg, azimuthDeg, a.KWp, true
 }
 
 // Battery is per-battery overrides (keyed by driver name in the top-level map).

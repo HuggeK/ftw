@@ -14,6 +14,25 @@ import (
 	"github.com/srcfl/ftw/go/internal/state"
 )
 
+type staticForecastProvider struct {
+	rows []RawForecast
+}
+
+func (p staticForecastProvider) Name() string { return "static" }
+
+func (p staticForecastProvider) Fetch(context.Context, float64, float64) ([]RawForecast, error) {
+	return p.rows, nil
+}
+
+func testPVArray(name string, kwp, tiltDeg, azimuthDeg float64) config.PVArray {
+	return config.PVArray{
+		Name:       name,
+		KWp:        kwp,
+		TiltDeg:    &tiltDeg,
+		AzimuthDeg: &azimuthDeg,
+	}
+}
+
 // ---- Clear-sky model sanity ----
 
 func TestClearSkyIsZeroAtMidnight(t *testing.T) {
@@ -254,9 +273,9 @@ func TestFromConfigPopulatesArrays(t *testing.T) {
 	cfg := &config.Weather{
 		Provider: "open_meteo", Latitude: 59, Longitude: 18,
 		PVArrays: []config.PVArray{
-			{Name: "south", KWp: 6, TiltDeg: 35, AzimuthDeg: 180},
-			{Name: "east", KWp: 4, TiltDeg: 30, AzimuthDeg: 90},
-			{Name: "empty", KWp: 0, TiltDeg: 10, AzimuthDeg: 200}, // skipped (kWp 0)
+			testPVArray("south", 6, 35, 180),
+			testPVArray("east", 4, 30, 90),
+			testPVArray("empty", 0, 10, 200), // skipped (kWp 0)
 		},
 	}
 	s := FromConfig(cfg, 10000, st, "ua")
@@ -266,6 +285,32 @@ func TestFromConfigPopulatesArrays(t *testing.T) {
 	}
 	if s.Arrays[0].KWp != 6 || s.Arrays[1].AzimuthDeg != 90 {
 		t.Errorf("array geometry mismatch: %+v", s.Arrays)
+	}
+}
+
+func TestFromConfigSkipsPartialArrayGeometry(t *testing.T) {
+	st, err := state.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	tilt := 35.0
+	cfg := &config.Weather{
+		Provider: "open_meteo", Latitude: 59.3293, Longitude: 18.0686,
+		PVArrays: []config.PVArray{
+			{Name: "missing azimuth", KWp: 10, TiltDeg: &tilt},
+			testPVArray("Stockholm south", 6, 35, 180),
+		},
+	}
+	s := FromConfig(cfg, 16000, st, "ua")
+	if s == nil {
+		t.Fatal("expected service")
+	}
+	if len(s.Arrays) != 1 {
+		t.Fatalf("expected only complete Stockholm geometry, got %d arrays: %+v", len(s.Arrays), s.Arrays)
+	}
+	if s.Arrays[0].AzimuthDeg != 180 || s.Arrays[0].KWp != 6 {
+		t.Fatalf("unexpected complete geometry: %+v", s.Arrays[0])
 	}
 }
 
@@ -291,6 +336,69 @@ func TestPOAPVWattsZeroAtNight(t *testing.T) {
 	w := poaPVWattsFromGHI(59.3293, 18.0686, tt, 500, []Array{{TiltDeg: 35, AzimuthDeg: 180, KWp: 10}})
 	if w != 0 {
 		t.Errorf("night POA watts should be 0, got %.2f", w)
+	}
+}
+
+func TestServiceGHIPhysicalBounds(t *testing.T) {
+	tt := time.Date(2026, 6, 21, 11, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name      string
+		ghi       float64
+		valid     bool
+		wantSolar float64
+	}{
+		{name: "negative", ghi: -100, valid: true, wantSolar: 0},
+		{name: "zero", ghi: 0, valid: true, wantSolar: 0},
+		{name: "nan", ghi: math.NaN(), valid: false},
+		{name: "positive infinity", ghi: math.Inf(1), valid: false},
+	}
+	for _, withArrays := range []bool{false, true} {
+		path := "without arrays"
+		if withArrays {
+			path = "with arrays"
+		}
+		for _, tc := range cases {
+			t.Run(path+"/"+tc.name, func(t *testing.T) {
+				st, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer st.Close()
+				ghi := tc.ghi
+				s := &Service{
+					Provider: staticForecastProvider{rows: []RawForecast{{HourStart: tt, SolarWm2: &ghi}}},
+					Store:    st,
+					Lat:      59.3293,
+					Lon:      18.0686,
+					RatedPVW: 10000,
+					Arrays:   nil,
+				}
+				if withArrays {
+					s.Arrays = []Array{{TiltDeg: 35, AzimuthDeg: 180, KWp: 10}}
+				}
+				s.fetchAndStore(context.Background())
+
+				rows, err := st.LoadForecasts(tt.UnixMilli(), tt.Add(time.Hour).UnixMilli())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !tc.valid {
+					if len(rows) != 0 {
+						t.Fatalf("non-finite irradiance should omit the row, got %+v", rows)
+					}
+					return
+				}
+				if len(rows) != 1 || rows[0].PVWEstimated == nil || rows[0].SolarWm2 == nil {
+					t.Fatalf("expected one finite forecast row, got %+v", rows)
+				}
+				if got := *rows[0].PVWEstimated; got != 0 {
+					t.Errorf("PV estimate from %s irradiance = %.2f, want 0", tc.name, got)
+				}
+				if got := *rows[0].SolarWm2; got != tc.wantSolar {
+					t.Errorf("stored irradiance = %.2f, want %.2f", got, tc.wantSolar)
+				}
+			})
+		}
 	}
 }
 

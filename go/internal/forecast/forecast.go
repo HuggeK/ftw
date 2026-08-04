@@ -280,9 +280,9 @@ func FromConfig(cfg *config.Weather, ratedPVW float64, st *state.Store, userAgen
 		// their geometry just because the config model grew.
 		var arrays []Array
 		for _, a := range cfg.PVArrays {
-			arrays = append(arrays, Array{
-				TiltDeg: a.TiltDeg, AzimuthDeg: a.AzimuthDeg, KWp: a.KWp,
-			})
+			if converted, ok := arrayFromConfig(a); ok {
+				arrays = append(arrays, converted)
+			}
 		}
 		if len(arrays) == 0 {
 			arrays = append(arrays, Array{
@@ -299,8 +299,8 @@ func FromConfig(cfg *config.Weather, ratedPVW float64, st *state.Store, userAgen
 	// use it to project irradiance onto each plane in fetchAndStore.
 	var arrays []Array
 	for _, a := range cfg.PVArrays {
-		if a.KWp > 0 {
-			arrays = append(arrays, Array{TiltDeg: a.TiltDeg, AzimuthDeg: a.AzimuthDeg, KWp: a.KWp})
+		if converted, ok := arrayFromConfig(a); ok {
+			arrays = append(arrays, converted)
 		}
 	}
 	return &Service{
@@ -351,6 +351,18 @@ func (s *Service) fetchAndStore(ctx context.Context) {
 	nowMs := time.Now().UnixMilli()
 	points := make([]state.ForecastPoint, 0, len(rows))
 	for _, r := range rows {
+		// A negative irradiance is not physical; retain the row with a
+		// zero signal. Non-finite values are invalid provider data and must
+		// not reach SQLite, where they can become NULL silently.
+		var solarWm2 *float64
+		if r.SolarWm2 != nil {
+			ghi, ok := normalizeIrradiance(*r.SolarWm2)
+			if !ok {
+				slog.Warn("forecast row skipped", "reason", "non-finite irradiance", "provider", s.Provider.Name(), "slot", r.HourStart)
+				continue
+			}
+			solarWm2 = &ghi
+		}
 		// Pick the most direct PV signal the provider gave us. Forecast.Solar
 		// returns site-calibrated watts directly; Open-Meteo returns shortwave
 		// radiation we turn into watts via rated × W/m²/1000; met.no only has
@@ -359,14 +371,22 @@ func (s *Service) fetchAndStore(ctx context.Context) {
 		switch {
 		case r.PVWEstimated != nil:
 			pvW = *r.PVWEstimated
-		case r.SolarWm2 != nil && len(s.Arrays) > 0:
-			// Orientation-aware: project GHI onto each configured plane and sum.
-			pvW = poaPVWattsFromGHI(s.Lat, s.Lon, r.HourStart, *r.SolarWm2, s.Arrays)
-		case r.SolarWm2 != nil && s.RatedPVW > 0:
-			// No geometry configured — flat, orientation-blind estimate.
-			pvW = s.RatedPVW * (*r.SolarWm2) / 1000.0
+		case solarWm2 != nil:
+			var ok bool
+			pvW, ok = pvWFromGHI(s.Lat, s.Lon, r.HourStart, *solarWm2, s.RatedPVW, s.Arrays)
+			if !ok {
+				slog.Warn("forecast row skipped", "reason", "non-finite irradiance", "provider", s.Provider.Name(), "slot", r.HourStart)
+				continue
+			}
 		default:
 			pvW = EstimatePVW(s.Lat, s.Lon, r.HourStart, r.CloudCoverPct, s.RatedPVW)
+		}
+		if math.IsNaN(pvW) || math.IsInf(pvW, 0) {
+			slog.Warn("forecast row skipped", "reason", "non-finite PV estimate", "provider", s.Provider.Name(), "slot", r.HourStart)
+			continue
+		}
+		if pvW < 0 {
+			pvW = 0
 		}
 		pvPtr := &pvW
 		points = append(points, state.ForecastPoint{
@@ -374,7 +394,7 @@ func (s *Service) fetchAndStore(ctx context.Context) {
 			SlotLenMin:    60,
 			CloudCoverPct: r.CloudCoverPct,
 			TempC:         r.TempC,
-			SolarWm2:      r.SolarWm2,
+			SolarWm2:      solarWm2,
 			PVWEstimated:  pvPtr,
 			Source:        s.Provider.Name(),
 			FetchedAtMs:   nowMs,
@@ -387,6 +407,38 @@ func (s *Service) fetchAndStore(ctx context.Context) {
 	slog.Info("forecast fetched", "count", len(points), "provider", s.Provider.Name())
 }
 
+func arrayFromConfig(a config.PVArray) (Array, bool) {
+	tiltDeg, azimuthDeg, kWp, ok := a.CompleteGeometry()
+	if !ok {
+		return Array{}, false
+	}
+	return Array{TiltDeg: tiltDeg, AzimuthDeg: azimuthDeg, KWp: kWp}, true
+}
+
+func normalizeIrradiance(ghiWm2 float64) (float64, bool) {
+	if math.IsNaN(ghiWm2) || math.IsInf(ghiWm2, 0) {
+		return 0, false
+	}
+	if ghiWm2 < 0 {
+		return 0, true
+	}
+	return ghiWm2, true
+}
+
+func pvWFromGHI(lat, lon float64, t time.Time, ghiWm2, ratedPVW float64, arrays []Array) (float64, bool) {
+	ghiWm2, ok := normalizeIrradiance(ghiWm2)
+	if !ok {
+		return 0, false
+	}
+	if len(arrays) > 0 {
+		return poaPVWattsFromGHI(lat, lon, t, ghiWm2, arrays), true
+	}
+	if ratedPVW <= 0 {
+		return 0, true
+	}
+	return ratedPVW * ghiWm2 / 1000.0, true
+}
+
 // poaPVWattsFromGHI converts a global-horizontal irradiance (W/m², positive)
 // into expected DC PV output (W, positive) by projecting it onto each
 // configured array's plane via sunpos and scaling by nameplate. This is the
@@ -394,6 +446,10 @@ func (s *Service) fetchAndStore(ctx context.Context) {
 // is used whenever the provider supplies GHI and the site has per-plane
 // geometry. Returns 0 when the sun is down or no arrays produce output.
 func poaPVWattsFromGHI(lat, lon float64, t time.Time, ghiWm2 float64, arrays []Array) float64 {
+	ghiWm2, ok := normalizeIrradiance(ghiWm2)
+	if !ok {
+		return 0
+	}
 	var total float64
 	for _, a := range arrays {
 		if a.KWp <= 0 {
