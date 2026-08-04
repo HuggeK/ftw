@@ -147,9 +147,10 @@ func (s *Server) handleDriverControl(w http.ResponseWriter, r *http.Request) {
 	// Keep command dispatch and hold transitions under one per-driver lock.
 	// Registry.SendWithGeneration selects the concrete running instance and
 	// returns its generation, so expiry can never pair a new command with an
-	// old status snapshot.
-	state := s.controlState(name)
-	state.mu.Lock()
+	// old status snapshot. The state lookup and lock are also one lifecycle
+	// transaction: clearDriverControlState takes the same locks in the same
+	// order, so it cannot remove the map entry between these operations.
+	state := s.lockControlState(name, s.beforeDriverControlStateLock)
 	defer state.mu.Unlock()
 	generation, err := s.deps.Registry.SendWithGeneration(r.Context(), name, body)
 	if err != nil {
@@ -254,6 +255,10 @@ func clampToDeclared(value float64, in drivers.CatalogControlInput) float64 {
 func (s *Server) controlState(name string) *controlDriverState {
 	s.controlStateMu.Lock()
 	defer s.controlStateMu.Unlock()
+	return s.controlStateLocked(name)
+}
+
+func (s *Server) controlStateLocked(name string) *controlDriverState {
 	if s.controlStates == nil {
 		s.controlStates = make(map[string]*controlDriverState)
 	}
@@ -262,6 +267,22 @@ func (s *Server) controlState(name string) *controlDriverState {
 		state = &controlDriverState{}
 		s.controlStates[name] = state
 	}
+	return state
+}
+
+// lockControlState serializes a state map lookup with acquisition of that
+// driver's mutex. Lifecycle invalidation uses controlStateMu -> state.mu as
+// well, so a request can either own the state before removal starts or see a
+// removed state after removal finishes; it cannot keep a pointer that was
+// deleted in between.
+func (s *Server) lockControlState(name string, beforeStateLock func()) *controlDriverState {
+	s.controlStateMu.Lock()
+	state := s.controlStateLocked(name)
+	if beforeStateLock != nil {
+		beforeStateLock()
+	}
+	state.mu.Lock()
+	s.controlStateMu.Unlock()
 	return state
 }
 
@@ -326,8 +347,7 @@ func (s *Server) SendDriverDefault(ctx context.Context, name string) error {
 	if _, ok := s.deps.Registry.ControlStatus(name); !ok {
 		return fmt.Errorf("driver %q not found", name)
 	}
-	state := s.controlState(name)
-	state.mu.Lock()
+	state := s.lockControlState(name, nil)
 	defer state.mu.Unlock()
 	s.clearControlHoldLocked(state)
 	return s.sendDefaultLocked(ctx, name)
@@ -388,16 +408,16 @@ func (s *Server) clearDriverControl(name string) {
 
 func (s *Server) clearDriverControlState(name string, expected *controlDriverState) {
 	s.controlStateMu.Lock()
+	defer s.controlStateMu.Unlock()
 	state := s.controlStates[name]
 	if expected != nil && state != expected {
-		s.controlStateMu.Unlock()
 		return
 	}
-	delete(s.controlStates, name)
-	s.controlStateMu.Unlock()
-	if state != nil {
-		state.mu.Lock()
-		s.clearControlHoldLocked(state)
-		state.mu.Unlock()
+	if state == nil {
+		return
 	}
+	state.mu.Lock()
+	s.clearControlHoldLocked(state)
+	delete(s.controlStates, name)
+	state.mu.Unlock()
 }

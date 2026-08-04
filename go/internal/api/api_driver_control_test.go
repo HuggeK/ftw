@@ -510,6 +510,126 @@ func TestDriverControlBindsHoldToRestartedGeneration(t *testing.T) {
 	}
 }
 
+func TestDriverControlLookupRaceCannotOrphanStateOrTimer(t *testing.T) {
+	tests := []struct {
+		name      string
+		lifecycle func(*Server, config.Driver) error
+	}{
+		{
+			name: "remove",
+			lifecycle: func(srv *Server, _ config.Driver) error {
+				srv.deps.Registry.Remove("heat")
+				return nil
+			},
+		},
+		{
+			name: "restart",
+			lifecycle: func(srv *Server, cfg config.Driver) error {
+				return srv.deps.Registry.Restart(context.Background(), cfg)
+			},
+		},
+		{
+			name: "reload",
+			lifecycle: func(srv *Server, cfg config.Driver) error {
+				srv.deps.Registry.Reload(context.Background(), []config.Driver{cfg}, true)
+				return nil
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			srv, tel := controlServerWithLua(t, controlSafetyProbeLua)
+			cfg := srv.deps.Cfg.Drivers[0]
+			lookedUp := make(chan struct{})
+			resume := make(chan struct{})
+			var pauseOnce sync.Once
+			var resumeOnce sync.Once
+			resumeRequest := func() { resumeOnce.Do(func() { close(resume) }) }
+			defer resumeRequest()
+			srv.beforeDriverControlStateLock = func() {
+				pauseOnce.Do(func() {
+					close(lookedUp)
+					<-resume
+				})
+			}
+
+			postDone := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				postDone <- post(t, srv, "/api/drivers/heat/control",
+					`{"control":"set_offset","value":1,"duration_s":1}`)
+			}()
+			select {
+			case <-lookedUp:
+			case <-time.After(time.Second):
+				t.Fatal("control request did not reach the post-lookup pause")
+			}
+
+			lifecycleDone := make(chan error, 1)
+			go func() { lifecycleDone <- test.lifecycle(srv, cfg) }()
+			mapProbeDone := make(chan bool, 1)
+			go func() { mapProbeDone <- srv.peekControlState("heat") == nil }()
+			select {
+			case removed := <-mapProbeDone:
+				if removed {
+					t.Fatalf("%s removed control state between lookup and state.mu", test.name)
+				}
+			case <-time.After(100 * time.Millisecond):
+			}
+
+			resumeRequest()
+			var rec *httptest.ResponseRecorder
+			select {
+			case rec = <-postDone:
+			case <-time.After(2 * time.Second):
+				t.Fatal("control request did not finish after lifecycle release")
+			}
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("raced POST = %d, body %s; request must not arm a stale state", rec.Code, rec.Body.String())
+			}
+			select {
+			case err := <-lifecycleDone:
+				if err != nil {
+					t.Fatalf("%s = %v", test.name, err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("lifecycle deadlocked after the request released state.mu")
+			}
+
+			if got := srv.activeControlHold("heat"); got != nil {
+				t.Fatalf("%s left an orphaned hold: %+v", test.name, got)
+			}
+			if got := driverDetail(t, srv, "heat"); got.Hold != nil {
+				t.Fatalf("GET after %s exposed an orphaned hold: %+v", test.name, got.Hold)
+			}
+
+			if test.name == "remove" {
+				time.Sleep(1500 * time.Millisecond)
+				if got, _, ok := tel.LatestMetric("heat", "defaulted"); ok && got != 0 {
+					t.Fatalf("removed driver received orphaned timer default: %v", got)
+				}
+				return
+			}
+
+			if rec := post(t, srv, "/api/drivers/heat/control",
+				`{"control":"set_offset","value":-2,"duration_s":600}`); rec.Code != http.StatusOK {
+				t.Fatalf("new-generation POST after %s = %d, body %s", test.name, rec.Code, rec.Body.String())
+			}
+			waitMetric(t, tel, "heat", "applied", -2)
+			if got := driverDetail(t, srv, "heat"); got.Hold == nil {
+				t.Fatalf("GET after %s lost the valid replacement hold", test.name)
+			}
+			time.Sleep(1500 * time.Millisecond)
+			if got, _, ok := tel.LatestMetric("heat", "defaulted"); ok && got != 0 {
+				t.Fatalf("old timer defaulted the new generation after %s: %v", test.name, got)
+			}
+			if got, _, ok := tel.LatestMetric("heat", "applied"); !ok || got != -2 {
+				t.Fatalf("new generation after %s applied %v/%v, want -2", test.name, got, ok)
+			}
+		})
+	}
+}
+
 func TestDriverControlExpiryDefaultFailureBlocksUntilRecovery(t *testing.T) {
 	srv, _ := controlServerWithLua(t, controlExpiryRecoveryProbeLua)
 
