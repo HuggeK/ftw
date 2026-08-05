@@ -27,8 +27,24 @@ panel on it: one switch and the maximum surplus to report. The switch sets
 both gates together, because either alone does nothing, and the feed stays
 off until the maximum is above 0 — that ceiling is what bounds every value
 FTW can send. A driver that declares no write path gets no panel. What the
-pump needs at its own end — menu 7.5.15 set to read/write, Solar PV input on
-— cannot be checked from FTW, so the panel states it.
+pump needs at its own end cannot be checked from FTW, so the panel states it:
+
+1. **Installer menu 7.5.15** — Local REST API set to **read/write**.
+2. **Menu 4.2.2 "solar electricity"** — turn on the external Solar PV
+   source, named **"Modbus TCP/IP Ext. (Solar PV)"** on the pump (register
+   2107; names read live off an S735). FTW deliberately never writes this
+   register — turning the feature on is the owner's consent, given at the
+   device, and the driver holds every non-zero value back until it reads 1.
+   Menu 4.2.2 is a plus function under menu 4.2: if it is not visible, add
+   the solar-electricity function from installer menu 7.2.1 (add/remove
+   accessories). The same menu holds what the pump *does* with the value —
+   "include own consumption" (register 2108) and the "(Solar PV)" offsets
+   for heating, cooling and pool.
+
+The tell that the pump is listening: the read-only point *Total average
+power (Solar PV)* (register 2178, emitted as
+`hp_total_average_power_solar_pv`) starts tracking the fed value instead of
+sitting at 0.
 
 Once armed, core feeds the driver every control tick with the site's
 solar-attributable export: the smaller of live PV generation and grid export,
@@ -44,8 +60,9 @@ the feed (dead-man's switch, default-mode clear, startup orphan sweep) runs
 inside FTW — none of them can fire once FTW is gone, and the pump's own
 timeout for a silently stopped feed is undocumented. Before uninstalling FTW
 or permanently disabling the feed, turn the **Solar PV input (2107) off on
-the pump** — or set the Local REST API back to **read-only (menu 7.5.15)**
-— so no stale surplus value can stand with nobody left to clear it.
+the pump** (menu 4.2.2) — or set the Local REST API back to **read-only
+(menu 7.5.15)** — so no stale surplus value can stand with nobody left to
+clear it.
 
 ## Why the local API (vs. the cloud or raw Modbus)
 

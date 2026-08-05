@@ -75,11 +75,12 @@
       'placeholder="e.g. 9000">' +
       '<p class="drv-write-warning" style="color:var(--red-e);font-size:0.78rem;margin:6px 0 0" hidden></p>' +
       '<p style="color:var(--text-dim);font-size:0.75rem;margin:8px 0 0">' +
-      'On the pump itself: set the Local REST API to <strong>read/write</strong> (installer menu 7.5.15) and turn on the <strong>Solar PV</strong> input. ' +
+      'On the pump itself: set the Local REST API to <strong>read/write</strong> (installer menu 7.5.15) and turn on the external Solar PV source — ' +
+      '“<strong>Modbus TCP/IP Ext. (Solar PV)</strong>”, register 2107, in the pump’s <strong>solar electricity</strong> settings (menu 4.2.2; a plus function, added from installer menu 7.2.1 if the menu is missing). ' +
       'FTW cannot check either from here — a pump left read-only answers every write with “read only value”.' +
       '</p>' +
       '<p style="color:var(--text-dim);font-size:0.75rem;margin:6px 0 0">' +
-      'Turning this off clears the feed to 0 W. Before removing FTW altogether, turn the Solar PV input off on the pump as well: ' +
+      'Turning this off clears the feed to 0 W. Before removing FTW altogether, turn the Solar PV input off on the pump as well (menu 4.2.2): ' +
       'once FTW is gone nothing is left to clear a stale value.' +
       '</p>' +
       '</fieldset>';
