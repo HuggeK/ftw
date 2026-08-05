@@ -30,6 +30,15 @@ FTW can send. A driver that declares no write path gets no panel. What the
 pump needs at its own end — menu 7.5.15 set to read/write, Solar PV input on
 — cannot be checked from FTW, so the panel states it.
 
+Once armed, core feeds the driver every control tick with the site's
+solar-attributable export: the smaller of live PV generation and grid export,
+after subtracting battery/V2X discharge (stored energy is never advertised to
+the pump as sunshine). The value comes from FTW's own telemetry, so the site
+needs a PV source FTW can see and a site meter; a site without PV telemetry
+feeds a standing 0. A stale site meter stops dispatch and reverts the driver
+to its default mode, which clears the pump-side register — the same clear the
+driver's own dead-man switch enforces if commands stop arriving.
+
 **Decommissioning a write-enabled setup.** Every automatic safeguard around
 the feed (dead-man's switch, default-mode clear, startup orphan sweep) runs
 inside FTW — none of them can fire once FTW is gone, and the pump's own
