@@ -71,6 +71,13 @@ func configNumber(v any) float64 {
 // refusal would print the same line every few seconds for as long as
 // the operator leaves the pump half-configured, so only transitions
 // are logged: first refusal, a changed refusal, and recovery.
+//
+// Deliberately not routed through driverActuationTracker: its question
+// — does refusing this say core cannot put power where it asked? — is
+// answered no for a hint. No power was asked for, the driver's health
+// is untouched by declining to relay information the device owner has
+// not consented to receive, and booking the refusal would paint a
+// correctly-configured read-only pump as a device fault.
 type solarFeedSender struct {
 	lastErr map[string]string
 }

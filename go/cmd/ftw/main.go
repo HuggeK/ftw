@@ -808,7 +808,20 @@ func main() {
 		// explicit 0 → disabled. See EffectiveSafetyMarginA.
 		ctrl.SiteFuseSafetyA = newCfg.Fuse.EffectiveSafetyMarginA()
 		ctrl.MaxExportW = newCfg.Site.MaxExportW
+		// Lowering the fuse can strand a peak limit that was legal when it
+		// was set. SetPeakLimit refuses to create that state; only a reload
+		// can arrive at it from the other side, and it is silent — the
+		// threshold simply stops being the first thing to bind. Say so
+		// while the operator is still looking at the config they just saved.
+		// Peak shaving only: in every other mode the threshold is unread,
+		// so warning about it would be noise.
+		peakCeilingW, peakDead := ctrl.PeakLimitIsDead()
+		peakLimitW, peakMode := ctrl.PeakLimitW, ctrl.Mode == control.ModePeakShaving
 		ctrlMu.Unlock()
+		if peakDead && peakMode {
+			slog.Warn("peak limit is now above the site's import ceiling and cannot bind",
+				"peak_limit_w", peakLimitW, "import_ceiling_w", peakCeilingW)
+		}
 
 		// Keep the loadpoint controller's per-phase EV fuse clamp in
 		// sync with hot-reloaded fuse params — previously startup-only,
@@ -1481,6 +1494,13 @@ func main() {
 		}()
 	}
 
+	// One tracker for every dispatch path: storage, PV curtail and EV all
+	// report refused commands here, and it walks a driver that cannot
+	// actuate to its declared default. Built before the loadpoint
+	// controller because that controller needs it. See
+	// driver_failure_default.go.
+	actuation := newDriverActuationTracker(tel)
+
 	// ---- EV loadpoint controller ----
 	// loadpoint.Controller owns per-tick EV dispatch, including the
 	// energy-allocation contract, snapping and phase transitions.
@@ -1529,6 +1549,12 @@ func main() {
 			}, true
 		}
 		lpController = loadpoint.NewController(lpMgr, planAdapter, telAdapter, reg.Send)
+		// A charger that answers every poll and refuses every setpoint is
+		// the storage bug of #800 on the EV wire: it holds its last
+		// current and the plan keeps counting the load. Only the periodic
+		// ev_set_current is reported — see loadpoint.DispatchOutcomeFunc
+		// for the sends that are deliberately not.
+		lpController.SetDispatchOutcome(actuation.recordCommandOutcome)
 		// Wire the site fuse so the per-phase EV clamp and the
 		// phase-split derivation can use the actual site voltage and
 		// breaker rating instead of hard-coding 230 V × 16 A.
@@ -2383,7 +2409,6 @@ func main() {
 	const evStopHigh = 100.0 // W — "was actually drawing"
 	const evStopLow = 50.0   // W — "now essentially zero"
 	var staleDefaults staleSiteDefaultTracker
-	actuation := newDriverActuationTracker(tel)
 	solarFeed := newSolarFeedSender()
 	for {
 		select {
@@ -2695,20 +2720,9 @@ func main() {
 			ctrlMu.Lock()
 			curtailTargets := control.ComputePVCurtail(ctrl, tel)
 			ctrlMu.Unlock()
-			for _, c := range curtailTargets {
-				var payload []byte
-				if c.LimitW > 0 {
-					payload, _ = json.Marshal(map[string]any{
-						"action":  "curtail",
-						"power_w": c.LimitW,
-					})
-				} else {
-					payload, _ = json.Marshal(map[string]any{
-						"action": "curtail_disable",
-					})
-				}
-				sendDriverCommand(ctx, reg, "pv curtail send", c.Driver, payload, driverCmdTimeout)
-			}
+			// The cap is a dispatch command and its outcome is counted; the
+			// release is not. See pv_curtail_dispatch.go.
+			dispatchPVCurtail(ctx, reg, actuation, curtailTargets, driverCmdTimeout, tickNow)
 
 			// ---- Solar-surplus feed dispatch ----
 			// Per-tick hint to drivers whose operator armed a `solar_pv`
@@ -3914,11 +3928,16 @@ func haCallbacks(ctx context.Context, ctrl *control.State, ctrlMu *sync.Mutex, s
 			ctrl.SetGridTarget(w)
 			return st.SaveConfig("grid_target_w", strconv.FormatFloat(w, 'f', 1, 64))
 		},
+		// Same validation as POST /api/peak_limit — an HA number can be
+		// dragged past the site's fuse just as easily as an API caller can
+		// post past it, and the two setters must not diverge (#mode-drift
+		// again, one field down). The returned error reaches the bridge,
+		// which logs it; HA's own state topic republishes the value FTW
+		// actually holds, so the operator sees the number snap back.
 		SetPeakLimit: func(w float64) error {
 			ctrlMu.Lock()
 			defer ctrlMu.Unlock()
-			ctrl.PeakLimitW = w
-			return nil
+			return ctrl.SetPeakLimit(w)
 		},
 		SetEVCharging: func(w float64, active bool) error {
 			ctrlMu.Lock()
