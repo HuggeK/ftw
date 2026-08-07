@@ -11,7 +11,7 @@ import (
 	"github.com/srcfl/ftw/go/internal/apiauth"
 )
 
-// MutationPolicy is the trust boundary for state-changing HTTP requests.
+// MutationPolicy is the trust boundary for protected HTTP requests.
 // Local LAN clients remain compatible without a token; public/FQDN access is
 // opt-in and must prove possession of Token.
 type MutationPolicy struct {
@@ -34,10 +34,11 @@ type MutationPolicy struct {
 //     from here on is written against apiauth.From, so the whole future job
 //     of authenticating the LAN API is changing this one branch.
 //
-// The guarding half is unchanged: browser cross-site writes, non-JSON request
-// bodies, malformed Host/Origin metadata and unauthenticated writes addressed
-// through non-local hostnames are refused. Semantically active GET/HEAD
-// requests are protected too; ordinary read-only requests are unaffected.
+// The guarding half rejects browser cross-site writes, non-JSON request
+// bodies, malformed Host/Origin metadata and unauthenticated protected
+// requests addressed through non-local hostnames. Semantically active and
+// secret-bearing GET/HEAD requests are protected too; ordinary reads remain
+// unaffected.
 func Authenticate(next http.Handler, policy MutationPolicy) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := apiauth.From(r.Context()); !ok {
@@ -61,7 +62,7 @@ func Authenticate(next http.Handler, policy MutationPolicy) http.Handler {
 		if policy.RequireTokenForRemote && (!isLocalAuthority(reqAuthority) || !isLocalClient(r.RemoteAddr)) {
 			if strings.TrimSpace(policy.Token) == "" {
 				writeJSON(w, http.StatusForbidden, map[string]string{
-					"error": "remote API mutations are disabled; configure FTW_API_TOKEN or use a local address",
+					"error": "remote access to protected API routes is disabled; configure FTW_API_TOKEN or use a local address",
 				})
 				return
 			}
@@ -106,6 +107,11 @@ func requiresMutationProtection(r *http.Request) bool {
 	case http.MethodOptions:
 		return false
 	case http.MethodGet, http.MethodHead:
+		if r.URL.Path == "/api/caldav/credentials" ||
+			r.URL.Path == "/api/backups" ||
+			strings.HasPrefix(r.URL.Path, "/api/backups/") {
+			return true
+		}
 		switch r.URL.Path {
 		case "/api/scan", "/api/oauth/myuplink/start":
 			return true
