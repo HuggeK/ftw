@@ -10,14 +10,21 @@ import (
 )
 
 const (
-	SoftwareIdentityUplinkHost = "uplink.home.sourceful.energy"
+	// The host is only a question to the kernel — "which interface would
+	// carry my uplink?" — so it must be a name the box actually dials.
+	// It was uplink.home.sourceful.energy until Home Link was retired
+	// (Aug 2026) and its DNS record with it; a dead name here made every
+	// identity resolution fail on the lookup, before any route was read.
+	// The MAC of the answering interface is the identity; the host never
+	// is, so this change re-derives the same identity over a live name.
+	SoftwareIdentityUplinkHost = "relay.ftw.energy"
 	SoftwareIdentityUplinkPort = 443
 )
 
 var (
 	ErrNoUsableRoute      = errors.New("no usable uplink route")
 	ErrAmbiguousRoute     = errors.New("uplink route is ambiguous")
-	ErrUnsupportedBinding = errors.New("home link identity binding is unsupported")
+	ErrUnsupportedBinding = errors.New("gateway identity binding is unsupported")
 )
 
 type StableInterface struct {
