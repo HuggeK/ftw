@@ -28,7 +28,7 @@ func TestContractGenIsCurrent(t *testing.T) {
 		t.Fatalf("read generated file: %v", err)
 	}
 	if string(got) != string(want) {
-		t.Fatalf("contract_gen.go is stale; run: go generate ./internal/appproto/...\n"+
+		t.Fatalf("contract_gen.go is stale; run: go generate ./internal/...\n"+
 			"(registry: %s)", filepath.Clean(registryPath))
 	}
 }
@@ -66,6 +66,10 @@ func TestFrozenFieldIdsAreFrozen(t *testing.T) {
 		7: "src_grid",
 		8: "src_pv",
 		9: "src_battery",
+		// Extended deliberately on 2026-08-05 for EV charging. The freeze
+		// covers the id's meaning, not its presence: like battery_soc,
+		// ev_w is sent only when the hardware exists.
+		10: "ev_w",
 	}
 	for fid, name := range want {
 		if got := FrozenFieldNames[fid]; got != name {
@@ -74,6 +78,24 @@ func TestFrozenFieldIdsAreFrozen(t *testing.T) {
 	}
 	if len(FrozenFieldNames) != len(want) {
 		t.Fatalf("the frozen set has %d fields, want %d", len(FrozenFieldNames), len(want))
+	}
+}
+
+// The ops in the registry are this repository's, copied there so neither side
+// hand-writes an operation name or the scope it demands. defaultOps() in
+// command.go stays the authority on what this box accepts; this catches the
+// two drifting apart. Containment rather than equality, on purpose: the
+// registry may name an op ahead of the box — battery.hold today — and a box
+// that lacks it answers ErrUnknownOp, which command_test.go pins.
+func TestRegistryOpsMatchCommandTable(t *testing.T) {
+	for op, spec := range defaultOps() {
+		scope, ok := RegistryOps[op]
+		if !ok {
+			t.Fatalf("op %q is accepted but not in contract/registry.yaml", op)
+		}
+		if scope != spec.scope {
+			t.Fatalf("op %q: command table demands scope %q, registry says %q", op, spec.scope, scope)
+		}
 	}
 }
 
