@@ -348,6 +348,13 @@ func (w *surplusWindow) push(v float64) float64 {
 	return sum / float64(w.n)
 }
 
+// MaxManualHold bounds a timed manual hold so a forgotten diagnostic
+// override cannot indefinitely displace planned dispatch. Persistent
+// operator holds are exempt: they end on Stop or unplug, never on time.
+// One constant for every door that installs a hold — the HTTP route and
+// the app session validate against this same number.
+const MaxManualHold = 30 * time.Minute
+
 // ManualHold pins a loadpoint to a specific dispatch payload until
 // ExpiresAt. PowerW is sent verbatim; PhaseMode / PhaseSplitW /
 // MinPhaseHoldS / Voltage / MaxAmpsPerPhase override the loadpoint's
@@ -1303,6 +1310,9 @@ func (c *Controller) tickOne(ctx context.Context, now time.Time, lpCfg Config, d
 		// and the staleness tracker already owns that transition. A charger
 		// that refuses the standdown must not be excluded for it — the fault
 		// being handled is the meter's.
+		// The standdown is still the box ordering zero; record it so the
+		// interruption latch knows this stop is ours.
+		c.manager.SetCommandedW(lpCfg.ID, 0)
 		payload, err := json.Marshal(map[string]any{
 			"action":  "ev_set_current",
 			"power_w": 0,
@@ -1542,6 +1552,13 @@ func (c *Controller) tickOne(ctx context.Context, now time.Time, lpCfg Config, d
 	}
 
 	c.applyPerPhaseFuseClamp(lpCfg, cmd)
+	// Tell the manager what was ordered, after every clamp has spoken.
+	// The interruption latch reads this to keep a pause the box chose —
+	// plan slot, Stop hold, surplus clamp — from ever reading as a
+	// charge that failed.
+	if w, ok := cmd["power_w"].(float64); ok {
+		c.manager.SetCommandedW(lpCfg.ID, w)
+	}
 	payload, err := json.Marshal(cmd)
 	if err != nil {
 		return
