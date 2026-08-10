@@ -16,7 +16,9 @@ import (
 	"github.com/srcfl/ftw/go/internal/appuplink"
 	"github.com/srcfl/ftw/go/internal/config"
 	"github.com/srcfl/ftw/go/internal/control"
+	"github.com/srcfl/ftw/go/internal/loadpoint"
 	"github.com/srcfl/ftw/go/internal/mpc"
+	"github.com/srcfl/ftw/go/internal/notifications"
 	"github.com/srcfl/ftw/go/internal/prices"
 	"github.com/srcfl/ftw/go/internal/state"
 	"github.com/srcfl/ftw/go/internal/telemetry"
@@ -335,6 +337,59 @@ func (a *appPrices) Slots(_ context.Context, fromMs, toMs int64) ([]appproto.Pri
 	return out, nil
 }
 
+// appLoadpoints is the command lane's way to the box's EV charging: the same
+// loadpoint controller the HTTP routes call, behind appproto's narrow
+// questions. Boost carries the same replan nudge the HTTP enable route has —
+// the cancel path needs none here because the controller's stopped hook
+// already replans on every active-to-stopped transition, whichever door
+// asked.
+type appLoadpoints struct {
+	mgr  *loadpoint.Manager
+	ctrl *loadpoint.Controller
+	mpc  *mpc.Service
+}
+
+func (a *appLoadpoints) Exists(id string) bool {
+	_, ok := a.mgr.State(id)
+	return ok
+}
+
+func (a *appLoadpoints) Hold(id string, h loadpoint.ManualHold) {
+	a.ctrl.SetManualHold(id, h)
+}
+
+func (a *appLoadpoints) ClearHold(id string) {
+	a.ctrl.ClearManualHold(id)
+}
+
+func (a *appLoadpoints) ObservedHold(id string, now time.Time) (loadpoint.ManualHold, bool) {
+	return a.ctrl.GetManualHold(id, now)
+}
+
+func (a *appLoadpoints) Boost(id string, lease loadpoint.BatteryBoostLease, now time.Time) error {
+	if _, err := a.ctrl.EnableBatteryBoost(id, lease, now); err != nil {
+		return err
+	}
+	if a.mpc != nil {
+		// The same nudge the HTTP enable gives, for the same reason: a boost
+		// changes what moves, and the planner should know now rather than at
+		// its next scheduled run. Off this goroutine and unattached to the
+		// session — a phone that drops its socket right after tapping must
+		// not abort the planner mid-run.
+		go a.mpc.ReplanWithReason(context.Background(), "loadpoint_battery_boost_enabled")
+	}
+	return nil
+}
+
+func (a *appLoadpoints) CancelBoost(id string, now time.Time) {
+	a.ctrl.CancelBatteryBoost(id, now)
+}
+
+func (a *appLoadpoints) ObservedBoost(id string, now time.Time) loadpoint.BatteryBoostStatus {
+	_, status := a.ctrl.BatteryBoost(id, now)
+	return status
+}
+
 // appPlans hands over the planner's current output.
 type appPlans struct {
 	planner *mpc.Service
@@ -395,12 +450,15 @@ func startAppLink(
 	st *state.Store,
 	tel *telemetry.Store,
 	planner *mpc.Service,
+	lpMgr *loadpoint.Manager,
+	lpCtrl *loadpoint.Controller,
 	priceSvc *prices.Service,
 	ctrl *control.State,
 	ctrlMu *sync.Mutex,
 	revision *control.Revision,
 	siteMeterStale time.Duration,
 	gateway *lateAPI,
+	webPush *notifications.WebPush,
 ) (*appenroll.Identity, *appuplink.Uplink, bool, error) {
 	enabled := cfg != nil && cfg.AppLink != nil && cfg.AppLink.Enabled
 
@@ -439,6 +497,16 @@ func startAppLink(
 		)
 	}
 
+	// EV charging rides on the loadpoint controller, so the two loadpoint
+	// ops work exactly when the HTTP routes do. Without one the port stays
+	// nil, the ops answer E_UNAVAILABLE, and der.ev stays unsaid so the app
+	// hides the buttons rather than drawing dead ones.
+	var loadpoints appproto.Loadpoints
+	if lpMgr != nil && lpCtrl != nil {
+		loadpoints = &appLoadpoints{mgr: lpMgr, ctrl: lpCtrl, mpc: planner}
+		caps = append(caps, appproto.CapDerEv)
+	}
+
 	// Prices ride on the price service, and only when it has a zone and a
 	// store to have fetched into. With either missing there is nothing to
 	// serve, so the capability stays unsaid rather than advertised and empty.
@@ -454,8 +522,18 @@ func startAppLink(
 	// starting, which is true.
 	caps = append(caps, appproto.CapApiPassthrough)
 
+	// The dead man's switch rides on the uplink exactly when there is
+	// state to hold subscriptions in and a VAPID key to sign for them —
+	// a row the push service would refuse is not a farewell. With neither
+	// it produces no rows and the uplink says no extra word.
+	var deadman appuplink.DeadmanSource
+	if st != nil && webPush != nil {
+		deadman = deadmanFromState{st: st, wp: webPush}
+	}
+
 	uplink, err := appuplink.New(appuplink.Options{
-		Enroll: enroll,
+		Enroll:  enroll,
+		Deadman: deadman,
 		Handler: func(
 			sender appproto.Sender,
 			caller apiauth.Caller,
@@ -469,10 +547,11 @@ func startAppLink(
 				Site:    site,
 				Info:    info,
 				Modes:   modes,
-				Plans:   plans,
-				History: history,
-				Prices:  priceReader,
-				API:     gateway,
+				Plans:      plans,
+				History:    history,
+				Prices:     priceReader,
+				Loadpoints: loadpoints,
+				API:        gateway,
 				Caller:  caller,
 				Grants:  grants,
 				Caps:    caps,
@@ -555,6 +634,9 @@ func (l *lateAPI) Route(r *http.Request) apiauth.RouteFacts {
 type appLinkAPI struct {
 	enroll *appenroll.Identity
 	uplink *appuplink.Uplink
+	// st sweeps a revoked phone's push subscriptions. Nil in embeddings
+	// without storage; the sweep is then vacuously done.
+	st *state.Store
 }
 
 // MintPairingCode issues an owner's or a viewer's QR code.
@@ -618,6 +700,21 @@ func (a *appLinkAPI) RevokeDevice(id string) error {
 	if a.uplink != nil && key != nil {
 		a.uplink.DropSessionsByAppKey(key)
 	}
+	// A phone that may no longer read the house may no longer be told
+	// about it: its push subscriptions go with the grant, and the relay's
+	// pre-encrypted farewell rows for them go on the resync.
+	if a.st != nil {
+		n, err := a.st.DeletePushSubscriptionsByDevice(id)
+		switch {
+		case err != nil:
+			slog.Warn("could not sweep a revoked phone's push subscriptions", "device", id, "err", err)
+		case n > 0:
+			slog.Info("swept a revoked phone's push subscriptions", "device", id, "rows", n)
+			if a.uplink != nil {
+				go a.uplink.ResyncDeadman()
+			}
+		}
+	}
 	return nil
 }
 
@@ -648,9 +745,9 @@ func appLinkError(err error) error {
 // panics on first use. Returning an untyped nil is the difference between
 // "pairing is off" and a crash on the one screen someone reaches for when
 // nothing else works.
-func appEnrollForAPI(enroll *appenroll.Identity, uplink *appuplink.Uplink, enabled bool) api.AppEnroller {
+func appEnrollForAPI(enroll *appenroll.Identity, uplink *appuplink.Uplink, st *state.Store, enabled bool) api.AppEnroller {
 	if !enabled || enroll == nil {
 		return nil
 	}
-	return &appLinkAPI{enroll: enroll, uplink: uplink}
+	return &appLinkAPI{enroll: enroll, uplink: uplink, st: st}
 }

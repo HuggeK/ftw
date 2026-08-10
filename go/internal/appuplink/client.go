@@ -117,10 +117,18 @@ type Options struct {
 
 	Logger *slog.Logger
 
-	// Injectable seams. Production leaves them nil.
-	Dialer *websocket.Dialer
-	Now    func() time.Time
-	Random func() float64
+	// Deadman, when set, arms the dead man's switch: rows posted to the
+	// relay's HTTPS side, claims spoken on every connection. Nil leaves
+	// the uplink exactly as it was — no rows, no claims, no text frames.
+	Deadman DeadmanSource
+
+	// Injectable seams. Production leaves them nil (and zero).
+	Dialer      *websocket.Dialer
+	Now         func() time.Time
+	Random      func() float64
+	DeadmanHTTP *http.Client
+	// DeadmanRefresh shortens the six-hour re-signing cadence in tests.
+	DeadmanRefresh time.Duration
 }
 
 // HandlerBuilder makes one message-layer handler for one app session.
@@ -150,11 +158,22 @@ type Uplink struct {
 	attempt     int
 	corrections int
 
-	// liveMu guards live, the sessions of the current relay connection.
-	// Kept on the uplink so a revoke can reach into whatever connection is
-	// up right now; nil between connections, when there is nothing to drop.
-	liveMu sync.Mutex
-	live   *sessions
+	// liveMu guards live, the sessions of the current relay connection,
+	// and liveText, the same connection's text-frame writer (the deadman
+	// claims ride on it). Kept on the uplink so a revoke can reach into
+	// whatever connection is up right now; nil between connections, when
+	// there is nothing to drop and nothing to say.
+	liveMu   sync.Mutex
+	live     *sessions
+	liveText func(string) error
+
+	// The dead man's switch bookkeeping: which row ids the relay holds,
+	// so a removed subscription's row is deleted rather than left armed.
+	deadmanMu      sync.Mutex
+	deadmanPosted  map[string]bool
+	deadmanOrigin  string
+	deadmanHTTP    *http.Client
+	deadmanRefresh time.Duration
 }
 
 // DropSessionsByAppKey tears down every live session a revoked key holds.
@@ -196,11 +215,15 @@ func New(opts Options) (*Uplink, error) {
 	}
 
 	u := &Uplink{
-		opts:   opts,
-		log:    opts.Logger.With("component", "appuplink"),
-		dialer: opts.Dialer,
-		now:    opts.Now,
-		random: opts.Random,
+		opts:           opts,
+		log:            opts.Logger.With("component", "appuplink"),
+		dialer:         opts.Dialer,
+		now:            opts.Now,
+		random:         opts.Random,
+		deadmanOrigin:  deadmanOrigin(opts.Endpoint),
+		deadmanHTTP:    opts.DeadmanHTTP,
+		deadmanPosted:  map[string]bool{},
+		deadmanRefresh: opts.DeadmanRefresh,
 	}
 	if u.dialer == nil {
 		u.dialer = productionDialer()
@@ -210,6 +233,12 @@ func New(opts Options) (*Uplink, error) {
 	}
 	if u.random == nil {
 		u.random = randomFloat
+	}
+	if u.deadmanHTTP == nil {
+		u.deadmanHTTP = &http.Client{Timeout: 10 * time.Second}
+	}
+	if u.deadmanRefresh <= 0 {
+		u.deadmanRefresh = deadmanRefreshInterval
 	}
 	return u, nil
 }
@@ -322,6 +351,17 @@ func (u *Uplink) serve(ctx context.Context, conn *websocket.Conn) (int, string, 
 		}
 		return conn.WriteMessage(websocket.BinaryMessage, message)
 	}
+	// Text frames share the socket and the mutex. Only the deadman claims
+	// use them; a box with the switch unarmed never says a text word, so a
+	// relay that predates the contract never sees one.
+	writeText := func(word string) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		if err := conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+			return err
+		}
+		return conn.WriteMessage(websocket.TextMessage, []byte(word))
+	}
 
 	live := &sessions{
 		build:  u.opts.Handler,
@@ -332,13 +372,39 @@ func (u *Uplink) serve(ctx context.Context, conn *websocket.Conn) (int, string, 
 	}
 	u.liveMu.Lock()
 	u.live = live
+	u.liveText = writeText
 	u.liveMu.Unlock()
 	defer func() {
 		u.liveMu.Lock()
 		u.live = nil
+		u.liveText = nil
 		u.liveMu.Unlock()
 		live.closeAll()
 	}()
+
+	// Post the rows and claim their ids for this connection. The claim is
+	// per-socket state on the relay, so it must happen on every connect —
+	// and off this goroutine, because it talks HTTP and the read loop must
+	// start missing heartbeats on time. And while the connection lasts, the
+	// rows are re-posted on a six-hour cadence: each row's auth is a VAPID
+	// signature with 24 hours to live, and a connection quiet for a day
+	// would otherwise leave the relay holding a farewell it could no longer
+	// deliver. Same shape as the lane-0 ticker below.
+	if u.opts.Deadman != nil {
+		go u.ResyncDeadman()
+		refresh := time.NewTicker(u.deadmanRefresh)
+		defer refresh.Stop()
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-refresh.C:
+					u.ResyncDeadman()
+				}
+			}
+		}()
+	}
 
 	conn.SetReadLimit(maxFrameBytes)
 	_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
