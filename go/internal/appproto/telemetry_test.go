@@ -47,7 +47,8 @@ func TestSnapCarriesTheDictionaryAndEveryFrozenField(t *testing.T) {
 // signs; that happens at the driver boundary and nowhere else.
 func TestFieldsKeepTheSiteSignConvention(t *testing.T) {
 	h, _, rec, _ := newRig(t)
-	subscribe(t, h, rec)
+	deliver(t, h, MsgHello, nil, Hello{Proto: ProtoRange{Min: 0, Max: ProtoMax}})
+	rec.reset()
 	deliver(t, h, MsgSub, nil, Sub{Bucket: 512, Hz: 1})
 
 	snap := body[Snap](t, rec.only(t, MsgSnap))
@@ -67,7 +68,8 @@ func TestFieldsKeepTheSiteSignConvention(t *testing.T) {
 func TestModeFieldIsAnIndexIntoTheCatalogue(t *testing.T) {
 	h, box, rec, _ := newRig(t)
 	box.snap.Mode = control.ModePeakShaving
-	subscribe(t, h, rec)
+	deliver(t, h, MsgHello, nil, Hello{Proto: ProtoRange{Min: 0, Max: ProtoMax}})
+	rec.reset()
 	deliver(t, h, MsgSub, nil, Sub{Bucket: 512, Hz: 1})
 
 	snap := body[Snap](t, rec.only(t, MsgSnap))
@@ -87,7 +89,8 @@ func TestModeFieldIsAnIndexIntoTheCatalogue(t *testing.T) {
 func TestStateOfChargeIsPermilleOnTheWire(t *testing.T) {
 	h, box, rec, _ := newRig(t)
 	box.snap.BatterySoC = 0.6235
-	subscribe(t, h, rec)
+	deliver(t, h, MsgHello, nil, Hello{Proto: ProtoRange{Min: 0, Max: ProtoMax}})
+	rec.reset()
 	deliver(t, h, MsgSub, nil, Sub{Bucket: 512, Hz: 1})
 
 	snap := body[Snap](t, rec.only(t, MsgSnap))
@@ -111,6 +114,56 @@ func TestNothingChangedStillSendsATick(t *testing.T) {
 	}
 	if f.size != 512 {
 		t.Fatalf("tick is %d bytes, want exactly the 512-byte bucket", f.size)
+	}
+}
+
+func TestHiddenSubscriptionSendsOneFrameEveryFivePulses(t *testing.T) {
+	h, _, rec, _ := newRig(t)
+	subscribe(t, h, rec)
+	deliver(t, h, MsgSub, nil, Sub{Bucket: 512, Hz: 0.2})
+
+	for i := 0; i < 4; i++ {
+		if err := h.Tick(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := len(rec.snapshot()); got != 0 {
+		t.Fatalf("hidden session sent %d frames in its first four pulses", got)
+	}
+	if err := h.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	first := body[Tick](t, rec.only(t, MsgTick))
+	if first.Seq != 1 {
+		t.Fatalf("first hidden tick has seq %d, want 1", first.Seq)
+	}
+
+	// Returning to the foreground preserves the stream and makes the next
+	// one-second pulse due. An older box may send a snapshot here; a new one
+	// needs no bulk resync just to change cadence.
+	rec.reset()
+	deliver(t, h, MsgSub, nil, Sub{Bucket: 256, Hz: 1})
+	if err := h.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	f := rec.only(t, MsgTick)
+	if f.size != 512 {
+		t.Fatalf("resub changed the fixed bucket to %d bytes", f.size)
+	}
+	if got := body[Tick](t, f).Seq; got != 2 {
+		t.Fatalf("foreground tick has seq %d, want continuity at 2", got)
+	}
+}
+
+func TestUnknownCadenceFallsBackToOneHertz(t *testing.T) {
+	h, _, rec, _ := newRig(t)
+	deliver(t, h, MsgSub, nil, Sub{Bucket: 512, Hz: 99})
+	rec.reset()
+	if err := h.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if !rec.has(MsgTick) {
+		t.Fatal("unknown cadence did not fall back to one hertz")
 	}
 }
 
@@ -366,7 +419,8 @@ func TestSourceStateLadder(t *testing.T) {
 func TestNonFiniteWattsBecomeZeroRatherThanBreakingTheFrame(t *testing.T) {
 	h, box, rec, _ := newRig(t)
 	box.snap.PVW = nan()
-	subscribe(t, h, rec)
+	deliver(t, h, MsgHello, nil, Hello{Proto: ProtoRange{Min: 0, Max: ProtoMax}})
+	rec.reset()
 	deliver(t, h, MsgSub, nil, Sub{Bucket: 512, Hz: 1})
 
 	snap := body[Snap](t, rec.only(t, MsgSnap))
