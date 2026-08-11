@@ -6,12 +6,19 @@ import math
 import threading
 import time
 
+import cvxpy as cp
 import numpy as np
 import pytest
 
+from ftw_optimizer.deadline import SolveDeadlineExceeded
 from ftw_optimizer.direct_highs import DirectHighsError, _remaining_time_s
 from ftw_optimizer.multistage import clear_multistage_cache
-from ftw_optimizer.model import _canonicalize_storage_payload
+from ftw_optimizer.model import (
+    OPTIMAL_STATUSES,
+    _arbitrage_spread_ore_kwh,
+    _canonicalize_storage_payload,
+)
+from ftw_optimizer.protocol import ProtocolError
 from ftw_optimizer.scenario_tree import (
     Scenario,
     build_scenario_tree,
@@ -19,6 +26,12 @@ from ftw_optimizer.scenario_tree import (
     reduce_scenarios,
 )
 from ftw_optimizer.worker import handle, handshake
+
+
+def test_cvxpy_user_limit_is_not_an_accepted_solution() -> None:
+    assert cp.OPTIMAL in OPTIMAL_STATUSES
+    assert cp.OPTIMAL_INACCURATE in OPTIMAL_STATUSES
+    assert cp.USER_LIMIT not in OPTIMAL_STATUSES
 
 
 def test_worker_handshake_exposes_module_contract() -> None:
@@ -156,13 +169,103 @@ def base_request() -> dict:
     }
 
 
+def mode_spread_request(mode: str, backend: str, spread: float) -> dict:
+    request = base_request()
+    request["request_id"] = f"spread-{mode}-{backend}-{spread}"
+    request["settings"].update(
+        {
+            "mode": mode,
+            "shared_backend": backend,
+            "min_arbitrage_spread_ore_kwh": spread,
+        }
+    )
+    request["slots"] = [
+        {
+            "start_ms": 1,
+            "len_min": 60,
+            "price_ore": 30,
+            "spot_ore": 0,
+            "confidence": 1,
+            "pv_w": 0,
+            "load_w": 2000,
+            "max_import_w": 8000,
+            "max_export_w": 8000,
+        }
+    ]
+    request["storages"][0].update(
+        {
+            "initial_energy_wh": 8000,
+            "terminal_price_ore_kwh": 0,
+            "cycle_cost_ore_kwh": 0,
+            "throughput_cost_ore_kwh": 0,
+        }
+    )
+    return request
+
+
+@pytest.mark.parametrize("mode", ["self_consumption", "cheap_charge"])
+@pytest.mark.parametrize("backend", ["highs", "cvxpy"])
+def test_arbitrage_spread_does_not_tax_service_discharge(
+    mode: str, backend: str
+) -> None:
+    without_spread = handle(mode_spread_request(mode, backend, 0))
+    with_spread = handle(mode_spread_request(mode, backend, 100))
+    assert without_spread["ok"], without_spread
+    assert with_spread["ok"], with_spread
+    baseline_w = without_spread["plan"]["actions"][0]["battery_w"]
+    guarded_w = with_spread["plan"]["actions"][0]["battery_w"]
+    assert baseline_w < -1900
+    assert guarded_w == pytest.approx(baseline_w, abs=2)
+
+
+@pytest.mark.parametrize("scenario_policy", ["recourse", "multistage"])
+def test_arbitrage_spread_is_ignored_by_stochastic_service_policies(
+    scenario_policy: str,
+) -> None:
+    without_spread = mode_spread_request("self_consumption", "auto", 0)
+    with_spread = mode_spread_request("self_consumption", "auto", 100)
+    for request in (without_spread, with_spread):
+        request["settings"]["scenario_policy"] = scenario_policy
+        request["settings"]["decomposition_method"] = "extensive"
+
+    baseline = handle(without_spread)
+    guarded = handle(with_spread)
+    assert baseline["ok"], baseline
+    assert guarded["ok"], guarded
+    baseline_w = baseline["plan"]["actions"][0]["battery_w"]
+    guarded_w = guarded["plan"]["actions"][0]["battery_w"]
+    assert baseline_w < -1900
+    assert guarded_w == pytest.approx(baseline_w, abs=2)
+
+
+@pytest.mark.parametrize("mode", ["arbitrage", "passive_arbitrage"])
+@pytest.mark.parametrize("backend", ["highs", "cvxpy"])
+def test_arbitrage_spread_still_blocks_marginal_arbitrage_discharge(
+    mode: str, backend: str
+) -> None:
+    without_spread = handle(mode_spread_request(mode, backend, 0))
+    with_spread = handle(mode_spread_request(mode, backend, 100))
+    assert without_spread["ok"], without_spread
+    assert with_spread["ok"], with_spread
+    assert without_spread["plan"]["actions"][0]["battery_w"] < -1900
+    assert abs(with_spread["plan"]["actions"][0]["battery_w"]) < 2
+
+
+def test_arbitrage_spread_is_validated_even_when_mode_ignores_it() -> None:
+    with pytest.raises(ProtocolError, match="must be a number"):
+        _arbitrage_spread_ore_kwh(
+            {"min_arbitrage_spread_ore_kwh": "bad"},
+            "self_consumption",
+        )
+
+
 def test_direct_highs_accepts_a_positive_sub_50ms_budget() -> None:
     remaining = _remaining_time_s(time.perf_counter() + 0.01)
     assert 0.0 < remaining <= 0.01
 
 
 def test_direct_highs_rejects_an_exhausted_budget() -> None:
-    with pytest.raises(DirectHighsError, match="time budget exhausted"):
+    with pytest.raises(SolveDeadlineExceeded, match="deadline exceeded"):
         _remaining_time_s(time.perf_counter() - 0.001)
 
 

@@ -19,6 +19,9 @@ import (
 var appVectors = map[string]string{
 	// {t:'hello', b:{proto:{min:0,max:1}, app:{build:'test',ua:'pwa'}, locales:['sv']}}
 	"hello": "a261746568656c6c6f6162a36570726f746fa2636d696e00636d61780163617070a2656275696c64647465737462756163707761676c6f63616c657381627376",
+	// {t:'hello', b:{proto:{min:0,max:1}, app:{build:'test',ua:'pwa'},
+	//                    locales:['sv'], sub:{bucket:512,hz:1}}}
+	"hello_sub": "a261746568656c6c6f6162a46570726f746fa2636d696e00636d61780163617070a2656275696c64647465737462756163707761676c6f63616c65738162737663737562a2666275636b657419020062687a01",
 	// {t:'sub', b:{bucket:512, hz:1}}
 	"sub": "a26174637375626162a2666275636b657419020062687a01",
 	// {t:'plan.get', id:4}
@@ -60,6 +63,20 @@ func TestHandlesTheAppsOwnHello(t *testing.T) {
 	ok := body[HelloOK](t, rec.only(t, MsgHelloOK))
 	if ok.Proto != ProtoMax || ok.Mode != BoxModeFull {
 		t.Fatalf("hello_ok = %+v", ok)
+	}
+}
+
+func TestHandlesTheAppsOwnHelloWithSubscription(t *testing.T) {
+	h, _, rec, _ := newRig(t)
+	if err := h.Handle(t.Context(), appFrame(t, "hello_sub")); err != nil {
+		t.Fatal(err)
+	}
+	frames := rec.snapshot()
+	if len(frames) != 2 || frames[0].env.T != MsgHelloOK || frames[1].env.T != MsgSnap {
+		t.Fatalf("fast hello sent %s, want hello_ok then snap", rec.types())
+	}
+	if ok := body[HelloOK](t, frames[0]); !ok.Subscribed {
+		t.Fatal("hello_ok omitted subscribed=true")
 	}
 }
 
@@ -156,7 +173,8 @@ func TestHandlesAHelloFromANewerApp(t *testing.T) {
 func TestOutboundBodiesMatchTheAppsDeclaredShapes(t *testing.T) {
 	h, box, rec, clock := newRig(t)
 	box.plan = samplePlan(clock.now)
-	subscribe(t, h, rec)
+	deliver(t, h, MsgHello, nil, Hello{Proto: ProtoRange{Min: 0, Max: ProtoMax}})
+	rec.reset()
 	deliver(t, h, MsgSub, nil, Sub{Bucket: 512, Hz: 1})
 
 	snap := body[Snap](t, rec.only(t, MsgSnap))

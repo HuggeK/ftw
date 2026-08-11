@@ -12,7 +12,6 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/srcfl/ftw/go/internal/optimizercontract"
@@ -86,7 +85,7 @@ type ProcessTransportConfig struct {
 type ProcessTransport struct {
 	cfg ProcessTransportConfig
 
-	mu        sync.Mutex
+	mu        *contextGate
 	cmd       *exec.Cmd
 	stdin     io.WriteCloser
 	scanner   *bufio.Scanner
@@ -98,14 +97,20 @@ func NewProcessTransport(cfg ProcessTransportConfig) (*ProcessTransport, error) 
 	if len(cfg.Command) == 0 || strings.TrimSpace(cfg.Command[0]) == "" {
 		return nil, errors.New("optimizer command is empty")
 	}
-	return &ProcessTransport{cfg: cfg}, nil
+	return &ProcessTransport{cfg: cfg, mu: newContextGate()}, nil
 }
 
 func (t *ProcessTransport) RoundTrip(ctx context.Context, payload []byte) ([]byte, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	if err := t.mu.acquire(ctx); err != nil {
+		return nil, err
+	}
+	defer t.mu.release()
 	t.cancelIdleStopLocked()
 	if err := t.ensureStartedLocked(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		t.scheduleIdleStopLocked()
 		return nil, err
 	}
 	if _, err := t.stdin.Write(append(append([]byte(nil), payload...), '\n')); err != nil {
@@ -122,13 +127,16 @@ func (t *ProcessTransport) RoundTrip(ctx context.Context, payload []byte) ([]byt
 }
 
 func (t *ProcessTransport) Health(ctx context.Context) (OptimizerRuntimeInfo, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.cancelIdleStopLocked()
-	if err := ctx.Err(); err != nil {
+	if err := t.mu.acquire(ctx); err != nil {
 		return OptimizerRuntimeInfo{}, err
 	}
+	defer t.mu.release()
+	t.cancelIdleStopLocked()
 	if err := t.ensureStartedLocked(); err != nil {
+		return OptimizerRuntimeInfo{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		t.scheduleIdleStopLocked()
 		return OptimizerRuntimeInfo{}, err
 	}
 	payload, _ := json.Marshal(map[string]any{
@@ -216,8 +224,8 @@ func (t *ProcessTransport) scheduleIdleStopLocked() {
 	t.cancelIdleStopLocked()
 	var timer *time.Timer
 	timer = time.AfterFunc(t.cfg.IdleTimeout, func() {
-		t.mu.Lock()
-		defer t.mu.Unlock()
+		_ = t.mu.acquire(context.Background())
+		defer t.mu.release()
 		if t.idleTimer != timer {
 			return
 		}
@@ -239,8 +247,8 @@ func (t *ProcessTransport) stopLocked() {
 }
 
 func (t *ProcessTransport) Close() error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	_ = t.mu.acquire(context.Background())
+	defer t.mu.release()
 	t.cancelIdleStopLocked()
 	if t.cmd == nil {
 		return nil
@@ -254,6 +262,47 @@ func (t *ProcessTransport) Close() error {
 		t.stopLocked()
 		return nil
 	}
+}
+
+// contextGate serializes access to the warm process without hiding queue wait
+// from the caller's deadline. A request canceled while it waits never reaches
+// stdin, so it cannot occupy the worker after its result has become useless.
+type contextGate struct {
+	token chan struct{}
+}
+
+func newContextGate() *contextGate {
+	g := &contextGate{token: make(chan struct{}, 1)}
+	g.token <- struct{}{}
+	return g
+}
+
+func (g *contextGate) acquire(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-g.token:
+		if err := ctx.Err(); err != nil {
+			g.release()
+			return err
+		}
+		return nil
+	}
+}
+
+func (g *contextGate) release() {
+	g.token <- struct{}{}
+}
+
+func (g *contextGate) Lock() {
+	_ = g.acquire(context.Background())
+}
+
+func (g *contextGate) Unlock() {
+	g.release()
 }
 
 type UnixTransport struct{ socketPath string }

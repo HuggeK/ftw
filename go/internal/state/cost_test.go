@@ -10,6 +10,31 @@ func approxEq(a, b, tol float64) bool {
 	return math.Abs(a-b) <= tol
 }
 
+const costTestStepMs int64 = 10 * 60 * 1000
+
+func constantCostHistory(startMs, endMs int64, gridW, loadW, batW, pvW float64) []HistoryPoint {
+	out := make([]HistoryPoint, 0, (endMs-startMs)/costTestStepMs+1)
+	for ts := startMs; ts <= endMs; ts += costTestStepMs {
+		out = append(out, HistoryPoint{
+			TsMs: ts, GridW: gridW, LoadW: loadW, BatW: batW, PVW: pvW,
+		})
+	}
+	return out
+}
+
+func joinCostHistory(a, b []HistoryPoint) []HistoryPoint {
+	if len(a) == 0 {
+		return b
+	}
+	if len(b) == 0 {
+		return a
+	}
+	if a[len(a)-1].TsMs == b[0].TsMs {
+		b = b[1:]
+	}
+	return append(a, b...)
+}
+
 func TestDailyCostBreakdown_LoadBaselineCountsAvoidedImportAndExport(t *testing.T) {
 	s := freshStore(t)
 
@@ -25,11 +50,11 @@ func TestDailyCostBreakdown_LoadBaselineCountsAvoidedImportAndExport(t *testing.
 	// exactly, so actual grid is zero. In hour 2 PV exceeds load and exports
 	// 0.5 kW. The no-PV/no-battery baseline is still the full 2 kWh house
 	// load bought from the grid.
-	if err := s.BulkRecordHistory([]HistoryPoint{
-		{TsMs: 0, GridW: 0, LoadW: 1000},
-		{TsMs: 3_600_000, GridW: 0, LoadW: 1000},
-		{TsMs: 7_200_000, GridW: -500, LoadW: 1000},
-	}); err != nil {
+	pts := joinCostHistory(
+		constantCostHistory(0, 3_600_000, 0, 1000, 0, 0),
+		constantCostHistory(3_600_000, 7_200_000, -500, 1000, 0, 0),
+	)
+	if err := s.BulkRecordHistory(pts); err != nil {
 		t.Fatalf("record history: %v", err)
 	}
 
@@ -80,11 +105,7 @@ func TestDailyCostBreakdown_NoPVBatteryBaselineMatchesActualImport(t *testing.T)
 	}); err != nil {
 		t.Fatalf("save prices: %v", err)
 	}
-	if err := s.BulkRecordHistory([]HistoryPoint{
-		{TsMs: 0, GridW: 1000, LoadW: 1000},
-		{TsMs: 3_600_000, GridW: 1000, LoadW: 1000},
-		{TsMs: 7_200_000, GridW: 1000, LoadW: 1000},
-	}); err != nil {
+	if err := s.BulkRecordHistory(constantCostHistory(0, 7_200_000, 1000, 1000, 0, 0)); err != nil {
 		t.Fatalf("record history: %v", err)
 	}
 
@@ -261,11 +282,11 @@ func TestDailyCostBreakdown_EVChargingPricedAtDailyAverage(t *testing.T) {
 	// Hour 2 (400 öre): house = 0, EV off → grid 0.
 	// House load_w is the "house minus EV" component; EV is derived as
 	// grid_w − bat_w − pv_w − load_w = 11000 in hour 1, 0 in hour 2.
-	if err := s.BulkRecordHistory([]HistoryPoint{
-		{TsMs: 0, GridW: 11000, LoadW: 0},
-		{TsMs: 3_600_000, GridW: 11000, LoadW: 0},
-		{TsMs: 7_200_000, GridW: 0, LoadW: 0},
-	}); err != nil {
+	pts := joinCostHistory(
+		constantCostHistory(0, 3_600_000, 11000, 0, 0, 0),
+		constantCostHistory(3_600_000, 7_200_000, 0, 0, 0, 0),
+	)
+	if err := s.BulkRecordHistory(pts); err != nil {
 		t.Fatalf("record history: %v", err)
 	}
 
@@ -325,11 +346,7 @@ func TestDailyCostBreakdown_EVInPriceGapExcludedFromBaseline(t *testing.T) {
 	// EV charges 11 kW across BOTH hours (grid imports 11 kW, no house load):
 	//   row @3.6M → EV over (0, 3.6M]   midpoint 1.8M  → COVERED
 	//   row @7.2M → EV over (3.6M, 7.2M] midpoint 5.4M → GAP (no slot)
-	if err := s.BulkRecordHistory([]HistoryPoint{
-		{TsMs: 0, GridW: 11000, LoadW: 0},
-		{TsMs: 3_600_000, GridW: 11000, LoadW: 0},
-		{TsMs: 7_200_000, GridW: 11000, LoadW: 0},
-	}); err != nil {
+	if err := s.BulkRecordHistory(constantCostHistory(0, 7_200_000, 11000, 0, 0, 0)); err != nil {
 		t.Fatalf("record history: %v", err)
 	}
 
@@ -362,11 +379,11 @@ func TestDailyCostBreakdown_EVOnExpensiveHourPaysVsDailyAverage(t *testing.T) {
 		t.Fatalf("save prices: %v", err)
 	}
 	// EV charges only on the 400-öre hour.
-	if err := s.BulkRecordHistory([]HistoryPoint{
-		{TsMs: 0, GridW: 0, LoadW: 0},
-		{TsMs: 3_600_000, GridW: 0, LoadW: 0},
-		{TsMs: 7_200_000, GridW: 11000, LoadW: 0},
-	}); err != nil {
+	pts := joinCostHistory(
+		constantCostHistory(0, 3_600_000, 0, 0, 0, 0),
+		constantCostHistory(3_600_000, 7_200_000, 11000, 0, 0, 0),
+	)
+	if err := s.BulkRecordHistory(pts); err != nil {
 		t.Fatalf("record history: %v", err)
 	}
 
@@ -403,10 +420,7 @@ func TestDailyCostBreakdown_BatteryChargeNotMistakenForEV(t *testing.T) {
 	}
 	// House 1 kW, battery charging 5 kW from grid → grid 6 kW import.
 	// load_w (house only) = 1000, bat_w = 5000, ev_w derived = 0.
-	if err := s.BulkRecordHistory([]HistoryPoint{
-		{TsMs: 0, GridW: 6000, LoadW: 1000, BatW: 5000},
-		{TsMs: 3_600_000, GridW: 6000, LoadW: 1000, BatW: 5000},
-	}); err != nil {
+	if err := s.BulkRecordHistory(constantCostHistory(0, 3_600_000, 6000, 1000, 5000, 0)); err != nil {
 		t.Fatalf("record history: %v", err)
 	}
 
@@ -442,11 +456,11 @@ func TestDailyCostBreakdown_PVBatteryAndEVStack(t *testing.T) {
 	// Hour 2 (expensive):
 	//   house  = 1 kW,  EV    =  0,     bat = −1 kW (discharge), pv = 0
 	//   grid_w = 1 + 0 + (−1) = 0.
-	if err := s.BulkRecordHistory([]HistoryPoint{
-		{TsMs: 0, GridW: 17000, LoadW: 1000, BatW: 5000},
-		{TsMs: 3_600_000, GridW: 17000, LoadW: 1000, BatW: 5000},
-		{TsMs: 7_200_000, GridW: 0, LoadW: 1000, BatW: -1000},
-	}); err != nil {
+	pts := joinCostHistory(
+		constantCostHistory(0, 3_600_000, 17000, 1000, 5000, 0),
+		constantCostHistory(3_600_000, 7_200_000, 0, 1000, -1000, 0),
+	)
+	if err := s.BulkRecordHistory(pts); err != nil {
 		t.Fatalf("record history: %v", err)
 	}
 
@@ -485,6 +499,167 @@ func TestDailyCostBreakdown_PVBatteryAndEVStack(t *testing.T) {
 	// + cheap-hour charging all contribute.
 	if !approxEq(b.SavedOre(), 1100, 0.01) {
 		t.Errorf("SavedOre = %.4f, want 1100", b.SavedOre())
+	}
+}
+
+func TestDailyCostBreakdown_LongHistoryGapDoesNotCreateEnergyOrCost(t *testing.T) {
+	s := freshStore(t)
+	if err := s.SavePrices([]PricePoint{{
+		Zone: "SE3", SlotTsMs: 0, SlotLenMin: 60,
+		SpotOreKwh: 50, TotalOreKwh: 100, Source: "test",
+	}}); err != nil {
+		t.Fatalf("save prices: %v", err)
+	}
+	if err := s.BulkRecordHistory([]HistoryPoint{
+		{TsMs: 0, GridW: 1000, LoadW: 1000},
+		{TsMs: 5 * 60_000, GridW: 1000, LoadW: 1000},
+		{TsMs: 35 * 60_000, GridW: 1000, LoadW: 1000},
+		{TsMs: 40 * 60_000, GridW: 1000, LoadW: 1000},
+	}); err != nil {
+		t.Fatalf("record history: %v", err)
+	}
+
+	b, err := s.DailyCostBreakdown(0, 60*60_000, "SE3", ExportPricing{})
+	if err != nil {
+		t.Fatalf("breakdown: %v", err)
+	}
+	wantWh := 1000.0 * 10.0 / 60.0
+	wantOre := wantWh * 100.0 / 1000.0
+	if !approxEq(b.ImportWh, wantWh, 0.01) || !approxEq(b.LoadWh, wantWh, 0.01) {
+		t.Errorf("gap-attributed energy = import %.4f load %.4f, want %.4f", b.ImportWh, b.LoadWh, wantWh)
+	}
+	if !approxEq(b.ActualCostOre(), wantOre, 0.01) || !approxEq(b.BaselineCostOre, wantOre, 0.01) {
+		t.Errorf("gap-attributed cost = actual %.4f baseline %.4f, want %.4f", b.ActualCostOre(), b.BaselineCostOre, wantOre)
+	}
+	wantCovered := int64(10 * 60_000)
+	if b.ExpectedMs != 60*60_000 || b.HistoryCoveredMs != wantCovered || b.PricedCoveredMs != wantCovered {
+		t.Errorf("coverage durations = %+v, want expected=3600000 history=priced=%d", b, wantCovered)
+	}
+	if !approxEq(b.HistoryCoveragePct(), 1.0/6.0, 1e-9) || !approxEq(b.PricedCoveragePct(), 1.0/6.0, 1e-9) {
+		t.Errorf("coverage ratios = history %.6f priced %.6f, want 1/6", b.HistoryCoveragePct(), b.PricedCoveragePct())
+	}
+}
+
+func TestDailyCostBreakdown_AcceptsWarmTierCadence(t *testing.T) {
+	s := freshStore(t)
+	if err := s.SavePrices([]PricePoint{{
+		Zone: "SE3", SlotTsMs: 0, SlotLenMin: 60,
+		SpotOreKwh: 50, TotalOreKwh: 100, Source: "test",
+	}}); err != nil {
+		t.Fatalf("save prices: %v", err)
+	}
+	for ts := int64(0); ts <= 60*60_000; ts += 15 * 60_000 {
+		if _, err := s.db.Exec(`INSERT INTO history_warm(ts_ms, grid_w, load_w, json) VALUES (?, ?, ?, '{}')`, ts, 1000, 1000); err != nil {
+			t.Fatalf("seed warm history: %v", err)
+		}
+	}
+
+	b, err := s.DailyCostBreakdown(0, 60*60_000, "SE3", ExportPricing{})
+	if err != nil {
+		t.Fatalf("breakdown: %v", err)
+	}
+	if !approxEq(b.ImportWh, 1000, 0.01) || b.HistoryCoveragePct() != 1 || b.PricedCoveragePct() != 1 {
+		t.Errorf("warm-tier breakdown = %+v, want 1 kWh and full coverage", b)
+	}
+}
+
+func TestDailyCostBreakdown_PriceGapLowersPricedCoverageOnly(t *testing.T) {
+	s := freshStore(t)
+	if err := s.SavePrices([]PricePoint{{
+		Zone: "SE3", SlotTsMs: 0, SlotLenMin: 30,
+		SpotOreKwh: 50, TotalOreKwh: 100, Source: "test",
+	}}); err != nil {
+		t.Fatalf("save prices: %v", err)
+	}
+	if err := s.BulkRecordHistory(constantCostHistory(0, 60*60_000, 1000, 1000, 0, 0)); err != nil {
+		t.Fatalf("record history: %v", err)
+	}
+
+	b, err := s.DailyCostBreakdown(0, 60*60_000, "SE3", ExportPricing{})
+	if err != nil {
+		t.Fatalf("breakdown: %v", err)
+	}
+	if !approxEq(b.ImportWh, 1000, 0.01) || !approxEq(b.LoadWh, 1000, 0.01) {
+		t.Errorf("unpriced energy was lost: import %.4f load %.4f, want 1000", b.ImportWh, b.LoadWh)
+	}
+	if !approxEq(b.ActualCostOre(), 50, 0.01) || !approxEq(b.BaselineCostOre, 50, 0.01) {
+		t.Errorf("priced-half cost = actual %.4f baseline %.4f, want 50", b.ActualCostOre(), b.BaselineCostOre)
+	}
+	if b.HistoryCoveragePct() != 1 || !approxEq(b.PricedCoveragePct(), 0.5, 1e-9) {
+		t.Errorf("coverage = history %.4f priced %.4f, want 1.0/0.5", b.HistoryCoveragePct(), b.PricedCoveragePct())
+	}
+}
+
+func TestDailyCostBreakdown_UsesClippedPreRangeSample(t *testing.T) {
+	s := freshStore(t)
+	if err := s.SavePrices([]PricePoint{{
+		Zone: "SE3", SlotTsMs: 0, SlotLenMin: 10,
+		SpotOreKwh: 50, TotalOreKwh: 100, Source: "test",
+	}}); err != nil {
+		t.Fatalf("save prices: %v", err)
+	}
+	if err := s.BulkRecordHistory([]HistoryPoint{
+		{TsMs: -5 * 60_000, GridW: 9000, LoadW: 9000},
+		{TsMs: 5 * 60_000, GridW: 1000, LoadW: 1000},
+		{TsMs: 10 * 60_000, GridW: 1000, LoadW: 1000},
+	}); err != nil {
+		t.Fatalf("record history: %v", err)
+	}
+
+	b, err := s.DailyCostBreakdown(0, 10*60_000, "SE3", ExportPricing{})
+	if err != nil {
+		t.Fatalf("breakdown: %v", err)
+	}
+	wantWh := 1000.0 / 6.0
+	if !approxEq(b.ImportWh, wantWh, 0.01) || b.HistoryCoveredMs != 10*60_000 || b.PricedCoveredMs != 10*60_000 {
+		t.Errorf("clipped predecessor breakdown = %+v, want %.4f Wh and full coverage", b, wantWh)
+	}
+}
+
+func TestDailyCostBreakdown_DedupesHistoryTiersByResolution(t *testing.T) {
+	s := freshStore(t)
+	if err := s.SavePrices([]PricePoint{{
+		Zone: "SE3", SlotTsMs: 0, SlotLenMin: 10,
+		SpotOreKwh: 50, TotalOreKwh: 100, Source: "test",
+	}}); err != nil {
+		t.Fatalf("save prices: %v", err)
+	}
+	for _, row := range []struct {
+		table string
+		ts    int64
+		w     float64
+	}{
+		{"history_hot", 0, 1000}, {"history_hot", 5 * 60_000, 1000},
+		{"history_warm", 0, 2000}, {"history_warm", 5 * 60_000, 2000}, {"history_warm", 10 * 60_000, 2000},
+		{"history_cold", 0, 9000}, {"history_cold", 5 * 60_000, 9000}, {"history_cold", 10 * 60_000, 9000},
+	} {
+		if _, err := s.db.Exec(`INSERT INTO `+row.table+`(ts_ms, grid_w, load_w, json) VALUES (?, ?, ?, '{}')`, row.ts, row.w, row.w); err != nil {
+			t.Fatalf("seed %s: %v", row.table, err)
+		}
+	}
+
+	b, err := s.DailyCostBreakdown(0, 10*60_000, "SE3", ExportPricing{})
+	if err != nil {
+		t.Fatalf("breakdown: %v", err)
+	}
+	// (0,5m] uses hot's 1 kW row; (5m,10m] uses warm's 2 kW row.
+	if !approxEq(b.ImportWh, 250, 0.01) || b.HistoryCoveragePct() != 1 {
+		t.Errorf("deduplicated breakdown = %+v, want 250 Wh and full coverage", b)
+	}
+}
+
+func TestDayCostBreakdownCoverageRatiosAreBounded(t *testing.T) {
+	if got := (DayCostBreakdown{ExpectedMs: 100, HistoryCoveredMs: 120}).HistoryCoveragePct(); got != 1 {
+		t.Fatalf("history coverage = %v, want 1", got)
+	}
+	if got := (DayCostBreakdown{ExpectedMs: 100, PricedCoveredMs: 120}).PricedCoveragePct(); got != 1 {
+		t.Fatalf("priced coverage = %v, want 1", got)
+	}
+	if got := (DayCostBreakdown{ExpectedMs: 0, HistoryCoveredMs: 10}).HistoryCoveragePct(); got != 0 {
+		t.Fatalf("zero-range history coverage = %v, want 0", got)
+	}
+	if got := (DayCostBreakdown{ExpectedMs: 100, PricedCoveredMs: -1}).PricedCoveragePct(); got != 0 {
+		t.Fatalf("negative priced coverage = %v, want 0", got)
 	}
 }
 

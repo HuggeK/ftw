@@ -222,7 +222,10 @@ func (h *Handler) serveAPI(id uint32, req APIReq) error {
 	if req.MaxBytes > 0 && req.MaxBytes < max {
 		max = req.MaxBytes
 	}
-	writer := &apiWriter{h: h, id: id, ctx: ctx, max: max, header: http.Header{}}
+	writer := &apiWriter{
+		h: h, id: id, ctx: ctx, max: max, header: http.Header{},
+		buf: make([]byte, 0, APIChunkBytes),
+	}
 	h.serveHandler(writer, request)
 	return writer.finish()
 }
@@ -509,19 +512,25 @@ func (w *apiWriter) Write(p []byte) (int, error) {
 		take = take[:room]
 		w.truncated = true
 	}
-
-	w.buf = append(w.buf, take...)
-	w.written += int64(len(take))
-	for len(w.buf) >= APIChunkBytes {
-		if err := w.flush(APIChunkBytes); err != nil {
-			w.sendErr = err
-			return 0, err
+	accepted := 0
+	for len(take) > 0 {
+		space := APIChunkBytes - len(w.buf)
+		n := min(space, len(take))
+		w.buf = append(w.buf, take[:n]...)
+		take = take[n:]
+		accepted += n
+		w.written += int64(n)
+		if len(w.buf) == APIChunkBytes {
+			if err := w.flush(APIChunkBytes); err != nil {
+				w.sendErr = err
+				return accepted, err
+			}
 		}
 	}
 	if w.truncated {
-		return len(take), errAPIStopped
+		return accepted, errAPIStopped
 	}
-	return len(p), nil
+	return accepted, nil
 }
 
 func (w *apiWriter) flush(n int) error {
@@ -530,7 +539,8 @@ func (w *apiWriter) flush(n int) error {
 	if err := w.h.sendBulk(MsgAPIChunk, &w.id, chunk); err != nil {
 		return err
 	}
-	w.buf = append(w.buf[:0], w.buf[n:]...)
+	copy(w.buf, w.buf[n:])
+	w.buf = w.buf[:len(w.buf)-n]
 	return nil
 }
 

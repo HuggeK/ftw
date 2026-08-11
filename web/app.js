@@ -45,7 +45,7 @@
   const STATUS_DISPLAY_TAU_MS = 8 * 1000;
   let chartRange = "5m";             // current selected range
   let currentMode = null;
-  let animating = true;              // 30fps redraw loop flag
+  let animating = !document.hidden;  // 30fps redraw loop flag
   let lastDataTs = 0;                // browser-clock timestamp of newest pushed point
   let lastPushAt = 0;                // browser-clock timestamp of last push attempt — for dedupe (NEVER mix with server ts)
   let lastFlashAt = 0;               // browser-clock timestamp of last "new data" flash
@@ -53,6 +53,24 @@
   // Kept as a named helper because components share the same local API surface.
   function apiFetch(path, opts) {
     return fetch(path, opts || {});
+  }
+
+  // A single-flight read must always settle. Without a deadline, one half-open
+  // request would keep its lock or cache entry forever and every later timer
+  // would reuse work that can no longer finish. Keep the deadline through JSON
+  // decoding too: receiving headers does not mean the response body arrived.
+  const API_READ_TIMEOUT_MS = 15_000;
+  function boundedApiRead(path, decode) {
+    var controller = new AbortController();
+    var timer = setTimeout(function () { controller.abort(); }, API_READ_TIMEOUT_MS);
+    var request;
+    try {
+      request = apiFetch(path, { signal: controller.signal });
+    } catch (err) {
+      clearTimeout(timer);
+      return Promise.reject(err);
+    }
+    return request.then(decode).finally(function () { clearTimeout(timer); });
   }
 
   // ---- Chart data ----
@@ -2185,11 +2203,19 @@
   // facts like siteHasPV() without re-fetching. `null` until the
   // first fetch lands; consumers MUST handle null.
   var lastStatusPayload = null;
+  var statusPollTimer = null;
+  var statusPollInFlight = false;
+  var liveHistoryPollTimer = null;
   function fetchStatus() {
     return Promise.all([
-      apiFetch("/api/status").then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); }),
-      apiFetch("/api/loadpoints").then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; }),
-      apiFetch("/api/health").then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; }),
+      boundedApiRead("/api/status", function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      }),
+      boundedApiRead("/api/loadpoints", function (r) { return r.ok ? r.json() : null; })
+        .catch(function () { return null; }),
+      boundedApiRead("/api/health", function (r) { return r.ok ? r.json() : null; })
+        .catch(function () { return null; }),
     ])
       .then(function (results) {
         var data = results[0];
@@ -2224,6 +2250,45 @@
         setConnected(false);
         if (firstLoad) { showSetupBanner(); }
       });
+  }
+
+  // Only the visibility-owned poll is coalesced. Command handlers still call
+  // fetchStatus directly so an operator action can refresh without waiting for
+  // the next timer. Settling a hidden poll only releases the lock; returning to
+  // the tab or a later timer tick decides when the next poll starts.
+  function pollStatus() {
+    if (document.hidden || statusPollInFlight) return;
+    statusPollInFlight = true;
+    fetchStatus().finally(function () {
+      statusPollInFlight = false;
+    });
+  }
+
+  function syncStatusPolling() {
+    if (document.hidden) {
+      if (statusPollTimer !== null) {
+        clearInterval(statusPollTimer);
+        statusPollTimer = null;
+      }
+      if (liveHistoryPollTimer !== null) {
+        clearInterval(liveHistoryPollTimer);
+        liveHistoryPollTimer = null;
+      }
+      return;
+    }
+
+    // Refresh both live surfaces at once after returning to the tab, then keep
+    // exactly one foreground timer for each. These reads are useless while
+    // hidden; history's minute poll used to remain after status polling paused.
+    pollStatus();
+    loadHistory(chartRange, true);
+    fetchLiveHistory(true);
+    if (statusPollTimer === null) {
+      statusPollTimer = setInterval(pollStatus, POLL_INTERVAL);
+    }
+    if (liveHistoryPollTimer === null) {
+      liveHistoryPollTimer = setInterval(function () { fetchLiveHistory(true); }, 60_000);
+    }
   }
 
   // ---- Storage-health banner (DB corruption auto-recovered) ----
@@ -3641,7 +3706,7 @@
           b.classList.toggle("active", b === e.target);
         });
         chartRange = e.target.dataset.range;
-        loadHistory(chartRange);
+        loadHistory(chartRange, true);
       }
     });
   }
@@ -3728,10 +3793,9 @@
   }
 
   // ---- History loader ----
-  function loadHistory(range) {
+  function loadHistory(range, force) {
     var points = CHART_POINTS;
-    return apiFetch("/api/history?range=" + (range || "5m") + "&points=" + points)
-      .then(function (res) { return res.ok ? res.json() : null; })
+    return fetchHistory(range || "5m", points, force)
       .then(function (data) {
         if (!data || !data.items) return;
         // Populate chart history from persisted data
@@ -3808,6 +3872,7 @@
   // Pause animation when tab is hidden (saves battery on background tabs)
   document.addEventListener("visibilitychange", function () {
     animating = !document.hidden;
+    syncStatusPolling();
   });
 
   // ---- History wrapper: one Week/Month toggle drives all three tiles ----
@@ -4050,12 +4115,16 @@
     var key = range + "|" + points;
     var now = Date.now();
     var c = historyFetchCache[key];
-    if (!force && c && (now - c.at) < HISTORY_CACHE_TTL_MS) {
-      if (c.data) return Promise.resolve(c.data);
-      if (c.promise) return c.promise;
+    // Never overlap the same history read. A forced timer or visibility
+    // refresh may bypass completed cache data, but not work already in flight.
+    if (c && c.promise) return c.promise;
+    if (!force && c && c.data && (now - c.at) < HISTORY_CACHE_TTL_MS) {
+      return Promise.resolve(c.data);
     }
-    var promise = apiFetch("/api/history?range=" + range + "&points=" + points)
-      .then(function (r) { return r.ok ? r.json() : null; })
+    var promise = boundedApiRead(
+      "/api/history?range=" + range + "&points=" + points,
+      function (r) { return r.ok ? r.json() : null; }
+    )
       .then(function (data) { historyFetchCache[key] = { at: Date.now(), data: data }; return data; })
       .catch(function (err) {
         var cur = historyFetchCache[key];
@@ -4068,6 +4137,7 @@
 
   var lastLiveHistFetch = 0;
   function fetchLiveHistory(force) {
+    if (document.hidden) return Promise.resolve();
     lastLiveHistFetch = Date.now();
     return fetchHistory("24h", 288, force) // 5-min cadence
       .then(function (d) {
@@ -4079,11 +4149,7 @@
 
   // ---- Init ----
   renderModeCatalog(); // build mode buttons from the server's canonical catalog
-  loadHistory(chartRange);
-  fetchStatus();
-  fetchLiveHistory();
-  setInterval(fetchStatus, POLL_INTERVAL);
-  setInterval(function () { fetchLiveHistory(true); }, 60_000); // 1-min refresh — always fresh
+  syncStatusPolling();
   window.addEventListener("resize", function () {
     // Redraw the 24h chart at the new width. Reuses the cached payload
     // (fetchHistory's short TTL) so a first-load resize storm doesn't

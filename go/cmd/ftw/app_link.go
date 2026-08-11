@@ -233,31 +233,21 @@ type appHistory struct {
 	st *state.Store
 }
 
-func (a *appHistory) Series(
-	_ context.Context, name string, stepMs, fromMs, toMs int64,
-) ([]appproto.HistorySample, error) {
+func (a *appHistory) Window(
+	ctx context.Context, names []string, stepMs, fromMs, toMs int64,
+) (map[string][]appproto.HistorySample, error) {
 	type term struct {
 		flow state.EnergyFlow
 		sign float64
 	}
-	var terms []term
-	switch name {
-	case "grid_w":
-		terms = []term{{state.FlowGridImport, 1}, {state.FlowGridExport, -1}}
-	case "pv_w":
-		terms = []term{{state.FlowPVGeneration, -1}}
-	case "battery_w":
-		terms = []term{{state.FlowBatteryCharge, 1}, {state.FlowBatteryDischarge, -1}}
-	case "load_w":
-		terms = []term{{state.FlowConsumerUse, 1}}
-	default:
-		// A series this box does not keep has no data. That is already a
-		// thing the wire can say, and it beats refusing the whole query
-		// because one series in it was unknown.
-		return nil, nil
+	termsByName := map[string][]term{
+		"grid_w":    {{state.FlowGridImport, 1}, {state.FlowGridExport, -1}},
+		"pv_w":      {{state.FlowPVGeneration, -1}},
+		"battery_w": {{state.FlowBatteryCharge, 1}, {state.FlowBatteryDischarge, -1}},
+		"load_w":    {{state.FlowConsumerUse, 1}},
 	}
 
-	points, _, err := a.st.LoadEnergyHistory(state.EnergyHistoryQuery{
+	points, _, err := a.st.LoadEnergyHistoryContext(ctx, state.EnergyHistoryQuery{
 		SinceMS:  fromMs,
 		UntilMS:  toMs,
 		BucketMS: stepMs,
@@ -271,19 +261,31 @@ func (a *appHistory) Series(
 	// A bucket exists on the wire only if some term reported it. A bucket
 	// where nothing was metered stays absent and becomes MISSING, which is
 	// the honest answer — zero would claim the house used no power at all.
-	byStart := map[int64]float64{}
+	byName := make(map[string]map[int64]float64, len(names))
+	for _, name := range names {
+		if termsByName[name] != nil {
+			byName[name] = map[int64]float64{}
+		}
+	}
 	for _, p := range points {
-		for _, t := range terms {
-			if p.Flow != t.flow {
-				continue
+		for _, name := range names {
+			terms := termsByName[name]
+			for _, t := range terms {
+				if p.Flow != t.flow {
+					continue
+				}
+				byName[name][p.BucketStartMS] += t.sign * p.EnergyWh * 3_600_000 / float64(p.BucketLenMS)
 			}
-			byStart[p.BucketStartMS] += t.sign * p.EnergyWh * 3_600_000 / float64(p.BucketLenMS)
 		}
 	}
 
-	out := make([]appproto.HistorySample, 0, len(byStart))
-	for start, w := range byStart {
-		out = append(out, appproto.HistorySample{StartMs: start, W: w})
+	out := make(map[string][]appproto.HistorySample, len(byName))
+	for name, byStart := range byName {
+		series := make([]appproto.HistorySample, 0, len(byStart))
+		for start, w := range byStart {
+			series = append(series, appproto.HistorySample{StartMs: start, W: w})
+		}
+		out[name] = series
 	}
 	return out, nil
 }
@@ -543,20 +545,20 @@ func startAppLink(
 			// are read-only apart from the mode, and the mode goes through
 			// control's own validation.
 			return appproto.New(appproto.Config{
-				Clock:   appproto.SystemClock{StartedAt: site.started, Source: "ntp"},
-				Site:    site,
-				Info:    info,
-				Modes:   modes,
+				Clock:      appproto.SystemClock{StartedAt: site.started, Source: "ntp"},
+				Site:       site,
+				Info:       info,
+				Modes:      modes,
 				Plans:      plans,
 				History:    history,
 				Prices:     priceReader,
 				Loadpoints: loadpoints,
 				API:        gateway,
-				Caller:  caller,
-				Grants:  grants,
-				Caps:    caps,
-				Codec:   appuplink.Codec(),
-				Sender:  sender,
+				Caller:     caller,
+				Grants:     grants,
+				Caps:       caps,
+				Codec:      appuplink.Codec(),
+				Sender:     sender,
 				// The three frozen power fields point at the source whose
 				// freshness governs them. The site meter is the only one the
 				// box can name without knowing the site's hardware.

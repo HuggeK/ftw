@@ -32,6 +32,7 @@ func TestHandleSavingsDailyNoState(t *testing.T) {
 	if days, _ := body["days"].([]any); len(days) != 0 {
 		t.Fatalf("expected empty days, got %d", len(days))
 	}
+	assertSavingsAttribution(t, body)
 }
 
 // State present but cfg.Price.Zone empty → endpoint short-circuits with
@@ -62,6 +63,7 @@ func TestHandleSavingsDailyNoZone(t *testing.T) {
 	if days, _ := body["days"].([]any); len(days) != 0 {
 		t.Fatalf("expected empty days for unconfigured zone, got %d", len(days))
 	}
+	assertSavingsAttribution(t, body)
 }
 
 // End-to-end with real history + prices: seed a known cheap/expensive
@@ -131,14 +133,19 @@ func TestHandleSavingsDailyEndToEnd(t *testing.T) {
 	}
 
 	var body struct {
-		Days   []map[string]any `json:"days"`
-		Totals map[string]any   `json:"totals"`
+		Days       []map[string]any `json:"days"`
+		Totals     map[string]any   `json:"totals"`
+		ValueScope string           `json:"value_scope"`
+		Baseline   string           `json:"baseline"`
 	}
 	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
 		t.Fatalf("invalid json: %v (body: %s)", err, rr.Body.String())
 	}
 	if len(body.Days) != 2 {
 		t.Fatalf("want 2 days, got %d", len(body.Days))
+	}
+	if body.ValueScope != savingsValueScope || body.Baseline != savingsBaseline {
+		t.Fatalf("attribution = %q/%q, want %q/%q", body.ValueScope, body.Baseline, savingsValueScope, savingsBaseline)
 	}
 	// Today is the last entry; the prior day should be all-zero.
 	yesterday := body.Days[0]
@@ -166,11 +173,101 @@ func TestHandleSavingsDailyEndToEnd(t *testing.T) {
 	if r, _ := today["resolution"].(string); r != "slot" {
 		t.Errorf("today.resolution = %q, want \"slot\"", r)
 	}
+	todayExpected := numberFromMap(today, "expected_ms")
+	todayHistory := numberFromMap(today, "history_covered_ms")
+	todayPriced := numberFromMap(today, "priced_covered_ms")
+	if todayExpected <= 0 || todayHistory <= 0 || todayPriced <= 0 || todayPriced > todayHistory || todayHistory > todayExpected {
+		t.Errorf("today coverage durations invalid: expected=%v history=%v priced=%v", todayExpected, todayHistory, todayPriced)
+	}
+	if got := numberFromMap(today, "history_coverage_pct"); got <= 0 || got > 1 {
+		t.Errorf("today.history_coverage_pct = %v, want (0,1]", got)
+	}
+	if got := numberFromMap(today, "priced_coverage_pct"); got <= 0 || got > 1 {
+		t.Errorf("today.priced_coverage_pct = %v, want (0,1]", got)
+	}
 	// Totals must aggregate the per-day values (yesterday is 0).
 	totalSaved, _ := body.Totals["saved_ore"].(float64)
 	todaySaved, _ := today["saved_ore"].(float64)
 	if !approxEqAPI(totalSaved, todaySaved, 0.01) {
 		t.Errorf("totals.saved_ore = %v, want ~%v (only today should have data)", totalSaved, todaySaved)
+	}
+	var expectedSum, historySum, pricedSum float64
+	for _, day := range body.Days {
+		expectedSum += numberFromMap(day, "expected_ms")
+		historySum += numberFromMap(day, "history_covered_ms")
+		pricedSum += numberFromMap(day, "priced_covered_ms")
+	}
+	if got := numberFromMap(body.Totals, "expected_ms"); got != expectedSum {
+		t.Errorf("totals.expected_ms = %v, want %v", got, expectedSum)
+	}
+	if got := numberFromMap(body.Totals, "history_covered_ms"); got != historySum {
+		t.Errorf("totals.history_covered_ms = %v, want %v", got, historySum)
+	}
+	if got := numberFromMap(body.Totals, "priced_covered_ms"); got != pricedSum {
+		t.Errorf("totals.priced_covered_ms = %v, want %v", got, pricedSum)
+	}
+	if got, want := numberFromMap(body.Totals, "history_coverage_pct"), historySum/expectedSum; !approxEqAPI(got, want, 1e-9) {
+		t.Errorf("weighted history coverage = %v, want %v", got, want)
+	}
+	if got, want := numberFromMap(body.Totals, "priced_coverage_pct"), pricedSum/expectedSum; !approxEqAPI(got, want, 1e-9) {
+		t.Errorf("weighted cost coverage = %v, want %v", got, want)
+	}
+}
+
+func TestHandleSavingsDailyPricedDayWithoutHistoryReportsZeroCoverage(t *testing.T) {
+	st, err := state.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	now := time.Now()
+	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	start := todayStart.AddDate(0, 0, -1)
+	if err := st.SavePrices([]state.PricePoint{{
+		Zone: "SE3", SlotTsMs: start.UnixMilli(), SlotLenMin: int(todayStart.Sub(start) / time.Minute),
+		SpotOreKwh: 50, TotalOreKwh: 100, Source: "test",
+	}}); err != nil {
+		t.Fatalf("SavePrices: %v", err)
+	}
+	srv := New(&Deps{
+		State: st,
+		Cfg:   &config.Config{Price: &config.Price{Zone: "SE3"}},
+		CfgMu: &sync.RWMutex{},
+	})
+	req := httptest.NewRequest(http.MethodGet, "/api/savings/daily?days=2", nil)
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200 (body: %s)", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		Days       []map[string]any `json:"days"`
+		ValueScope string           `json:"value_scope"`
+		Baseline   string           `json:"baseline"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	if len(body.Days) != 2 {
+		t.Fatalf("days = %d, want 2", len(body.Days))
+	}
+	day := body.Days[0]
+	if got, _ := day["resolution"].(string); got != "slot" {
+		t.Fatalf("resolution = %q, want slot", got)
+	}
+	if numberFromMap(day, "expected_ms") <= 0 || numberFromMap(day, "history_covered_ms") != 0 ||
+		numberFromMap(day, "priced_covered_ms") != 0 || numberFromMap(day, "history_coverage_pct") != 0 ||
+		numberFromMap(day, "priced_coverage_pct") != 0 {
+		t.Fatalf("coverage without history = %+v, want positive expected and zero covered", day)
+	}
+	for _, key := range []string{"actual_cost_ore", "baseline_cost_ore", "saved_ore"} {
+		if got := numberFromMap(day, key); got != 0 {
+			t.Errorf("%s = %v, want 0", key, got)
+		}
+	}
+	if body.ValueScope != savingsValueScope || body.Baseline != savingsBaseline {
+		t.Fatalf("attribution = %q/%q, want %q/%q", body.ValueScope, body.Baseline, savingsValueScope, savingsBaseline)
 	}
 }
 
@@ -232,6 +329,35 @@ func TestSavingsResolutionUsesPriceSlotPresence(t *testing.T) {
 	}
 	if got := resolutionFor(state.DayCostBreakdown{}); got != "no_prices" {
 		t.Fatalf("missing prices should be no_prices, got %q", got)
+	}
+}
+
+func TestSavingsCoveragePctIsBounded(t *testing.T) {
+	for _, tc := range []struct {
+		covered, expected int64
+		want              float64
+	}{
+		{0, 100, 0},
+		{-1, 100, 0},
+		{10, 0, 0},
+		{50, 100, 0.5},
+		{120, 100, 1},
+	} {
+		if got := boundedCoveragePct(tc.covered, tc.expected); got != tc.want {
+			t.Errorf("boundedCoveragePct(%d, %d) = %v, want %v", tc.covered, tc.expected, got, tc.want)
+		}
+	}
+}
+
+func numberFromMap(values map[string]any, key string) float64 {
+	value, _ := values[key].(float64)
+	return value
+}
+
+func assertSavingsAttribution(t *testing.T, body map[string]any) {
+	t.Helper()
+	if body["value_scope"] != savingsValueScope || body["baseline"] != savingsBaseline {
+		t.Fatalf("attribution = %v/%v, want %q/%q", body["value_scope"], body["baseline"], savingsValueScope, savingsBaseline)
 	}
 }
 

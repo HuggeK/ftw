@@ -294,11 +294,11 @@ func (s *sessions) count() int {
 	return len(s.live)
 }
 
-// tick drives every subscribed session's telemetry frame.
+// tick sends the global one-second pulse to every live session.
 //
-// Every session, every tick, whether or not anything changed: silence on lane
-// 0 would itself tell the relay operator that nothing happened in the house
-// that second.
+// Each handler gates that pulse to its own subscribed 1 Hz or 0.2 Hz cadence.
+// On a due pulse it sends a frame even when nothing changed, so silence within
+// that cadence does not reveal whether the house was idle.
 func (s *sessions) tick() {
 	s.mu.Lock()
 	live := append([]*session(nil), s.live...)

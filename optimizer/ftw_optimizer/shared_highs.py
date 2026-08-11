@@ -11,7 +11,8 @@ from .direct_highs import (
     SharedBaselineReplayError,
     solve_direct_highs,
 )
-from .model import _STORAGE_INITIAL_ABOVE_MAXIMUM_KEY, _solver_options
+from .deadline import SolveDeadline
+from .model import _STORAGE_INITIAL_ABOVE_MAXIMUM_KEY
 from .multistage import _prepare
 from .protocol import ProtocolError, finite_number, require_dict, require_list
 from .scenario_tree import ScenarioTree
@@ -21,7 +22,11 @@ class DirectSharedIneligible(RuntimeError):
     pass
 
 
-def solve_shared_highs(payload: dict[str, Any], started: float) -> dict[str, Any]:
+def solve_shared_highs(
+    payload: dict[str, Any],
+    started: float,
+    deadline: SolveDeadline,
+) -> dict[str, Any]:
     """Solve shared storage through the sparse HiGHS builder."""
     prepared_started = time.perf_counter()
     direct_payload, risk_alpha = _direct_payload(payload)
@@ -119,9 +124,6 @@ def solve_shared_highs(payload: dict[str, Any], started: float) -> dict[str, Any
         ),
     )
     prepare_ms = (time.perf_counter() - prepared_started) * 1000.0
-    deadline = started + float(
-        _solver_options(prepared.settings, "HIGHS")["time_limit"]
-    )
     try:
         return solve_direct_highs(
             prepared,
@@ -132,6 +134,7 @@ def solve_shared_highs(payload: dict[str, Any], started: float) -> dict[str, Any
             deadline=deadline,
         )
     except SharedBaselineReplayError as exc:
+        deadline.check("shared baseline retry")
         return solve_direct_highs(
             prepared,
             started,
