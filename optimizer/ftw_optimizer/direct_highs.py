@@ -9,7 +9,11 @@ import highspy
 import numpy as np
 
 from . import SCHEMA_VERSION
-from .model import _solver_options, _storage_starts_above_maximum
+from .model import (
+    _arbitrage_spread_ore_kwh,
+    _solver_options,
+    _storage_starts_above_maximum,
+)
 from .protocol import finite_number
 
 if TYPE_CHECKING:
@@ -198,13 +202,7 @@ def solve_direct_highs(
         key: model.variable(0.0, upper) for key, upper in sorted(curtail_upper.items())
     }
 
-    spread = max(
-        0.0,
-        finite_number(
-            prepared.settings.get("min_arbitrage_spread_ore_kwh", 0),
-            "settings.min_arbitrage_spread_ore_kwh",
-        ),
-    )
+    spread = _arbitrage_spread_ore_kwh(prepared.settings, prepared.mode)
     for si, scenario in enumerate(prepared.scenario_set.scenarios):
         pv_generation = np.maximum(0.0, -scenario.pv)
         pv_surplus = np.maximum(0.0, pv_generation - scenario.load)
@@ -783,13 +781,7 @@ def _response(
                 )
         degradation = 0.0
         terminal_value = 0.0
-        spread = max(
-            0.0,
-            finite_number(
-                prepared.settings.get("min_arbitrage_spread_ore_kwh", 0),
-                "settings.min_arbitrage_spread_ore_kwh",
-            ),
-        )
+        spread = _arbitrage_spread_ore_kwh(prepared.settings, prepared.mode)
         for index, spec in enumerate(prepared.storages):
             discharge_rate = spread + max(
                 0.0, float(spec.get("cycle_cost_ore_kwh", 0))

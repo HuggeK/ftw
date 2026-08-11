@@ -11,6 +11,7 @@ import numpy as np
 from . import SCHEMA_VERSION
 from .model import (
     OPTIMAL_STATUSES,
+    _arbitrage_spread_ore_kwh,
     _canonicalize_storage_payload,
     _export_price,
     _mode,
@@ -140,6 +141,7 @@ def solve_storage_recourse(payload: dict[str, Any]) -> dict[str, Any]:
     strict_sc_penalty: cp.Expression = cp.Constant(0.0)
     worst_service_slack = cp.Variable(nonneg=True, name="worst_service_slack")
     bonus_ore = max(0.0, finite_number(settings.get("pv_charge_bonus_ore_kwh", 0), "settings.pv_charge_bonus_ore_kwh"))
+    arbitrage_spread = _arbitrage_spread_ore_kwh(settings, mode)
     unsafe_cycle = bool(np.any(eff_import < 0)) or bonus_ore > 0
     unsafe_meter_split = bool(np.any(eff_import < eff_export - 1e-9))
 
@@ -199,7 +201,7 @@ def solve_storage_recourse(payload: dict[str, Any]) -> dict[str, Any]:
                 scenario_service += shortfall / capacity
 
             cycle_ore = max(0.0, finite_number(spec.get("cycle_cost_ore_kwh", 0), "storage.cycle_cost_ore_kwh"))
-            cycle_ore += max(0.0, finite_number(settings.get("min_arbitrage_spread_ore_kwh", 0), "settings.min_arbitrage_spread_ore_kwh"))
+            cycle_ore += arbitrage_spread
             scenario_cycle += cycle_ore * cp.sum(cp.multiply(dt_h, discharge)) / 1000.0
             terminal_price = finite_number(spec.get("terminal_price_ore_kwh", 0), "storage.terminal_price_ore_kwh")
             scenario_terminal += terminal_price * energy[-1] / 1000.0
