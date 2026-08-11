@@ -10,6 +10,7 @@ import cvxpy as cp
 import numpy as np
 import pytest
 
+from ftw_optimizer.deadline import SolveDeadlineExceeded
 from ftw_optimizer.direct_highs import DirectHighsError, _remaining_time_s
 from ftw_optimizer.multistage import clear_multistage_cache
 from ftw_optimizer.model import (
@@ -264,7 +265,7 @@ def test_direct_highs_accepts_a_positive_sub_50ms_budget() -> None:
 
 
 def test_direct_highs_rejects_an_exhausted_budget() -> None:
-    with pytest.raises(DirectHighsError, match="time budget exhausted"):
+    with pytest.raises(SolveDeadlineExceeded, match="deadline exceeded"):
         _remaining_time_s(time.perf_counter() - 0.001)
 
 

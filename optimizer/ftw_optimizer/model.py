@@ -9,6 +9,7 @@ import cvxpy as cp
 import numpy as np
 
 from . import SCHEMA_VERSION
+from .deadline import SolveDeadline, SolveDeadlineExceeded
 from .protocol import ProtocolError, finite_number, positive_number, require_dict, require_list
 
 
@@ -244,22 +245,43 @@ def _export_price(slot: dict[str, Any], settings: dict[str, Any]) -> float:
     return price
 
 
-def _solver_options(settings: dict[str, Any], solver: str) -> dict[str, Any]:
-    time_limit = positive_number(settings.get("time_limit_s", 2.0), "settings.time_limit_s")
+def _solver_options(
+    settings: dict[str, Any],
+    solver: str,
+    deadline: SolveDeadline | None = None,
+) -> dict[str, Any]:
+    configured_limit = positive_number(
+        settings.get("time_limit_s", 2.0),
+        "settings.time_limit_s",
+    )
+    if deadline is None:
+        time_limit = max(0.05, configured_limit)
+    else:
+        time_limit = min(
+            configured_limit,
+            deadline.remaining_s(f"{solver} solve"),
+        )
     if solver == cp.HIGHS:
         return {
-            "time_limit": max(0.05, time_limit),
+            "time_limit": time_limit,
             "mip_rel_gap": max(
                 0.0,
                 finite_number(settings.get("mip_rel_gap", 0.005), "settings.mip_rel_gap"),
             ),
         }
-    return {"time_limit": max(0.05, time_limit)}
+    return {"time_limit": time_limit}
 
 
-def solve(payload: dict[str, Any]) -> dict[str, Any]:
+def solve(
+    payload: dict[str, Any],
+    deadline: SolveDeadline | None = None,
+) -> dict[str, Any]:
+    started = time.perf_counter()
     payload = _canonicalize_storage_payload(payload)
     settings = require_dict(payload.get("settings", {}), "settings")
+    if deadline is None:
+        deadline = SolveDeadline.from_payload(payload, started_at=started)
+    deadline.check("optimizer model build")
     commercial = require_dict(
         payload.get("commercial_constraints", {}),
         "commercial_constraints",
@@ -279,15 +301,14 @@ def solve(payload: dict[str, Any]) -> dict[str, Any]:
         # and thermal state can be evaluated against equally stateful telemetry.
         from .recourse import solve_storage_recourse
 
-        return solve_storage_recourse(payload)
+        return solve_storage_recourse(payload, deadline)
     if scenario_policy == "multistage":
         from .multistage import solve_storage_multistage
 
-        return solve_storage_multistage(payload)
+        return solve_storage_multistage(payload, deadline)
     if scenario_policy != "shared":
         raise ProtocolError("settings.scenario_policy must be shared, recourse, or multistage")
 
-    started = time.perf_counter()
     shared_backend = str(settings.get("shared_backend", "auto"))
     if shared_backend not in {"auto", "highs", "cvxpy"}:
         raise ProtocolError("settings.shared_backend must be auto, highs, or cvxpy")
@@ -301,19 +322,23 @@ def solve(payload: dict[str, Any]) -> dict[str, Any]:
         from .shared_highs import DirectSharedIneligible, solve_shared_highs
 
         try:
-            response = solve_shared_highs(payload, started)
+            response = solve_shared_highs(payload, started, deadline)
             _validate_storage_replay(
                 response["plan"]["actions"],
                 require_list(payload.get("slots", []), "slots"),
                 require_list(payload.get("storages", []), "storages"),
             )
             return response
+        except SolveDeadlineExceeded:
+            raise
         except DirectSharedIneligible as exc:
             if shared_backend == "highs":
                 raise ProtocolError(str(exc)) from exc
+            deadline.check("shared backend fallback")
         except Exception as exc:
             if shared_backend == "highs":
                 raise
+            deadline.check("shared backend fallback")
             # The direct path is optional in auto mode. Let the reference
             # model validate the request again as it builds the fallback.
             direct_fallback_reason = str(exc) or type(exc).__name__
@@ -523,11 +548,11 @@ def solve(payload: dict[str, Any]) -> dict[str, Any]:
             constraints += [charge <= max_charge * direction, discharge <= max_discharge * (1 - direction)]
             discrete = True
         target = spec.get("target_energy_wh")
-        deadline = int(spec.get("target_slot", n - 1))
+        target_slot = int(spec.get("target_slot", n - 1))
         if target is not None:
-            deadline = min(n - 1, max(0, deadline))
+            target_slot = min(n - 1, max(0, target_slot))
             shortfall = cp.Variable(nonneg=True, name=f"storage_{i}_shortfall")
-            constraints.append(energy[deadline + 1] + shortfall >= finite_number(target, f"storages[{i}].target_energy_wh"))
+            constraints.append(energy[target_slot + 1] + shortfall >= finite_number(target, f"storages[{i}].target_energy_wh"))
             service_slack += shortfall / capacity
             spec["_shortfall"] = shortfall
         total_charge += charge
@@ -629,9 +654,9 @@ def solve(payload: dict[str, Any]) -> dict[str, Any]:
         shortfall: cp.Variable | None = None
         target = spec.get("target_energy_wh")
         if target is not None:
-            deadline = min(n - 1, max(0, int(spec.get("target_slot", n - 1))))
+            target_slot = min(n - 1, max(0, int(spec.get("target_slot", n - 1))))
             shortfall = cp.Variable(nonneg=True, name=f"flex_{i}_shortfall")
-            constraints.append(energy[deadline + 1] + shortfall >= finite_number(target, f"flex_loads[{i}].target_energy_wh"))
+            constraints.append(energy[target_slot + 1] + shortfall >= finite_number(target, f"flex_loads[{i}].target_energy_wh"))
             service_slack += shortfall / capacity
         total_flex += power
         flex_loads.append(FlexVars(spec, power, energy, selection, shortfall))
@@ -931,12 +956,18 @@ def solve(payload: dict[str, Any]) -> dict[str, Any]:
 
     def run_problem(problem: cp.Problem, solver_name: str) -> None:
         solver = cp.HIGHS if solver_name == "HIGHS" else cp.CLARABEL
-        problem.solve(solver=solver, warm_start=True, **_solver_options(settings, solver))
+        problem.solve(
+            solver=solver,
+            warm_start=True,
+            **_solver_options(settings, solver, deadline),
+        )
+        deadline.check(f"{solver_name} solve")
 
     solver_used = preferred_solver
     try:
         run_problem(slack_problem, solver_used)
     except cp.error.SolverError:
+        deadline.check("service solver fallback")
         if discrete or solver_used == "CLARABEL":
             raise
         solver_used = "CLARABEL"
@@ -950,6 +981,7 @@ def solve(payload: dict[str, Any]) -> dict[str, Any]:
     try:
         run_problem(cost_problem, solver_used)
     except cp.error.SolverError:
+        deadline.check("economic solver fallback")
         if discrete or solver_used == "CLARABEL":
             raise
         solver_used = "CLARABEL"

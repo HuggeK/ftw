@@ -9,6 +9,7 @@ import cvxpy as cp
 import numpy as np
 
 from . import SCHEMA_VERSION
+from .deadline import SolveDeadline
 from .model import OPTIMAL_STATUSES, _arbitrage_spread_ore_kwh, _solver_options
 from .protocol import ProtocolError, finite_number
 
@@ -68,7 +69,10 @@ def ph_eligible(prepared: "PreparedMultistage") -> tuple[bool, str]:
 
 
 def solve_progressive_hedging(
-    prepared: "PreparedMultistage", started: float, prepare_ms: float
+    prepared: "PreparedMultistage",
+    started: float,
+    prepare_ms: float,
+    deadline: SolveDeadline,
 ) -> dict[str, Any]:
     eligible, reason = ph_eligible(prepared)
     if not eligible:
@@ -82,6 +86,7 @@ def solve_progressive_hedging(
         _build_subproblem(prepared, si, rho_value)
         for si in range(len(prepared.scenario_set.scenarios))
     ]
+    deadline.check("progressive hedging model build")
     build_ms = (time.perf_counter() - build_started) * 1000.0
 
     probabilities = np.asarray([scenario.probability for scenario in prepared.scenario_set.scenarios])
@@ -94,7 +99,11 @@ def solve_progressive_hedging(
         subproblem.consensus_kw.value = np.zeros_like(decisions[0])
         subproblem.dual_kw.value = np.zeros_like(decisions[0])
         _solve_problem(
-            subproblem.initial_problem, settings, len(subproblems), max_iterations
+            subproblem.initial_problem,
+            settings,
+            len(subproblems),
+            max_iterations,
+            deadline,
         )
     decisions = [_decision_value(subproblem) for subproblem in subproblems]
     consensus = _consensus_values(prepared, decisions, probabilities)
@@ -106,7 +115,13 @@ def solve_progressive_hedging(
         for si, subproblem in enumerate(subproblems):
             subproblem.consensus_kw.value = consensus[si]
             subproblem.dual_kw.value = dual[si]
-            _solve_problem(subproblem.problem, settings, len(subproblems), max_iterations)
+            _solve_problem(
+                subproblem.problem,
+                settings,
+                len(subproblems),
+                max_iterations,
+                deadline,
+            )
             decisions[si] = _decision_value(subproblem)
         consensus = _consensus_values(prepared, decisions, probabilities)
         residual_w = _nonanticipativity_residual_w(prepared, decisions, consensus)
@@ -238,6 +253,7 @@ def _solve_problem(
     settings: dict[str, Any],
     scenario_count: int,
     max_iterations: int,
+    deadline: SolveDeadline,
 ) -> None:
     options_settings = dict(settings)
     total_limit = max(0.1, finite_number(settings.get("time_limit_s", 2), "settings.time_limit_s"))
@@ -248,8 +264,9 @@ def _solve_problem(
         solver=cp.HIGHS,
         warm_start=True,
         enforce_dpp=True,
-        **_solver_options(options_settings, cp.HIGHS),
+        **_solver_options(options_settings, cp.HIGHS, deadline),
     )
+    deadline.check("progressive hedging solve")
     if problem.status not in OPTIMAL_STATUSES or problem.value is None:
         raise ProgressiveHedgingNotConverged(
             f"PH subproblem failed with status {problem.status}"
