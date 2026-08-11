@@ -2,6 +2,7 @@ package state
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/srcfl/ftw/go/internal/gridcost"
 )
@@ -35,6 +36,9 @@ type DayCostBreakdown struct {
 	AvgImportOreKwh  float64 // time-weighted mean of total_ore_kwh over slots in range
 	AvgExportOreKwh  float64 // time-weighted mean of effective export price over slots in range
 	PriceSlotCount   int     // overlapping price slots used for the cost model
+	ExpectedMs       int64   // requested wall-clock duration
+	HistoryCoveredMs int64   // duration backed by a bounded telemetry interval
+	PricedCoveredMs  int64   // history-covered duration with a matching price slot
 }
 
 // ActualCostOre is the net cost the household actually paid: import cost minus
@@ -57,6 +61,29 @@ func (b DayCostBreakdown) SavedOre() float64 {
 	return b.BaselineCostOre - b.ActualCostOre()
 }
 
+// HistoryCoveragePct is the bounded fraction of the requested range backed by
+// usable telemetry. It reports 0 for an empty or invalid range.
+func (b DayCostBreakdown) HistoryCoveragePct() float64 {
+	return boundedCoveragePct(b.HistoryCoveredMs, b.ExpectedMs)
+}
+
+// PricedCoveragePct is the bounded fraction of the requested range backed by
+// both usable telemetry and a price slot. Only this duration can contribute to
+// actual or baseline cost.
+func (b DayCostBreakdown) PricedCoveragePct() float64 {
+	return boundedCoveragePct(b.PricedCoveredMs, b.ExpectedMs)
+}
+
+func boundedCoveragePct(coveredMs, expectedMs int64) float64 {
+	if coveredMs <= 0 || expectedMs <= 0 {
+		return 0
+	}
+	if coveredMs >= expectedMs {
+		return 1
+	}
+	return float64(coveredMs) / float64(expectedMs)
+}
+
 // ExportPricing aliases the shared export pricing knobs used by the planner
 // and historical cost reporting.
 type ExportPricing = gridcost.ExportPricing
@@ -74,6 +101,11 @@ type priceSlot struct {
 // inside the range. 1 day is comfortably above any real provider's slot
 // length (NordPool 15 min, ENTSOE up to 60 min).
 const maxSlotPadMs = int64(24 * 60 * 60 * 1000)
+
+// maxCostIntegrationGap is long enough for the 15-minute warm history tier
+// and short enough to reject an outage. Applying a stale power reading across
+// a longer gap would manufacture energy, cost and savings.
+const maxCostIntegrationGap = 20 * time.Minute
 
 // DailyCostBreakdown integrates grid flow across [sinceMs, untilMs] using all
 // three history tiers and prices it slot-by-slot against the prices table for
@@ -96,6 +128,9 @@ const maxSlotPadMs = int64(24 * 60 * 60 * 1000)
 // Returns zeroes (not an error) when the history is empty over the range —
 // callers can render that as "no data" without special-casing nil.
 func (s *Store) DailyCostBreakdown(sinceMs, untilMs int64, zone string, ep ExportPricing) (DayCostBreakdown, error) {
+	if untilMs <= sinceMs {
+		return DayCostBreakdown{}, nil
+	}
 	slots, err := s.loadPriceSlotsForRange(zone, sinceMs, untilMs)
 	if err != nil {
 		return DayCostBreakdown{}, fmt.Errorf("DailyCostBreakdown: load slots: %w", err)
@@ -156,11 +191,16 @@ func (s *Store) loadPriceSlotsForRange(zone string, sinceMs, untilMs int64) ([]p
 	return slots, rows.Err()
 }
 
-// integrateHistoryRange streams every history-tier sample in [sinceMs, untilMs]
-// in ts order and accumulates dt-weighted Wh and öre. The "current row's
-// grid_w applied over (prev_ts, ts_ms]" rule mirrors the SQL form that
-// `DailyEnergy` uses; the first row of the stream has no predecessor and is
-// silently dropped (it provides the prev_ts for the next iteration only).
+// integrateHistoryRange streams every history-tier sample in timestamp order
+// and accumulates dt-weighted Wh and öre. It reads up to one maximum valid gap
+// before sinceMs so the first in-range row can have a predecessor, then clips
+// every contribution to [sinceMs, untilMs). The "current row's grid_w applied
+// over (prev_ts, ts_ms]" rule mirrors the SQL form that `DailyEnergy` uses.
+//
+// Equal timestamps can exist briefly while history moves between tiers. They
+// are deduplicated in hot, warm, cold order so one interval is never counted
+// twice. Raw intervals above maxCostIntegrationGap contribute neither energy
+// nor coverage; the later row still becomes the next predecessor.
 //
 // Slots are walked with a sliding pointer: both sides are ascending, so for
 // each midpoint we advance until the slot's EndMs is past the midpoint.
@@ -175,34 +215,43 @@ func (s *Store) loadPriceSlotsForRange(zone string, sinceMs, untilMs int64) ([]p
 // `load_w` for the history rows). Pricing of EVWh is deferred to the
 // caller (DailyCostBreakdown applies the day's avg import).
 func (s *Store) integrateHistoryRange(sinceMs, untilMs int64, slots []priceSlot, ep ExportPricing) (DayCostBreakdown, error) {
+	historyStartMs := sinceMs - maxCostIntegrationGap.Milliseconds()
 	rows, err := s.db.Query(`
 		WITH all_rows AS (
 			SELECT ts_ms,
 			       COALESCE(grid_w, 0) AS grid_w,
 			       COALESCE(load_w, 0) AS load_w,
 			       COALESCE(bat_w,  0) AS bat_w,
-			       COALESCE(pv_w,   0) AS pv_w
+			       COALESCE(pv_w,   0) AS pv_w,
+			       0 AS tier
 			FROM history_hot  WHERE ts_ms BETWEEN ? AND ?
 			UNION ALL
 			SELECT ts_ms,
 			       COALESCE(grid_w, 0),
 			       COALESCE(load_w, 0),
 			       COALESCE(bat_w,  0),
-			       COALESCE(pv_w,   0)
+			       COALESCE(pv_w,   0),
+			       1
 			FROM history_warm WHERE ts_ms BETWEEN ? AND ?
 			UNION ALL
 			SELECT ts_ms,
 			       COALESCE(grid_w, 0),
 			       COALESCE(load_w, 0),
 			       COALESCE(bat_w,  0),
-			       COALESCE(pv_w,   0)
+			       COALESCE(pv_w,   0),
+			       2
 			FROM history_cold WHERE ts_ms BETWEEN ? AND ?
+		), ranked AS (
+			SELECT ts_ms, grid_w, load_w, bat_w, pv_w,
+			       ROW_NUMBER() OVER (PARTITION BY ts_ms ORDER BY tier ASC) AS row_rank
+			FROM all_rows
 		)
-		SELECT ts_ms, grid_w, load_w, bat_w, pv_w FROM all_rows ORDER BY ts_ms ASC
+		SELECT ts_ms, grid_w, load_w, bat_w, pv_w
+		FROM ranked WHERE row_rank = 1 ORDER BY ts_ms ASC
 	`,
-		sinceMs, untilMs,
-		sinceMs, untilMs,
-		sinceMs, untilMs,
+		historyStartMs, untilMs,
+		historyStartMs, untilMs,
+		historyStartMs, untilMs,
 	)
 	if err != nil {
 		return DayCostBreakdown{}, err
@@ -210,7 +259,7 @@ func (s *Store) integrateHistoryRange(sinceMs, untilMs int64, slots []priceSlot,
 	defer rows.Close()
 
 	var (
-		out      DayCostBreakdown
+		out      = DayCostBreakdown{ExpectedMs: untilMs - sinceMs}
 		havePrev bool
 		prevTs   int64
 		slotIdx  int
@@ -227,9 +276,16 @@ func (s *Store) integrateHistoryRange(sinceMs, untilMs int64, slots []priceSlot,
 			continue
 		}
 
-		dtMs := ts - prevTs
-		midTs := (ts + prevTs) / 2
+		rawDtMs := ts - prevTs
+		intervalStart := maxInt64(prevTs, sinceMs)
+		intervalEnd := minInt64(ts, untilMs)
 		prevTs = ts
+		if rawDtMs > maxCostIntegrationGap.Milliseconds() || intervalEnd <= intervalStart {
+			continue
+		}
+		dtMs := intervalEnd - intervalStart
+		midTs := intervalStart + dtMs/2
+		out.HistoryCoveredMs += dtMs
 
 		// Sliding pointer: advance past slots whose EndMs <= midTs.
 		// Slots may be sparse (gaps allowed), so we accept "no covering
@@ -240,6 +296,9 @@ func (s *Store) integrateHistoryRange(sinceMs, untilMs int64, slots []priceSlot,
 		var covering *priceSlot
 		if slotIdx < len(slots) && slots[slotIdx].StartMs <= midTs && slots[slotIdx].EndMs > midTs {
 			covering = &slots[slotIdx]
+		}
+		if covering != nil {
+			out.PricedCoveredMs += dtMs
 		}
 
 		if loadW > 0 {
