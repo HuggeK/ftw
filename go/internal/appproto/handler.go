@@ -108,11 +108,26 @@ type Handler struct {
 	// apiBusy is the passthrough queue, and its depth is one.
 	apiBusy atomic.Bool
 
+	// History has one worker per session while work exists. A new query replaces
+	// the queued or running one, and cancellation reaches SQLite through the
+	// HistoryProvider context.
+	histMu         sync.Mutex
+	histGeneration uint64
+	histActive     uint64
+	histRunning    bool
+	histCancel     context.CancelFunc
+	histPending    *historyRequest
+
 	mu         sync.Mutex
 	proto      int
 	subscribed bool
 	bucket     int
-	seq        uint64
+	// cadenceEvery is the number of one-second uplink pulses between lane 0
+	// frames. cadenceLeft counts down to the next one. Only 1 and 5 are valid:
+	// one hertz while visible, 0.2 hertz while hidden.
+	cadenceEvery uint8
+	cadenceLeft  uint8
+	seq          uint64
 	// lastSent is the value the client was last told for each field. Only
 	// fields actually put on the wire are recorded, so anything dropped to
 	// fit a bucket is simply still different next tick and goes then.
@@ -191,17 +206,19 @@ func New(cfg Config) (*Handler, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Handler{
-		cfg:      cfg,
-		log:      cfg.Logger.With("component", "appproto"),
-		modes:    wireModes(control.ModeCatalog()),
-		dict:     fieldDict(cfg.SrcGrid, cfg.SrcPV, cfg.SrcBattery),
-		cmds:     newCmdLog(),
-		ops:      defaultOps(),
-		ctx:      ctx,
-		cancel:   cancel,
-		proto:    ProtoMax,
-		bucket:   512,
-		lastSent: map[string]int64{},
+		cfg:          cfg,
+		log:          cfg.Logger.With("component", "appproto"),
+		modes:        wireModes(control.ModeCatalog()),
+		dict:         fieldDict(cfg.SrcGrid, cfg.SrcPV, cfg.SrcBattery),
+		cmds:         newCmdLog(),
+		ops:          defaultOps(),
+		ctx:          ctx,
+		cancel:       cancel,
+		proto:        ProtoMax,
+		bucket:       512,
+		cadenceEvery: 1,
+		cadenceLeft:  1,
+		lastSent:     map[string]int64{},
 	}, nil
 }
 
@@ -213,6 +230,12 @@ func New(cfg Config) (*Handler, error) {
 // passthrough.
 func (h *Handler) Close() {
 	h.cancel()
+	h.histMu.Lock()
+	if h.histCancel != nil {
+		h.histCancel()
+	}
+	h.histPending = nil
+	h.histMu.Unlock()
 }
 
 // ScopesForRole expands a registry role into the scopes it carries.
@@ -354,6 +377,7 @@ func (h *Handler) onHello(env Envelope) error {
 	source, syncedAtMs := h.cfg.Clock.Sync()
 	id := h.cfg.Info.Identity()
 
+	fastSub := hello.Sub != nil && boot == nil
 	body := HelloOK{
 		Proto: proto,
 		Mode:  mode,
@@ -363,13 +387,14 @@ func (h *Handler) onHello(env Envelope) error {
 			SyncedAtMs: syncedAtMs,
 			UptimeMs:   h.cfg.Clock.UptimeMs(),
 		},
-		Caps:     caps,
-		CapsHash: capsHash(caps),
-		Modes:    h.modes,
-		Boot:     boot,
-		Hint:     hint,
-		Role:     h.cfg.Caller.Role,
-		Scopes:   h.cfg.Caller.Scopes.Names(),
+		Caps:       caps,
+		CapsHash:   capsHash(caps),
+		Modes:      h.modes,
+		Boot:       boot,
+		Hint:       hint,
+		Role:       h.cfg.Caller.Role,
+		Scopes:     h.cfg.Caller.Scopes.Names(),
+		Subscribed: fastSub,
 	}
 
 	h.mu.Lock()
@@ -379,7 +404,13 @@ func (h *Handler) onHello(env Envelope) error {
 	// Bulk, not lane 0. The reply carries the capability list and the mode
 	// catalogue, both of which vary in size with what the box supports, and
 	// lane 0 exists so that its frames vary in size with nothing.
-	return h.sendBulk(MsgHelloOK, nil, body)
+	if err := h.sendBulk(MsgHelloOK, nil, body); err != nil {
+		return err
+	}
+	if fastSub {
+		return h.applySub(*hello.Sub)
+	}
+	return nil
 }
 
 // canWrite reports whether this grant carries any scope that changes
@@ -433,6 +464,10 @@ func (h *Handler) onSub(env Envelope) error {
 		})
 	}
 
+	return h.applySub(sub)
+}
+
+func (h *Handler) applySub(sub Sub) error {
 	bucket := sub.Bucket
 	if bucket != 256 && bucket != 512 {
 		// Lane 0 is one of two sizes for the life of the session. An
@@ -441,13 +476,36 @@ func (h *Handler) onSub(env Envelope) error {
 		bucket = 512
 	}
 
+	cadence := uint8(1)
+	if sub.Hz == 0.2 {
+		cadence = 5
+	}
+
 	h.mu.Lock()
-	h.subscribed = true
+	if h.subscribed {
+		// The control bucket stays fixed for this Noise session. A visibility
+		// change updates only the cadence and preserves the delta sequence.
+		h.cadenceEvery = cadence
+		h.cadenceLeft = cadence
+		h.mu.Unlock()
+		return nil
+	}
 	h.bucket = bucket
 	h.seq = 0
+	h.cadenceEvery = cadence
+	h.cadenceLeft = cadence
 	h.mu.Unlock()
 
-	return h.sendSnapshot()
+	// Keep subscribed false until the full snapshot is on the wire. Otherwise
+	// the one-second ticker can race ahead and send a delta before the snapshot
+	// that gives it meaning.
+	if err := h.sendSnapshot(); err != nil {
+		return err
+	}
+	h.mu.Lock()
+	h.subscribed = true
+	h.mu.Unlock()
+	return nil
 }
 
 // sendSnapshot puts the full site state on the bulk lane and records what the
@@ -482,16 +540,22 @@ func (h *Handler) sendSnapshot() error {
 	})
 }
 
-// Tick emits one telemetry frame. The caller drives it on the cadence the
-// subscription asked for and never skips a beat: a tick goes out even when
-// nothing changed, because silence would tell the relay operator that nothing
-// happened in the house that second.
+// Tick consumes one global one-second pulse. The handler gates that pulse to
+// this subscription's 1 Hz or 0.2 Hz cadence. On each due pulse it emits a
+// frame even when nothing changed, so the relay cannot distinguish an idle
+// house from an active one within the chosen cadence.
 func (h *Handler) Tick() error {
 	h.mu.Lock()
 	if !h.subscribed {
 		h.mu.Unlock()
 		return nil
 	}
+	if h.cadenceLeft > 1 {
+		h.cadenceLeft--
+		h.mu.Unlock()
+		return nil
+	}
+	h.cadenceLeft = h.cadenceEvery
 	bucket := h.bucket
 	h.mu.Unlock()
 

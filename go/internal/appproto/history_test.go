@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"math"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -87,25 +88,42 @@ type fakeLedger struct {
 	err    error
 }
 
-func (f *fakeLedger) Series(
-	_ context.Context, name string, stepMs, fromMs, toMs int64,
-) ([]HistorySample, error) {
+func (f *fakeLedger) Window(
+	_ context.Context, names []string, stepMs, fromMs, toMs int64,
+) (map[string][]HistorySample, error) {
 	f.calls++
 	if f.err != nil {
 		return nil, f.err
 	}
-	value, ok := f.values[name]
-	if !ok {
-		return nil, nil
-	}
-	var out []HistorySample
-	for at := fromMs; at < toMs; at += stepMs {
-		if f.holes[at] {
+	out := make(map[string][]HistorySample, len(names))
+	for _, name := range names {
+		value, ok := f.values[name]
+		if !ok {
 			continue
 		}
-		out = append(out, HistorySample{StartMs: at, W: value})
+		for at := fromMs; at < toMs; at += stepMs {
+			if f.holes[at] {
+				continue
+			}
+			out[name] = append(out[name], HistorySample{StartMs: at, W: value})
+		}
 	}
 	return out, nil
+}
+
+func waitHistory(t *testing.T, h *Handler) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		h.histMu.Lock()
+		idle := !h.histRunning && h.histPending == nil
+		h.histMu.Unlock()
+		if idle {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("history worker did not become idle")
 }
 
 func newHistoryRig(t *testing.T, ledger HistoryProvider) (*Handler, *recorder, *fakeClock) {
@@ -130,6 +148,7 @@ func newHistoryRig(t *testing.T, ledger HistoryProvider) (*Handler, *recorder, *
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	t.Cleanup(h.Close)
 	subscribe(t, h, rec)
 	return h, rec, clock
 }
@@ -159,6 +178,11 @@ func TestHistQueryServesTilesAndAnEnd(t *testing.T) {
 		FromMs: from,
 		ToMs:   clock.now.UnixMilli(),
 	})
+	waitHistory(t, h)
+	wantCalls := len(planHistoryQuery(ResN5m, from, clock.now.UnixMilli(), defaultMaxPoints).tiles)
+	if ledger.calls != wantCalls {
+		t.Fatalf("provider called %d times for %d tiles and two series; want one read per tile", ledger.calls, wantCalls)
+	}
 
 	chunks := histChunks(rec)
 	if len(chunks) == 0 {
@@ -194,6 +218,204 @@ func TestHistQueryServesTilesAndAnEnd(t *testing.T) {
 	}
 }
 
+type cancelLedger struct {
+	calls    atomic.Int32
+	started  chan struct{}
+	canceled chan struct{}
+}
+
+type stubbornLedger struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (f *stubbornLedger) Window(
+	_ context.Context, _ []string, _ int64, _, _ int64,
+) (map[string][]HistorySample, error) {
+	close(f.started)
+	<-f.release
+	return map[string][]HistorySample{}, nil
+}
+
+func (f *cancelLedger) Window(
+	ctx context.Context, _ []string, _ int64, _, _ int64,
+) (map[string][]HistorySample, error) {
+	if f.calls.Add(1) == 1 {
+		close(f.started)
+		<-ctx.Done()
+		close(f.canceled)
+		return nil, ctx.Err()
+	}
+	return map[string][]HistorySample{}, nil
+}
+
+func TestHistoryDoesNotBlockFramesAndNewestQueryCancelsTheOldOne(t *testing.T) {
+	ledger := &cancelLedger{started: make(chan struct{}), canceled: make(chan struct{})}
+	h, rec, clock := newHistoryRig(t, ledger)
+	from := clock.now.UnixMilli() - 3_600_000
+
+	deliver(t, h, MsgHistQuery, ptrU32(20), HistQuery{
+		Series: []string{"grid_w"}, Res: ResN5m, FromMs: from, ToMs: clock.now.UnixMilli(),
+	})
+	select {
+	case <-ledger.started:
+	case <-time.After(time.Second):
+		t.Fatal("history provider did not start")
+	}
+
+	// The shared uplink reader can still dispatch another message while SQLite
+	// history is waiting.
+	deliver(t, h, MsgPlanGet, ptrU32(21), nil)
+	if !rec.has(MsgPlan) {
+		t.Fatal("history query blocked a later frame")
+	}
+
+	deliver(t, h, MsgHistQuery, ptrU32(22), HistQuery{
+		Series: []string{"grid_w"}, Res: ResN5m, FromMs: from, ToMs: clock.now.UnixMilli(),
+	})
+	select {
+	case <-ledger.canceled:
+	case <-time.After(time.Second):
+		t.Fatal("replacement did not cancel the old provider context")
+	}
+	waitHistory(t, h)
+
+	var superseded, completed bool
+	for _, f := range rec.snapshot() {
+		switch f.env.T {
+		case MsgError:
+			if f.env.ID != nil && *f.env.ID == 20 {
+				superseded = body[ErrorBody](t, f).Args["reason"] == "superseded"
+			}
+		case MsgHistEnd:
+			completed = f.env.ID != nil && *f.env.ID == 22
+		}
+	}
+	if !superseded || !completed {
+		t.Fatalf("superseded=%v completed=%v; frames=%s", superseded, completed, rec.types())
+	}
+}
+
+func TestEvictedQuerySupersedesAProviderThatIgnoresCancellation(t *testing.T) {
+	ledger := &stubbornLedger{started: make(chan struct{}), release: make(chan struct{})}
+	h, rec, clock := newHistoryRig(t, ledger)
+	deliver(t, h, MsgHistQuery, ptrU32(30), HistQuery{
+		Series: []string{"grid_w"}, Res: ResN5m,
+		FromMs: clock.now.UnixMilli() - 3_600_000, ToMs: clock.now.UnixMilli(),
+	})
+	select {
+	case <-ledger.started:
+	case <-time.After(time.Second):
+		t.Fatal("stubborn provider did not start")
+	}
+
+	// This valid window is wholly beyond retention and needs no provider read,
+	// but it is still the newest query and must replace the active one.
+	deliver(t, h, MsgHistQuery, ptrU32(31), HistQuery{
+		Series: []string{"grid_w"}, Res: ResN5m,
+		FromMs: clock.now.Add(-3 * 365 * 24 * time.Hour).UnixMilli(),
+		ToMs:   clock.now.Add(-5 * 365 * 24 * time.Hour / 2).UnixMilli(),
+	})
+	close(ledger.release)
+	waitHistory(t, h)
+
+	var oldError, newEnd bool
+	for _, f := range rec.snapshot() {
+		if f.env.ID == nil {
+			continue
+		}
+		switch *f.env.ID {
+		case 30:
+			if f.env.T == MsgHistChunk || f.env.T == MsgHistEnd {
+				t.Fatalf("superseded query sent %s after its ignored cancellation", f.env.T)
+			}
+			if f.env.T == MsgError {
+				oldError = body[ErrorBody](t, f).Args["reason"] == "superseded"
+			}
+		case 31:
+			newEnd = f.env.T == MsgHistEnd
+		}
+	}
+	if !oldError || !newEnd {
+		t.Fatalf("oldError=%v newEnd=%v; frames=%s", oldError, newEnd, rec.types())
+	}
+}
+
+func TestHistoryClampsPointsAndSkipsEvictedYears(t *testing.T) {
+	ledger := &fakeLedger{values: map[string]float64{"grid_w": 500}}
+	h, rec, clock := newHistoryRig(t, ledger)
+	tooMany := int64(math.MaxInt64)
+	from := clock.now.Add(-3 * 365 * 24 * time.Hour).UnixMilli()
+	deliver(t, h, MsgHistQuery, ptrU32(23), HistQuery{
+		Series: []string{"grid_w"}, Res: ResN5m, FromMs: from, ToMs: clock.now.UnixMilli(),
+		MaxPoints: &tooMany,
+	})
+	waitHistory(t, h)
+
+	chunks := histChunks(rec)
+	if len(chunks) == 0 || len(chunks) > 106 {
+		t.Fatalf("bounded two-year query returned %d tiles", len(chunks))
+	}
+	if ledger.calls != len(chunks) {
+		t.Fatalf("provider reads=%d chunks=%d, want one per served tile", ledger.calls, len(chunks))
+	}
+	end := body[HistEnd](t, rec.only(t, MsgHistEnd))
+	if len(end.Gaps) != 1 || end.Gaps[0].Reason != GapEvicted {
+		t.Fatalf("gaps = %+v, want the skipped year marked evicted", end.Gaps)
+	}
+}
+
+func TestHistoryRefusesDuplicateSeries(t *testing.T) {
+	h, rec, clock := newHistoryRig(t, &fakeLedger{})
+	deliver(t, h, MsgHistQuery, ptrU32(24), HistQuery{
+		Series: []string{"grid_w", "grid_w"}, Res: ResN5m,
+		FromMs: clock.now.UnixMilli() - 3_600_000, ToMs: clock.now.UnixMilli(),
+	})
+	if got := body[ErrorBody](t, rec.only(t, MsgError)); got.Code != ErrUnknownOp {
+		t.Fatalf("duplicate series returned %s", got.Code)
+	}
+}
+
+func TestUnknownHistorySeriesDegradesToMissing(t *testing.T) {
+	h, rec, clock := newHistoryRig(t, &fakeLedger{values: map[string]float64{"grid_w": 500}})
+	deliver(t, h, MsgHistQuery, ptrU32(25), HistQuery{
+		Series: []string{"grid_w", "pv_w", "battery_w", "load_w", "future_w"}, Res: ResN5m,
+		FromMs: clock.now.UnixMilli() - 3_600_000, ToMs: clock.now.UnixMilli(),
+	})
+	waitHistory(t, h)
+	chunks := histChunks(rec)
+	if len(chunks) == 0 {
+		t.Fatal("unknown additive series refused the whole history query")
+	}
+	c := chunks[0]
+	if len(c.Series) != 5 || c.Series[4] != "future_w" {
+		t.Fatalf("series = %v, want the additive fifth column preserved", c.Series)
+	}
+	points := len(c.Data) / 4 / len(c.Series)
+	for p := 0; p < points; p++ {
+		off := (4*points + p) * 4
+		if got := int32(binary.LittleEndian.Uint32(c.Data[off:])); got != math.MinInt32 {
+			t.Fatalf("future series point %d = %d, want MISSING", p, got)
+		}
+	}
+}
+
+func BenchmarkBuildHistoryTileFourSeries(b *testing.B) {
+	ledger := &fakeLedger{values: map[string]float64{
+		"grid_w": 1200, "pv_w": -800, "battery_w": 300, "load_w": 1700,
+	}}
+	h := &Handler{cfg: Config{History: ledger}}
+	start := int64(1_760_000_000_000)
+	plan := planHistoryQuery(ResN5m, start, start+ResolutionTileSpanMs[ResN5m], defaultMaxPoints)
+	series := []string{"grid_w", "pv_w", "battery_w", "load_w"}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := h.buildTile(context.Background(), series, plan, plan.tiles[0], start+2*ResolutionTileSpanMs[ResN5m]); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func TestHistQueryTurnsAbsentBucketsIntoMissing(t *testing.T) {
 	holeAt := tileStartFor(ResN5m, 1_760_000_000_000-6*3_600_000)
 	ledger := &fakeLedger{
@@ -208,6 +430,7 @@ func TestHistQueryTurnsAbsentBucketsIntoMissing(t *testing.T) {
 		FromMs: clock.now.UnixMilli() - 6*3_600_000,
 		ToMs:   clock.now.UnixMilli(),
 	})
+	waitHistory(t, h)
 
 	c := histChunks(rec)[0]
 	offset := (holeAt - c.StartMs) / c.StepMs
@@ -225,6 +448,7 @@ func TestHistQuerySkipsTilesTheAppAlreadyHolds(t *testing.T) {
 	deliver(t, h, MsgHistQuery, ptrU32(3), HistQuery{
 		Series: []string{"grid_w"}, Res: ResN5m, FromMs: from, ToMs: clock.now.UnixMilli(),
 	})
+	waitHistory(t, h)
 	first := histChunks(rec)
 
 	var have []HistTileRef
@@ -242,6 +466,7 @@ func TestHistQuerySkipsTilesTheAppAlreadyHolds(t *testing.T) {
 		Series: []string{"grid_w"}, Res: ResN5m, FromMs: from, ToMs: clock.now.UnixMilli(),
 		Have: have,
 	})
+	waitHistory(t, h)
 	second := histChunks(rec)
 
 	for _, c := range second {

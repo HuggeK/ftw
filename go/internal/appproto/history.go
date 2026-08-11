@@ -2,8 +2,10 @@ package appproto
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
+	"time"
 )
 
 // History: the box's side of the tile protocol.
@@ -34,12 +36,11 @@ type HistorySample struct {
 // synthetic ledgers. A nil provider means the box keeps no history and says
 // so — the state this package shipped in first.
 type HistoryProvider interface {
-	// Series returns the buckets of `name` overlapping [fromMs, toMs), at
-	// the stored bucket width `stepMs`. Missing buckets are simply absent;
-	// the tile builder turns absence into MISSING samples. An unknown name
-	// returns an empty slice — a series that does not exist has no data,
-	// which is already a thing the wire can say.
-	Series(ctx context.Context, name string, stepMs, fromMs, toMs int64) ([]HistorySample, error)
+	// Window returns every requested series overlapping [fromMs, toMs), at the
+	// stored bucket width stepMs. One call is one store read; asking once per
+	// series made a four-column tile scan the same SQLite range four times.
+	// Missing buckets and unknown series are absent from the result.
+	Window(ctx context.Context, names []string, stepMs, fromMs, toMs int64) (map[string][]HistorySample, error)
 }
 
 // resolutionStepMs is the stored bucket width per resolution. This is the
@@ -52,8 +53,15 @@ var resolutionStepMs = map[Resolution]int64{
 // resolutionOrder is fine to coarse: the order the box clamps along.
 var resolutionOrder = []Resolution{ResN5m, ResN1h}
 
-// defaultMaxPoints matches the app's DEFAULT_MAX_POINTS.
-const defaultMaxPoints = 2000
+const (
+	// defaultMaxPoints matches the app's DEFAULT_MAX_POINTS and is also the
+	// server ceiling. A client may ask for fewer points, never more.
+	defaultMaxPoints = 2000
+	// Sixteen full 168-point columns occupy 10,752 bytes, leaving room for
+	// metadata inside the 16 KiB bulk bucket while allowing additive fields.
+	maxHistorySeries = 16
+	historyTimeout   = 15 * time.Second
+)
 
 // missingSample marks a hole on the wire. Distinct from zero, which is a
 // real reading. Same value as the app's MISSING_SAMPLE.
@@ -178,7 +186,18 @@ func planHistoryQuery(res Resolution, fromMs, toMs int64, maxPoints int) history
 // Serving a query
 // --------------------------------------------------------------------------
 
+type historyRequest struct {
+	generation uint64
+	id         uint32
+	series     []string
+	plan       historyPlan
+	have       map[string]string
+	gaps       []HistGap
+	nowMs      int64
+}
+
 func (h *Handler) onHistQuery(ctx context.Context, env Envelope) error {
+	_ = ctx // Work derives from the handler lifetime after validation below.
 	if env.ID == nil {
 		// A response nobody can route is a response nobody asked for.
 		return nil
@@ -196,63 +215,216 @@ func (h *Handler) onHistQuery(ctx context.Context, env Envelope) error {
 		h.log.Warn("undecodable hist.query dropped", "err", err)
 		return nil
 	}
-	if _, ok := ResolutionTileSpanMs[q.Res]; !ok || len(q.Series) == 0 || q.ToMs <= q.FromMs {
+	nowMs := h.cfg.Clock.Now().UnixMilli()
+	if _, ok := ResolutionTileSpanMs[q.Res]; !ok || len(q.Series) == 0 ||
+		len(q.Series) > maxHistorySeries || q.FromMs < 0 || q.ToMs <= q.FromMs || q.FromMs >= nowMs {
 		return h.sendError(env.ID, ErrorBody{
 			Code:      ErrUnknownOp,
 			Retryable: false,
 			Args:      map[string]any{"t": MsgHistQuery},
 		})
 	}
+	seenSeries := make(map[string]bool, len(q.Series))
+	series := make([]string, 0, len(q.Series))
+	for _, name := range q.Series {
+		badName := name == "" || len(name) > 64
+		for _, r := range name {
+			if r < 0x20 || r == 0x7f {
+				badName = true
+				break
+			}
+		}
+		if badName || seenSeries[name] {
+			return h.sendError(env.ID, ErrorBody{
+				Code:      ErrUnknownOp,
+				Retryable: false,
+				Args:      map[string]any{"t": MsgHistQuery, "field": "series"},
+			})
+		}
+		// Unknown names stay in the column list and receive MISSING samples.
+		// That lets a newer app ask an older box for one additive series without
+		// losing the four fields both builds understand.
+		seenSeries[name] = true
+		series = append(series, name)
+	}
 
 	maxPoints := defaultMaxPoints
 	if q.MaxPoints != nil && *q.MaxPoints > 0 {
-		maxPoints = int(*q.MaxPoints)
+		maxPoints = int(min(*q.MaxPoints, int64(defaultMaxPoints)))
 	}
 
-	have := make(map[string]string, len(q.Have))
+	// History cannot contain future rows, and nothing older than the coarsest
+	// store's retention can be served. Clamp before planning so an authenticated
+	// but broken client cannot make a loop spanning years of empty tiles.
+	toMs := min(q.ToMs, nowMs)
+	oldestMs := max(int64(0), nowMs-retentionMsOf(ResN1h))
+	fromMs := max(q.FromMs, oldestMs)
+	if toMs <= fromMs {
+		gaps := []HistGap{{FromMs: q.FromMs, ToMs: min(q.ToMs, oldestMs), Reason: GapEvicted}}
+		h.enqueueHistory(historyRequest{
+			id: *env.ID, series: series, plan: historyPlan{res: q.Res}, gaps: gaps, nowMs: nowMs,
+		})
+		return nil
+	}
+
+	plan := planHistoryQuery(q.Res, fromMs, toMs, maxPoints)
+	retainedFrom := max(int64(0), nowMs-retentionMsOf(plan.res))
+	if fromMs < retainedFrom {
+		fromMs = retainedFrom
+		if toMs <= fromMs {
+			gaps := []HistGap{{FromMs: q.FromMs, ToMs: min(q.ToMs, retainedFrom), Reason: GapEvicted}}
+			h.enqueueHistory(historyRequest{
+				id: *env.ID, series: series, plan: historyPlan{res: plan.res}, gaps: gaps, nowMs: nowMs,
+			})
+			return nil
+		}
+		plan = planHistoryQuery(q.Res, fromMs, toMs, maxPoints)
+	}
+
+	planned := make(map[string]bool, len(plan.tiles))
+	for _, tile := range plan.tiles {
+		planned[tile.id] = true
+	}
+	have := make(map[string]string, min(len(q.Have), len(plan.tiles)))
 	for _, ref := range q.Have {
-		have[ref.TileID] = ref.Etag
+		if planned[ref.TileID] {
+			have[ref.TileID] = ref.Etag
+		}
 	}
-
-	plan := planHistoryQuery(q.Res, q.FromMs, q.ToMs, maxPoints)
-	nowMs := h.cfg.Clock.Now().UnixMilli()
 
 	// Ranges the retention window has already eaten are named, not served as
 	// silence — the app says "evicted" instead of drawing a suspicious hole.
 	var gaps []HistGap
-	if retainedFrom := nowMs - retentionMsOf(plan.res); plan.tiles[0].startMs < retainedFrom {
+	if q.FromMs < retainedFrom {
 		gaps = append(gaps, HistGap{
-			FromMs: plan.tiles[0].startMs,
+			FromMs: q.FromMs,
 			ToMs:   min(retainedFrom, q.ToMs),
 			Reason: GapEvicted,
 		})
 	}
+	if gaps == nil {
+		gaps = []HistGap{}
+	}
 
-	for _, tile := range plan.tiles {
-		chunk, err := h.buildTile(ctx, q.Series, plan, tile, nowMs)
+	req := historyRequest{
+		id: *env.ID, series: series, plan: plan, have: have, gaps: gaps, nowMs: nowMs,
+	}
+	h.enqueueHistory(req)
+	return nil
+}
+
+func (h *Handler) enqueueHistory(req historyRequest) {
+	h.histMu.Lock()
+	h.histGeneration++
+	req.generation = h.histGeneration
+	if h.histCancel != nil {
+		h.histCancel()
+	}
+	replaced := h.histPending
+	h.histPending = &req
+	start := !h.histRunning
+	if start {
+		h.histRunning = true
+	}
+	h.histMu.Unlock()
+
+	if replaced != nil {
+		_ = h.sendHistoryError(replaced.id, "superseded")
+	}
+	if start {
+		go h.runHistory()
+	}
+}
+
+func (h *Handler) runHistory() {
+	for {
+		h.histMu.Lock()
+		if h.histPending == nil {
+			h.histRunning = false
+			h.histCancel = nil
+			h.histActive = 0
+			h.histMu.Unlock()
+			return
+		}
+		req := *h.histPending
+		h.histPending = nil
+		if req.generation != h.histGeneration {
+			h.histMu.Unlock()
+			_ = h.sendHistoryError(req.id, "superseded")
+			continue
+		}
+		ctx, cancel := context.WithTimeout(h.ctx, historyTimeout)
+		h.histActive = req.generation
+		h.histCancel = cancel
+		h.histMu.Unlock()
+
+		err := h.serveHistory(ctx, req)
+		cancel()
+
+		h.histMu.Lock()
+		superseded := req.generation != h.histGeneration
+		if h.histActive == req.generation {
+			h.histActive = 0
+			h.histCancel = nil
+		}
+		sessionDone := h.ctx.Err() != nil
+		h.histMu.Unlock()
+
+		if sessionDone {
+			continue
+		}
+		switch {
+		case superseded && err != nil:
+			err = h.sendHistoryError(req.id, "superseded")
+		case errors.Is(err, context.DeadlineExceeded):
+			err = h.sendHistoryError(req.id, "timeout")
+		case err != nil:
+			err = h.sendHistoryError(req.id, "provider")
+		}
 		if err != nil {
-			return h.sendError(env.ID, ErrorBody{
-				Code:      ErrUnavailable,
-				Retryable: ErrorRetryable[ErrUnavailable],
-				Args:      map[string]any{"subsystem": "history"},
-			})
+			h.log.Warn("history query failed", "err", err)
+		}
+	}
+}
+
+func (h *Handler) sendHistoryError(id uint32, reason string) error {
+	if h.ctx.Err() != nil {
+		return nil
+	}
+	return h.sendError(&id, ErrorBody{
+		Code:      ErrUnavailable,
+		Retryable: ErrorRetryable[ErrUnavailable],
+		Args:      map[string]any{"subsystem": "history", "reason": reason},
+	})
+}
+
+func (h *Handler) serveHistory(ctx context.Context, req historyRequest) error {
+	for _, tile := range req.plan.tiles {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		chunk, err := h.buildTile(ctx, req.series, req.plan, tile, req.nowMs)
+		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		// A closed tile the app already holds, byte for byte, is not resent.
 		// Partial tiles always go: their content moves with the clock, which
 		// is exactly why the app never caches them.
-		if !chunk.Partial && have[chunk.TileID] == chunk.Etag {
+		if !chunk.Partial && req.have[chunk.TileID] == chunk.Etag {
 			continue
 		}
-		if err := h.sendBulk(MsgHistChunk, env.ID, chunk); err != nil {
+		if err := h.sendBulk(MsgHistChunk, &req.id, chunk); err != nil {
 			return err
 		}
 	}
 
-	if gaps == nil {
-		// An absent list and an empty list must be the same statement.
-		gaps = []HistGap{}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	return h.sendBulk(MsgHistEnd, env.ID, HistEnd{ResActual: plan.res, Gaps: gaps})
+	return h.sendBulk(MsgHistEnd, &req.id, HistEnd{ResActual: req.plan.res, Gaps: req.gaps})
 }
 
 // buildTile reads the provider and packs one tile: int32 LE columns, one
@@ -268,12 +440,14 @@ func (h *Handler) buildTile(
 	tileEnd := tile.startMs + ResolutionTileSpanMs[plan.res]
 	points := tile.points
 
+	windows, err := h.cfg.History.Window(ctx, series, stepMs, tile.startMs, tileEnd)
+	if err != nil {
+		return HistChunk{}, err
+	}
+
 	data := make([]byte, int64(len(series))*points*4)
 	for s, name := range series {
-		samples, err := h.cfg.History.Series(ctx, name, stepMs, tile.startMs, tileEnd)
-		if err != nil {
-			return HistChunk{}, err
-		}
+		samples := windows[name]
 
 		// Stored buckets fold into strided points by plain mean: the ledger's
 		// buckets are equal width, so each carries equal weight.

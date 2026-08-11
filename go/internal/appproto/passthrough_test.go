@@ -1,6 +1,9 @@
 package appproto
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -10,6 +13,24 @@ import (
 
 	"github.com/srcfl/ftw/go/internal/apiauth"
 )
+
+type discardFrameSender struct{}
+
+func (discardFrameSender) Send([]byte) error { return nil }
+
+type failAtFrameSender struct {
+	calls  int
+	failAt int
+	err    error
+}
+
+func (s *failAtFrameSender) Send([]byte) error {
+	s.calls++
+	if s.calls == s.failAt {
+		return s.err
+	}
+	return nil
+}
 
 // stubAPI stands in for the box's HTTP layer where the test is about the
 // carriage rather than about who may ask. The refusals that matter — a viewer
@@ -321,6 +342,78 @@ func TestAnAnswerPastTheCeilingStopsAndSaysSo(t *testing.T) {
 	}
 	if got := len(apiChunks(rec)); got != 20_000 {
 		t.Fatalf("chunks carried %d bytes, want 20000", got)
+	}
+}
+
+func TestAPIWriterKeepsOnlyOneChunkBuffered(t *testing.T) {
+	ctx := context.Background()
+	h := &Handler{cfg: Config{Codec: testCodec{}, Sender: discardFrameSender{}}, ctx: ctx, bucket: 512}
+	w := &apiWriter{
+		h: h, id: 1, ctx: ctx, max: APIMaxBytes, header: make(http.Header),
+		buf: make([]byte, 0, APIChunkBytes),
+	}
+	w.header.Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	payload := make([]byte, 4<<20)
+	if _, err := w.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if cap(w.buf) > 2*APIChunkBytes {
+		t.Fatalf("writer retained a %d-byte buffer, want at most one chunk", cap(w.buf))
+	}
+}
+
+func TestAPIWriterReportsBytesAcceptedBeforeAFlushError(t *testing.T) {
+	wantErr := errors.New("carrier write failed")
+	sender := &failAtFrameSender{failAt: 2, err: wantErr} // api.head succeeds; first chunk fails
+	ctx := context.Background()
+	h := &Handler{cfg: Config{Codec: testCodec{}, Sender: sender}, ctx: ctx, bucket: 512}
+	w := &apiWriter{
+		h: h, id: 1, ctx: ctx, max: APIMaxBytes, header: make(http.Header),
+		buf: make([]byte, 0, APIChunkBytes),
+	}
+	w.header.Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	n, err := w.Write(make([]byte, APIChunkBytes+17))
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Write error = %v, want %v", err, wantErr)
+	}
+	if n != APIChunkBytes {
+		t.Fatalf("Write accepted %d bytes, want the %d bytes consumed before the flush failed", n, APIChunkBytes)
+	}
+	if w.written != APIChunkBytes {
+		t.Fatalf("writer counted %d bytes, want %d actually accepted", w.written, APIChunkBytes)
+	}
+}
+
+func BenchmarkAPIWriterLargeResponse(b *testing.B) {
+	for _, size := range []int{1 << 20, 4 << 20, 8 << 20} {
+		b.Run(fmt.Sprintf("%dMiB", size>>20), func(b *testing.B) {
+			payload := make([]byte, size)
+			ctx := context.Background()
+			h := &Handler{
+				cfg: Config{Codec: testCodec{}, Sender: discardFrameSender{}},
+				ctx: ctx, bucket: 512,
+			}
+			b.ReportAllocs()
+			b.SetBytes(int64(size))
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				w := &apiWriter{
+					h: h, id: 1, ctx: ctx, max: int64(size), header: make(http.Header),
+					buf: make([]byte, 0, APIChunkBytes),
+				}
+				w.header.Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				if _, err := w.Write(payload); err != nil {
+					b.Fatal(err)
+				}
+				if err := w.finish(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }
 

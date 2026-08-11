@@ -2,11 +2,24 @@ package state
 
 import (
 	"context"
+	"errors"
 	"math"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestLoadEnergyHistoryContextHonorsCancellation(t *testing.T) {
+	s := freshStore(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, err := s.LoadEnergyHistoryContext(ctx, EnergyHistoryQuery{
+		SinceMS: 1, UntilMS: 2, BucketMS: EnergyLedgerBucketMS, Limit: 1,
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("LoadEnergyHistoryContext error = %v, want context canceled", err)
+	}
+}
 
 func energyPtr(v float64) *float64 { return &v }
 

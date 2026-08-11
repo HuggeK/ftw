@@ -72,6 +72,10 @@ type Hello struct {
 	Proto   ProtoRange `cbor:"proto"`
 	App     AppInfo    `cbor:"app"`
 	Locales []string   `cbor:"locales"`
+	// Sub folds the first telemetry subscription into the hello. Older boxes
+	// ignore this additive field; subscribed in hello_ok tells a newer app whether
+	// it still needs to send the ordinary sub message.
+	Sub *Sub `cbor:"sub,omitempty"`
 }
 
 type ProtoRange struct {
@@ -119,6 +123,9 @@ type HelloOK struct {
 	// alone would leave the app unable to say "viewer" in a sentence.
 	Role   string   `cbor:"role"`
 	Scopes []string `cbor:"scopes"`
+	// Subscribed says the optional subscription carried by Hello was accepted.
+	// False also covers an older box, where this additive field is absent.
+	Subscribed bool `cbor:"subscribed,omitempty"`
 }
 
 // HintAppUpdate tells the app it is behind. It is a hint, not an error: the
@@ -173,10 +180,11 @@ const (
 
 // Sub starts the telemetry stream.
 type Sub struct {
-	// Bucket is the lane 0 frame size, fixed for the session: 256 or 512.
+	// Bucket is the lane 0 frame size, fixed by the first subscription: 256 or
+	// 512. A later sub may change only Hz.
 	Bucket int `cbor:"bucket"`
-	// Hz is the cadence: 1 in the foreground, 0.2 when the document is
-	// hidden. Also fixed for the session.
+	// Hz is the cadence: 1 in the foreground, 0.2 when the document is hidden.
+	// The app sends another sub when its visibility changes.
 	Hz float64 `cbor:"hz"`
 }
 

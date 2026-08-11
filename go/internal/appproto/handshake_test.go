@@ -26,6 +26,38 @@ func TestHelloNegotiatesDownToTheClient(t *testing.T) {
 	}
 }
 
+func TestHelloCanCarryTheFirstSubscription(t *testing.T) {
+	h, _, rec, _ := newRig(t)
+
+	deliver(t, h, MsgHello, nil, Hello{
+		Proto: ProtoRange{Min: 0, Max: ProtoMax},
+		App:   AppInfo{Build: "test", UA: "pwa"},
+		Sub:   &Sub{Bucket: 512, Hz: 1},
+	})
+
+	frames := rec.snapshot()
+	if len(frames) != 2 || frames[0].env.T != MsgHelloOK || frames[1].env.T != MsgSnap {
+		t.Fatalf("fast hello sent %s, want hello_ok then snap", rec.types())
+	}
+	ok := body[HelloOK](t, frames[0])
+	if !ok.Subscribed {
+		t.Fatal("hello_ok did not acknowledge the folded subscription")
+	}
+	if !h.Subscribed() {
+		t.Fatal("folded subscription did not start telemetry")
+	}
+}
+
+func TestHelloWithoutAFoldedSubscriptionKeepsTheOldFlow(t *testing.T) {
+	h, _, rec, _ := newRig(t)
+	deliver(t, h, MsgHello, nil, Hello{Proto: ProtoRange{Min: 0, Max: ProtoMax}})
+
+	ok := body[HelloOK](t, rec.only(t, MsgHelloOK))
+	if ok.Subscribed || h.Subscribed() || rec.has(MsgSnap) {
+		t.Fatal("ordinary hello subscribed before the old client sent sub")
+	}
+}
+
 // An app too old for the box degrades instead of dying. A hard version wall is
 // a white screen for everyone whose service worker pinned an old bundle.
 func TestHelloFromTooOldAnAppGetsFloorNotAnError(t *testing.T) {
@@ -103,7 +135,10 @@ func TestHelloOKReportsBootProgress(t *testing.T) {
 	eta := int64(90_000)
 	box.boot = &BootProgress{Phase: BootPhaseVacuum, Pct: 40, EtaMs: &eta}
 
-	deliver(t, h, MsgHello, nil, Hello{Proto: ProtoRange{Min: 0, Max: ProtoMax}})
+	deliver(t, h, MsgHello, nil, Hello{
+		Proto: ProtoRange{Min: 0, Max: ProtoMax},
+		Sub:   &Sub{Bucket: 512, Hz: 1},
+	})
 	ok := body[HelloOK](t, rec.only(t, MsgHelloOK))
 
 	if ok.Mode != BoxModeBooting {
@@ -111,6 +146,9 @@ func TestHelloOKReportsBootProgress(t *testing.T) {
 	}
 	if ok.Boot == nil || ok.Boot.Phase != BootPhaseVacuum || ok.Boot.Pct != 40 {
 		t.Fatalf("boot = %+v", ok.Boot)
+	}
+	if ok.Subscribed || rec.has(MsgSnap) {
+		t.Fatal("booting box acknowledged a subscription it cannot serve")
 	}
 }
 
