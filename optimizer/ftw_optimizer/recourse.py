@@ -9,6 +9,7 @@ import cvxpy as cp
 import numpy as np
 
 from . import SCHEMA_VERSION
+from .deadline import SolveDeadline
 from .model import (
     OPTIMAL_STATUSES,
     _arbitrage_spread_ore_kwh,
@@ -31,7 +32,10 @@ class ScenarioStorage:
     energy: cp.Variable
 
 
-def solve_storage_recourse(payload: dict[str, Any]) -> dict[str, Any]:
+def solve_storage_recourse(
+    payload: dict[str, Any],
+    deadline: SolveDeadline | None = None,
+) -> dict[str, Any]:
     """Solve a two-stage stochastic storage problem.
 
     Decisions in the configured non-anticipative prefix are shared across all
@@ -40,8 +44,11 @@ def solve_storage_recourse(payload: dict[str, Any]) -> dict[str, Any]:
     its shared first-stage action is intended for execution before replanning.
     """
 
-    payload = _canonicalize_storage_payload(payload)
     started = time.perf_counter()
+    payload = _canonicalize_storage_payload(payload)
+    if deadline is None:
+        deadline = SolveDeadline.from_payload(payload, started_at=started)
+    deadline.check("recourse model build")
     settings = require_dict(payload.get("settings", {}), "settings")
     if require_list(payload.get("flex_loads", []), "flex_loads"):
         raise ProtocolError("recourse shadow does not yet support flex_loads")
@@ -195,9 +202,9 @@ def solve_storage_recourse(payload: dict[str, Any]) -> dict[str, Any]:
                 discrete = True
             target = spec.get("target_energy_wh")
             if target is not None:
-                deadline = min(n - 1, max(0, int(spec.get("target_slot", n - 1))))
+                target_slot = min(n - 1, max(0, int(spec.get("target_slot", n - 1))))
                 shortfall = cp.Variable(nonneg=True, name=f"scenario_{si}_storage_{i}_shortfall")
-                constraints.append(energy[deadline + 1] + shortfall >= finite_number(target, f"storages[{i}].target_energy_wh"))
+                constraints.append(energy[target_slot + 1] + shortfall >= finite_number(target, f"storages[{i}].target_energy_wh"))
                 scenario_service += shortfall / capacity
 
             cycle_ore = max(0.0, finite_number(spec.get("cycle_cost_ore_kwh", 0), "storage.cycle_cost_ore_kwh"))
@@ -302,13 +309,19 @@ def solve_storage_recourse(payload: dict[str, Any]) -> dict[str, Any]:
 
     def run_problem(problem: cp.Problem, solver_name: str) -> None:
         solver = cp.HIGHS if solver_name == "HIGHS" else cp.CLARABEL
-        problem.solve(solver=solver, warm_start=True, **_solver_options(settings, solver))
+        problem.solve(
+            solver=solver,
+            warm_start=True,
+            **_solver_options(settings, solver, deadline),
+        )
+        deadline.check(f"recourse {solver_name} solve")
 
     slack_problem = cp.Problem(cp.Minimize(worst_service_slack), constraints)
     solver_used = preferred_solver
     try:
         run_problem(slack_problem, solver_used)
     except cp.error.SolverError:
+        deadline.check("recourse service solver fallback")
         if discrete or solver_used == "CLARABEL":
             raise
         solver_used = "CLARABEL"
@@ -323,6 +336,7 @@ def solve_storage_recourse(payload: dict[str, Any]) -> dict[str, Any]:
     try:
         run_problem(cost_problem, solver_used)
     except cp.error.SolverError:
+        deadline.check("recourse economic solver fallback")
         if discrete or solver_used == "CLARABEL":
             raise
         solver_used = "CLARABEL"

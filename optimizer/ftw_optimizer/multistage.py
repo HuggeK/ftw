@@ -11,6 +11,7 @@ import cvxpy as cp
 import numpy as np
 
 from . import SCHEMA_VERSION
+from .deadline import SolveDeadline, SolveDeadlineExceeded
 from .model import (
     OPTIMAL_STATUSES,
     ReplayConsistencyError,
@@ -166,11 +167,18 @@ class CompiledMultistage:
             )
 
 
-def solve_storage_multistage(payload: dict[str, Any]) -> dict[str, Any]:
+def solve_storage_multistage(
+    payload: dict[str, Any],
+    deadline: SolveDeadline | None = None,
+) -> dict[str, Any]:
     started = time.perf_counter()
+    if deadline is None:
+        deadline = SolveDeadline.from_payload(payload, started_at=started)
+    deadline.check("multistage model build")
     prepared_started = time.perf_counter()
     prepared = _prepare(payload)
     prepare_ms = (time.perf_counter() - prepared_started) * 1000.0
+    deadline.check("multistage preparation")
 
     decomposition_threshold = _positive_int(
         prepared.settings.get("decomposition_threshold", 20),
@@ -196,18 +204,27 @@ def solve_storage_multistage(payload: dict[str, Any]) -> dict[str, Any]:
         eligible, reason = ph_eligible(prepared)
         if eligible:
             try:
-                response = solve_progressive_hedging(prepared, started, prepare_ms)
+                response = solve_progressive_hedging(
+                    prepared,
+                    started,
+                    prepare_ms,
+                    deadline,
+                )
                 _validate_storage_replay(
                     response["plan"]["actions"], prepared.slots, prepared.storages
                 )
                 return response
+            except SolveDeadlineExceeded:
+                raise
             except ProgressiveHedgingNotConverged:
                 if decomposition_method == "progressive_hedging":
                     raise
+                deadline.check("progressive hedging fallback")
                 decomposition = "ph-fallback-scenario-reduction-extensive-dpp"
             except ReplayConsistencyError as exc:
                 if decomposition_method == "progressive_hedging":
                     raise
+                deadline.check("progressive hedging replay fallback")
                 prepared = _with_storage_discrete(prepared)
                 decomposition = f"ph-fallback-storage-replay-{exc}"
         elif decomposition_method == "progressive_hedging":
@@ -254,7 +271,11 @@ def solve_storage_multistage(payload: dict[str, Any]) -> dict[str, Any]:
 
         try:
             response = solve_direct_highs(
-                prepared, started, prepare_ms, decomposition.replace("-dpp", "")
+                prepared,
+                started,
+                prepare_ms,
+                decomposition.replace("-dpp", ""),
+                deadline=deadline,
             )
             _validate_storage_replay(
                 response["plan"]["actions"], prepared.slots, prepared.storages
@@ -263,6 +284,7 @@ def solve_storage_multistage(payload: dict[str, Any]) -> dict[str, Any]:
         except (DirectHighsError, ReplayConsistencyError) as exc:
             if multistage_backend == "highs":
                 raise
+            deadline.check("direct HiGHS fallback")
             direct_fallback_reason = str(exc)
             decomposition = f"direct-highs-fallback-{decomposition}"
             prepared = _with_storage_discrete(prepared)
@@ -284,12 +306,23 @@ def solve_storage_multistage(payload: dict[str, Any]) -> dict[str, Any]:
             solver_name = "HIGHS"
         solver_started = time.perf_counter()
         try:
-            _run_problem(compiled.service_problem, prepared.settings, solver_name)
+            _run_problem(
+                compiled.service_problem,
+                prepared.settings,
+                solver_name,
+                deadline,
+            )
         except cp.error.SolverError:
+            deadline.check("multistage service solver fallback")
             if prepared.discrete or solver_name == "CLARABEL":
                 raise
             solver_name = "CLARABEL"
-            _run_problem(compiled.service_problem, prepared.settings, solver_name)
+            _run_problem(
+                compiled.service_problem,
+                prepared.settings,
+                solver_name,
+                deadline,
+            )
         if compiled.service_problem.status not in OPTIMAL_STATUSES or compiled.service_problem.value is None:
             raise RuntimeError(
                 f"multistage service-level solve failed with status {compiled.service_problem.status}"
@@ -297,12 +330,23 @@ def solve_storage_multistage(payload: dict[str, Any]) -> dict[str, Any]:
         best_service = max(0.0, float(compiled.service_problem.value))
         compiled.service_cap.value = best_service + 1e-7
         try:
-            _run_problem(compiled.economic_problem, prepared.settings, solver_name)
+            _run_problem(
+                compiled.economic_problem,
+                prepared.settings,
+                solver_name,
+                deadline,
+            )
         except cp.error.SolverError:
+            deadline.check("multistage economic solver fallback")
             if prepared.discrete or solver_name == "CLARABEL":
                 raise
             solver_name = "CLARABEL"
-            _run_problem(compiled.economic_problem, prepared.settings, solver_name)
+            _run_problem(
+                compiled.economic_problem,
+                prepared.settings,
+                solver_name,
+                deadline,
+            )
         if compiled.economic_problem.status not in OPTIMAL_STATUSES or compiled.economic_problem.value is None:
             raise RuntimeError(
                 f"multistage economic solve failed with status {compiled.economic_problem.status}"
@@ -328,6 +372,7 @@ def solve_storage_multistage(payload: dict[str, Any]) -> dict[str, Any]:
         except ReplayConsistencyError as exc:
             if prepared.storage_discrete:
                 raise
+            deadline.check("storage replay fallback")
             prepared = _with_storage_discrete(prepared)
             direct_fallback_reason = str(exc)
             decomposition = f"storage-replay-fallback-{decomposition}"
@@ -880,9 +925,20 @@ def _compile(prepared: PreparedMultistage, key: tuple[Any, ...]) -> CompiledMult
     )
 
 
-def _run_problem(problem: cp.Problem, settings: dict[str, Any], solver_name: str) -> None:
+def _run_problem(
+    problem: cp.Problem,
+    settings: dict[str, Any],
+    solver_name: str,
+    deadline: SolveDeadline,
+) -> None:
     solver = cp.HIGHS if solver_name == "HIGHS" else cp.CLARABEL
-    problem.solve(solver=solver, warm_start=True, enforce_dpp=True, **_solver_options(settings, solver))
+    problem.solve(
+        solver=solver,
+        warm_start=True,
+        enforce_dpp=True,
+        **_solver_options(settings, solver, deadline),
+    )
+    deadline.check(f"multistage {solver_name} solve")
 
 
 def _response(
