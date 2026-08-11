@@ -37,6 +37,56 @@ func TestOptimizerProtocolVersionKeepsContractAlias(t *testing.T) {
 	}
 }
 
+func TestContextGateDropsCanceledWaiter(t *testing.T) {
+	gate := newContextGate()
+	if err := gate.acquire(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	waiting := make(chan struct{})
+	errCh := make(chan error, 1)
+	go func() {
+		close(waiting)
+		errCh <- gate.acquire(ctx)
+	}()
+	<-waiting
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("acquire error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled waiter remained blocked")
+	}
+
+	gate.release()
+	acquireCtx, acquireCancel := context.WithTimeout(context.Background(), time.Second)
+	defer acquireCancel()
+	if err := gate.acquire(acquireCtx); err != nil {
+		t.Fatalf("gate stayed occupied after canceled waiter: %v", err)
+	}
+	gate.release()
+}
+
+func TestProcessTransportRejectsCanceledContextBeforeWorkerLookup(t *testing.T) {
+	transport, err := NewProcessTransport(ProcessTransportConfig{
+		Command: []string{"ftw-worker-that-does-not-exist"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err = transport.RoundTrip(ctx, []byte(`{}`))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("RoundTrip error = %v, want context.Canceled", err)
+	}
+}
+
 func TestUnixTransportHandshakeAndRoundTrip(t *testing.T) {
 	path := fmt.Sprintf("/tmp/ftw-opt-%d.sock", time.Now().UnixNano())
 	t.Cleanup(func() { _ = os.Remove(path) })
