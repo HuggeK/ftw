@@ -20,6 +20,21 @@ class DirectHighsError(RuntimeError):
     pass
 
 
+SIMULTANEOUS_STORAGE_CYCLE_ERROR = (
+    "HiGHS returned simultaneous storage charge and discharge"
+)
+SHARED_BASELINE_REPLAY_ERROR = (
+    "direct shared mode violates the post-curtailment baseline"
+)
+
+
+class SharedBaselineReplayError(DirectHighsError):
+    def __init__(self, build_ms: float, solver_ms: float) -> None:
+        super().__init__(SHARED_BASELINE_REPLAY_ERROR)
+        self.build_ms = build_ms
+        self.solver_ms = solver_ms
+
+
 @dataclass
 class DirectScenarioVars:
     charge: list[list[int]]
@@ -30,16 +45,36 @@ class DirectScenarioVars:
     grid_export: list[int]
 
 
+@dataclass
+class DirectSharedStorageVars:
+    charge: list[list[int]]
+    discharge: list[list[int]]
+    energy: list[list[int]]
+    total_charge: list[list[int]]
+    total_discharge: list[list[int]]
+    service: dict[int, float]
+    economic: dict[int, float]
+
+
 class SparseModel:
     def __init__(self) -> None:
         self.lower: list[float] = []
         self.upper: list[float] = []
         self.rows: list[tuple[dict[int, float], float, float]] = []
+        self.integer: list[int] = []
 
-    def variable(self, lower: float = 0.0, upper: float = highspy.kHighsInf) -> int:
+    def variable(
+        self,
+        lower: float = 0.0,
+        upper: float = highspy.kHighsInf,
+        *,
+        integer: bool = False,
+    ) -> int:
         index = len(self.lower)
         self.lower.append(lower)
         self.upper.append(upper)
+        if integer:
+            self.integer.append(index)
         return index
 
     def row(
@@ -52,17 +87,38 @@ class SparseModel:
         self.rows.append((coefficients, lower, upper))
         return index
 
-    def build(self, costs: np.ndarray, settings: dict[str, Any]) -> highspy.Highs:
+    def build(
+        self,
+        costs: np.ndarray,
+        settings: dict[str, Any],
+        *,
+        time_limit_s: float,
+    ) -> highspy.Highs:
         highs = highspy.Highs()
         highs.setOptionValue("output_flag", False)
         options = _solver_options(settings, "HIGHS")
-        highs.setOptionValue("time_limit", float(options["time_limit"]))
+        highs.setOptionValue(
+            "time_limit", min(float(options["time_limit"]), time_limit_s)
+        )
         highs.setOptionValue("mip_rel_gap", float(options["mip_rel_gap"]))
         lower = np.asarray(self.lower, dtype=np.float64)
         upper = np.asarray(self.upper, dtype=np.float64)
         _require_ok(highs.addVars(len(lower), lower, upper), "add variables")
         indices = np.arange(len(lower), dtype=np.int32)
         _require_ok(highs.changeColsCost(len(lower), indices, costs), "set objective")
+        if self.integer:
+            integer_indices = np.asarray(self.integer, dtype=np.int32)
+            integer_types = np.full(
+                len(integer_indices),
+                highspy.HighsVarType.kInteger,
+                dtype=np.uint8,
+            )
+            _require_ok(
+                highs.changeColsIntegrality(
+                    len(integer_indices), integer_indices, integer_types
+                ),
+                "set integer variables",
+            )
 
         starts = np.zeros(len(self.rows) + 1, dtype=np.int32)
         row_indices: list[int] = []
@@ -97,6 +153,12 @@ def solve_direct_highs(
     started: float,
     prepare_ms: float,
     decomposition: str,
+    *,
+    shared: bool = False,
+    exact_shared_baseline: bool = False,
+    deadline: float | None = None,
+    prior_build_ms: float = 0.0,
+    prior_solver_ms: float = 0.0,
 ) -> dict[str, Any]:
     if _storage_starts_above_maximum(prepared.storages):
         raise DirectHighsError(
@@ -104,6 +166,10 @@ def solve_direct_highs(
         )
     if prepared.discrete or prepared.unsafe_cycle or prepared.unsafe_meter_split:
         raise DirectHighsError("direct HiGHS path requires a cycle-safe continuous tariff")
+    if deadline is None:
+        deadline = started + float(
+            _solver_options(prepared.settings, "HIGHS")["time_limit"]
+        )
     build_started = time.perf_counter()
     model = SparseModel()
     m = len(prepared.scenario_set.scenarios)
@@ -113,6 +179,7 @@ def solve_direct_highs(
     )
     service_terms: list[dict[int, float]] = []
     economic_terms: list[dict[int, float]] = []
+    risk_terms: list[dict[int, float]] = []
     scenario_vars: list[DirectScenarioVars] = []
 
     block_start_at = np.zeros(n, dtype=np.int64)
@@ -120,6 +187,7 @@ def solve_direct_highs(
         block_start_at[block_start:block_end] = block_start
 
     storage_actions: dict[tuple[int, int, int], tuple[int, int]] = {}
+    shared_storage: DirectSharedStorageVars | None = None
     curtail_upper: dict[tuple[int, int], float] = {}
     for si, scenario in enumerate(prepared.scenario_set.scenarios):
         pv_generation = np.maximum(0.0, -scenario.pv)
@@ -141,15 +209,25 @@ def solve_direct_highs(
         pv_generation = np.maximum(0.0, -scenario.pv)
         pv_surplus = np.maximum(0.0, pv_generation - scenario.load)
         base_import = np.maximum(0.0, scenario.load - pv_generation)
-        charges: list[list[int]] = []
-        discharges: list[list[int]] = []
-        energies: list[list[int]] = []
-        total_charge: list[list[int]] = [[] for _ in range(n)]
-        total_discharge: list[list[int]] = [[] for _ in range(n)]
-        service: dict[int, float] = {}
-        economic: dict[int, float] = {}
-
-        for storage_index, spec in enumerate(prepared.storages):
+        charges = shared_storage.charge if shared_storage is not None else []
+        discharges = shared_storage.discharge if shared_storage is not None else []
+        energies = shared_storage.energy if shared_storage is not None else []
+        total_charge = (
+            shared_storage.total_charge
+            if shared_storage is not None
+            else [[] for _ in range(n)]
+        )
+        total_discharge = (
+            shared_storage.total_discharge
+            if shared_storage is not None
+            else [[] for _ in range(n)]
+        )
+        service = dict(shared_storage.service) if shared_storage is not None else {}
+        economic = dict(shared_storage.economic) if shared_storage is not None else {}
+        # Shared charge and discharge make storage state deterministic across
+        # scenarios. Reuse its variables and rows; only meter flow varies.
+        storages_to_build = () if shared_storage is not None else prepared.storages
+        for storage_index, spec in enumerate(storages_to_build):
             capacity = float(spec["capacity_wh"])
             minimum = float(spec.get("min_energy_wh", 0))
             maximum = float(spec.get("max_energy_wh", capacity))
@@ -217,19 +295,35 @@ def solve_direct_highs(
                     _add(service, upper_recovery[t], 1.0 / (capacity * n))
 
             if spec.get("target_energy_wh") is not None:
-                deadline = int(spec.get("target_slot", n - 1))
+                target_slot = int(spec.get("target_slot", n - 1))
                 shortfall = model.variable()
                 target = float(spec["target_energy_wh"])
-                model.row({energy[deadline + 1]: 1.0, shortfall: 1.0}, target)
+                model.row(
+                    {energy[target_slot + 1]: 1.0, shortfall: 1.0},
+                    target,
+                )
                 _add(service, shortfall, 1.0 / capacity)
 
             cycle_coefficient = spread + max(0.0, float(spec.get("cycle_cost_ore_kwh", 0)))
+            throughput_coefficient = (
+                max(0.0, float(spec.get("throughput_cost_ore_kwh", 0)))
+                if shared
+                else 0.0
+            )
             for t in range(n):
                 _add(
                     economic,
                     discharge[t],
                     cycle_coefficient * float(prepared.dt_h[t]) / 1000.0,
                 )
+                if throughput_coefficient > 0:
+                    coefficient = (
+                        throughput_coefficient
+                        * float(prepared.dt_h[t])
+                        / 1000.0
+                    )
+                    _add(economic, charge[t], coefficient)
+                    _add(economic, discharge[t], coefficient)
             _add(
                 economic,
                 energy[-1],
@@ -238,6 +332,17 @@ def solve_direct_highs(
             charges.append(charge)
             discharges.append(discharge)
             energies.append(energy)
+        if shared and shared_storage is None:
+            shared_storage = DirectSharedStorageVars(
+                charges,
+                discharges,
+                energies,
+                total_charge,
+                total_discharge,
+                dict(service),
+                dict(economic),
+            )
+        scenario_grid_cost: dict[int, float] = {}
 
         curtail = [
             curtail_actions[(int(prepared.tree.node_at[si, t]), t)] for t in range(n)
@@ -245,10 +350,70 @@ def solve_direct_highs(
         grid_import: list[int] = []
         grid_export: list[int] = []
         for t in range(n):
+            net = float(scenario.load[t] - pv_generation[t])
+            shared_baseline_mode = shared and prepared.mode in {
+                "self_consumption",
+                "cheap_charge",
+                "passive_arbitrage",
+            }
+            baseline_stays_import = False
+            baseline_crosses = False
+            baseline_import_index: int | None = None
+            baseline_export_index: int | None = None
+            if shared_baseline_mode:
+                curtail_ceiling = float(
+                    curtail_upper[
+                        (int(prepared.tree.node_at[si, t]), t)
+                    ]
+                )
+                baseline_crosses = net < 0 < net + curtail_ceiling
+                if baseline_crosses and exact_shared_baseline:
+                    baseline_import_max = net + curtail_ceiling
+                    baseline_export_max = -net
+                    baseline_import_index = model.variable(
+                        0.0, baseline_import_max
+                    )
+                    baseline_export_index = model.variable(
+                        0.0, baseline_export_max
+                    )
+                    baseline_import_mode = model.variable(
+                        0.0, 1.0, integer=True
+                    )
+                    model.row(
+                        {
+                            baseline_import_index: 1.0,
+                            baseline_export_index: -1.0,
+                            curtail[t]: -1.0,
+                        },
+                        net,
+                        net,
+                    )
+                    model.row(
+                        {
+                            baseline_import_index: 1.0,
+                            baseline_import_mode: -baseline_import_max,
+                        },
+                        upper=0.0,
+                    )
+                    model.row(
+                        {
+                            baseline_export_index: 1.0,
+                            baseline_import_mode: baseline_export_max,
+                        },
+                        upper=baseline_export_max,
+                    )
+                baseline_stays_import = net >= 0
+
             import_upper = float(prepared.import_bound[t])
             export_upper = float(prepared.export_bound[t])
             if prepared.mode == "self_consumption":
-                import_upper = min(import_upper, float(base_import[t]) + 50.0)
+                if shared_baseline_mode:
+                    if not baseline_crosses and not baseline_stays_import:
+                        import_upper = min(import_upper, 50.0)
+                else:
+                    import_upper = min(
+                        import_upper, float(base_import[t]) + 50.0
+                    )
             import_index = model.variable(0.0, import_upper)
             export_index = model.variable(0.0, export_upper)
             grid_import.append(import_index)
@@ -262,9 +427,59 @@ def solve_direct_highs(
                 _add(balance, index, -1.0)
             for index in total_discharge[t]:
                 _add(balance, index, 1.0)
-            net = float(scenario.load[t] - pv_generation[t])
             model.row(balance, net, net)
-            if prepared.mode == "self_consumption":
+            if shared_baseline_mode and prepared.mode == "self_consumption":
+                if baseline_crosses and exact_shared_baseline:
+                    assert baseline_import_index is not None
+                    assert baseline_export_index is not None
+                    model.row(
+                        {import_index: 1.0, baseline_import_index: -1.0},
+                        upper=50.0,
+                    )
+                    model.row(
+                        {export_index: 1.0, baseline_export_index: -1.0},
+                        upper=50.0,
+                    )
+                elif baseline_crosses:
+                    model.row(
+                        {import_index: 1.0, curtail[t]: -1.0},
+                        upper=50.0,
+                    )
+                    model.row(
+                        {export_index: 1.0},
+                        upper=-net + 50.0,
+                    )
+                elif baseline_stays_import:
+                    model.row(
+                        {import_index: 1.0, curtail[t]: -1.0},
+                        upper=net + 50.0,
+                    )
+                    model.row({export_index: 1.0}, upper=50.0)
+                else:
+                    model.row(
+                        {export_index: 1.0, curtail[t]: 1.0},
+                        upper=-net + 50.0,
+                    )
+            elif shared_baseline_mode:
+                if baseline_crosses and exact_shared_baseline:
+                    assert baseline_export_index is not None
+                    model.row(
+                        {export_index: 1.0, baseline_export_index: -1.0},
+                        upper=1e-6,
+                    )
+                elif baseline_crosses:
+                    model.row(
+                        {export_index: 1.0},
+                        upper=-net + 1e-6,
+                    )
+                elif baseline_stays_import:
+                    model.row({export_index: 1.0}, upper=1e-6)
+                else:
+                    model.row(
+                        {export_index: 1.0, curtail[t]: 1.0},
+                        upper=-net + 1e-6,
+                    )
+            elif prepared.mode == "self_consumption":
                 model.row(
                     {export_index: 1.0, curtail[t]: 1.0},
                     upper=float(pv_surplus[t]) + 50.0,
@@ -279,11 +494,31 @@ def solve_direct_highs(
                 import_index,
                 float(prepared.effective_import[t] * prepared.dt_h[t] / 1000.0),
             )
+            if shared:
+                _add(
+                    scenario_grid_cost,
+                    import_index,
+                    float(
+                        prepared.effective_import[t]
+                        * prepared.dt_h[t]
+                        / 1000.0
+                    ),
+                )
             _add(
                 economic,
                 export_index,
                 -float(prepared.effective_export[t] * prepared.dt_h[t] / 1000.0),
             )
+            if shared:
+                _add(
+                    scenario_grid_cost,
+                    export_index,
+                    -float(
+                        prepared.effective_export[t]
+                        * prepared.dt_h[t]
+                        / 1000.0
+                    ),
+                )
 
             if prepared.mode in {"self_consumption", "passive_arbitrage"}:
                 house_import = model.variable()
@@ -306,6 +541,7 @@ def solve_direct_highs(
 
         service_terms.append(service)
         economic_terms.append(economic)
+        risk_terms.append(scenario_grid_cost if shared else economic)
         scenario_vars.append(
             DirectScenarioVars(
                 charges, discharges, energies, curtail, grid_import, grid_export
@@ -347,9 +583,9 @@ def solve_direct_highs(
         service_costs = np.pad(service_costs, (0, 1 + m))
         economic_costs = np.pad(economic_costs, (0, 1 + m))
         economic_costs[threshold] += prepared.economic_cvar_weight
-        for si, economic in enumerate(economic_terms):
+        for si, risk in enumerate(risk_terms):
             row = {excess[si]: 1.0, threshold: 1.0}
-            for index, value in economic.items():
+            for index, value in risk.items():
                 _add(row, index, -value)
             model.row(row, 0.0)
             economic_costs[excess[si]] += (
@@ -362,7 +598,11 @@ def solve_direct_highs(
     if len(economic_costs) < len(model.lower):
         economic_costs = np.pad(economic_costs, (0, len(model.lower) - len(economic_costs)))
 
-    highs = model.build(service_costs, prepared.settings)
+    highs = model.build(
+        service_costs,
+        prepared.settings,
+        time_limit_s=_remaining_time_s(deadline),
+    )
     build_ms = (time.perf_counter() - build_started) * 1000.0
     solver_started = time.perf_counter()
     _run_optimal(highs, "service")
@@ -381,11 +621,30 @@ def solve_direct_highs(
         highs.changeColsCost(len(model.lower), column_indices, economic_costs),
         "set economic objective",
     )
+    _require_ok(
+        highs.setOptionValue("time_limit", _remaining_time_s(deadline)),
+        "set economic time limit",
+    )
     _run_optimal(highs, "economic")
     solver_ms = (time.perf_counter() - solver_started) * 1000.0
+    mip_gap = float(highs.getInfo().mip_gap) if model.integer else None
     solution = np.asarray(highs.getSolution().col_value, dtype=np.float64)
     if len(solution) != len(model.lower) or not np.all(np.isfinite(solution)):
         raise DirectHighsError("HiGHS returned a non-finite solution")
+    if shared:
+        try:
+            _validate_shared_baseline_solution(
+                prepared, scenario_vars, solution
+            )
+        except DirectHighsError as exc:
+            if (
+                not exact_shared_baseline
+                and str(exc) == SHARED_BASELINE_REPLAY_ERROR
+            ):
+                raise SharedBaselineReplayError(
+                    build_ms, solver_ms
+                ) from exc
+            raise
 
     return _response(
         prepared,
@@ -395,11 +654,14 @@ def solve_direct_highs(
         best_service,
         started,
         prepare_ms,
-        build_ms,
-        solver_ms,
+        prior_build_ms + build_ms,
+        prior_solver_ms + solver_ms,
         decomposition,
         len(model.lower),
         len(model.rows),
+        len(model.integer),
+        mip_gap,
+        shared,
     )
 
 
@@ -416,9 +678,10 @@ def _response(
     decomposition: str,
     variables: int,
     constraints: int,
+    integer_variables: int,
+    mip_gap: float | None,
+    shared: bool,
 ) -> dict[str, Any]:
-    from .multistage import policy_config
-
     scenarios = prepared.scenario_set.scenarios
     base_index = next((i for i, scenario in enumerate(scenarios) if scenario.id == "base"), 0)
     base = scenarios[base_index]
@@ -427,9 +690,7 @@ def _response(
         for charges, discharges in zip(scenario.charge, scenario.discharge):
             for charge_index, discharge_index in zip(charges, discharges):
                 if min(solution[charge_index], solution[discharge_index]) > 1e-6:
-                    raise DirectHighsError(
-                        "HiGHS returned simultaneous storage charge and discharge"
-                    )
+                    raise DirectHighsError(SIMULTANEOUS_STORAGE_CYCLE_ERROR)
     total_capacity = sum(float(spec["capacity_wh"]) for spec in prepared.storages)
     initial_total = sum(float(spec["initial_energy_wh"]) for spec in prepared.storages)
     actions: list[dict[str, Any]] = []
@@ -457,6 +718,7 @@ def _response(
         )
         raw_total_cost += raw_cost
         curtailed_w = max(0.0, float(solution[base_vars.curtail[t]]))
+        pv_forecast = prepared.base_pv if shared else base.pv
         actions.append(
             {
                 "slot_start_ms": int(slot.get("start_ms", 0)),
@@ -465,7 +727,7 @@ def _response(
                 "grid_w": grid_w,
                 "soc_pct": stored_wh / total_capacity * 100.0,
                 "cost_ore": raw_cost,
-                "pv_limit_w": max(0.0, -base.pv[t] - curtailed_w)
+                "pv_limit_w": max(0.0, -pv_forecast[t] - curtailed_w)
                 if curtailed_w > 1e-5
                 else 0.0,
                 "storage_power_w": storage_power,
@@ -477,42 +739,117 @@ def _response(
             }
         )
     solve_ms = (time.perf_counter() - started) * 1000.0
+    solver: dict[str, Any] = {
+        "engine": "highspy",
+        "backend": "highs",
+        "status": "optimal",
+        "formulation": (
+            "milp"
+            if shared and integer_variables
+            else "convex"
+            if shared
+            else "multistage-lp"
+        ),
+        "objective_ore": objective,
+        "service_slack": best_service,
+        "solve_ms": solve_ms,
+        "prepare_ms": prepare_ms,
+        "build_ms": build_ms,
+        "solver_ms": solver_ms,
+        "cache_hit": False,
+        "dpp": False,
+        "mip_gap": mip_gap,
+        "scenario_count": len(scenarios),
+        "scenario_policy": "shared" if shared else "multistage",
+        "policy_version": "shared-v1" if shared else "storage-multistage-v1",
+        "non_anticipative_slots": prepared.first_stage_slots,
+        "model_variables": variables,
+        "model_constraints": constraints,
+    }
+    if shared:
+        probabilities = np.asarray([scenario.probability for scenario in scenarios])
+        energy_cost = 0.0
+        for probability, scenario in zip(probabilities, scenario_vars):
+            for t in range(prepared.n):
+                energy_cost += float(probability) * (
+                    prepared.effective_import[t]
+                    * prepared.dt_h[t]
+                    * solution[scenario.grid_import[t]]
+                    / 1000.0
+                    - prepared.effective_export[t]
+                    * prepared.dt_h[t]
+                    * solution[scenario.grid_export[t]]
+                    / 1000.0
+                )
+        degradation = 0.0
+        terminal_value = 0.0
+        spread = max(
+            0.0,
+            finite_number(
+                prepared.settings.get("min_arbitrage_spread_ore_kwh", 0),
+                "settings.min_arbitrage_spread_ore_kwh",
+            ),
+        )
+        for index, spec in enumerate(prepared.storages):
+            discharge_rate = spread + max(
+                0.0, float(spec.get("cycle_cost_ore_kwh", 0))
+            )
+            throughput_rate = max(
+                0.0, float(spec.get("throughput_cost_ore_kwh", 0))
+            )
+            for t in range(prepared.n):
+                degradation += (
+                    prepared.dt_h[t]
+                    * (
+                        discharge_rate * solution[base_vars.discharge[index][t]]
+                        + throughput_rate
+                        * (
+                            solution[base_vars.charge[index][t]]
+                            + solution[base_vars.discharge[index][t]]
+                        )
+                    )
+                    / 1000.0
+                )
+            terminal_value -= (
+                float(spec.get("terminal_price_ore_kwh", 0))
+                * solution[base_vars.energy[index][-1]]
+                / 1000.0
+            )
+        solver.update(
+            {
+                "cvar_weight": prepared.economic_cvar_weight,
+                "cvar_alpha": prepared.economic_cvar_alpha,
+                "objective_breakdown_ore": {
+                    "energy": float(energy_cost),
+                    "demand_charge_increment": 0.0,
+                    "degradation": float(degradation),
+                    "terminal_energy_value": float(terminal_value),
+                },
+            }
+        )
+    else:
+        from .multistage import policy_config
+
+        solver.update(
+            {
+                "scenario_original_count": prepared.scenario_set.original_count,
+                "scenario_reduction_error": prepared.scenario_set.reduction_error,
+                "policy_config": policy_config(prepared),
+                "tree_nodes": prepared.tree.node_count,
+                "move_blocks": len(prepared.blocks),
+                "decomposition": f"direct-highs-{decomposition}",
+                "risk_model": "service-cvar-then-expected-cost",
+                "service_cvar_weight": prepared.service_cvar_weight,
+                "service_cvar_alpha": prepared.service_cvar_alpha,
+                "economic_cvar_weight": prepared.economic_cvar_weight,
+                "economic_cvar_alpha": prepared.economic_cvar_alpha,
+            }
+        )
     return {
         "schema_version": SCHEMA_VERSION,
         "request_id": str(prepared.payload["request_id"]),
         "ok": True,
-        "solver": {
-            "engine": "highspy",
-            "backend": "highs",
-            "status": "optimal",
-            "formulation": "multistage-lp",
-            "objective_ore": objective,
-            "service_slack": best_service,
-            "solve_ms": solve_ms,
-            "prepare_ms": prepare_ms,
-            "build_ms": build_ms,
-            "solver_ms": solver_ms,
-            "cache_hit": False,
-            "dpp": False,
-            "mip_gap": None,
-            "scenario_count": len(scenarios),
-            "scenario_original_count": prepared.scenario_set.original_count,
-            "scenario_reduction_error": prepared.scenario_set.reduction_error,
-            "scenario_policy": "multistage",
-            "policy_version": "storage-multistage-v1",
-            "policy_config": policy_config(prepared),
-            "non_anticipative_slots": prepared.first_stage_slots,
-            "tree_nodes": prepared.tree.node_count,
-            "move_blocks": len(prepared.blocks),
-            "decomposition": f"direct-highs-{decomposition}",
-            "risk_model": "service-cvar-then-expected-cost",
-            "service_cvar_weight": prepared.service_cvar_weight,
-            "service_cvar_alpha": prepared.service_cvar_alpha,
-            "economic_cvar_weight": prepared.economic_cvar_weight,
-            "economic_cvar_alpha": prepared.economic_cvar_alpha,
-            "model_variables": variables,
-            "model_constraints": constraints,
-        },
+        "solver": solver,
         "plan": {
             "mode": prepared.mode,
             "horizon_slots": prepared.n,
@@ -526,6 +863,49 @@ def _response(
 
 def _add(coefficients: dict[int, float], index: int, value: float) -> None:
     coefficients[index] = coefficients.get(index, 0.0) + value
+
+
+def _remaining_time_s(deadline: float) -> float:
+    remaining = deadline - time.perf_counter()
+    if remaining <= 0.0:
+        raise DirectHighsError("direct HiGHS time budget exhausted")
+    return remaining
+
+
+def _validate_shared_baseline_solution(
+    prepared: "PreparedMultistage",
+    scenario_vars: list[DirectScenarioVars],
+    solution: np.ndarray,
+) -> None:
+    if prepared.mode not in {
+        "self_consumption",
+        "cheap_charge",
+        "passive_arbitrage",
+    }:
+        return
+    tolerance = 1e-4
+    for scenario, variables in zip(
+        prepared.scenario_set.scenarios, scenario_vars
+    ):
+        pv_generation = np.maximum(0.0, -scenario.pv)
+        for t in range(prepared.n):
+            curtailed = float(solution[variables.curtail[t]])
+            baseline = float(
+                scenario.load[t] - pv_generation[t] + curtailed
+            )
+            baseline_import = max(baseline, 0.0)
+            baseline_export = max(-baseline, 0.0)
+            grid_import = float(solution[variables.grid_import[t]])
+            grid_export = float(solution[variables.grid_export[t]])
+            if prepared.mode == "self_consumption":
+                valid = (
+                    grid_import <= baseline_import + 50.0 + tolerance
+                    and grid_export <= baseline_export + 50.0 + tolerance
+                )
+            else:
+                valid = grid_export <= baseline_export + 1e-6 + tolerance
+            if not valid:
+                raise DirectHighsError(SHARED_BASELINE_REPLAY_ERROR)
 
 
 def _accumulate(target: np.ndarray, terms: dict[int, float], weight: float) -> None:
