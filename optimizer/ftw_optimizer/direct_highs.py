@@ -9,7 +9,12 @@ import highspy
 import numpy as np
 
 from . import SCHEMA_VERSION
-from .model import _solver_options, _storage_starts_above_maximum
+from .deadline import SolveDeadline, SolveDeadlineExceeded
+from .model import (
+    _arbitrage_spread_ore_kwh,
+    _solver_options,
+    _storage_starts_above_maximum,
+)
 from .protocol import finite_number
 
 if TYPE_CHECKING:
@@ -156,7 +161,7 @@ def solve_direct_highs(
     *,
     shared: bool = False,
     exact_shared_baseline: bool = False,
-    deadline: float | None = None,
+    deadline: SolveDeadline | float | None = None,
     prior_build_ms: float = 0.0,
     prior_solver_ms: float = 0.0,
 ) -> dict[str, Any]:
@@ -167,9 +172,11 @@ def solve_direct_highs(
     if prepared.discrete or prepared.unsafe_cycle or prepared.unsafe_meter_split:
         raise DirectHighsError("direct HiGHS path requires a cycle-safe continuous tariff")
     if deadline is None:
-        deadline = started + float(
-            _solver_options(prepared.settings, "HIGHS")["time_limit"]
+        deadline = SolveDeadline(
+            started
+            + float(_solver_options(prepared.settings, "HIGHS")["time_limit"])
         )
+    _remaining_time_s(deadline)
     build_started = time.perf_counter()
     model = SparseModel()
     m = len(prepared.scenario_set.scenarios)
@@ -198,13 +205,7 @@ def solve_direct_highs(
         key: model.variable(0.0, upper) for key, upper in sorted(curtail_upper.items())
     }
 
-    spread = max(
-        0.0,
-        finite_number(
-            prepared.settings.get("min_arbitrage_spread_ore_kwh", 0),
-            "settings.min_arbitrage_spread_ore_kwh",
-        ),
-    )
+    spread = _arbitrage_spread_ore_kwh(prepared.settings, prepared.mode)
     for si, scenario in enumerate(prepared.scenario_set.scenarios):
         pv_generation = np.maximum(0.0, -scenario.pv)
         pv_surplus = np.maximum(0.0, pv_generation - scenario.load)
@@ -604,8 +605,12 @@ def solve_direct_highs(
         time_limit_s=_remaining_time_s(deadline),
     )
     build_ms = (time.perf_counter() - build_started) * 1000.0
+    _require_ok(
+        highs.setOptionValue("time_limit", _remaining_time_s(deadline)),
+        "set service time limit",
+    )
     solver_started = time.perf_counter()
-    _run_optimal(highs, "service")
+    _run_optimal(highs, "service", deadline)
     best_service = max(0.0, float(highs.getObjectiveValue()))
     _require_ok(
         highs.changeRowsBounds(
@@ -625,7 +630,7 @@ def solve_direct_highs(
         highs.setOptionValue("time_limit", _remaining_time_s(deadline)),
         "set economic time limit",
     )
-    _run_optimal(highs, "economic")
+    _run_optimal(highs, "economic", deadline)
     solver_ms = (time.perf_counter() - solver_started) * 1000.0
     mip_gap = float(highs.getInfo().mip_gap) if model.integer else None
     solution = np.asarray(highs.getSolution().col_value, dtype=np.float64)
@@ -783,13 +788,7 @@ def _response(
                 )
         degradation = 0.0
         terminal_value = 0.0
-        spread = max(
-            0.0,
-            finite_number(
-                prepared.settings.get("min_arbitrage_spread_ore_kwh", 0),
-                "settings.min_arbitrage_spread_ore_kwh",
-            ),
-        )
+        spread = _arbitrage_spread_ore_kwh(prepared.settings, prepared.mode)
         for index, spec in enumerate(prepared.storages):
             discharge_rate = spread + max(
                 0.0, float(spec.get("cycle_cost_ore_kwh", 0))
@@ -865,10 +864,12 @@ def _add(coefficients: dict[int, float], index: int, value: float) -> None:
     coefficients[index] = coefficients.get(index, 0.0) + value
 
 
-def _remaining_time_s(deadline: float) -> float:
+def _remaining_time_s(deadline: SolveDeadline | float) -> float:
+    if isinstance(deadline, SolveDeadline):
+        return deadline.remaining_s("direct HiGHS solve")
     remaining = deadline - time.perf_counter()
     if remaining <= 0.0:
-        raise DirectHighsError("direct HiGHS time budget exhausted")
+        raise SolveDeadlineExceeded("direct HiGHS solve deadline exceeded")
     return remaining
 
 
@@ -918,8 +919,18 @@ def _require_ok(status: highspy.HighsStatus, operation: str) -> None:
         raise DirectHighsError(f"HiGHS failed to {operation}: {status}")
 
 
-def _run_optimal(highs: highspy.Highs, phase: str) -> None:
-    _require_ok(highs.run(), f"run {phase} solve")
+def _run_optimal(
+    highs: highspy.Highs,
+    phase: str,
+    deadline: SolveDeadline | float,
+) -> None:
+    run_status = highs.run()
     status = highs.getModelStatus()
+    if status == highspy.HighsModelStatus.kTimeLimit:
+        raise SolveDeadlineExceeded(
+            f"direct HiGHS {phase} solve deadline exceeded"
+        )
+    _require_ok(run_status, f"run {phase} solve")
     if status != highspy.HighsModelStatus.kOptimal:
         raise DirectHighsError(f"HiGHS {phase} solve failed with status {status}")
+    _remaining_time_s(deadline)
