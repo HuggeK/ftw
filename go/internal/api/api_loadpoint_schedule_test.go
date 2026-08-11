@@ -18,10 +18,8 @@ import (
 // what the handlers do: PUT stores and rolls, DELETE clears, and both
 // force a replan tagged with the schedule-change reason.
 
-// newScheduleServer wires a manager and an MPC service whose store is
-// an empty temp db: ReplanWithReason records its reason and then
-// returns at "no prices available yet", which is all a replan
-// assertion needs.
+// newScheduleServer wires a manager and an MPC service with enough input for
+// the route-triggered replan to publish its plan and reason together.
 func newScheduleServer(t *testing.T) (*Server, *loadpoint.Manager, *mpc.Service) {
 	t.Helper()
 	mgr := loadpoint.NewManager()
@@ -31,7 +29,26 @@ func newScheduleServer(t *testing.T) (*Server, *loadpoint.Manager, *mpc.Service)
 		t.Fatalf("opening state store: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
-	svc := &mpc.Service{Store: st, Zone: "SE4"}
+	start := time.Now().UTC().Truncate(15 * time.Minute)
+	prices := make([]state.PricePoint, 4)
+	for i := range prices {
+		prices[i] = state.PricePoint{
+			Zone: "SE4", SlotTsMs: start.Add(time.Duration(i) * 15 * time.Minute).UnixMilli(),
+			SlotLenMin: 15, SpotOreKwh: 50, TotalOreKwh: 100,
+			Source: "test", FetchedAtMs: start.UnixMilli(),
+		}
+	}
+	if err := st.SavePrices(prices); err != nil {
+		t.Fatalf("saving prices: %v", err)
+	}
+	svc := mpc.New(st, nil, "SE4", mpc.Params{
+		Mode: mpc.ModeSelfConsumption, SoCLevels: 11, ActionLevels: 5,
+		CapacityWh: 10000, InitialSoCPct: 50, SoCMinPct: 10, SoCMaxPct: 95,
+		MaxChargeW: 3000, MaxDischargeW: 3000,
+		ChargeEfficiency: 0.95, DischargeEfficiency: 0.95,
+	})
+	svc.Horizon = time.Hour
+	svc.BaseLoad = 500
 	return New(&Deps{Loadpoints: mgr, MPC: svc}), mgr, svc
 }
 
