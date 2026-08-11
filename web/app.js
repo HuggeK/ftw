@@ -55,6 +55,24 @@
     return fetch(path, opts || {});
   }
 
+  // A single-flight read must always settle. Without a deadline, one half-open
+  // request would keep its lock or cache entry forever and every later timer
+  // would reuse work that can no longer finish. Keep the deadline through JSON
+  // decoding too: receiving headers does not mean the response body arrived.
+  const API_READ_TIMEOUT_MS = 15_000;
+  function boundedApiRead(path, decode) {
+    var controller = new AbortController();
+    var timer = setTimeout(function () { controller.abort(); }, API_READ_TIMEOUT_MS);
+    var request;
+    try {
+      request = apiFetch(path, { signal: controller.signal });
+    } catch (err) {
+      clearTimeout(timer);
+      return Promise.reject(err);
+    }
+    return request.then(decode).finally(function () { clearTimeout(timer); });
+  }
+
   // ---- Chart data ----
   var chartHistory = {
     grid: [],
@@ -2190,9 +2208,14 @@
   var liveHistoryPollTimer = null;
   function fetchStatus() {
     return Promise.all([
-      apiFetch("/api/status").then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); }),
-      apiFetch("/api/loadpoints").then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; }),
-      apiFetch("/api/health").then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; }),
+      boundedApiRead("/api/status", function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      }),
+      boundedApiRead("/api/loadpoints", function (r) { return r.ok ? r.json() : null; })
+        .catch(function () { return null; }),
+      boundedApiRead("/api/health", function (r) { return r.ok ? r.json() : null; })
+        .catch(function () { return null; }),
     ])
       .then(function (results) {
         var data = results[0];
@@ -4098,8 +4121,10 @@
     if (!force && c && c.data && (now - c.at) < HISTORY_CACHE_TTL_MS) {
       return Promise.resolve(c.data);
     }
-    var promise = apiFetch("/api/history?range=" + range + "&points=" + points)
-      .then(function (r) { return r.ok ? r.json() : null; })
+    var promise = boundedApiRead(
+      "/api/history?range=" + range + "&points=" + points,
+      function (r) { return r.ok ? r.json() : null; }
+    )
       .then(function (data) { historyFetchCache[key] = { at: Date.now(), data: data }; return data; })
       .catch(function (err) {
         var cur = historyFetchCache[key];

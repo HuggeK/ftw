@@ -7,6 +7,7 @@ const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
 const statusPaths = new Set(["/api/status", "/api/loadpoints", "/api/health"]);
 const liveHistoryPath = "/api/history?range=24h&points=288";
 const isHistoryPath = (path) => path.startsWith("/api/history?");
+const apiReadTimeoutMs = 15_000;
 
 function inertElement() {
   const classList = {
@@ -21,6 +22,7 @@ function inertElement() {
   });
   return {
     classList, dataset: {}, style: {}, children: [], childNodes: [],
+    parentNode: { insertBefore() {} },
     textContent: "", innerHTML: "", value: "", checked: false, hidden: false,
     addEventListener() {}, removeEventListener() {}, appendChild() {}, append() {},
     replaceChildren() {}, remove() {}, focus() {}, click() {},
@@ -36,8 +38,30 @@ function rig({ hidden = false } = {}) {
   const documentListeners = new Map();
   const windowListeners = new Map();
   const intervals = new Map();
+  const timeouts = new Map();
   const fetches = [];
   let nextTimer = 1;
+
+  class TestAbortSignal {
+    constructor() {
+      this.aborted = false;
+      this.listeners = new Set();
+    }
+    addEventListener(type, listener) {
+      if (type === "abort") this.listeners.add(listener);
+    }
+    abort() {
+      if (this.aborted) return;
+      this.aborted = true;
+      for (const listener of this.listeners) listener();
+      this.listeners.clear();
+    }
+  }
+
+  class TestAbortController {
+    constructor() { this.signal = new TestAbortSignal(); }
+    abort() { this.signal.abort(); }
+  }
 
   const document = {
     hidden,
@@ -61,9 +85,25 @@ function rig({ hidden = false } = {}) {
   const sandbox = {
     window, document, localStorage: storage, sessionStorage: storage,
     customElements: window.customElements,
-    fetch(path) {
-      const entry = { path: String(path), settled: false };
-      entry.promise = new Promise((resolve) => { entry.resolve = resolve; });
+    AbortController: TestAbortController,
+    fetch(path, opts = {}) {
+      const entry = { path: String(path), settled: false, aborted: false };
+      entry.promise = new Promise((resolve, reject) => {
+        entry.resolve = resolve;
+        entry.reject = reject;
+      });
+      const abort = () => {
+        if (entry.settled) return;
+        entry.settled = true;
+        entry.aborted = true;
+        const err = new Error("request aborted");
+        err.name = "AbortError";
+        entry.reject(err);
+      };
+      if (opts.signal) {
+        if (opts.signal.aborted) abort();
+        else opts.signal.addEventListener("abort", abort, { once: true });
+      }
       fetches.push(entry);
       return entry.promise;
     },
@@ -73,7 +113,12 @@ function rig({ hidden = false } = {}) {
       return id;
     },
     clearInterval(id) { intervals.delete(id); },
-    setTimeout() { return nextTimer++; }, clearTimeout() {},
+    setTimeout(fn, ms) {
+      const id = nextTimer++;
+      timeouts.set(id, { fn, ms });
+      return id;
+    },
+    clearTimeout(id) { timeouts.delete(id); },
     requestAnimationFrame() { return 0; }, cancelAnimationFrame() {},
     getComputedStyle() { return { getPropertyValue() { return ""; } }; },
     ResizeObserver: class { observe() {} disconnect() {} },
@@ -125,6 +170,14 @@ function rig({ hidden = false } = {}) {
       for (const timer of [...intervals.values()]) {
         if (timer.ms === 60_000) timer.fn();
       }
+    },
+    async expireApiReads() {
+      const due = [...timeouts.entries()].filter(([, timer]) => timer.ms === apiReadTimeoutMs);
+      for (const [id, timer] of due) {
+        timeouts.delete(id);
+        timer.fn();
+      }
+      await new Promise((resolve) => setImmediate(resolve));
     },
     settleStatusFetches() { return settleFetches((path) => statusPaths.has(path)); },
     settleHistoryFetches() { return settleFetches(isHistoryPath); },
@@ -209,4 +262,29 @@ test("dashboard starts dormant when loaded in a hidden document", () => {
   assert.equal(app.historyFetches().length, 2, "hide/show must reuse both unresolved history requests");
   assert.equal(app.statusTimers().length, 1);
   assert.equal(app.liveHistoryTimers().length, 1);
+});
+
+test("a timed-out read releases both single-flight gates", async () => {
+  const app = rig();
+
+  assert.equal(app.statusFetches().length, 3);
+  assert.equal(app.liveHistoryFetches().length, 1);
+
+  // None of the startup reads settle. Expire their controlled deadlines in one
+  // step, then let promise rejection and finally handlers drain.
+  await app.expireApiReads();
+  assert.equal(app.statusFetches().filter((entry) => entry.aborted).length, 3);
+  assert.equal(app.historyFetches().filter((entry) => entry.aborted).length, 2);
+
+  app.runStatusTimers();
+  app.runLiveHistoryTimers();
+  assert.equal(app.statusFetches().length, 6, "status should retry after its timed-out poll");
+  assert.equal(app.liveHistoryFetches().length, 2, "forced history should retry after its timed-out read");
+
+  // The replacement reads are still unresolved, so normal single-flight still
+  // coalesces later timer ticks.
+  app.runStatusTimers();
+  app.runLiveHistoryTimers();
+  assert.equal(app.statusFetches().length, 6);
+  assert.equal(app.liveHistoryFetches().length, 2);
 });
