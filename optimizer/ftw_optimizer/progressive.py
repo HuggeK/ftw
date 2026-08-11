@@ -9,7 +9,7 @@ import cvxpy as cp
 import numpy as np
 
 from . import SCHEMA_VERSION
-from .model import OPTIMAL_STATUSES, _solver_options
+from .model import OPTIMAL_STATUSES, _arbitrage_spread_ore_kwh, _solver_options
 from .protocol import ProtocolError, finite_number
 
 if TYPE_CHECKING:
@@ -144,13 +144,7 @@ def _build_subproblem(
     cycle_cost: cp.Expression = cp.Constant(0.0)
     terminal_credit: cp.Expression = cp.Constant(0.0)
     decision_rows: list[cp.Expression] = []
-    spread = max(
-        0.0,
-        finite_number(
-            prepared.settings.get("min_arbitrage_spread_ore_kwh", 0),
-            "settings.min_arbitrage_spread_ore_kwh",
-        ),
-    )
+    spread = _arbitrage_spread_ore_kwh(prepared.settings, prepared.mode)
     for i, spec in enumerate(prepared.storages):
         charge = cp.Variable(n, nonneg=True, name=f"ph_s{scenario_index}_b{i}_charge")
         discharge = cp.Variable(n, nonneg=True, name=f"ph_s{scenario_index}_b{i}_discharge")

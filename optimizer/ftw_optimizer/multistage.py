@@ -15,6 +15,7 @@ from .model import (
     OPTIMAL_STATUSES,
     ReplayConsistencyError,
     _STORAGE_INITIAL_ABOVE_MAXIMUM_KEY,
+    _arbitrage_spread_ore_kwh,
     _canonicalize_storage_payload,
     _export_price,
     _mode,
@@ -140,13 +141,7 @@ class CompiledMultistage:
                 "settings.pv_charge_bonus_ore_kwh",
             ),
         )
-        spread = max(
-            0.0,
-            finite_number(
-                prepared.settings.get("min_arbitrage_spread_ore_kwh", 0),
-                "settings.min_arbitrage_spread_ore_kwh",
-            ),
-        )
+        spread = _arbitrage_spread_ore_kwh(prepared.settings, prepared.mode)
         for i, spec in enumerate(prepared.storages):
             initial = finite_number(spec.get("initial_energy_wh"), f"storages[{i}].initial_energy_wh")
             minimum = finite_number(spec.get("min_energy_wh", 0), f"storages[{i}].min_energy_wh")

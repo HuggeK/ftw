@@ -12,7 +12,7 @@ from . import SCHEMA_VERSION
 from .protocol import ProtocolError, finite_number, positive_number, require_dict, require_list
 
 
-OPTIMAL_STATUSES = {cp.OPTIMAL, cp.OPTIMAL_INACCURATE, cp.USER_LIMIT}
+OPTIMAL_STATUSES = {cp.OPTIMAL, cp.OPTIMAL_INACCURATE}
 
 
 @dataclass
@@ -209,6 +209,26 @@ def _mode(payload: dict[str, Any]) -> str:
     if mode not in allowed:
         raise ProtocolError(f"unsupported settings.mode {mode!r}")
     return mode
+
+
+def _arbitrage_spread_ore_kwh(settings: dict[str, Any], mode: str) -> float:
+    """Return the configured discharge hurdle only for arbitrage policies.
+
+    Parse the setting in every mode so malformed requests still fail at the
+    same contract boundary. Self-consumption and cheap-charge use physical
+    cycle costs only; their discharge is a service decision, not arbitrage.
+    """
+
+    spread = max(
+        0.0,
+        finite_number(
+            settings.get("min_arbitrage_spread_ore_kwh", 0),
+            "settings.min_arbitrage_spread_ore_kwh",
+        ),
+    )
+    if mode not in {"arbitrage", "passive_arbitrage"}:
+        return 0.0
+    return spread
 
 
 def _export_price(slot: dict[str, Any], settings: dict[str, Any]) -> float:
@@ -856,9 +876,10 @@ def solve(payload: dict[str, Any]) -> dict[str, Any]:
 
     cycle_cost = cp.Constant(0.0)
     terminal_credit = cp.Constant(0.0)
+    arbitrage_spread = _arbitrage_spread_ore_kwh(settings, mode)
     for storage in storages:
         cycle_ore = max(0.0, finite_number(storage.spec.get("cycle_cost_ore_kwh", 0), "storage.cycle_cost_ore_kwh"))
-        cycle_ore += max(0.0, finite_number(settings.get("min_arbitrage_spread_ore_kwh", 0), "settings.min_arbitrage_spread_ore_kwh"))
+        cycle_ore += arbitrage_spread
         cycle_cost += cycle_ore * cp.sum(cp.multiply(dt_h, storage.discharge)) / 1000.0
         throughput_ore = max(
             0.0,
