@@ -277,7 +277,82 @@ def load_realized_csv(path: Path | None) -> dict[int, dict[str, float]]:
     return rows
 
 
-def _realized_cost(
+def _record_timestamp_ms(record: dict[str, Any]) -> int:
+    diagnostic = record.get("diagnostic", {})
+    summary = record.get("summary", {})
+    if not isinstance(diagnostic, dict):
+        diagnostic = {}
+    if not isinstance(summary, dict):
+        summary = {}
+    return int(summary.get("ts_ms", diagnostic.get("computed_at_ms", 0)))
+
+
+def _first_slot(record: dict[str, Any]) -> dict[str, Any] | None:
+    diagnostic = record.get("diagnostic", {})
+    if not isinstance(diagnostic, dict):
+        return None
+    slots = diagnostic.get("slots", [])
+    if not isinstance(slots, list) or not slots or not isinstance(slots[0], dict):
+        return None
+    return slots[0]
+
+
+def select_causal_first_steps(
+    snapshots: Iterable[dict[str, Any]],
+    realized: dict[int, dict[str, float]],
+) -> tuple[list[dict[str, Any]], Counter[str]]:
+    """Pick at most one decision made by each realized interval's start.
+
+    A diagnostic written after the interval starts cannot describe the action
+    available at that decision cutoff. Among diagnostics available by the
+    cutoff, the newest one wins. Realized intervals must also be valid and
+    non-overlapping before their costs can be added.
+    """
+
+    by_interval: dict[int, dict[str, Any]] = {}
+    exclusions: Counter[str] = Counter()
+    for record in snapshots:
+        slot = _first_slot(record)
+        if slot is None:
+            exclusions["missing first action"] += 1
+            continue
+        start_ms = int(slot.get("slot_start_ms", 0))
+        actual = realized.get(start_ms)
+        if actual is None:
+            exclusions["missing realized interval"] += 1
+            continue
+        decision_ms = _record_timestamp_ms(record)
+        if decision_ms <= 0:
+            exclusions["missing decision timestamp"] += 1
+            continue
+        if decision_ms > start_ms:
+            exclusions["diagnostic after decision cutoff"] += 1
+            continue
+        previous = by_interval.get(start_ms)
+        if previous is None or decision_ms > _record_timestamp_ms(previous):
+            if previous is not None:
+                exclusions["superseded before decision cutoff"] += 1
+            by_interval[start_ms] = record
+        else:
+            exclusions["superseded before decision cutoff"] += 1
+
+    selected: list[dict[str, Any]] = []
+    previous_end_ms = -math.inf
+    for start_ms, record in sorted(by_interval.items()):
+        actual = realized[start_ms]
+        end_ms = actual.get("bucket_end_ms", math.nan)
+        if not math.isfinite(end_ms) or end_ms <= start_ms:
+            exclusions["invalid realized interval"] += 1
+            continue
+        if start_ms < previous_end_ms:
+            exclusions["overlapping realized interval"] += 1
+            continue
+        selected.append(record)
+        previous_end_ms = end_ms
+    return selected, exclusions
+
+
+def _interval_cost(
     grid_w: float,
     dt_h: float,
     import_ore_kwh: float,
@@ -285,6 +360,22 @@ def _realized_cost(
 ) -> float:
     grid_kwh = grid_w * dt_h / 1000.0
     return import_ore_kwh * max(grid_kwh, 0.0) - export_ore_kwh * max(-grid_kwh, 0.0)
+
+
+def _forecast_balance_residual_w(
+    slot: dict[str, Any], action: dict[str, Any]
+) -> float | None:
+    if action.get("grid_w") is None:
+        return None
+    grid_w = float(action["grid_w"])
+    expected_grid_w = (
+        float(slot.get("load_w", 0))
+        + float(slot.get("pv_w", 0))
+        + float(action.get("battery_w", 0))
+    )
+    if not math.isfinite(grid_w) or not math.isfinite(expected_grid_w):
+        return None
+    return grid_w - expected_grid_w
 
 
 def dp_evaluation_reference(
@@ -302,7 +393,7 @@ def dp_evaluation_reference(
     raise SnapshotSkip("missing same-input DP evaluation shadow")
 
 
-def realized_first_slot(
+def first_action_counterfactual(
     diagnostic: dict[str, Any],
     response: dict[str, Any],
     realized: dict[int, dict[str, float]],
@@ -325,17 +416,57 @@ def realized_first_slot(
     actual = realized.get(start_ms)
     if actual is None:
         return None
+    raw_interval_end_ms = actual.get("bucket_end_ms", math.nan)
+    common = {
+        "eligible": False,
+        "interval_start_ms": start_ms,
+        "interval_end_ms": (
+            int(raw_interval_end_ms) if math.isfinite(raw_interval_end_ms) else None
+        ),
+        "decision_cutoff_ms": start_ms,
+        "metric_scope": "grid_boundary_energy_only",
+    }
     required = (
-        actual["bucket_end_ms"],
-        actual["pv_w"],
-        actual["ev_w"],
-        actual["v2x_w"],
-        actual["house_load_w"],
-        actual["total_ore_kwh"],
-        actual["spot_ore_kwh"],
+        raw_interval_end_ms,
+        actual.get("pv_w", math.nan),
+        actual.get("ev_w", math.nan),
+        actual.get("v2x_w", math.nan),
+        actual.get("house_load_w", math.nan),
+        actual.get("total_ore_kwh", math.nan),
+        actual.get("spot_ore_kwh", math.nan),
     )
     if not all(math.isfinite(value) for value in required):
-        return None
+        return {**common, "excluded_reason": "non-finite realized interval"}
+
+    interval_end_ms = int(actual["bucket_end_ms"])
+    planned_end_ms = start_ms + int(old_slot.get("len_min", 0)) * 60_000
+    if planned_end_ms != interval_end_ms:
+        return {
+            **common,
+            "excluded_reason": "realized interval does not match the first action",
+        }
+
+    reference_pv_limit_w = float(old_action.get("pv_limit_w", 0) or 0)
+    candidate_pv_limit_w = float(new.get("pv_limit_w", 0) or 0)
+    reference_balance_residual_w = _forecast_balance_residual_w(old_slot, old_action)
+    candidate_balance_residual_w = _forecast_balance_residual_w(old_slot, new)
+    balance_implies_curtailment = any(
+        residual is not None and abs(residual) > 2
+        for residual in (reference_balance_residual_w, candidate_balance_residual_w)
+    )
+    if (
+        reference_pv_limit_w > 1e-5
+        or candidate_pv_limit_w > 1e-5
+        or balance_implies_curtailment
+    ):
+        return {
+            **common,
+            "excluded_reason": "PV curtailment is not modeled in counterfactual replay",
+            "reference_pv_limit_w": reference_pv_limit_w,
+            "candidate_pv_limit_w": candidate_pv_limit_w,
+            "reference_forecast_balance_residual_w": reference_balance_residual_w,
+            "candidate_forecast_balance_residual_w": candidate_balance_residual_w,
+        }
 
     params = diagnostic.get("params", {})
     export_ore = actual["spot_ore_kwh"]
@@ -362,22 +493,43 @@ def realized_first_slot(
         (max_import_w > 0 and new_grid_w > max_import_w + 2)
         or (max_export_w > 0 and new_grid_w < -max_export_w - 2)
     )
-    old_cost = _realized_cost(old_grid_w, dt_h, actual["total_ore_kwh"], export_ore)
-    new_cost = _realized_cost(new_grid_w, dt_h, actual["total_ore_kwh"], export_ore)
+    old_cost = _interval_cost(old_grid_w, dt_h, actual["total_ore_kwh"], export_ore)
+    new_cost = _interval_cost(new_grid_w, dt_h, actual["total_ore_kwh"], export_ore)
     return {
-        "bucket_start_ms": start_ms,
+        **common,
+        "eligible": True,
         "actual_base_w": base_w,
         "forecast_base_w": float(old_slot.get("load_w", 0)) + float(old_slot.get("pv_w", 0)),
-        "old_battery_w": float(old_action.get("battery_w", 0)),
-        "new_battery_w": float(new.get("battery_w", 0)),
-        "old_grid_w": old_grid_w,
-        "new_grid_w": new_grid_w,
-        "old_cost_ore": old_cost,
-        "new_cost_ore": new_cost,
-        "delta_ore": new_cost - old_cost,
+        "reference_battery_w": float(old_action.get("battery_w", 0)),
+        "candidate_battery_w": float(new.get("battery_w", 0)),
+        "reference_grid_w": old_grid_w,
+        "candidate_grid_w": new_grid_w,
+        "reference_grid_cost_ore": old_cost,
+        "candidate_grid_cost_ore": new_cost,
+        "grid_cost_delta_ore": new_cost - old_cost,
         "mode_violation": mode_violation,
         "limit_violation": limit_violation,
     }
+
+
+def realized_first_slot(
+    diagnostic: dict[str, Any],
+    response: dict[str, Any],
+    realized: dict[int, dict[str, float]],
+    max_import_w: float,
+    max_export_w: float,
+    old_action: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Compatibility alias; reports a first-action counterfactual, not delivery."""
+
+    return first_action_counterfactual(
+        diagnostic,
+        response,
+        realized,
+        max_import_w,
+        max_export_w,
+        old_action,
+    )
 
 
 def run_backtest(
@@ -397,17 +549,23 @@ def run_backtest(
     realized = load_realized_csv(realized_csv)
     if limit > 0:
         snapshots = snapshots[:limit]
+    counterfactual_requested = realized_csv is not None
+    selection_exclusions: Counter[str] = Counter()
+    if counterfactual_requested:
+        replay_records, selection_exclusions = select_causal_first_steps(snapshots, realized)
+    else:
+        replay_records = sorted(snapshots, key=_record_timestamp_ms)
+
     results: list[dict[str, Any]] = []
     failures: Counter[str] = Counter()
     skips: Counter[str] = Counter()
+    counterfactual_exclusions: Counter[str] = Counter()
     solve_times: list[float] = []
-    deltas: list[float] = []
-    old_costs: list[float] = []
-    new_costs: list[float] = []
+    horizon_deltas: list[float] = []
     out_of_bounds_starts = 0
-    realized_candidates: list[dict[str, Any]] = []
+    first_action_rows: list[dict[str, Any]] = []
 
-    for position, record in enumerate(snapshots, start=1):
+    for position, record in enumerate(replay_records, start=1):
         diagnostic = record.get("diagnostic", {})
         summary = record.get("summary", {})
         params = diagnostic.get("params", {}) if isinstance(diagnostic, dict) else {}
@@ -443,50 +601,50 @@ def run_backtest(
             failures[message] += 1
             row.update({"ok": False, "error": message})
             results.append(row)
-            print(f"replayed {position}/{len(snapshots)} failed: {message}", file=sys.stderr)
+            print(f"replayed {position}/{len(replay_records)} failed: {message}", file=sys.stderr)
             continue
 
         new_cost = float(response["plan"]["total_cost_ore"])
         solve_ms = float(response["solver"]["solve_ms"])
         delta = new_cost - old_cost
-        old_costs.append(old_cost)
-        new_costs.append(new_cost)
-        deltas.append(delta)
+        horizon_deltas.append(delta)
         solve_times.append(solve_ms)
         row.update(
             {
                 "ok": True,
-                "old_dp_cost_ore": old_cost,
-                "new_optimizer_cost_ore": new_cost,
-                "delta_ore": delta,
+                "horizon_objective": {
+                    "reference_dp_cost_ore": old_cost,
+                    "candidate_optimizer_cost_ore": new_cost,
+                    "delta_ore": delta,
+                    "additive": False,
+                },
                 "solve_ms": solve_ms,
                 "status": response["solver"]["status"],
                 "formulation": response["solver"]["formulation"],
                 "service_slack": response["solver"]["service_slack"],
             }
         )
-        actual = realized_first_slot(
-            diagnostic, response, realized, max_import_w, max_export_w, old_action
-        )
-        if actual is not None:
-            row["realized_first_slot"] = actual
-            realized_candidates.append({"ts_ms": row["ts_ms"], **actual})
+        if counterfactual_requested:
+            counterfactual = first_action_counterfactual(
+                diagnostic, response, realized, max_import_w, max_export_w, old_action
+            )
+            if counterfactual is not None:
+                row["first_action_counterfactual"] = counterfactual
+                if counterfactual["eligible"]:
+                    first_action_rows.append(counterfactual)
+                else:
+                    counterfactual_exclusions[str(counterfactual["excluded_reason"])] += 1
+            else:
+                counterfactual_exclusions["counterfactual unavailable"] += 1
         results.append(row)
-        print(f"replayed {position}/{len(snapshots)}", file=sys.stderr)
+        print(f"replayed {position}/{len(replay_records)}", file=sys.stderr)
 
-    realized_by_bucket: dict[int, dict[str, Any]] = {}
-    for candidate in realized_candidates:
-        bucket = int(candidate["bucket_start_ms"])
-        previous = realized_by_bucket.get(bucket)
-        offset = abs(int(candidate["ts_ms"]) - bucket)
-        previous_offset = abs(int(previous["ts_ms"]) - bucket) if previous else math.inf
-        if previous is None or offset < previous_offset:
-            realized_by_bucket[bucket] = candidate
-    realized_unique = list(realized_by_bucket.values())
-    realized_deltas = [float(row["delta_ore"]) for row in realized_unique]
+    first_action_deltas = [
+        float(row["grid_cost_delta_ore"]) for row in first_action_rows
+    ]
 
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at_ms": int(time.time() * 1000),
         "dataset": metadata,
         "configuration": {
@@ -497,9 +655,12 @@ def run_backtest(
             "max_export_w": max_export_w,
             "min_arbitrage_spread_ore_kwh": min_arbitrage_spread_ore_kwh,
             "historical_scenarios": False,
+            "decision_cutoff": "realized_interval_start",
+            "state_policy": "independent_persisted_snapshot",
         },
         "summary": {
             "snapshots": len(snapshots),
+            "replayed_snapshots": len(replay_records),
             "solved": len(solve_times),
             "failed": sum(failures.values()),
             "skipped": sum(skips.values()),
@@ -510,22 +671,30 @@ def run_backtest(
                 "p99": _percentile(solve_times, 0.99),
                 "max": max(solve_times) if solve_times else None,
             },
-            "planned_cost_ore": {
-                "old_dp_sum": sum(old_costs),
-                "new_optimizer_sum": sum(new_costs),
-                "delta_sum": sum(deltas),
-                "delta_p50": _percentile(deltas, 0.50),
-                "delta_p95": _percentile(deltas, 0.95),
+            "horizon_objective_diagnostics": {
+                "comparisons": len(horizon_deltas),
+                "additive": False,
+                "delta_p50": _percentile(horizon_deltas, 0.50),
+                "delta_p95": _percentile(horizon_deltas, 0.95),
             },
-            "realized_first_slot": {
-                "unique_slots": len(realized_unique),
-                "old_dp_cost_ore": sum(float(row["old_cost_ore"]) for row in realized_unique),
-                "new_optimizer_cost_ore": sum(float(row["new_cost_ore"]) for row in realized_unique),
-                "delta_ore": sum(realized_deltas),
-                "delta_p50": _percentile(realized_deltas, 0.50),
-                "delta_p95": _percentile(realized_deltas, 0.95),
-                "mode_violations": sum(bool(row["mode_violation"]) for row in realized_unique),
-                "limit_violations": sum(bool(row["limit_violation"]) for row in realized_unique),
+            "first_action_counterfactual": {
+                "requested": counterfactual_requested,
+                "metric_scope": "grid_boundary_energy_only",
+                "selected_intervals": len(replay_records) if counterfactual_requested else 0,
+                "scored_intervals": len(first_action_rows),
+                "reference_dp_grid_cost_ore": sum(
+                    float(row["reference_grid_cost_ore"]) for row in first_action_rows
+                ),
+                "candidate_optimizer_grid_cost_ore": sum(
+                    float(row["candidate_grid_cost_ore"]) for row in first_action_rows
+                ),
+                "grid_cost_delta_ore": sum(first_action_deltas),
+                "grid_cost_delta_p50": _percentile(first_action_deltas, 0.50),
+                "grid_cost_delta_p95": _percentile(first_action_deltas, 0.95),
+                "mode_violations": sum(bool(row["mode_violation"]) for row in first_action_rows),
+                "limit_violations": sum(bool(row["limit_violation"]) for row in first_action_rows),
+                "selection_exclusions": dict(selection_exclusions.most_common()),
+                "counterfactual_exclusions": dict(counterfactual_exclusions.most_common()),
             },
             "failures": dict(failures.most_common()),
             "skips": dict(skips.most_common()),
@@ -534,7 +703,12 @@ def run_backtest(
             "Historical diagnostics preserve forecast snapshots, not realized outcomes.",
             "The legacy diagnostic schema does not preserve full loadpoint contracts; those snapshots are skipped.",
             "Historical PV/load scenario distributions are unavailable, so replay uses the persisted base/downside slots without CVaR.",
-            "Realized first-slot results are one-step counterfactuals; live dispatch feedback would adjust planned battery power.",
+            "Overlapping full-horizon objectives are per-snapshot diagnostics and are never summed.",
+            "First-action counterfactuals reprice planned battery actions against realized exogenous interval averages; neither command results nor measured battery delivery are persisted.",
+            "Each first-action comparison starts from its diagnostic's persisted SoC. Closed-loop state propagation needs both policies to be recomputed from the same propagated state.",
+            "First-action sums cover grid-boundary energy cost only. They omit battery wear and end-energy value, so they cannot rank policies that finish an interval with different stored energy.",
+            "Counterfactuals with a positive PV limit or a forecast balance that implies curtailment are excluded because replay does not model curtailed PV.",
+            "The legacy active-zero PV cap is detectable only when persisted grid power exposes its forecast balance residual.",
         ],
         "results": results,
     }
