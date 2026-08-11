@@ -105,8 +105,9 @@ type Service struct {
 	Loadpoint         LoadpointProbe // optional — when non-nil, the DP extends its state with EV dimensions
 	Loadpoints        LoadpointsProbe
 
-	// SaveDiag is called synchronously after every successful replan
-	// with the same Diagnostic the /api/mpc/diagnose endpoint would
+	// SaveDiag is called synchronously after every successful replan that
+	// remains the newest request, with the same Diagnostic the
+	// /api/mpc/diagnose endpoint would
 	// return + the trigger reason ("scheduled" / "reactive-pv" /
 	// "reactive-load" / "manual"). Nil disables persistence — the
 	// in-memory diagnose still works. Wired in main.go against
@@ -175,7 +176,12 @@ type Service struct {
 	MaxExportW float64
 
 	lastReplanAt time.Time
-	lastReason   string // "scheduled" | "reactive-pv" | "reactive-load" | "manual"
+	lastReason   string // reason paired with the currently published plan
+	// latestReplanGeneration identifies the newest requested solve. A solve
+	// may run after a newer request starts, but it cannot publish over it.
+	// This guard does not cancel solver work; transport deadlines and worker
+	// queue ownership remain separate concerns.
+	latestReplanGeneration uint64 // guarded by mu
 
 	// ExportBonusOreKwh and ExportFeeOreKwh flow in from config.Price.
 	// Used to compute default ExportOrePerKWh when Params doesn't set it.
@@ -222,6 +228,15 @@ type plannedPredictions struct {
 	load      []float64   // per-slot W (≥ 0)
 	slotStart []time.Time // slot-start timestamps for re-sampling
 	builtAt   time.Time
+}
+
+// replanRequest is an immutable snapshot of the caller's intent. In
+// particular, mode and reason must stay paired while a slower solve runs.
+type replanRequest struct {
+	generation uint64
+	params     Params
+	fleet      []BatteryFleetMember
+	reason     string
 }
 
 func (s *Service) driverOnline(name string) bool {
@@ -528,6 +543,10 @@ func (s *Service) SlotAt(now time.Time) (string, float64, bool) {
 	}
 	s.mu.RLock()
 	p := s.last
+	params := s.lastParams
+	if params.Mode == "" {
+		params = s.Defaults
+	}
 	s.mu.RUnlock()
 	if p == nil {
 		return "", 0, false
@@ -539,7 +558,7 @@ func (s *Service) SlotAt(now time.Time) (string, float64, bool) {
 	for _, a := range p.Actions {
 		end := a.SlotStartMs + int64(a.SlotLenMin)*60*1000
 		if nowMs >= a.SlotStartMs && nowMs < end {
-			return actionToSlot(a, s.Defaults.Mode)
+			return actionToSlot(a, params.Mode)
 		}
 	}
 	return "", 0, false
@@ -587,8 +606,9 @@ func (s *Service) SetMode(ctx context.Context, mode Mode) {
 	}
 	s.mu.Lock()
 	s.Defaults.Mode = mode
+	request := s.beginReplanLocked("mode_changed")
 	s.mu.Unlock()
-	s.replan(ctx)
+	s.runReplan(ctx, request)
 }
 
 // Start runs the planner in a goroutine. Does an initial plan immediately.
@@ -613,8 +633,7 @@ func (s *Service) Stop() {
 
 func (s *Service) loop(ctx context.Context) {
 	defer close(s.done)
-	s.lastReason = "scheduled"
-	s.replan(ctx)
+	s.replan(ctx, "scheduled")
 	t := time.NewTicker(s.Interval)
 	defer t.Stop()
 	var reactiveTick <-chan time.Time
@@ -630,8 +649,7 @@ func (s *Service) loop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			s.lastReason = "scheduled"
-			s.replan(ctx)
+			s.replan(ctx, "scheduled")
 		case <-reactiveTick:
 			s.observeShadow(time.Now())
 			s.checkDivergence(ctx)
@@ -753,13 +771,12 @@ func (s *Service) checkDivergence(ctx context.Context) {
 		"pv_err_wh", pvInt, "loadint_wh", loadInt,
 		"pv_w_now", pvW, "plan_pv_w", slot.PVW,
 		"load_w_now", loadW, "plan_load_w", slot.LoadW)
-	s.lastReason = reason
 	// Reset integrals after triggering so we don't immediately re-fire.
 	s.mu.Lock()
 	s.pvErrIntWh = 0
 	s.loadErrIntWh = 0
 	s.mu.Unlock()
-	s.replan(ctx)
+	s.replan(ctx, reason)
 }
 
 // snapshotPredictions samples the PV + load twins at the build-time slot
@@ -895,15 +912,12 @@ func (s *Service) checkTwinDrift(ctx context.Context) {
 	if reason == "" {
 		return
 	}
-	s.mu.Lock()
-	s.lastReason = reason
-	s.mu.Unlock()
-	s.replan(ctx)
+	s.replan(ctx, reason)
 }
 
 // Replan recomputes the plan once using current prices + forecast + SoC.
 // Exposed for tests and API triggers.
-func (s *Service) Replan(ctx context.Context) *Plan { return s.replan(ctx) }
+func (s *Service) Replan(ctx context.Context) *Plan { return s.replan(ctx, "manual") }
 
 // ReplanWithReason is Replan with an explicit reason string that lands
 // in slog + the diagnose snapshot. Use it when an external event (API
@@ -913,15 +927,36 @@ func (s *Service) Replan(ctx context.Context) *Plan { return s.replan(ctx) }
 // 12:34?". Reasons should be short kebab-style, e.g.
 // "surplus_only_disabled", "target_soc_changed", "mode_changed".
 func (s *Service) ReplanWithReason(ctx context.Context, reason string) *Plan {
-	if reason != "" {
-		s.mu.Lock()
-		s.lastReason = reason
-		s.mu.Unlock()
-	}
-	return s.replan(ctx)
+	return s.replan(ctx, reason)
 }
 
-func (s *Service) replan(ctx context.Context) *Plan {
+func (s *Service) replan(ctx context.Context, reason string) *Plan {
+	return s.runReplan(ctx, s.beginReplan(reason))
+}
+
+func (s *Service) beginReplan(reason string) replanRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.beginReplanLocked(reason)
+}
+
+// beginReplanLocked assigns the generation and snapshots the effective
+// defaults under the same lock. Callers that change Defaults first, such as
+// SetMode, use this form so no old solve can commit in between those actions.
+func (s *Service) beginReplanLocked(reason string) replanRequest {
+	if reason == "" {
+		reason = "manual"
+	}
+	s.latestReplanGeneration++
+	return replanRequest{
+		generation: s.latestReplanGeneration,
+		params:     s.Defaults,
+		fleet:      append([]BatteryFleetMember(nil), s.BatteryFleet...),
+		reason:     reason,
+	}
+}
+
+func (s *Service) runReplan(ctx context.Context, request replanRequest) *Plan {
 	now := time.Now()
 	untilMs := now.Add(s.Horizon).UnixMilli()
 	sinceMs := now.UnixMilli() - 15*60*1000 // small margin — slot starting ≤15min ago still in-flight
@@ -974,10 +1009,8 @@ func (s *Service) replan(ctx context.Context) *Plan {
 	clampSlotGridLimits(slots, s.FuseMaxW, s.MaxExportW)
 	clampSlotGridLimits(fallbackSlots, s.FuseMaxW, s.MaxExportW)
 
-	s.mu.RLock()
-	p := s.Defaults
-	fleet := append([]BatteryFleetMember(nil), s.BatteryFleet...)
-	s.mu.RUnlock()
+	p := request.params
+	fleet := request.fleet
 	if len(fleet) > 0 {
 		var ok bool
 		p, ok = s.onlineFleetParams(p, fleet)
@@ -1093,6 +1126,9 @@ func (s *Service) replan(ctx context.Context) *Plan {
 		"loadpoint_id", loadpointID,
 	)
 	var plan Plan
+	var shadowRecoursePlan *Plan
+	var shadowError string
+	publishShadow := false
 	if s.Optimizer == nil {
 		slots = fallbackSlots
 		plan = Optimize(slots, p)
@@ -1133,10 +1169,10 @@ func (s *Service) replan(ctx context.Context) *Plan {
 				candidate.DPShadow.FirstAction.EMSMode = mode
 			}
 
-			var recoursePlan *Plan
 			if s.EnableRecourseShadow {
+				publishShadow = true
 				if len(p.activeLoadpoints()) > 0 {
-					s.ensureShadowEvaluator().SetError("recourse shadow skipped while flexible loads are active", now)
+					shadowError = "recourse shadow skipped while flexible loads are active"
 				} else {
 					policy := s.ChallengerPolicy
 					if policy == "" {
@@ -1162,9 +1198,9 @@ func (s *Service) replan(ctx context.Context) *Plan {
 					}
 					if recourseErr != nil {
 						slog.Warn("mpc: stochastic challenger failed", "policy", policy, "err", recourseErr)
-						s.ensureShadowEvaluator().SetError(recourseErr.Error(), now)
+						shadowError = recourseErr.Error()
 					} else {
-						recoursePlan = &recourse
+						shadowRecoursePlan = &recourse
 						candidate.RecourseShadow = compareDPShadow(candidate, recourse)
 						candidate.RecourseShadow.ForecastBasis = "same stochastic scenario input; conditional decisions after non-anticipative prefix"
 						candidate.RecourseShadow.Solver = recourse.Solver
@@ -1176,9 +1212,6 @@ func (s *Service) replan(ctx context.Context) *Plan {
 						}
 					}
 				}
-				evaluator := s.ensureShadowEvaluator()
-				evaluator.SetPlans(&candidate, recoursePlan, slots, p, time.Now())
-				candidate.ShadowEvaluation = evaluator.Snapshot()
 			}
 			optimizerSolveMs := 0.0
 			if candidate.Solver != nil {
@@ -1237,17 +1270,36 @@ func (s *Service) replan(ctx context.Context) *Plan {
 	pp := s.snapshotPredictions(slots, forecasts)
 
 	s.mu.Lock()
+	if request.generation != s.latestReplanGeneration {
+		latest := s.latestReplanGeneration
+		s.mu.Unlock()
+		slog.Info("mpc: discarded superseded replan",
+			"generation", request.generation,
+			"latest_generation", latest,
+			"mode", p.Mode,
+			"reason", request.reason)
+		return s.Latest()
+	}
+	if publishShadow {
+		if s.shadowEvaluator == nil {
+			s.shadowEvaluator = newStatefulShadowEvaluator()
+		}
+		if shadowError != "" {
+			s.shadowEvaluator.SetError(shadowError, now)
+		}
+		s.shadowEvaluator.SetPlans(&plan, shadowRecoursePlan, slots, p, time.Now())
+		plan.ShadowEvaluation = s.shadowEvaluator.Snapshot()
+	}
 	s.last = &plan
 	s.lastSlots = slots
 	s.lastParams = p
 	s.lastLoadpointID = loadpointID
 	s.lastReplanAt = time.Now()
 	s.plannedPredictions = pp
-	reason := s.lastReason
-	if reason == "" {
-		reason = "manual"
-	}
+	s.lastReason = request.reason
+	reason := request.reason
 	replanAtMs := s.lastReplanAt.UnixMilli()
+	saveDiag := s.SaveDiag
 	s.mu.Unlock()
 	// Horizon statistics — surfaced in logs so operators can
 	// reconstruct "what did the DP know?" without pulling the full
@@ -1285,29 +1337,20 @@ func (s *Service) replan(ctx context.Context) *Plan {
 	// this replan later. Best-effort: errors log and continue so a
 	// flaky disk never blocks planning.
 	//
-	// Critically: build from the LOCAL plan/slots/p we just computed,
-	// not from s.last via Diagnose(). A concurrent replan could have
-	// swapped s.last between our unlock and the Diagnose() call,
-	// which would pair a different plan with OUR reason — writing a
-	// corrupt snapshot. Using the locals keeps (plan, reason)
-	// atomically consistent even under concurrent replans.
-	if s.SaveDiag != nil {
+	// Build from the local plan/slots/p accepted by the generation check,
+	// not from s.last via Diagnose(). This keeps each persisted plan paired
+	// with the params and reason from the same request. Once accepted, every
+	// active plan gets a historical diagnostic even if another request starts
+	// before this disk write completes. A never-active plan does not reach this
+	// hook, and the service mutex is not held across disk I/O.
+	if saveDiag != nil {
 		if d := buildDiagnostic(&plan, slots, p, s.Zone, replanAtMs, reason); d != nil {
-			if err := s.SaveDiag(d, reason); err != nil {
+			if err := saveDiag(d, reason); err != nil {
 				slog.Warn("mpc: persist diagnostic failed", "err", err)
 			}
 		}
 	}
 	return &plan
-}
-
-func (s *Service) ensureShadowEvaluator() *StatefulShadowEvaluator {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.shadowEvaluator == nil {
-		s.shadowEvaluator = newStatefulShadowEvaluator()
-	}
-	return s.shadowEvaluator
 }
 
 // observeShadow samples realized exogenous power for closed-loop scoring. It
