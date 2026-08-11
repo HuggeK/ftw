@@ -10,6 +10,11 @@ import (
 	"github.com/srcfl/ftw/go/internal/state"
 )
 
+const (
+	savingsValueScope = "site_total"
+	savingsBaseline   = "no_pv_no_battery_vehicle_energy_at_daily_average"
+)
+
 // daySavings is the cached per-local-day cost breakdown that powers
 // /api/savings/daily. Mirrors the immutable-day pattern dailyCache uses.
 // Past days never re-render; only today is recomputed each request.
@@ -29,6 +34,11 @@ type daySavings struct {
 	ActualCostOre    float64
 	FlatCostOre      float64
 	SavedOre         float64
+	ExpectedMs       int64
+	HistoryCoveredMs int64
+	PricedCoveredMs  int64
+	HistoryCoverage  float64
+	PricedCoverage   float64
 	Resolution       string // "slot" or "no_prices"
 }
 
@@ -49,6 +59,11 @@ func fromBreakdown(b state.DayCostBreakdown, resolution string) daySavings {
 		ActualCostOre:    b.ActualCostOre(),
 		FlatCostOre:      b.FlatCostOre(),
 		SavedOre:         b.SavedOre(),
+		ExpectedMs:       b.ExpectedMs,
+		HistoryCoveredMs: b.HistoryCoveredMs,
+		PricedCoveredMs:  b.PricedCoveredMs,
+		HistoryCoverage:  b.HistoryCoveragePct(),
+		PricedCoverage:   b.PricedCoveragePct(),
 		Resolution:       resolution,
 	}
 }
@@ -65,7 +80,9 @@ type savingsCacheT struct {
 }
 
 // handleSavingsDaily returns per-local-day actual net cost vs the load-only
-// no-PV/no-battery baseline. The endpoint name is kept for compatibility.
+// no-PV/no-battery baseline, with vehicle energy priced at the day's average.
+// This is combined site value, not incremental optimizer value. The endpoint
+// name and existing fields are kept for compatibility.
 //
 // GET /api/savings/daily?days=N
 //
@@ -79,13 +96,18 @@ type savingsCacheT struct {
 //	      "import_cost_ore": ..., "export_revenue_ore": ...,
 //	      "actual_cost_ore": ..., "baseline_cost_ore": ..., "saved_ore": ...,
 //	      "avg_import_ore_kwh": ..., "avg_export_ore_kwh": ...,
+//	      "expected_ms": ..., "history_covered_ms": ..., "priced_covered_ms": ...,
+//	      "history_coverage_pct": ..., "priced_coverage_pct": ...,
 //	      "resolution": "slot" | "no_prices"
 //	    },
 //	    ...
 //	  ],
 //	  "totals": { "import_wh": ..., "export_wh": ..., "load_wh": ...,
-//	              "actual_cost_ore": ..., "baseline_cost_ore": ..., "saved_ore": ... },
-//	  "tz": "Local"
+//	              "actual_cost_ore": ..., "baseline_cost_ore": ..., "saved_ore": ...,
+//	              "expected_ms": ..., "history_covered_ms": ..., "priced_covered_ms": ...,
+//	              "history_coverage_pct": ..., "priced_coverage_pct": ... },
+//	  "tz": "Local", "value_scope": "site_total",
+//	  "baseline": "no_pv_no_battery_vehicle_energy_at_daily_average"
 //	}
 //
 // Days where the prices table has no slot for the zone come back with
@@ -94,7 +116,9 @@ type savingsCacheT struct {
 // "data but no prices yet".
 func (s *Server) handleSavingsDaily(w http.ResponseWriter, r *http.Request) {
 	if s.deps.State == nil {
-		writeJSON(w, 200, map[string]any{"days": []any{}})
+		writeJSON(w, 200, map[string]any{
+			"days": []any{}, "value_scope": savingsValueScope, "baseline": savingsBaseline,
+		})
 		return
 	}
 
@@ -128,7 +152,10 @@ func (s *Server) handleSavingsDaily(w http.ResponseWriter, r *http.Request) {
 	}
 	if zone == "" {
 		// No price provider configured → nothing to compare against.
-		writeJSON(w, 200, map[string]any{"days": []any{}, "tz": time.Now().Location().String()})
+		writeJSON(w, 200, map[string]any{
+			"days": []any{}, "tz": time.Now().Location().String(),
+			"value_scope": savingsValueScope, "baseline": savingsBaseline,
+		})
 		return
 	}
 
@@ -140,6 +167,7 @@ func (s *Server) handleSavingsDaily(w http.ResponseWriter, r *http.Request) {
 
 	out := make([]map[string]any, 0, days)
 	var tImpWh, tExpWh, tLoadWh, tActual, tBaseline, tSaved float64
+	var tExpectedMs, tHistoryCoveredMs, tPricedCoveredMs int64
 
 	for i := days - 1; i >= 0; i-- {
 		dayStart := todayMidnight.AddDate(0, 0, -i)
@@ -182,6 +210,9 @@ func (s *Server) handleSavingsDaily(w http.ResponseWriter, r *http.Request) {
 		tActual += ds.ActualCostOre
 		tBaseline += ds.BaselineCostOre
 		tSaved += ds.SavedOre
+		tExpectedMs += ds.ExpectedMs
+		tHistoryCoveredMs += ds.HistoryCoveredMs
+		tPricedCoveredMs += ds.PricedCoveredMs
 
 		out = append(out, map[string]any{
 			"day":                dayKey,
@@ -197,11 +228,16 @@ func (s *Server) handleSavingsDaily(w http.ResponseWriter, r *http.Request) {
 			"baseline_cost_ore":  ds.BaselineCostOre,
 			// Deprecated compatibility alias: now equals baseline_cost_ore
 			// (house slot-priced + EV at daily-avg), not a flat-average tariff.
-			"flat_cost_ore":      ds.FlatCostOre,
-			"saved_ore":          ds.SavedOre,
-			"avg_import_ore_kwh": ds.AvgImportOreKwh,
-			"avg_export_ore_kwh": ds.AvgExportOreKwh,
-			"resolution":         ds.Resolution,
+			"flat_cost_ore":        ds.FlatCostOre,
+			"saved_ore":            ds.SavedOre,
+			"avg_import_ore_kwh":   ds.AvgImportOreKwh,
+			"avg_export_ore_kwh":   ds.AvgExportOreKwh,
+			"expected_ms":          ds.ExpectedMs,
+			"history_covered_ms":   ds.HistoryCoveredMs,
+			"priced_covered_ms":    ds.PricedCoveredMs,
+			"history_coverage_pct": ds.HistoryCoverage,
+			"priced_coverage_pct":  ds.PricedCoverage,
+			"resolution":           ds.Resolution,
 		})
 	}
 
@@ -214,11 +250,28 @@ func (s *Server) handleSavingsDaily(w http.ResponseWriter, r *http.Request) {
 			"actual_cost_ore":   tActual,
 			"baseline_cost_ore": tBaseline,
 			// Deprecated compatibility alias for older UI callers.
-			"flat_cost_ore": tBaseline,
-			"saved_ore":     tSaved,
+			"flat_cost_ore":        tBaseline,
+			"saved_ore":            tSaved,
+			"expected_ms":          tExpectedMs,
+			"history_covered_ms":   tHistoryCoveredMs,
+			"priced_covered_ms":    tPricedCoveredMs,
+			"history_coverage_pct": boundedCoveragePct(tHistoryCoveredMs, tExpectedMs),
+			"priced_coverage_pct":  boundedCoveragePct(tPricedCoveredMs, tExpectedMs),
 		},
-		"tz": loc.String(),
+		"tz":          loc.String(),
+		"value_scope": savingsValueScope,
+		"baseline":    savingsBaseline,
 	})
+}
+
+func boundedCoveragePct(coveredMs, expectedMs int64) float64 {
+	if coveredMs <= 0 || expectedMs <= 0 {
+		return 0
+	}
+	if coveredMs >= expectedMs {
+		return 1
+	}
+	return float64(coveredMs) / float64(expectedMs)
 }
 
 // resolutionFor reports whether the breakdown saw any price data. A day
