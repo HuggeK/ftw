@@ -1,8 +1,12 @@
 package api
 
-import "net/http"
+import (
+	"net/http"
 
-// What this box would tell Sourceful about itself.
+	"github.com/srcfl/ftw/go/internal/config"
+)
+
+// What this box would add to FTW's daily fleet totals.
 //
 // The endpoint exists so the Settings tab can render the real message rather
 // than a paragraph promising what the message contains. It is built by the
@@ -12,6 +16,9 @@ import "net/http"
 type fleetPingView struct {
 	Enabled  bool   `json:"enabled"`
 	Endpoint string `json:"endpoint"`
+	// FTWRelay lets Settings state FTW's retention rules only when the running
+	// process is using the endpoint those rules govern.
+	FTWRelay bool `json:"ftw_relay"`
 	// Payload is the whole message, exactly as it would be posted.
 	Payload any `json:"payload"`
 }
@@ -24,16 +31,18 @@ func (s *Server) handleFleetPing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolved the same way the sender resolves them, so a config that never
-	// carried the section reads here as what the box is actually doing.
+	// The switch is live, but the endpoint is fixed when the pinger starts.
+	// Report that active endpoint rather than a newly saved value that needs a
+	// restart before it can be used.
 	s.deps.CfgMu.RLock()
 	enabled := s.deps.Cfg.FleetPing.On()
-	endpoint := s.deps.Cfg.FleetPing.Resolved()
 	s.deps.CfgMu.RUnlock()
 
+	endpoint := s.deps.FleetPing.Endpoint()
 	writeJSON(w, http.StatusOK, fleetPingView{
 		Enabled:  enabled,
 		Endpoint: endpoint,
+		FTWRelay: endpoint == config.DefaultFleetPingEndpoint,
 		Payload:  s.deps.FleetPing.Payload(),
 	})
 }

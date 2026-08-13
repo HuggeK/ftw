@@ -1,4 +1,4 @@
-// Settings → Fleet ping: the message this box sends Sourceful once a day.
+// Settings → Fleet ping: the message this box adds to FTW's fleet totals.
 //
 // This tab is not a privacy policy. A policy is a promise; this screen shows
 // the actual payload, built by the same call the sender uses, so somebody
@@ -79,12 +79,16 @@
   // clock, and until then one box's arrival times are still loosely related.
   function whereLine(body) {
     var endpoint = (body && body.endpoint) || "nowhere";
+    var handling = body && body.ftw_relay
+      ? " The FTW relay adds the report to that day's totals, then drops it and does not save the source address. These are reports, not unique boxes."
+      : " This box uses a custom collector. FTW cannot say what that service stores or whether it counts unique boxes.";
     if (body && body.enabled) {
       return "Sent to " + endpoint +
-        ", once a day, at a time that moves from day to day — it takes a few days to work its way round the clock.";
+        ", once a day, at a time that moves from day to day — it takes a few days to work its way round the clock." +
+        handling;
     }
     return "Nothing is sent. This is the message that would go to " + endpoint +
-      ", once a day, if you switched it on.";
+      ", once a day, if you switched it on." + handling;
   }
 
   function row(label, value) {
@@ -140,7 +144,7 @@
           slot.textContent = "";
           var err = document.createElement("p");
           err.className = "hint";
-          err.textContent = "The fleet ping is not running on this box, so there is nothing to show.";
+          err.textContent = "Fleet statistics are not running on this box, so there is nothing to show.";
           slot.appendChild(err);
           return;
         }
@@ -173,21 +177,21 @@
       setTimeout(refresh, 0);
 
       return (
-        "<fieldset><legend>Fleet ping</legend>" +
-        '<p class="hint">Once a day this box tells Sourceful six things: its ' +
+        "<fieldset><legend>Fleet statistics</legend>" +
+        '<p class="hint">When sharing is on, this box sends six things once a day: its ' +
         "FTW version, its release channel, the kinds of device it talks to, " +
         "roughly how much battery, its price zone, and roughly how old the " +
         "install is. Nothing else — no id, no key, no serial, no site name, no " +
         "counter, no timestamp — so nothing in the message says which box sent " +
-        "it.</p>" +
+        "it. The message itself cannot prove how many unique boxes sent reports.</p>" +
         '<p class="hint fleet-ping-limits">Two limits, plainly. Those six things still describe ' +
         "you: a beta box in a small price zone with a big battery may be the " +
-        "only one of its kind. And Sourceful sees the address you send from, " +
-        "the way any website does. Below is the whole message, as this box " +
-        "would send it right now.</p>" +
+        "only one of its kind. And the receiving service sees the address during " +
+        "the request, the way any website does. What it keeps depends on the " +
+        "endpoint shown below. Here is the whole message, as this box would send it right now.</p>" +
         '<label><input type="checkbox" id="fleet-ping-enabled" ' +
         'data-checkbox-path="fleet_ping.enabled"' + (enabled ? " checked" : "") +
-        "> Send the daily fleet ping</label>" +
+        "> Share daily fleet statistics</label>" +
         '<p class="hint">Takes effect as soon as you save. No restart.</p>' +
         '<div id="fleet-ping-payload"></div>' +
         "</fieldset>"
