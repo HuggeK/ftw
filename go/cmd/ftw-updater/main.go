@@ -113,15 +113,19 @@ type server struct {
 	// pins to the requested version. nil/empty means "inherit only".
 	runner func(ctx context.Context, env []string, args ...string) error
 	// imageID captures the image backing the running service before an update.
+	// imageRef captures the exact image reference used to create it so an
+	// automatic rollback can restore a beta's runtime identity as well as its
+	// bytes.
 	// healthCheck waits for the recreated service to become healthy. Both are
 	// injectable so the rollback path is testable without Docker.
 	imageID     func(ctx context.Context, service string) (string, error)
+	imageRef    func(ctx context.Context, service string) (string, error)
 	containerID func(ctx context.Context, service string) (string, error)
 	healthCheck func(ctx context.Context, service string) error
 	// selfReplace brings the updater sidecar to the release Core just moved to.
 	// Injectable so the ordering — only after a verified Core update, never able
 	// to fail one — is testable without Docker. See self_replace.go.
-	selfReplace func(target string) error
+	selfReplace       func(target string) error
 	chownFile         func(string, int, int) error
 	checkSnapshotFile func(context.Context, string, string, string) error
 	stageSnapshotFile func(context.Context, string, string, string, string) error
@@ -274,6 +278,7 @@ func main() {
 	}
 	srv.mainServiceName = selectedService
 	srv.imageID = srv.currentServiceImageID
+	srv.imageRef = srv.currentServiceImageRef
 	srv.containerID = srv.serviceContainerID
 	srv.healthCheck = srv.waitForServiceHealth
 	srv.selfReplace = func(target string) error {
@@ -518,11 +523,18 @@ func (s *server) runComponentJob(action, target, component string, startedAt tim
 	// Capture the current immutable image ID before pulling. Docker retains the
 	// old image object after the tag moves, which lets us retag and recreate it
 	// if the new container never becomes healthy.
-	var previousImageID string
+	var previousImageID, previousImageTag string
 	if action == "update" && s.imageID != nil {
 		inspectCtx, cancelInspect := context.WithTimeout(context.Background(), 30*time.Second)
 		var err error
 		previousImageID, err = s.imageID(inspectCtx, spec.service)
+		if err == nil && s.imageRef != nil {
+			if previousRef, refErr := s.imageRef(inspectCtx, spec.service); refErr == nil {
+				previousImageTag, _ = imageTagFromReference(previousRef)
+			} else {
+				slog.Warn("cannot capture current image tag; rollback will use a synthetic tag", "service", spec.service, "err", refErr)
+			}
+		}
 		cancelInspect()
 		if err != nil {
 			s.writeState(State{State: "failed", Action: action, Component: component, Target: target, StartedAt: now, UpdatedAt: time.Now(), Message: "cannot capture current image for rollback: " + err.Error()})
@@ -602,7 +614,7 @@ func (s *server) runComponentJob(action, target, component string, startedAt tim
 		cancelHealth()
 		if healthErr != nil {
 			if action == "update" && previousImageID != "" {
-				if rollbackErr := s.restorePreviousComponentImage(previousImageID, spec); rollbackErr == nil {
+				if rollbackErr := s.restorePreviousComponentImageWithTag(previousImageID, previousImageTag, spec); rollbackErr == nil {
 					s.writeState(State{State: "failed", Action: action, Component: component, Target: target, StartedAt: now, UpdatedAt: time.Now(), Message: "new image failed health check; previous image restored: " + healthErr.Error()})
 					return
 				} else {
@@ -664,6 +676,16 @@ func (s *server) runComponentRollback(component string, startedAt time.Time) {
 		s.writeState(State{State: "failed", Action: "component_rollback", Component: component, StartedAt: now, UpdatedAt: time.Now(), Message: err.Error(), PreviousImageID: previous})
 		return
 	}
+	cleanup, err := s.prepareComponentImagePin(spec)
+	if err != nil {
+		s.writeState(State{State: "failed", Action: "component_rollback", Component: component, StartedAt: now, UpdatedAt: time.Now(), Message: "compose preflight failed: " + err.Error(), PreviousImageID: previous})
+		return
+	}
+	defer cleanup()
+	if err := s.validateComponentImagePin(spec); err != nil {
+		s.writeState(State{State: "failed", Action: "component_rollback", Component: component, StartedAt: now, UpdatedAt: time.Now(), Message: "compose preflight failed: " + err.Error(), PreviousImageID: previous})
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	current, currentErr := s.imageID(ctx, spec.service)
 	cancel()
@@ -708,6 +730,10 @@ func (s *server) restorePreviousImage(imageID string) error {
 }
 
 func (s *server) restorePreviousComponentImage(imageID string, spec componentSpec) error {
+	return s.restorePreviousComponentImageWithTag(imageID, "", spec)
+}
+
+func (s *server) restorePreviousComponentImageWithTag(imageID, previousTag string, spec componentSpec) error {
 	image, ok, err := serviceImageFromComposeFiles(s.composeFiles(), spec.service)
 	if err != nil {
 		return err
@@ -715,11 +741,14 @@ func (s *server) restorePreviousComponentImage(imageID string, spec componentSpe
 	if !ok {
 		return fmt.Errorf("service %q has no image", spec.service)
 	}
-	repository, err := composeImageRepository(image)
-	if err != nil {
-		return err
+	repository, ok := composeImageRepositoryForTag(image, spec.tagVariable)
+	if !ok {
+		return fmt.Errorf("service %q image %q does not reference %s", spec.service, image, spec.tagVariable)
 	}
-	rollbackTag := fmt.Sprintf("ftw-rollback-%d", time.Now().Unix())
+	rollbackTag := previousTag
+	if rollbackTag == "" {
+		rollbackTag = fmt.Sprintf("ftw-rollback-%d", time.Now().Unix())
+	}
 	rollbackRef := repository + ":" + rollbackTag
 	timeout := 10 * time.Minute
 	if spec.name == "core" {
@@ -743,8 +772,8 @@ func (s *server) restorePreviousComponentImage(imageID string, spec componentSpe
 }
 
 // prepareUpdateImagePin makes old Compose layouts safe for immutable updates.
-// Older and developer installations often hard-code an image tag, so merely
-// exporting FTW_IMAGE_TAG would leave the running service on the old digest.
+// Older and developer installations may hard-code an image tag or omit the
+// container-side FTW_IMAGE_TAG mapping needed to report the selected release.
 // The project directory is deliberately mounted read-only in the updater;
 // instead of rewriting user configuration, add a generated override last in
 // the Compose file chain for this update only. Compose keeps the original
@@ -765,18 +794,25 @@ func (s *server) prepareComponentImagePin(spec componentSpec) (func(), error) {
 	if !ok {
 		return func() {}, fmt.Errorf("service %q is missing an image entry in compose files", spec.service)
 	}
-	if strings.Contains(image, spec.tagVariable) {
-		return func() {}, nil
-	}
+	_, imageUsesTag := composeImageRepositoryForTag(image, spec.tagVariable)
 
 	type imageService struct {
-		Image string `yaml:"image"`
+		Image       string            `yaml:"image,omitempty"`
+		Environment map[string]string `yaml:"environment"`
+	}
+	override := imageService{
+		Environment: map[string]string{
+			spec.tagEnv: "${" + spec.tagVariable + ":-latest}",
+		},
+	}
+	if !imageUsesTag {
+		override.Image = spec.image + ":${" + spec.tagVariable + ":-latest}"
 	}
 	doc := struct {
 		Services map[string]imageService `yaml:"services"`
 	}{
 		Services: map[string]imageService{
-			spec.service: {Image: spec.image + ":${" + spec.tagVariable + ":-latest}"},
+			spec.service: override,
 		},
 	}
 	data, err := yaml.Marshal(doc)
@@ -810,7 +846,7 @@ func (s *server) prepareComponentImagePin(spec componentSpec) (func(), error) {
 		return func() {}, fmt.Errorf("close compatibility override: %w", err)
 	}
 	s.updateOverrideFile = path
-	slog.Warn("using transient canonical image override for legacy compose", "service", spec.service, "previous_image", image)
+	slog.Warn("using transient release image override for legacy compose", "service", spec.service, "previous_image", image)
 
 	cleanup := func() {
 		s.updateOverrideFile = ""
@@ -821,11 +857,58 @@ func (s *server) prepareComponentImagePin(spec componentSpec) (func(), error) {
 	return cleanup, nil
 }
 
-func composeImageRepository(image string) (string, error) {
-	if i := strings.Index(image, ":${"); i > 0 {
-		return image[:i], nil
+func composeImageRepositoryForTag(image, variable string) (string, bool) {
+	marker := ":${" + variable
+	i := strings.LastIndex(image, marker)
+	if i <= 0 {
+		return "", false
 	}
-	return "", fmt.Errorf("image %q does not use a supported repository:${*_IMAGE_TAG} form", image)
+	repository := image[:i]
+	if !staticImageRepository(repository) {
+		return "", false
+	}
+	suffix := image[i+len(marker):]
+	if suffix == "}" || (strings.HasPrefix(suffix, ":-") && strings.IndexByte(suffix, '}') == len(suffix)-1) {
+		return repository, true
+	}
+	return "", false
+}
+
+func staticImageRepository(repository string) bool {
+	parts := strings.Split(repository, "/")
+	if len(parts) == 0 {
+		return false
+	}
+	for i, part := range parts {
+		if part == "" {
+			return false
+		}
+		if colon := strings.IndexByte(part, ':'); colon >= 0 {
+			if i != 0 || len(parts) == 1 || colon == 0 || colon == len(part)-1 || strings.IndexByte(part[colon+1:], ':') >= 0 {
+				return false
+			}
+			for _, c := range part[colon+1:] {
+				if c < '0' || c > '9' {
+					return false
+				}
+			}
+			part = part[:colon]
+		}
+		if !((part[0] >= 'a' && part[0] <= 'z') || (part[0] >= '0' && part[0] <= '9')) {
+			return false
+		}
+		last := part[len(part)-1]
+		if !((last >= 'a' && last <= 'z') || (last >= '0' && last <= '9')) {
+			return false
+		}
+		for _, c := range part {
+			if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-' {
+				continue
+			}
+			return false
+		}
+	}
+	return true
 }
 
 // validateComposeImagePin catches old host-side compose files that hard-code
@@ -848,7 +931,7 @@ func (s *server) validateComponentImagePin(spec componentSpec) error {
 	if !ok {
 		return fmt.Errorf("service %q is missing an image entry in compose files", spec.service)
 	}
-	if !strings.Contains(image, spec.tagVariable) {
+	if _, ok := composeImageRepositoryForTag(image, spec.tagVariable); !ok {
 		return fmt.Errorf("service %q image %q does not reference %s", spec.service, image, spec.tagVariable)
 	}
 	return nil
@@ -1402,6 +1485,39 @@ func (s *server) currentServiceImageID(ctx context.Context, service string) (str
 		return "", errors.New("running container has no image ID")
 	}
 	return imageID, nil
+}
+
+func (s *server) currentServiceImageRef(ctx context.Context, service string) (string, error) {
+	containerID, err := s.serviceContainerID(ctx, service)
+	if err != nil {
+		return "", err
+	}
+	out, err := dockerOutput(ctx, "inspect", "--format", "{{.Config.Image}}", containerID)
+	if err != nil {
+		return "", err
+	}
+	imageRef := strings.TrimSpace(out)
+	if imageRef == "" {
+		return "", errors.New("running container has no image reference")
+	}
+	return imageRef, nil
+}
+
+func imageTagFromReference(imageRef string) (string, bool) {
+	imageRef = strings.TrimSpace(imageRef)
+	if imageRef == "" || strings.Contains(imageRef, "@") {
+		return "", false
+	}
+	lastSlash := strings.LastIndexByte(imageRef, '/')
+	lastColon := strings.LastIndexByte(imageRef, ':')
+	if lastColon <= lastSlash || lastColon == len(imageRef)-1 {
+		return "", false
+	}
+	tag := imageRef[lastColon+1:]
+	if !isImmutableImageTag(tag) {
+		return "", false
+	}
+	return tag, true
 }
 
 func (s *server) waitForServiceHealth(ctx context.Context, service string) error {
