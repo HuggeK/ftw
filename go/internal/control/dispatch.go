@@ -354,10 +354,11 @@ type State struct {
 	// rating — the recurring Ferroamp EnergyHub 0x8030 fault after ~8 kW
 	// sustained midday export. Sourced from site.max_export_w.
 	MaxExportW float64
-	// EVChargingW is the effective aggregate vehicle charging load the
-	// control loop excludes when BatteryCoversEV=false. It is recomputed
-	// from ManualEVChargingW plus live EV/V2X charger telemetry each dispatch
-	// tick, so manual uninstrumented EV load can coexist with live V2X.
+	// EVChargingW is the effective aggregate vehicle charging load. Self
+	// (manual) keeps it in the raw meter signal; other modes exclude the
+	// uncovered share when BatteryCoversEV=false. It is recomputed from
+	// ManualEVChargingW plus live EV/V2X charger telemetry each dispatch tick,
+	// so manual uninstrumented EV load can coexist with live V2X.
 	EVChargingW       float64
 	ManualEVChargingW float64
 	liveEVChargingW   float64
@@ -368,13 +369,19 @@ type State struct {
 	//     it doesn't consume PV that the EV could be claiming
 	//   - the legacy PI / self-consumption path biases the grid setpoint
 	//     so it leaves `reserveRemaining` of export untouched
-	// Where reserveRemaining = max(0, EVSurplusOnlyReserveW - EVChargingW)
-	// — once the EV has ramped up to the reserve, no further headroom is
-	// withheld from the battery. Populated each tick by main.go from
-	// loadpoint.Manager.States(): sum of MaxChargeW across LPs that are
-	// SurplusOnly && PluggedIn. Set to 0 when no such LP is connected,
-	// in which case all behaviour reverts to the pre-existing path.
+	// Where reserveRemaining = max(0, EVSurplusOnlyReserveW -
+	// EVSurplusOnlyChargingW) — once the protected EVs have ramped up to
+	// the reserve, no further headroom is withheld from the battery.
+	// Populated each tick by main.go from loadpoint.Manager.States(). Set
+	// to 0 when no such LP is connected, in which case all behaviour
+	// reverts to the pre-existing path.
 	EVSurplusOnlyReserveW float64
+	// EVSurplusOnlyChargingW is the actual positive charging draw from the
+	// loadpoints counted by EVSurplusOnlyReserveW. It stays separate from
+	// aggregate EVChargingW so a regular EV can still be covered by the home
+	// battery when another loadpoint is surplus-only. Populated by main.go on
+	// every dispatch tick.
+	EVSurplusOnlyChargingW float64
 
 	// EVCurtailHeadroomW is the parallel quantity sized for the
 	// PV-curtail decision. EVSurplusOnlyReserveW above is intentionally
@@ -1491,19 +1498,18 @@ func ComputeDispatch(
 		state.liveEVChargingW = 0
 	}
 	state.EVChargingW = state.ManualEVChargingW + state.liveEVChargingW
-	// Vehicle signal: subtract vehicle power from grid so batteries don't
-	// try to cover EV/V2X charging or absorb V2X discharge by default.
-	// This makes the effective grid the controller works on the house-side
-	// portion only — a sensible default that avoids shuffling energy through
-	// stationary storage and vehicles twice on a normal day.
-	//
-	// BatteryCoversEV (default false) flips this in modes where the
-	// operator wants batteries to cover vehicle draw/interactions. In normal
-	// self-consumption the EV/V2X import/export is left outside stationary
-	// battery dispatch unless BatteryCoversEV is enabled.
+	// Self (manual) is the plain site-meter controller: EV charging stays in
+	// the signal, so the battery chases raw site import/export even when
+	// BatteryCoversEV is off. Planner and other manual modes keep the opt-in
+	// EV policy. Surplus-only limits Self later, after PI, so charging still
+	// follows real meter export while discharge stops at the house load. V2X
+	// discharge keeps its old opt-in guard so Self does not fill the home
+	// battery from a car by default.
 	gridW := rawGridW
-	if !state.BatteryCoversEV {
+	if state.Mode != ModeSelfConsumption && !state.BatteryCoversEV {
 		gridW -= state.uncoveredEVChargingW()
+	}
+	if !state.BatteryCoversEV {
 		gridW -= vehicleFlow.V2XDischargeW
 	}
 
@@ -2106,6 +2112,19 @@ func ComputeDispatch(
 				ceiling := surplus.chargeCeilingAfterEVReserveW()
 				if targetTotal2 > ceiling {
 					totalCorrection = ceiling - currentTotal
+				}
+			} else if targetTotal2 < 0 && state.Mode == ModeSelfConsumption {
+				// Self sees the raw meter, but surplus-only must not turn its EV
+				// import into home-battery discharge. Exclude only the protected
+				// EV draw: house load and regular EVs remain coverable. If PV
+				// already covers those loads, stop at idle.
+				coverableGridW := gridW - state.EVSurplusOnlyChargingW
+				maxDischargeTargetW := currentTotal - coverableGridW
+				if maxDischargeTargetW > 0 {
+					maxDischargeTargetW = 0
+				}
+				if targetTotal2 < maxDischargeTargetW {
+					totalCorrection = maxDischargeTargetW - currentTotal
 				}
 			} else if targetTotal2 < 0 && gridW <= 0 {
 				// No-discharge floor: while the EV reserve is active the
@@ -3204,7 +3223,7 @@ func newSurplusAccounting(rawGridW, effectiveGridW, currentBatteryW float64, sta
 		effectiveGridW:      effectiveGridW,
 		currentBatteryW:     currentBatteryW,
 		evReserveRemainingW: evReserveRemainingW(state),
-		evActive:            state != nil && state.EVChargingW > evActiveThresholdW,
+		evActive:            state != nil && state.EVSurplusOnlyChargingW > evActiveThresholdW,
 	}
 }
 
@@ -3212,7 +3231,7 @@ func evReserveRemainingW(state *State) float64 {
 	if state == nil || state.EVSurplusOnlyReserveW <= 0 {
 		return 0
 	}
-	remaining := state.EVSurplusOnlyReserveW - state.EVChargingW
+	remaining := state.EVSurplusOnlyReserveW - state.EVSurplusOnlyChargingW
 	if remaining < 0 {
 		return 0
 	}
