@@ -103,18 +103,22 @@ func (m Mode) IsPlannerMode() bool {
 // stale/missing and the control loop falls back to self_consumption with
 // grid_target=0.
 //
-// Returns (mode_string, grid_target_w, ok). mode_string maps to a Mode
-// constant; the dispatch uses its existing mode logic for HOW batteries
-// respond. The plan is a scheduler, not a regulator.
+// Returns (mode_string, grid_target_w, decision_id, ok). mode_string maps to a
+// Mode constant; the dispatch uses its existing mode logic for HOW batteries
+// respond. decision_id is report metadata only. The plan is a scheduler, not a
+// regulator.
 //
 // Legacy — the new contract (energy-allocation per slot, EMS converts to
 // power) uses SlotDirectiveFunc.
-type PlanTargetFunc func(now time.Time) (string, float64, bool)
+type PlanTargetFunc func(now time.Time) (string, float64, string, bool)
 
 // SlotDirective mirrors mpc.SlotDirective — we redefine here to keep the
 // control package import-cycle free. Populated by main.go's injected
 // SlotDirectiveFunc adapter.
 type SlotDirective struct {
+	// DecisionID identifies the accepted plan that produced this directive.
+	// It is report metadata only; dispatch math never reads it.
+	DecisionID      string
 	SlotStart       time.Time
 	SlotEnd         time.Time
 	BatteryEnergyWh float64 // site-signed: + = charge, − = discharge
@@ -286,6 +290,32 @@ type DispatchTarget struct {
 type CurtailTarget struct {
 	Driver string  `json:"driver"`
 	LimitW float64 `json:"limit_w"`
+}
+
+type controlPlanSource uint8
+
+const (
+	controlPlanNone controlPlanSource = iota
+	controlPlanDirective
+	controlPlanLegacyTarget
+)
+
+// controlPlanSnapshot keeps every plan-dependent safety check in one battery
+// control tick on the same accepted plan. ComputeDispatch owns its lifetime.
+type controlPlanSnapshot struct {
+	active bool
+	source controlPlanSource
+	tickAt time.Time
+
+	directiveCaptured bool
+	directiveOK       bool
+	directive         SlotDirective
+
+	legacyCaptured bool
+	legacyOK       bool
+	legacyMode     string
+	legacyGridW    float64
+	legacyID       string
 }
 
 // State holds all persistent state for one instance of the control loop.
@@ -484,6 +514,10 @@ type State struct {
 	currentDirective SlotDirective
 	slotDelivered    float64   // Wh delivered to batteries since slot start
 	lastTickTs       time.Time // for ∫ battery_w dt
+	// controlSlotDecisionID is the accepted plan used to choose the last
+	// battery control tick's slot. It is cleared when a tick uses no slot.
+	controlSlotDecisionID string
+	controlPlanSnapshot   controlPlanSnapshot
 
 	// slotActualWh + slotActualLastTs + slotActualSlotStart are the
 	// path-agnostic per-slot delivery accumulator. Updated on EVERY
@@ -680,6 +714,9 @@ func (s *State) GetBatteryManualHold(now time.Time) (BatteryManualHold, bool) {
 // distinguish from "the plan asked for nothing".
 type SlotEnergySnapshot struct {
 	HasSlot bool
+	// DecisionID is the accepted plan used to choose the last battery
+	// control tick's slot. Empty means that tick used no slot identity.
+	DecisionID string
 	// PlannedWh is the plan's BatteryEnergyWh for the slot in flight.
 	// Site-signed: positive charges.
 	PlannedWh float64
@@ -697,6 +734,7 @@ type SlotEnergySnapshot struct {
 // hold the outer ctrlMu.
 func (s *State) SlotEnergy() SlotEnergySnapshot {
 	out := SlotEnergySnapshot{
+		DecisionID:   s.controlSlotDecisionID,
 		PlannedWh:    s.slotActualPlannedWh,
 		ActualWh:     s.slotActualWh,
 		EnergyPathWh: s.slotDelivered,
@@ -816,7 +854,7 @@ func updateSlotDeliveryMetrics(state *State, currentTotalW float64, now time.Tim
 	if state == nil || state.SlotDirective == nil {
 		return
 	}
-	dir, ok := state.SlotDirective(now)
+	dir, ok := plannerSelfDirectiveAt(state, now)
 	if !ok {
 		return
 	}
@@ -920,6 +958,8 @@ func preparePlannerSelf(state *State, now time.Time) plannerSelfDecision {
 		state.PlanStale = true
 		return plannerSelfDecision{noChargeOnStalePlan: true}
 	}
+	state.controlSlotDecisionID = dir.DecisionID
+	state.controlPlanSnapshot.source = controlPlanDirective
 
 	state.PlanStale = false
 	return plannerSelfDecision{
@@ -930,10 +970,74 @@ func preparePlannerSelf(state *State, now time.Time) plannerSelfDecision {
 }
 
 func plannerSelfDirectiveAt(state *State, now time.Time) (SlotDirective, bool) {
+	if state.controlPlanSnapshot.active {
+		if !state.controlPlanSnapshot.directiveCaptured {
+			state.controlPlanSnapshot.directiveCaptured = true
+			if state.SlotDirective != nil {
+				state.controlPlanSnapshot.directive, state.controlPlanSnapshot.directiveOK = state.SlotDirective(state.controlPlanSnapshot.tickAt)
+			}
+		}
+		return state.controlPlanSnapshot.directive, state.controlPlanSnapshot.directiveOK
+	}
 	if state.SlotDirective == nil {
 		return SlotDirective{}, false
 	}
 	return state.SlotDirective(now)
+}
+
+func planTargetAt(state *State, now time.Time) (string, float64, string, bool) {
+	if state.controlPlanSnapshot.active {
+		if !state.controlPlanSnapshot.legacyCaptured {
+			state.controlPlanSnapshot.legacyCaptured = true
+			if state.PlanTarget != nil {
+				state.controlPlanSnapshot.legacyMode,
+					state.controlPlanSnapshot.legacyGridW,
+					state.controlPlanSnapshot.legacyID,
+					state.controlPlanSnapshot.legacyOK = state.PlanTarget(state.controlPlanSnapshot.tickAt)
+			}
+		}
+		return state.controlPlanSnapshot.legacyMode,
+			state.controlPlanSnapshot.legacyGridW,
+			state.controlPlanSnapshot.legacyID,
+			state.controlPlanSnapshot.legacyOK
+	}
+	if state.PlanTarget == nil {
+		return "", 0, "", false
+	}
+	return state.PlanTarget(now)
+}
+
+func planDirectiveForIntent(state *State) (SlotDirective, bool) {
+	if state.controlPlanSnapshot.active {
+		switch state.controlPlanSnapshot.source {
+		case controlPlanDirective:
+			return state.controlPlanSnapshot.directive, state.controlPlanSnapshot.directiveOK
+		case controlPlanLegacyTarget:
+			// Legacy PI uses PlanTarget for its setpoint but keeps the energy
+			// directive as an independent sign guard. Reuse it only when both
+			// callbacks identify the same accepted plan; a replan between the
+			// two reads must not mix generations.
+			if state.controlPlanSnapshot.directiveOK &&
+				state.controlPlanSnapshot.directive.DecisionID == state.controlPlanSnapshot.legacyID {
+				return state.controlPlanSnapshot.directive, true
+			}
+		}
+		return SlotDirective{}, false
+	}
+	return plannerSelfDirectiveAt(state, state.now())
+}
+
+func planTargetForIntent(state *State) (string, float64, bool) {
+	if state.controlPlanSnapshot.active {
+		if state.controlPlanSnapshot.source != controlPlanLegacyTarget {
+			return "", 0, false
+		}
+		return state.controlPlanSnapshot.legacyMode,
+			state.controlPlanSnapshot.legacyGridW,
+			state.controlPlanSnapshot.legacyOK
+	}
+	mode, gridW, _, ok := planTargetAt(state, state.now())
+	return mode, gridW, ok
 }
 
 func plannerSelfDirectiveIsIdle(dir SlotDirective) bool {
@@ -1184,6 +1288,12 @@ func ComputeDispatch(
 	driverCapacities map[string]float64,
 	fuseMaxW float64,
 ) []DispatchTarget {
+	// Each tick reports only the plan identity it actually consulted for its
+	// main battery decision.
+	state.controlSlotDecisionID = ""
+	tickAt := state.now()
+	state.controlPlanSnapshot = controlPlanSnapshot{active: true, tickAt: tickAt}
+	defer func() { state.controlPlanSnapshot = controlPlanSnapshot{} }()
 	// ---- Per-slot Wh delivery observability (path-agnostic) ----
 	// Runs on EVERY tick before any mode/short-circuit decision so the
 	// idle / charge / holdoff / reactive-fallback paths all contribute
@@ -1198,7 +1308,7 @@ func ComputeDispatch(
 	// from this data. The point is to measure first, decide whether a
 	// cap is warranted later.
 	{
-		now := state.now()
+		now := tickAt
 		var liveBatTotal float64
 		for name := range driverCapacities {
 			if r := store.Get(name, telemetry.DerBattery); r != nil {
@@ -1317,7 +1427,9 @@ func ComputeDispatch(
 	case state.Mode.IsPlannerMode():
 		// planner_cheap / planner_arbitrage.
 		if state.UseEnergyDispatch && state.SlotDirective != nil {
-			if dir, ok := state.SlotDirective(state.now()); ok {
+			if dir, ok := plannerSelfDirectiveAt(state, state.now()); ok {
+				state.controlSlotDecisionID = dir.DecisionID
+				state.controlPlanSnapshot.source = controlPlanDirective
 				currentDirective = dir
 				// planner_arbitrage and planner_passive_arbitrage idle slots: skip the energy path and
 				// fall through to reactive PI (same as planner_self does always).
@@ -1404,13 +1516,15 @@ func ComputeDispatch(
 			}
 		}
 		if !useEnergyPath && !arbitrageFamilyIdleSlot && !coverLoadDischargeSlot {
-			var modeStr string
+			var modeStr, decisionID string
 			var gridW float64
 			ok := false
 			if state.PlanTarget != nil {
-				modeStr, gridW, ok = state.PlanTarget(state.now())
+				modeStr, gridW, decisionID, ok = planTargetAt(state, state.now())
 			}
 			if ok {
+				state.controlSlotDecisionID = decisionID
+				state.controlPlanSnapshot.source = controlPlanLegacyTarget
 				effectiveMode = Mode(modeStr)
 				state.SetGridTarget(gridW)
 				state.PlanStale = false
@@ -3515,7 +3629,7 @@ func planHasNonDischargeIntent(state *State) bool {
 	const idleWh = 50.0
 	const idleGridW = 100.0
 	if state.SlotDirective != nil {
-		if dir, ok := state.SlotDirective(state.now()); ok {
+		if dir, ok := planDirectiveForIntent(state); ok {
 			// For passive_arbitrage: only block reactive discharge when the
 			// plan slot has explicit charge intent. Idle and discharge slots
 			// get no non-discharge block — reactive discharge may cover load.
@@ -3542,7 +3656,7 @@ func planHasNonDischargeIntent(state *State) bool {
 		}
 	}
 	if state.PlanTarget != nil {
-		if modeStr, gridW, ok := state.PlanTarget(state.now()); ok {
+		if modeStr, gridW, ok := planTargetForIntent(state); ok {
 			switch Mode(modeStr) {
 			case ModeCharge:
 				return true
@@ -4123,7 +4237,7 @@ func planSignIntent(state *State) int {
 	const idleWh = 50.0     // a near-zero per-slot energy is idle, not signed
 	const idleGridW = 100.0 // matches mpc.IdleGateThresholdW for sign decisions
 	if state.SlotDirective != nil {
-		if dir, ok := state.SlotDirective(state.now()); ok {
+		if dir, ok := planDirectiveForIntent(state); ok {
 			if dir.BatteryEnergyWh > idleWh {
 				// A charge-from-PV-surplus slot has no hard charge commitment
 				// (see coverLoadChargeSlot) — report idle intent so the sign
@@ -4140,7 +4254,7 @@ func planSignIntent(state *State) int {
 		}
 	}
 	if state.PlanTarget != nil {
-		if modeStr, gridW, ok := state.PlanTarget(state.now()); ok {
+		if modeStr, gridW, ok := planTargetForIntent(state); ok {
 			switch Mode(modeStr) {
 			case ModeCharge:
 				return +1

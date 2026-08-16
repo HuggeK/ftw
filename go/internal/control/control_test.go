@@ -1834,7 +1834,7 @@ func TestEnergyDispatchFallsBackToLegacyWhenDirectiveUnavailable(t *testing.T) {
 	st.SlotDirective = func(time.Time) (SlotDirective, bool) { return SlotDirective{}, false }
 	// Legacy fallback hook: return ok=false too, should route to the
 	// "plan stale" self-consumption-with-grid-target=0 branch.
-	st.PlanTarget = func(time.Time) (string, float64, bool) { return "", 0, false }
+	st.PlanTarget = func(time.Time) (string, float64, string, bool) { return "", 0, "", false }
 
 	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
 	if !st.PlanStale {
@@ -2820,8 +2820,8 @@ func TestPlannerArbitrageCoverLoadChasesGridZeroNotPlannedImport(t *testing.T) {
 	// Production wiring: PlanTarget exists alongside SlotDirective.
 	// actionToSlot returns ("self_consumption", a.GridW, true) for
 	// arbitrage discharge — i.e. would set grid_target to planned import.
-	st.PlanTarget = func(time.Time) (string, float64, bool) {
-		return "self_consumption", 1700, true
+	st.PlanTarget = func(time.Time) (string, float64, string, bool) {
+		return "self_consumption", 1700, "", true
 	}
 
 	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
@@ -3279,7 +3279,7 @@ func TestPlannerSelfStalePlanDischargesToCoverLoad(t *testing.T) {
 	st.SlewRateW = 10000
 	st.MinDispatchIntervalS = 0
 	st.SlotDirective = func(time.Time) (SlotDirective, bool) { return SlotDirective{}, false }
-	st.PlanTarget = func(time.Time) (string, float64, bool) { return "", 0, false }
+	st.PlanTarget = func(time.Time) (string, float64, string, bool) { return "", 0, "", false }
 
 	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
 	if len(targets) != 1 {
@@ -3312,7 +3312,7 @@ func TestPlannerSelfStalePlanBlocksPVCharging(t *testing.T) {
 	st.SlewRateW = 10000
 	st.MinDispatchIntervalS = 0
 	st.SlotDirective = func(time.Time) (SlotDirective, bool) { return SlotDirective{}, false }
-	st.PlanTarget = func(time.Time) (string, float64, bool) { return "", 0, false }
+	st.PlanTarget = func(time.Time) (string, float64, string, bool) { return "", 0, "", false }
 
 	targets := ComputeDispatch(store, st, caps(map[string]float64{
 		"ferroamp": 15200,
@@ -4420,13 +4420,42 @@ func TestPlanSignFloorReadsLegacyPlanTarget(t *testing.T) {
 	// mapping.
 	st := NewState(0, 0, "ferroamp")
 	st.Mode = ModePlannerArbitrage
-	st.PlanTarget = func(time.Time) (string, float64, bool) {
-		return "self_consumption", -4000, true
+	st.PlanTarget = func(time.Time) (string, float64, string, bool) {
+		return "self_consumption", -4000, "", true
 	}
 	in := []DispatchTarget{{Driver: "pixii", TargetW: 1700}} // charge against discharge plan
 	out := applyPlanSignFloor(in, st)
 	if out[0].TargetW != 0 {
 		t.Errorf("legacy-path discharge intent: TargetW = %f, want 0", out[0].TargetW)
+	}
+}
+
+func TestLegacyPlanSignGuardUsesOnlyMatchingDirectiveIdentity(t *testing.T) {
+	const decisionID = "00000000-0000-4000-8000-000000000304"
+	st := NewState(0, 0, "ferroamp")
+	st.Mode = ModePlannerArbitrage
+	st.SlotDirective = func(time.Time) (SlotDirective, bool) { return SlotDirective{}, false }
+	st.PlanTarget = func(time.Time) (string, float64, string, bool) { return "", 0, "", false }
+	st.controlPlanSnapshot = controlPlanSnapshot{
+		active:      true,
+		source:      controlPlanLegacyTarget,
+		directiveOK: true,
+		directive: SlotDirective{
+			DecisionID:      decisionID,
+			BatteryEnergyWh: -600,
+		},
+		legacyOK:   true,
+		legacyMode: string(ModeSelfConsumption),
+		legacyID:   decisionID,
+	}
+
+	if got := planSignIntent(st); got != -1 {
+		t.Fatalf("matching legacy/directive plan sign = %d, want discharge (-1)", got)
+	}
+
+	st.controlPlanSnapshot.directive.DecisionID = "00000000-0000-4000-8000-000000000305"
+	if got := planSignIntent(st); got != 0 {
+		t.Fatalf("mixed-plan directive sign = %d, want neutral legacy intent (0)", got)
 	}
 }
 
@@ -4466,8 +4495,8 @@ func TestComputeDispatchAppliesSignFloorOnDischargeSlot(t *testing.T) {
 	// here to return grid_target=0 to model the bug behaviour where the
 	// negative grid target failed to plumb through (whatever the cause).
 	// The plan INTENT (discharge) still comes from SlotDirective.
-	st.PlanTarget = func(time.Time) (string, float64, bool) {
-		return "self_consumption", 0, true // bug: should have been negative
+	st.PlanTarget = func(time.Time) (string, float64, string, bool) {
+		return "self_consumption", 0, "", true // bug: should have been negative
 	}
 	st.SlotDirective = func(time.Time) (SlotDirective, bool) {
 		return SlotDirective{
@@ -5617,6 +5646,131 @@ func makeSlotMetricsState(siteMeter string, dirFn SlotDirectiveFunc) *State {
 	st.MinDispatchIntervalS = 0
 	st.SlotDirective = dirFn
 	return st
+}
+
+func TestControlSlotIdentityTracksSameSlotReplan(t *testing.T) {
+	now := time.Date(2026, 8, 16, 12, 5, 0, 0, time.UTC)
+	current := SlotDirective{
+		DecisionID:      "00000000-0000-4000-8000-000000000301",
+		SlotStart:       now.Add(-5 * time.Minute),
+		SlotEnd:         now.Add(10 * time.Minute),
+		BatteryEnergyWh: 250,
+		Strategy:        "arbitrage",
+	}
+	available := true
+	calls := 0
+	store := seedStore(0, []struct {
+		name          string
+		currentW, soc float64
+	}{{"ferroamp", 0, 0.5}})
+	st := makeSlotMetricsState("ferroamp", func(time.Time) (SlotDirective, bool) {
+		calls++
+		return current, available
+	})
+	st.clock = func() time.Time { return now }
+
+	_ = ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
+	if got := st.SlotEnergy().DecisionID; got != current.DecisionID {
+		t.Fatalf("first control tick decision ID = %q, want %q", got, current.DecisionID)
+	}
+	if calls != 1 {
+		t.Fatalf("first control tick read %d plan generations, want 1", calls)
+	}
+
+	current.DecisionID = "00000000-0000-4000-8000-000000000302"
+	_ = ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
+	if got := st.SlotEnergy().DecisionID; got != current.DecisionID {
+		t.Fatalf("same-slot replan decision ID = %q, want %q", got, current.DecisionID)
+	}
+	if calls != 2 {
+		t.Fatalf("second control tick read %d total plan generations, want 2", calls)
+	}
+
+	available = false
+	_ = ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
+	if got := st.SlotEnergy().DecisionID; got != "" {
+		t.Fatalf("tick without a plan slot retained decision ID %q", got)
+	}
+	if calls != 3 {
+		t.Fatalf("stale-plan tick read %d total plan generations, want 3", calls)
+	}
+}
+
+func TestControlSlotIdentityTracksLegacyPlan(t *testing.T) {
+	now := time.Date(2026, 8, 16, 12, 5, 0, 0, time.UTC)
+	decisionID := "00000000-0000-4000-8000-000000000303"
+	available := true
+	calls := 0
+	store := seedStore(0, []struct {
+		name          string
+		currentW, soc float64
+	}{{"ferroamp", 0, 0.5}})
+	st := NewState(0, 0, "ferroamp")
+	st.Mode = ModePlannerArbitrage
+	st.SlewRateW = 100000
+	st.clock = func() time.Time { return now }
+	st.PlanTarget = func(time.Time) (string, float64, string, bool) {
+		calls++
+		return "self_consumption", 0, decisionID, available
+	}
+
+	_ = ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
+	if got := st.SlotEnergy().DecisionID; got != decisionID {
+		t.Fatalf("legacy control tick decision ID = %q, want %q", got, decisionID)
+	}
+	if calls != 1 {
+		t.Fatalf("legacy control tick read %d plan generations, want 1", calls)
+	}
+
+	available = false
+	_ = ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
+	if got := st.SlotEnergy().DecisionID; got != "" {
+		t.Fatalf("legacy tick without a plan slot retained decision ID %q", got)
+	}
+	if calls != 2 {
+		t.Fatalf("stale legacy tick read %d total plan generations, want 2", calls)
+	}
+}
+
+func TestLegacyPlanCallbacksUseOneTickTime(t *testing.T) {
+	boundary := time.Date(2026, 8, 16, 12, 15, 0, 0, time.UTC)
+	clockCalls := 0
+	var directiveAt, targetAt time.Time
+	const decisionID = "00000000-0000-4000-8000-000000000306"
+
+	store := seedStore(0, []struct {
+		name          string
+		currentW, soc float64
+	}{{"ferroamp", 0, 0.5}})
+	st := NewState(0, 0, "ferroamp")
+	st.Mode = ModePlannerArbitrage
+	st.SlewRateW = 100000
+	st.MinDispatchIntervalS = 0
+	st.clock = func() time.Time {
+		clockCalls++
+		if clockCalls == 1 {
+			return boundary.Add(-time.Nanosecond)
+		}
+		return boundary
+	}
+	st.SlotDirective = func(at time.Time) (SlotDirective, bool) {
+		directiveAt = at
+		return SlotDirective{
+			DecisionID:      decisionID,
+			SlotStart:       boundary.Add(-15 * time.Minute),
+			SlotEnd:         boundary,
+			BatteryEnergyWh: -600,
+		}, true
+	}
+	st.PlanTarget = func(at time.Time) (string, float64, string, bool) {
+		targetAt = at
+		return string(ModeSelfConsumption), 0, decisionID, true
+	}
+
+	_ = ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
+	if !directiveAt.Equal(targetAt) {
+		t.Fatalf("one control tick read directive at %s and legacy target at %s", directiveAt, targetAt)
+	}
 }
 
 //  1. The accumulator integrates current battery total × dt across
