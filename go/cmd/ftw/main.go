@@ -1568,7 +1568,13 @@ func main() {
 		// current and the plan keeps counting the load. Only the periodic
 		// ev_set_current is reported — see loadpoint.DispatchOutcomeFunc
 		// for the sends that are deliberately not.
+		lpController.SetOutcomeSender(reg.SendWithOutcome)
+		lpController.SetCycleSender(reg.SendEVContinuation)
 		lpController.SetDispatchOutcome(actuation.recordCommandOutcome)
+		lpController.SetDriverOnline(func(name string) bool {
+			health := tel.DriverHealth(name)
+			return health != nil && health.IsOnline()
+		})
 		// Wire the site fuse so the per-phase EV clamp and the
 		// phase-split derivation can use the actual site voltage and
 		// breaker rating instead of hard-coding 230 V × 16 A.
@@ -2454,6 +2460,9 @@ func main() {
 	// Every dispatch command carries its own deadline — see
 	// driverCommandTimeout for the stall it bounds.
 	driverCmdTimeout := driverCommandTimeout(controlInterval)
+	if lpController != nil {
+		lpController.SetCommandTimeout(driverCmdTimeout)
+	}
 
 	// Graceful shutdown
 	sigc := make(chan os.Signal, 1)
