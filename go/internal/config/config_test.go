@@ -946,6 +946,52 @@ func TestSlewExplicitDisablePreserved(t *testing.T) {
 	}
 }
 
+func TestAppLinkDefaultsOnAndPreservesOptOut(t *testing.T) {
+	absent := &Config{}
+	applyDefaults(absent)
+	if absent.AppLink == nil || !absent.AppLink.Enabled {
+		t.Fatalf("omitted app_link must default on, got %+v", absent.AppLink)
+	}
+
+	disabled := &Config{AppLink: &AppLink{Enabled: false}}
+	applyDefaults(disabled)
+	if disabled.AppLink.Enabled {
+		t.Fatal("explicit app_link opt-out was overwritten")
+	}
+}
+
+func TestParseAppLinkPreservesExplicitNullOptOut(t *testing.T) {
+	tests := []struct {
+		name    string
+		suffix  string
+		enabled bool
+	}{
+		{name: "omitted", enabled: true},
+		{name: "bare null", suffix: "app_link:\n", enabled: false},
+		{name: "named null", suffix: "app_link: null\n", enabled: false},
+		{name: "null alias", suffix: "disabled: &disabled null\napp_link: *disabled\n", enabled: false},
+		{name: "null with ignored complex key", suffix: "legacy:\n  ? [old, key]\n  : ignored\napp_link: null\n", enabled: false},
+		{name: "merged null", suffix: "defaults: &defaults\n  app_link: null\n<<: *defaults\n", enabled: false},
+		{name: "merged sequence first null", suffix: "off: &off {app_link: null}\non: &on {app_link: {enabled: true}}\n<<: [*off, *on]\n", enabled: false},
+		{name: "merged sequence first true", suffix: "off: &off {app_link: null}\non: &on {app_link: {enabled: true}}\n<<: [*on, *off]\n", enabled: true},
+		{name: "direct true overrides merged null", suffix: "off: &off {app_link: null}\n<<: *off\napp_link: {enabled: true}\n", enabled: true},
+		{name: "empty mapping", suffix: "app_link: {}\n", enabled: false},
+		{name: "explicit false", suffix: "app_link:\n  enabled: false\n", enabled: false},
+		{name: "explicit true", suffix: "app_link:\n  enabled: true\n", enabled: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := Parse([]byte(minimalYAML+tt.suffix), t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.AppLink.On(); got != tt.enabled {
+				t.Fatalf("app link enabled = %v, want %v", got, tt.enabled)
+			}
+		})
+	}
+}
+
 func TestNotificationsDefaults(t *testing.T) {
 	c := &Config{Notifications: &Notifications{Enabled: false}}
 	applyDefaults(c)
