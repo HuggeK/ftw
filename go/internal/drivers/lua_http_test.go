@@ -4,8 +4,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -195,6 +198,76 @@ func TestHTTPTestRigSelfCheck(t *testing.T) {
 	if atomic.LoadInt32(&hits) != 1 {
 		t.Errorf("rig sanity: server saw %d hits, want 1", atomic.LoadInt32(&hits))
 	}
+}
+
+func TestLuaHTTPProxyChecksLocalDestinationBeforeProxy(t *testing.T) {
+	var proxyHits atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyHits.Add(1)
+		if r.URL.Host == "" {
+			t.Errorf("proxy request lost absolute destination: %+v", r.URL)
+		}
+		_, _ = w.Write([]byte("proxy-ok"))
+	}))
+	defer proxy.Close()
+	proxyURL, err := url.Parse(proxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	newRequest := func(method, target string) *http.Request {
+		req, err := http.NewRequest(method, target, strings.NewReader(`{"command":"start"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Basic dTpw")
+		return req
+	}
+
+	for _, allow := range []bool{false, true} {
+		name := "opt-in off"
+		if allow {
+			name = "opt-in on"
+		}
+		t.Run(name+" bypasses the proxy", func(t *testing.T) {
+			proxyHits.Store(0)
+			transport := newLuaHTTPTransport(allow, http.ProxyURL(proxyURL))
+			baseDial := transport.DialContext
+			transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+				host, _, _ := net.SplitHostPort(address)
+				if host == "inverter.local" {
+					return nil, errors.New("test blocked direct local dial")
+				}
+				return baseDial(ctx, network, address)
+			}
+			client := &http.Client{Transport: transport}
+			for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodPatch} {
+				resp, err := client.Do(newRequest(method, "http://inverter.local/api"))
+				if resp != nil {
+					_ = resp.Body.Close()
+				}
+				if err == nil {
+					t.Errorf("%s unexpectedly completed its blocked direct dial", method)
+				}
+			}
+			if got := proxyHits.Load(); got != 0 {
+				t.Fatalf(".local requests reached proxy %d times, want 0", got)
+			}
+		})
+	}
+
+	t.Run("ordinary host still uses the proxy", func(t *testing.T) {
+		proxyHits.Store(0)
+		client := &http.Client{Transport: newLuaHTTPTransport(false, http.ProxyURL(proxyURL))}
+		resp, err := client.Do(newRequest(http.MethodGet, "http://ordinary.example/api"))
+		if err != nil {
+			t.Fatalf("ordinary host request failed: %v", err)
+		}
+		_ = resp.Body.Close()
+		if got := proxyHits.Load(); got != 1 {
+			t.Fatalf("ordinary host reached proxy %d times, want 1", got)
+		}
+	})
 }
 
 // TLS pinning lets a driver reach a self-signed HTTPS endpoint (e.g. a
