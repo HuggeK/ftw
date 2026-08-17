@@ -894,7 +894,7 @@
         if (modbus) {
           html += '<fieldset><legend>Modbus TCP</legend>' +
             '<div class="field-row"><div>' +
-            '<label>Host ' + help('IP of the Modbus-TCP device (e.g. Sungrow inverter LAN port).') + '</label>' +
+            '<label>Host ' + help('IP or hostname of the Modbus-TCP device (e.g. Sungrow inverter LAN port). If you use a raw IP, reserve it for the device in your router\'s DHCP settings so it can\'t change.') + '</label>' +
             '<input type="text" data-path="drivers.' + idx + '.capabilities.modbus.host" value="' + escHtml(modbus.host) + '">' +
             '</div><div>' +
             '<label>Port</label><input type="number" data-path="drivers.' + idx + '.capabilities.modbus.port" value="' + (modbus.port || 502) + '">' +
@@ -957,7 +957,7 @@
           // pass reveals each one only when the signed catalog says that the
           // gateway reports both the site meter and that DER kind.
           html += '<fieldset><legend>HTTP</legend>' +
-            '<label>Host / IP ' + help('Hostname (e.g. zap.local) or IP address of the device. mDNS names work when your OS resolver supports them; otherwise use the LAN IP.') + '</label>' +
+            '<label>Host / IP ' + help('Hostname (e.g. zap.local) or IP address of the device. Prefer the device\'s mDNS (.local) name when it broadcasts one — it survives DHCP lease changes. If you use a raw IP, reserve it for the device in your router\'s DHCP settings so it can\'t change.') + '</label>' +
             '<input type="text" data-path="drivers.' + idx + '.config.host" value="' + escHtml(lcfg.host || '') + '" placeholder="zap.local">' +
             ((d.lua || '').indexOf('zap.lua') >= 0
               ? '<p class="zap-p1-note" style="margin:8px 0 0;font-size:0.82rem;color:var(--text-dim);line-height:1.45">This driver is the P1/HAN site meter. If the Zap also lists an inverter, battery or charger, add that device here with its own driver. Do not use Zap as a proxy for those.</p>'
