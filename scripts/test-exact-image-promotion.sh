@@ -158,6 +158,8 @@ grep -Fq 'BETA_TAG="${INPUT_BETA}"' "${release}"
 grep -Fq -- '--pattern ftw-image-digests.json' "${release}"
 grep -Fq 'current_digest="$(scripts/inspect-image-digest.sh "${image_ref}")"' "${release}"
 grep -Fq -- '-f source_beta="${BETA_TAG}"' "${release}"
+grep -Fq -- '-f release_id="${RELEASE_ID}"' "${release}"
+grep -Fq -- '--json databaseId,tagName,name,body,isDraft,isPrerelease,publishedAt' "${release}"
 grep -Fq 'if RELEASE_JSON="$(gh release view "${TAG}"' "${release}"
 grep -Fq '.isDraft == true' "${release}"
 grep -Fq 'Refreshed draft GitHub Release ${TAG}; release-assets will resume it.' "${release}"
@@ -166,7 +168,9 @@ grep -Fq -- '--draft' "${release}"
 grep -Fq 'name: Validate both exact candidate manifests' "${assets}"
 grep -Fq 'name: Preflight all exact stable aliases' "${assets}"
 grep -Fq 'name: Publish and verify exact stable aliases updater before Core' "${assets}"
-grep -Fq 'scripts/promote-paired-latest.sh' "${assets}"
+grep -Fq '.release-workflow/scripts/promote-paired-latest.sh' "${assets}"
+grep -Fq -- '--ref master -f tag=vX.Y.Z -f source_beta=vX.Y.Z-beta.N -f release_id=123' "${assets}"
+grep -Fq -- '--ref master -f tag=vX.Y.Z -f release_id=123' "${assets}"
 grep -Fq 'name: verify complete draft assets' "${assets}"
 grep -Fq 'python3 scripts/check-stable-release.py order "${TAG}"' "${assets}"
 grep -Fq 'python3 scripts/check-stable-release.py assets "${TAG}"' "${assets}"
@@ -181,15 +185,19 @@ if grep -Fq 'GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}' "${assets}" || \
   echo "release-assets must not use the per-run token for draft release access" >&2
   exit 1
 fi
-grep -Fq -- '--draft=false --prerelease=false --latest' "${root}/scripts/promote-paired-latest.sh"
+grep -Fq '"${release_command}" publish "${FTW_RELEASE_ID}"' "${root}/scripts/promote-paired-latest.sh"
+grep -Fq -- '-F draft=false' "${root}/scripts/github-release-by-id.sh"
+grep -Fq -- '-F prerelease=false' "${root}/scripts/github-release-by-id.sh"
+grep -Fq -- '-f make_latest=true' "${root}/scripts/github-release-by-id.sh"
 grep -Fq 'needs: [meta, publish]' "${assets}"
 grep -Fq 'group: release-assets-stable-latest' "${assets}"
 grep -Fq -- '--pattern ftw-image-digests.json' "${assets}"
-grep -Fq -- '--pattern ftw-promotion-receipt.json' "${assets}"
+grep -Fq 'ftw-promotion-receipt.json' "${assets}"
 grep -Fq 'source_beta is required for its first promotion.' "${assets}"
 grep -Fq 'is already bound to ${BETA_TAG}, not requested ${INPUT_BETA}.' "${assets}"
-grep -Fq 'gh release upload "${TAG}" "${PROMOTION_RECORD}"' "${assets}"
-grep -Fq 'gh release download "${STABLE_TAG}"' "${assets}"
+grep -Fq 'release_id:' "${assets}"
+grep -Fq 'scripts/github-release-by-id.sh upload' "${assets}"
+grep -Fq 'scripts/github-release-by-id.sh download' "${assets}"
 grep -Fq 'current_digest="$(scripts/inspect-image-digest.sh "${source}")"' "${assets}"
 grep -Fq 'test "$(scripts/inspect-image-digest.sh "${canonical}:${tag}")" = "${expected}"' "${assets}"
 grep -Fq '"${source}@${source_digest}"' "${assets}"
@@ -197,7 +205,7 @@ grep -Fq 'sha256sum -c "${checksum_name}"' "${assets}"
 grep -Fq 'and ((.imager.devices // []) | length) > 0' "${assets}"
 grep -Fq '[ "${STABLE_COMMIT}" != "${GITHUB_SHA}" ]' "${assets}"
 grep -Fq '[ "${GITHUB_REF}" != "refs/heads/master" ]' "${assets}"
-grep -Fq 'RELEASE_JSON="$(gh release view "${TAG}"' "${assets}"
+grep -Fq 'RELEASE_JSON="$(scripts/github-release-by-id.sh show "${RELEASE_ID}")"' "${assets}"
 if grep -Fq 'Expected one draft GitHub Release for ${TAG}; found ${RELEASE_COUNT}.' "${assets}"; then
   echo "release-assets must not look for drafts in the REST release collection" >&2
   exit 1
@@ -309,9 +317,9 @@ if ! grep -Fq -- '--tag "${compatibility}:beta"' <<<"${compatibility_block}" || 
   exit 1
 fi
 
-promotion_upload="$(grep -n 'gh release upload "${TAG}" "${PROMOTION_RECORD}"' "${assets}" | cut -d: -f1)"
+promotion_upload="$(grep -n 'scripts/github-release-by-id.sh upload' "${assets}" | head -1 | cut -d: -f1)"
 stable_docker="$(grep -n '^  docker:$' "${assets}" | cut -d: -f1)"
-asset_draft_lookup="$(grep -n 'RELEASE_JSON="$(gh release view "${TAG}"' "${assets}" | cut -d: -f1)"
+asset_draft_lookup="$(grep -n 'RELEASE_JSON="$(scripts/github-release-by-id.sh show "${RELEASE_ID}")"' "${assets}" | cut -d: -f1)"
 asset_release_inventory="$(grep -n 'RELEASE_PAGES="$(gh api --paginate --slurp' "${assets}" | cut -d: -f1)"
 stable_order_guard="$(grep -n 'check-stable-release.py order "${TAG}"' "${assets}" | cut -d: -f1)"
 if [ "${asset_draft_lookup}" -ge "${asset_release_inventory}" ] || \
@@ -358,7 +366,7 @@ paired_validation="$(grep -n 'name: Validate both exact candidate manifests' "${
 exact_preflight="$(grep -n 'name: Preflight all exact stable aliases' "${assets}" | cut -d: -f1)"
 exact_publish="$(grep -n 'name: Publish and verify exact stable aliases updater before Core' "${assets}" | cut -d: -f1)"
 stable_publish_job="$(grep -n '^  publish:$' "${assets}" | cut -d: -f1)"
-latest_transaction="$(grep -n 'scripts/promote-paired-latest.sh' "${assets}" | cut -d: -f1)"
+latest_transaction="$(grep -n '.release-workflow/scripts/promote-paired-latest.sh' "${assets}" | cut -d: -f1)"
 if [ "${paired_validation}" -ge "${exact_preflight}" ] || \
    [ "${exact_preflight}" -ge "${exact_publish}" ] || \
    [ "${exact_publish}" -ge "${stable_publish_job}" ] || \
@@ -457,7 +465,7 @@ for required in \
   'packages: write' \
   '.isDraft == true' \
   'for alias in "${TAG}" "${VERSION}" "sha-${short_sha}"; do' \
-  'scripts/promote-paired-latest.sh'; do
+  '.release-workflow/scripts/promote-paired-latest.sh'; do
   if ! grep -Fq -- "${required}" <<<"${final_publish_block}"; then
     echo "final stable publication gate is missing ${required}" >&2
     exit 1
