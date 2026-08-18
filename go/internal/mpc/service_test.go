@@ -1080,3 +1080,57 @@ func TestSlotDirectiveAtNilService(t *testing.T) {
 		t.Error("nil Service returned ok=true")
 	}
 }
+
+func TestClampForecastPVHouseNameplate(t *testing.T) {
+	t.Parallel()
+	wild := 3544200.0
+	ok := 3200.0
+	bjorn := 2046200.0 // tooltip 2046.2 kW with rated 18960 W
+	rows := clampForecastPV([]state.ForecastPoint{
+		{PVWEstimated: &wild},
+		{PVWEstimated: &ok},
+		{PVWEstimated: &bjorn},
+	}, 18960)
+	if rows[0].PVWEstimated == nil || *rows[0].PVWEstimated != 18960 {
+		t.Fatalf("3544 kW row must cut to 18960 W, got %+v", rows[0].PVWEstimated)
+	}
+	if rows[1].PVWEstimated == nil || *rows[1].PVWEstimated != 3200 {
+		t.Fatalf("in-range estimate must stay, got %+v", rows[1].PVWEstimated)
+	}
+	if rows[2].PVWEstimated == nil || *rows[2].PVWEstimated != 18960 {
+		t.Fatalf("2046.2 kW row must cut to 18960 W, got %+v", rows[2].PVWEstimated)
+	}
+}
+
+func TestCapSlotsPVToNameplate(t *testing.T) {
+	t.Parallel()
+	slots := capSlotsPVToNameplate([]Slot{
+		{PVW: -2046200},
+		{PVW: -3200},
+		{PVW: 0},
+	}, 18960)
+	if slots[0].PVW != -18960 {
+		t.Fatalf("2 MW slot must cut to −18960 W, got %v", slots[0].PVW)
+	}
+	if slots[1].PVW != -3200 {
+		t.Fatalf("in-range generation must stay, got %v", slots[1].PVW)
+	}
+	if slots[2].PVW != 0 {
+		t.Fatalf("night slot must stay 0, got %v", slots[2].PVW)
+	}
+}
+
+func TestCapPlanPVToNameplate(t *testing.T) {
+	t.Parallel()
+	plan := &Plan{Actions: []Action{{PVW: -2046200}, {PVW: -4000}}}
+	capPlanPVToNameplate(plan, 18960)
+	if plan.PVNameplateW != 18960 {
+		t.Fatalf("plan must carry nameplate, got %v", plan.PVNameplateW)
+	}
+	if plan.Actions[0].PVW != -18960 {
+		t.Fatalf("published action must cut to −18960 W, got %v", plan.Actions[0].PVW)
+	}
+	if plan.Actions[1].PVW != -4000 {
+		t.Fatalf("in-range action must stay, got %v", plan.Actions[1].PVW)
+	}
+}

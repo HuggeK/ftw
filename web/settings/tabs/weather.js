@@ -53,6 +53,17 @@
       host.innerHTML = '<p style="color:var(--text-dim);font-size:0.75rem;margin:4px 0 8px">No arrays defined — model will learn orientation from telemetry.</p>';
       return;
     }
+    var ratedW = Number(config.weather && config.weather.pv_rated_w);
+    var wattsAsKwp = arrays.some(function (a) {
+      var kwp = Number(a.kwp);
+      if (!(kwp > 0)) return false;
+      if (kwp >= 1000) return true;
+      // Copied "PV rated (W)" into kWp (18960 W → 18960 kWp).
+      return ratedW >= 1000 && Math.abs(kwp - ratedW) / ratedW < 0.05;
+    });
+    var kwpWarn = wattsAsKwp
+      ? '<p role="alert" style="color:#f59e0b;font-size:0.8rem;margin:4px 0 8px">kWp is kilowatts-peak, not the watts from <b>PV rated (W)</b>. An 18.96 kW roof is <b>18.96</b>, not 18960 — pasting watts makes the PV forecast read as megawatts and provider changes will not fix it.</p>'
+      : "";
     var previewHtml = '<div class="pv-arrays-3d-slot" ' +
       'style="margin:4px 0 10px"><ftw-pv-arrays-3d></ftw-pv-arrays-3d></div>';
     var rows = arrays.map(function (a, i) {
@@ -73,7 +84,7 @@
           '<button class="btn-remove" data-pv-arr-remove="' + i + '" type="button" title="Remove">✕</button>' +
         '</div></fieldset>';
     });
-    host.innerHTML = previewHtml + rows.join("");
+    host.innerHTML = kwpWarn + previewHtml + rows.join("");
     var pushArraysToPreview = function () {
       var el = host.querySelector("ftw-pv-arrays-3d");
       if (el && typeof el.setArrays === "function") {
@@ -182,7 +193,8 @@
         '<div id="pv-arrays-list"></div>' +
         '<button class="btn-add" id="pv-array-add" type="button">+ Add array</button>' +
         '<p style="color:var(--text-dim);font-size:0.75rem;margin:8px 0 0">' +
-        'Tilt: 0° = flat roof, 35° = typical pitched roof, 90° = wall. Azimuth: 0 = N, 90 = E, 180 = S, 270 = W.' +
+        'Tilt: 0° = flat roof, 35° = typical pitched roof, 90° = wall. Azimuth: 0 = N, 90 = E, 180 = S, 270 = W. ' +
+        'kWp is kilowatts-peak — a 10 kW roof is 10, not 10000 (that field is watts).' +
         '</p>' +
         '</fieldset>';
     },
