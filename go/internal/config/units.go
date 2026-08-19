@@ -42,17 +42,7 @@ func (c *Config) NormalizeUnits() {
 }
 
 func pickFraction(canonical, legacyPercent float64) float64 {
-	v := canonical
-	if v == 0 && legacyPercent != 0 {
-		v = legacyPercent
-	}
-	if v > 1 {
-		return units.FractionFromLegacyPercent(v)
-	}
-	if v < 0 {
-		return 0
-	}
-	return v
+	return units.DecodeJSONFraction(canonical, legacyPercent)
 }
 
 func (a *PVArray) normalizeRatedW() {

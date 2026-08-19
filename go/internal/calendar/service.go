@@ -15,7 +15,6 @@ import (
 
 	"github.com/srcfl/ftw/go/internal/config"
 	"github.com/srcfl/ftw/go/internal/loadmodel"
-	"github.com/srcfl/ftw/go/internal/units"
 )
 
 // LoadProfiler is the slice of *loadmodel.Service the calendar service needs:
@@ -172,9 +171,9 @@ func (s *Service) applyConfig(cfg config.CalDAV, firstLoadpointID string) {
 	if horizonDays <= 0 {
 		horizonDays = config.DefaultCalDAVHorizonDays
 	}
-	targetSoC := units.PercentFromFraction(cfg.EVDefaultTargetSoC)
+	targetSoC := cfg.EVDefaultTargetSoC
 	if targetSoC <= 0 {
-		targetSoC = units.PercentFromFraction(config.DefaultCalDAVEVTargetSoC)
+		targetSoC = config.DefaultCalDAVEVTargetSoC
 	}
 	away := cfg.AwayKeywords
 	if len(away) == 0 {
@@ -506,7 +505,7 @@ func (s *Service) apply(intents Intents, now time.Time) {
 	if next != nil && s.lp != nil {
 		if next.LoadpointID == "" {
 			slog.Warn("caldav: EV event has no loadpoint to target; ignoring", "title", next.Title)
-		} else if s.lp.SetTarget(next.LoadpointID, next.TargetSoCPct, next.Departure) {
+		} else if s.lp.SetTarget(next.LoadpointID, next.TargetSoC, next.Departure) {
 			s.mu.Lock()
 			prev := s.lastEV
 			s.lastEV = next
@@ -514,7 +513,7 @@ func (s *Service) apply(intents Intents, now time.Time) {
 			if prev == nil || *prev != *next {
 				slog.Info("caldav: EV target set from calendar",
 					"loadpoint", next.LoadpointID,
-					"target_soc_pct", next.TargetSoCPct,
+					"target_soc", next.TargetSoC,
 					"departure", next.Departure)
 			}
 		}

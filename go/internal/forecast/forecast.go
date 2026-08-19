@@ -445,10 +445,9 @@ func (s *Service) nameplateW() float64 {
 	return NameplateW(s.RatedPVW, s.Arrays)
 }
 
-// NameplateW is the site PV ceiling used to clamp wild forecasts.
-// Prefer the sanitized array sum; if that is >10× the explicit
-// pv_rated_w, the arrays still look like watts and we keep the
-// smaller explicit rating.
+// NameplateW is the site PV ceiling. Arrays store rated watts; the
+// sum of those is the nameplate. pv_rated_w is the fallback when no
+// complete array geometry exists.
 func NameplateW(ratedPVW float64, arrays []Array) float64 {
 	var sumW float64
 	for _, a := range arrays {
@@ -467,9 +466,9 @@ func NameplateW(ratedPVW float64, arrays []Array) float64 {
 }
 
 // nameplateHeadroom is 1: a forecast must not exceed the site
-// nameplate. STC/POA can theoretically overshoot a little on a cold
-// clear day; that is sacrificed so a kWp-as-watts paste cannot plan
-// on megawatts. 0 nameplate disables the cut.
+// nameplate. This is a physics gate, not a unit conversion. Core
+// stores rated watts so the gate should rarely fire. 0 nameplate
+// disables the cut.
 const nameplateHeadroom = 1.0
 
 func clampPVToNameplate(pvW, nameplateW float64) (float64, bool) {
@@ -525,9 +524,8 @@ func poaPVWattsFromGHI(lat, lon float64, t time.Time, ghiWm2 float64, arrays []A
 	return total
 }
 
-// Load returns forecasts in [sinceMs, untilMs]. Estimates stored
-// before kWp-as-watts was sanitized are clamped to nameplate so a
-// 3-hour-old 10 MW row cannot keep driving the plan chart.
+// Load returns forecasts in [sinceMs, untilMs]. A last-resort
+// nameplate gate still clips a stored row that exceeds the roof.
 func (s *Service) Load(sinceMs, untilMs int64) ([]state.ForecastPoint, error) {
 	rows, err := s.Store.LoadForecasts(sinceMs, untilMs)
 	if err != nil {
@@ -537,9 +535,7 @@ func (s *Service) Load(sinceMs, untilMs int64) ([]state.ForecastPoint, error) {
 }
 
 // ClampForecasts copies any estimate above nameplate down onto that
-// ceiling. The planner and /api/forecast both read through this so a
-// row saved before kWp-as-watts was sanitized cannot keep showing
-// 2046 kW on an 18.96 kW roof.
+// ceiling. Physics gate only: stored units are already watts.
 func ClampForecasts(rows []state.ForecastPoint, nameplateW float64) []state.ForecastPoint {
 	if nameplateW <= 0 {
 		return rows

@@ -43,14 +43,11 @@ const PANEL_EDGE_MIN = 1.4;         // floor so a 0.5 kWp array is still visible
 const PANEL_EDGE_MAX = 7;           // cap so a 30 kWp array doesn't swallow the scene
 const PANEL_ELEV    = 0.4;          // height above ground plane for the panel base
 
-// Visual scale is kW-peak. Core stores rated_w (watts); legacy kwp is
-// kWp unless the value is ≥ 1000 (watts pasted into that field).
+// Visual scale is kW-peak. Core stores rated_w (watts).
 function arrayKwpForScale(a) {
   const ratedW = Number(a && a.rated_w);
   if (ratedW > 0) return ratedW / 1000;
-  const kwp = Number(a && a.kwp);
-  if (!(kwp > 0)) return 0;
-  return kwp >= 1000 ? kwp / 1000 : kwp;
+  return 0;
 }
 
 // Gap between adjacent panels along the orbit (world units). Small —

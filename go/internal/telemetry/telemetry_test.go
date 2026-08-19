@@ -328,7 +328,7 @@ func TestStorePreservesSoCWhenMissing(t *testing.T) {
 
 func TestStorePreservesVehicleSoCWhenDriverReplaysCache(t *testing.T) {
 	s := NewStore()
-	freshSoC := 61.0
+	freshSoC := 0.61
 	s.Update("tesla", DerVehicle, 0, &freshSoC, json.RawMessage(`{"soc_fresh":true}`))
 	first := s.Get("tesla", DerVehicle)
 	if first == nil || first.SoC == nil || first.SoCUpdatedAt.IsZero() {
@@ -339,7 +339,7 @@ func TestStorePreservesVehicleSoCWhenDriverReplaysCache(t *testing.T) {
 		t.Fatalf("fresh vehicle samples = %+v, want power plus SoC", samples)
 	}
 
-	cachedSoC := 62.0 // cached replays must not replace the last proven value
+	cachedSoC := 0.62 // cached replays must not replace the last proven value
 	s.Update("tesla", DerVehicle, 0, &cachedSoC, json.RawMessage(`{"soc_fresh":false}`))
 	got := s.Get("tesla", DerVehicle)
 	if got == nil || got.SoC == nil || *got.SoC != freshSoC {
@@ -360,7 +360,7 @@ func TestStoreFailsClosedOnInvalidVehicleSoCFreshness(t *testing.T) {
 		json.RawMessage(`{`),
 	} {
 		s := NewStore()
-		soc := 61.0
+		soc := 0.61
 		s.Update("vehicle", DerVehicle, 0, &soc, data)
 		got := s.Get("vehicle", DerVehicle)
 		if got == nil || got.SoC != nil || !got.SoCUpdatedAt.IsZero() {
@@ -374,7 +374,7 @@ func TestStoreFailsClosedOnInvalidVehicleSoCFreshness(t *testing.T) {
 
 func TestStoreDropsCachedVehicleSoCWithoutFreshPredecessor(t *testing.T) {
 	s := NewStore()
-	cachedSoC := 61.0
+	cachedSoC := 0.61
 	s.Update("vehicle", DerVehicle, 0, &cachedSoC, json.RawMessage(`{"soc_fresh":false}`))
 	got := s.Get("vehicle", DerVehicle)
 	if got == nil || got.SoC != nil || !got.SoCUpdatedAt.IsZero() {

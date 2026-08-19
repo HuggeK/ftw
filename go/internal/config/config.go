@@ -1111,7 +1111,8 @@ type Weather struct {
 // PVArray is one physically-distinct panel group. Multi-plane
 // residential installs typically have two or three (e.g. south roof
 // + east roof + garage) with different tilt/azimuth. The sum of all
-// KWp values should match the total PV nameplate at the site.
+// rated_w values should match the total PV nameplate at the site.
+// kwp is a legacy YAML key folded into rated_w on load.
 type PVArray struct {
 	Name       string   `yaml:"name,omitempty" json:"name,omitempty"`
 	RatedW     float64  `yaml:"rated_w,omitempty" json:"rated_w,omitempty"`

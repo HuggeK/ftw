@@ -127,7 +127,7 @@ func TestEvaluateExportAndGridChargingLimitsUseCurrentGridPower(t *testing.T) {
 func basePolicy() *config.V2XPolicy {
 	return &config.V2XPolicy{
 		Enabled:             true,
-		MinReserveSoC:    0.20,
+		MinReserveSoC:       0.20,
 		MaxChargeW:          3500,
 		MaxDischargeW:       3200,
 		ExportAllowed:       true,

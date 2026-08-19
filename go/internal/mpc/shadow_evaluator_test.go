@@ -33,7 +33,7 @@ func TestStatefulShadowEvaluatorScoresSameRealizationWithIndependentSoC(t *testi
 	if math.Abs(score.ChallengerCostOre) > 1e-6 || math.Abs(score.ChallengerMinusChampionOre+100) > 1e-6 {
 		t.Fatalf("unexpected challenger score: %+v", score)
 	}
-	if math.Abs(score.ChampionVirtualSoC-55) > 1e-6 || math.Abs(score.ChallengerVirtualSoC-45) > 1e-6 {
+	if math.Abs(score.ChampionVirtualSoC-0.55) > 1e-6 || math.Abs(score.ChallengerVirtualSoC-0.45) > 1e-6 {
 		t.Fatalf("virtual SoC did not evolve independently: %+v", score)
 	}
 }
@@ -57,7 +57,7 @@ func TestStatefulShadowEvaluatorProjectsModeAndEnergyBounds(t *testing.T) {
 	if score.ChampionClampCount != 30 || score.ChallengerClampCount != 30 {
 		t.Fatalf("expected SoC/mode clamps: %+v", score)
 	}
-	if math.Abs(score.ChampionVirtualSoC-10) > 1e-6 || math.Abs(score.ChallengerVirtualSoC-10) > 1e-6 {
+	if math.Abs(score.ChampionVirtualSoC-0.10) > 1e-6 || math.Abs(score.ChallengerVirtualSoC-0.10) > 1e-6 {
 		t.Fatalf("minimum SoC was violated: %+v", score)
 	}
 }
@@ -76,7 +76,7 @@ func TestStatefulShadowEvaluatorRestoresPersistedRun(t *testing.T) {
 	evaluator.Restore(persisted)
 	evaluator.SetPlans(plan, plan, slots, p, now)
 	score := evaluator.Snapshot()
-	if score.StartedAtMs != 123 || score.Samples != 42 || score.ChampionVirtualSoC != 43 || score.ChallengerVirtualSoC != 47 {
+	if score.StartedAtMs != 123 || score.Samples != 42 || score.ChampionVirtualSoC != 0.43 || score.ChallengerVirtualSoC != 0.47 {
 		t.Fatalf("persisted evaluation was not resumed: %+v", score)
 	}
 }
@@ -121,7 +121,7 @@ func TestShadowEvaluatorDoesNotInventRecoveryFromInitialBandViolation(t *testing
 	evaluator.SetPlans(plan, plan, slots, p, start)
 	_ = evaluator.Observe(start, 500, 0)
 	score := evaluator.Observe(start.Add(time.Minute), 500, 0)
-	if score.ChampionVirtualSoC != 5 || score.ChallengerVirtualSoC != 5 {
+	if score.ChampionVirtualSoC != 0.05 || score.ChallengerVirtualSoC != 0.05 {
 		t.Fatalf("evaluator invented operating-band recovery: %+v", score)
 	}
 	if score.ChampionClampCount != 1 || score.ChallengerClampCount != 1 {

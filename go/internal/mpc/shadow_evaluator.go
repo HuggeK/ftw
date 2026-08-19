@@ -31,8 +31,8 @@ type ShadowEvaluation struct {
 	ChampionValuedCostOre            float64            `json:"champion_valued_cost_ore"`
 	ChallengerValuedCostOre          float64            `json:"challenger_valued_cost_ore"`
 	ChallengerMinusChampionValuedOre float64            `json:"challenger_minus_champion_valued_ore"`
-	ChampionVirtualSoC            float64            `json:"champion_virtual_soc_pct"`
-	ChallengerVirtualSoC          float64            `json:"challenger_virtual_soc_pct"`
+	ChampionVirtualSoC               float64            `json:"champion_virtual_soc"`
+	ChallengerVirtualSoC             float64            `json:"challenger_virtual_soc"`
 	ChampionStorageEnergyWh          map[string]float64 `json:"champion_storage_energy_wh,omitempty"`
 	ChallengerStorageEnergyWh        map[string]float64 `json:"challenger_storage_energy_wh,omitempty"`
 	ChampionClampCount               int64              `json:"champion_clamp_count"`
@@ -400,8 +400,8 @@ func (e *StatefulShadowEvaluator) updateVirtualSoCLocked() {
 	}
 	e.summary.ChampionStorageEnergyWh = cloneEnergyMap(e.championWh)
 	e.summary.ChallengerStorageEnergyWh = cloneEnergyMap(e.challengerWh)
-	e.summary.ChampionVirtualSoC = sumEnergy(e.championWh) / capacity * 100
-	e.summary.ChallengerVirtualSoC = sumEnergy(e.challengerWh) / capacity * 100
+	e.summary.ChampionVirtualSoC = sumEnergy(e.championWh) / capacity
+	e.summary.ChallengerVirtualSoC = sumEnergy(e.challengerWh) / capacity
 	e.summary.ChampionTerminalValueOre = e.params.TerminalSoCPrice * sumEnergy(e.championWh) / 1000
 	e.summary.ChallengerTerminalValueOre = e.params.TerminalSoCPrice * sumEnergy(e.challengerWh) / 1000
 	e.summary.ChampionValuedCostOre = e.summary.ChampionCostOre - e.summary.ChampionTerminalValueOre

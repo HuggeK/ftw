@@ -802,15 +802,15 @@
           if (lpEv) {
             // Prefer vehicle-reported when present; fall back to
             // the inferred SoC the manager computed from session_wh.
-            if (lpEv.vehicle_soc_pct > 0) {
-              evSoc = lpEv.vehicle_soc_pct;
+            if (lpEv.vehicle_soc > 0) {
+              evSoc = lpEv.vehicle_soc * 100;
               evSocSource = "vehicle";
-            } else if (lpEv.current_soc_pct > 0) {
-              evSoc = lpEv.current_soc_pct;
+            } else if (lpEv.current_soc > 0) {
+              evSoc = lpEv.current_soc * 100;
               evSocSource = lpEv.soc_source || "inferred";
             }
-            if (lpEv.vehicle_charge_limit_pct > 0) {
-              evLimit = lpEv.vehicle_charge_limit_pct;
+            if (lpEv.vehicle_charge_limit > 0) {
+              evLimit = lpEv.vehicle_charge_limit * 100;
             }
             evSocStale = !!lpEv.vehicle_stale;
           }
@@ -3026,7 +3026,7 @@
     var socBox = document.createElement("div");
     socBox.style.marginTop = "0.25rem";
 
-    var curSoc = (lp && lp.current_soc_pct != null) ? lp.current_soc_pct : null;
+    var curSoc = (lp && lp.current_soc != null) ? lp.current_soc * 100 : null;
     var socSource = (lp && lp.soc_source) ? lp.soc_source : "";
     var sourceNote = socSource === "vehicle"
       ? "Live from the car — drag only to correct drift."
@@ -3074,7 +3074,7 @@
         apiFetch("/api/loadpoints/" + encodeURIComponent(lp.id) + "/soc", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ soc_pct: v }),
+          body: JSON.stringify({ soc: v / 100 }),
         }).then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
           .then(function (res) {
             socSetBtn.disabled = false;
@@ -3182,11 +3182,11 @@
     // Convert "minutes-of-day-UTC" to a "HH:MM" string in the browser's
     // local zone. The UI shows local time everywhere; we marshal back to
     // UTC minutes on save.
-    var hasSched = !!(sched.soc_pct || sched.recurring || sched.surplus_unlock_bat_soc_pct);
+    var hasSched = !!(sched.soc || sched.recurring || sched.surplus_unlock_bat_soc);
     var initLocalHHMM = utcMinsToLocalHHMM(typeof sched.time_of_day_min_utc === "number" ? sched.time_of_day_min_utc : 360);
-    var initSoC = typeof sched.soc_pct === "number" && sched.soc_pct > 0 ? sched.soc_pct : 50;
+    var initSoC = typeof sched.soc === "number" && sched.soc > 0 ? sched.soc * 100 : 50;
     var initRec = !!sched.recurring;
-    var savedUnlock = typeof sched.surplus_unlock_bat_soc_pct === "number" ? sched.surplus_unlock_bat_soc_pct : 0;
+    var savedUnlock = typeof sched.surplus_unlock_bat_soc === "number" ? sched.surplus_unlock_bat_soc * 100 : 0;
     // Surplus on/off is derived from the saved threshold: > 0 ⇒ enabled.
     // The threshold input retains the last-used value (or defaults to 50)
     // so unchecking + re-checking doesn't wipe the user's pick.
@@ -3434,10 +3434,10 @@
       var unlockVal = (hasPV && surCb.checked) ? Number(unlockWrap.input.value) : 0;
       var body = {
         schedule: {
-          soc_pct: Number(targetSlider.value),
+          soc: Number(targetSlider.value) / 100,
           time_of_day_min_utc: minUTC,
           recurring: !!recCb.checked,
-          surplus_unlock_bat_soc_pct: unlockVal,
+          surplus_unlock_bat_soc: unlockVal > 0 ? unlockVal / 100 : 0,
         },
       };
       // CONTROL write — strict (FIX-B): loadpoint schedule save.

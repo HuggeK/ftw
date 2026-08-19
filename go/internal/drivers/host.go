@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/srcfl/ftw/go/internal/telemetry"
+	"github.com/srcfl/ftw/go/internal/units"
 )
 
 // ErrNoCapability is returned by host functions the driver wasn't granted.
@@ -643,6 +644,13 @@ func (h *HostEnv) emitTelemetry(rawJSON []byte) error {
 		case env.VehicleSoCFract != nil:
 			soc = env.VehicleSoCFract
 		}
+	}
+	// Driver door: Tesla battery_level and similar vendor percents arrive
+	// as 0–100 on DerVehicle. Battery and V2X already emit 0–1 and are
+	// rejected if they do not. Convert only vehicles, before ValidateReading.
+	if t == telemetry.DerVehicle && soc != nil {
+		f := units.FractionFromLegacyPercent(*soc)
+		soc = &f
 	}
 	if err := telemetry.ValidateReading(t, rawW, soc); err != nil {
 		return fmt.Errorf("emit_telemetry: %w", err)

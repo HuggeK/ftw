@@ -73,6 +73,18 @@ func TestPermilleDoor(t *testing.T) {
 	}
 }
 
+func TestDecodeJSONFraction(t *testing.T) {
+	if got := DecodeJSONFraction(0.80, 0); got != 0.80 {
+		t.Fatalf("canonical 0.80 = %v", got)
+	}
+	if got := DecodeJSONFraction(0, 80); got != 0.80 {
+		t.Fatalf("legacy 80 = %v", got)
+	}
+	if got := DecodeJSONFraction(0.50, 80); got != 0.50 {
+		t.Fatalf("canonical wins = %v", got)
+	}
+}
+
 func TestValidFraction(t *testing.T) {
 	if !ValidFraction(0) || !ValidFraction(1) || !ValidFraction(0.55) {
 		t.Fatal("expected 0, 1, 0.55 valid")

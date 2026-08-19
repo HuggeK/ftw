@@ -5,7 +5,7 @@
 // Data sources:
 //   GET /api/loadpoints  — array of LP states (id, driver, surplus_only,
 //                          plugged_in, max_charge_w, allowed_steps_w,
-//                          current_soc_pct, target_soc_pct, target_time,
+//                          current_soc, target_soc, target_time,
 //                          vehicle_*, soc_source).
 //   GET /api/mpc/plan    — current plan; actions[] include optional
 //                          loadpoint_w + loadpoint_soc (0–1) when an LP
@@ -120,10 +120,10 @@
   function batteryBoostBlock(lp) {
     const boost = lp.battery_boost || { state: 'inactive', active: false };
     if (boost.active) {
-      const target = boost.ev_target_soc_pct > 0 ? ` · EV target ${boost.ev_target_soc_pct.toFixed(0)}%` : '';
+      const target = boost.ev_target_soc > 0 ? ` · EV target ${fmtPct(boost.ev_target_soc)}` : '';
       return '<div class="lp-boost lp-boost-active">' +
         '<div class="lp-boost-title">Battery boost ' + badge('ACTIVE', true) + '</div>' +
-        `<div class="lp-boost-copy">${fmtRemaining(boost.expires_at_ms)} left · home reserve ${boost.min_battery_soc_pct.toFixed(0)}%${target}</div>` +
+        `<div class="lp-boost-copy">${fmtRemaining(boost.expires_at_ms)} left · home reserve ${fmtPct(boost.min_battery_soc)}${target}</div>` +
         `<button class="lp-boost-cancel" type="button" data-lp="${escapeHtml(lp.id)}">Stop boost</button>` +
         '</div>';
     }
@@ -161,35 +161,35 @@
 
   function configBlock(lp) {
     const d = fmtDeadline(lp.target_time);
-    const target = (lp.target_soc_pct > 0)
-      ? `${lp.target_soc_pct.toFixed(0)}%${d ? ' by ' + d : ''}`
+    const target = (lp.target_soc > 0)
+      ? `${fmtPct(lp.target_soc)}${d ? ' by ' + d : ''}`
       : 'opportunistic';
     const vehicle = (lp.vehicle_driver)
       ? `${escapeHtml(lp.vehicle_driver)}${lp.vehicle_charging_state ? ' · ' + escapeHtml(lp.vehicle_charging_state) : ''}${lp.vehicle_stale ? ' · stale' : ''}`
       : '—';
-    // When soc_source is "vehicle", the BMS reading (vehicle_soc_pct)
+    // When soc_source is "vehicle", the BMS reading (vehicle_soc)
     // is ground truth and what the operator expects to see — render
-    // that. current_soc_pct stays as the controller's inference state
+    // that. current_soc stays as the controller's inference state
     // (the planner's input for stability across ticks) and is shown
     // in parens as "(inferred: 65.1%)" so the discrepancy is visible
     // when it exists. When soc_source is "inferred" the inference
     // value is the only one we have, so display it directly.
     let soc = '—';
-    if (lp.soc_source === 'vehicle' && lp.vehicle_soc_pct != null) {
-      soc = `${lp.vehicle_soc_pct.toFixed(0)}% (vehicle)`;
-      if (lp.current_soc_pct != null &&
-          Math.abs(lp.vehicle_soc_pct - lp.current_soc_pct) >= 1) {
-        soc += ` · inferred ${lp.current_soc_pct.toFixed(1)}%`;
+    if (lp.soc_source === 'vehicle' && lp.vehicle_soc != null) {
+      soc = `${fmtPct(lp.vehicle_soc)} (vehicle)`;
+      if (lp.current_soc != null &&
+          Math.abs(lp.vehicle_soc - lp.current_soc) >= 0.01) {
+        soc += ` · inferred ${fmtPct(lp.current_soc)}`;
       }
-    } else if (lp.current_soc_pct != null) {
-      soc = `${lp.current_soc_pct.toFixed(1)}%${lp.soc_source ? ' (' + escapeHtml(lp.soc_source) + ')' : ''}`;
+    } else if (lp.current_soc != null) {
+      soc = `${fmtPct(lp.current_soc)}${lp.soc_source ? ' (' + escapeHtml(lp.soc_source) + ')' : ''}`;
     }
     // Inline manual SoC correction. The backend (POST /api/loadpoints/{id}/soc)
     // re-anchors the inferred SoC, so it only works during an active session —
     // show the ✎ affordance only when plugged in.
     let socCell = soc;
     if (lp.plugged_in) {
-      const cur = (lp.current_soc_pct != null) ? lp.current_soc_pct.toFixed(1) : '';
+      const cur = (lp.current_soc != null) ? (lp.current_soc * 100).toFixed(1) : '';
       socCell = `${soc} <button class="lp-soc-edit" type="button" data-lp="${escapeHtml(lp.id)}" data-cur="${cur}" title="Set SoC manually" ` +
         `style="background:none;border:none;cursor:pointer;color:var(--accent-e);font-size:0.9em;padding:0 4px">✎</button>`;
     }
@@ -350,7 +350,7 @@
     apiFetch('/api/loadpoints/' + encodeURIComponent(btn.dataset.lp) + '/soc', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ soc_pct: val }),
+      body: JSON.stringify({ soc: val / 100 }),
     })
       .then(r => r.json().then(j => ({ ok: r.ok, body: j })))
       .then(res => {
@@ -385,8 +385,8 @@
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         duration_s: duration,
-        min_battery_soc_pct: reserve,
-        ev_target_soc_pct: target,
+        min_battery_soc: reserve / 100,
+        ev_target_soc: target ? target / 100 : 0,
         departure_at_ms: departure,
       }),
     })

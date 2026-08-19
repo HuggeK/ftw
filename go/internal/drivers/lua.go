@@ -685,8 +685,10 @@ func registerHost(L *lua.LState, env *HostEnv) {
 	//              ev_target_energy_req_wh, ev_min_energy_req_wh,
 	//              ev_max_energy_req_wh, rated_power_w, status, protocol,
 	//              control_mode
-	//   vehicle -> soc (required, vehicle battery level % 0-100),
-	//              charge_limit_pct (optional, vehicle-configured limit),
+	//   vehicle -> soc (required, 0–1 fraction; 0–100 vendor percents
+	//              are converted at this door),
+	//              charge_limit / charge_limit_pct (optional; 0–1 or
+	//              legacy 0–100, converted at PickBestVehicle),
 	//              charging_state (optional, e.g. "Charging"|"Stopped"|"Complete"),
 	//              time_to_full_min (optional),
 	//              stale (optional bool, true when data hasn't refreshed

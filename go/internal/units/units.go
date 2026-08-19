@@ -63,6 +63,20 @@ func FractionFromLegacyPercent(v float64) float64 {
 	return v
 }
 
+// DecodeJSONFraction is the HTTP/JSON inbound door. Canonical (already 0–1)
+// wins when set; otherwise legacyPercent (0–100 or already 0–1) is folded.
+func DecodeJSONFraction(canonical, legacyPercent float64) float64 {
+	v := canonical
+	if v == 0 && legacyPercent != 0 {
+		v = legacyPercent
+	}
+	return FractionFromLegacyPercent(v)
+}
+
+// DefaultPluginSoC is the conservative EV plug-in assumption when the
+// operator has not set plugin_soc. Chargers like Easee do not report BMS.
+const DefaultPluginSoC = 0.20
+
 // PercentFromFraction is the UI/HA door. Core must not store the result.
 func PercentFromFraction(f float64) float64 {
 	return f * 100.0

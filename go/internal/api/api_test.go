@@ -319,7 +319,7 @@ func TestHandleV2XPolicyReturnsLiveEnvelope(t *testing.T) {
 		Cfg: &config.Config{V2X: &config.V2XPolicy{
 			Enabled:             true,
 			DriverName:          "dc2",
-			MinReserveSoC:    0.20,
+			MinReserveSoC:       0.20,
 			MaxChargeW:          6000,
 			MaxDischargeW:       4000,
 			ExportAllowed:       false,
