@@ -1746,7 +1746,7 @@
       { name: "Load pred", val: a.load_w, color: "#fde68a" },
       { name: "Battery",   val: a.battery_w, color: "#f59e0b", showSign: true },
       { name: "Grid",      val: a.grid_w,    color: "#ef4444", showSign: true },
-      { name: "SoC",       val: a.soc_pct + "%", color: "#60a5fa", literal: true },
+      { name: "SoC",       val: a.soc != null ? Math.round(a.soc * 100) + "%" : "—", color: "#60a5fa", literal: true },
       { name: "Price",     val: fmtPricePerKwh(a.price_ore), color: "#fbbf24", literal: true },
     ];
 

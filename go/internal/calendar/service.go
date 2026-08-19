@@ -15,6 +15,7 @@ import (
 
 	"github.com/srcfl/ftw/go/internal/config"
 	"github.com/srcfl/ftw/go/internal/loadmodel"
+	"github.com/srcfl/ftw/go/internal/units"
 )
 
 // LoadProfiler is the slice of *loadmodel.Service the calendar service needs:
@@ -171,9 +172,9 @@ func (s *Service) applyConfig(cfg config.CalDAV, firstLoadpointID string) {
 	if horizonDays <= 0 {
 		horizonDays = config.DefaultCalDAVHorizonDays
 	}
-	targetSoC := cfg.EVDefaultTargetSoCPct
+	targetSoC := units.PercentFromFraction(cfg.EVDefaultTargetSoC)
 	if targetSoC <= 0 {
-		targetSoC = config.DefaultCalDAVEVTargetSoC
+		targetSoC = units.PercentFromFraction(config.DefaultCalDAVEVTargetSoC)
 	}
 	away := cfg.AwayKeywords
 	if len(away) == 0 {

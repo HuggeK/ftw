@@ -1815,12 +1815,12 @@ func seededPlanner() []goldenScenario {
 				slot.PlannedGridW = roundW(rng.Float64()*6000 - 3000)
 			}
 			if rng.Float64() < 0.15 {
-				slot.LivePVSurplusSoCCapPct = roundW(60 + rng.Float64()*35)
+				slot.LivePVSurplusSoCCapPct = 0.60 + rng.Float64()*0.35
 			}
 			in.Slot = slot
 		}
 		if rng.Float64() < 0.10 {
-			in.State.PVSurplusAbsorbSoCCapPct = roundW(70 + rng.Float64()*20)
+			in.State.PVSurplusAbsorbSoCCapPct = 0.70 + rng.Float64()*0.20
 		}
 		out = append(out, goldenScenario{
 			ID: fmt.Sprintf("seeded_planner/%03d_%s", i, mode), Seed: seed, Inputs: in,

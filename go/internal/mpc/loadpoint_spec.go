@@ -32,16 +32,16 @@ type LoadpointSpec struct {
 	// SoC grid. Coarser than battery (11 is typical — EV loads are
 	// lumpy anyway).
 	Levels int
-	MinPct float64 // usually 0
-	MaxPct float64 // usually 100
+	SoCMin float64 // usually 0
+	SoCMax float64 // usually 1
 
 	// Plan-start conditions.
-	InitialSoCPct float64 // EV SoC at the first slot
+	InitialSoC float64 // EV SoC at the first slot
 	PluggedIn     bool    // when false, Optimize treats the loadpoint as absent
 
 	// User intent. A zero target means no deadline — charge
 	// opportunistically based on price/PV surplus only.
-	TargetSoCPct  float64
+	TargetSoC  float64
 	TargetSlotIdx int // zero-based slot by whose end the target must be met; ignored when target is zero
 
 	// Electrical constraints. AllowedStepsW MUST include 0 (off) and

@@ -5321,7 +5321,7 @@ func TestPVSurplusAbsorberAbsorbsExtraExportWhenEnabled(t *testing.T) {
 	store.DriverHealthMut("pv-1").RecordSuccess()
 
 	st := newStateWithEnergyDispatch(dir, "ferroamp")
-	st.PVSurplusAbsorbSoCCapPct = 88 // enable
+	st.PVSurplusAbsorbSoCCapPct = 0.88 // enable
 	st.PVSurplusAbsorbThresholdW = 100
 
 	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
@@ -5356,7 +5356,7 @@ func TestPVSurplusAbsorberDisplacesLaterGridCharge(t *testing.T) {
 		Strategy:               "arbitrage",
 		PlannedGridW:           -1000, // preserve 1 kW of planned PV export
 		HasPlannedGridW:        true,
-		LivePVSurplusSoCCapPct: 80, // energy-derived replacement ceiling
+		LivePVSurplusSoCCapPct: 0.8, // energy-derived replacement ceiling
 	}
 	store := seedStore(-4000, []struct {
 		name          string
@@ -5431,7 +5431,7 @@ func TestPVSurplusAbsorberHoldsAtCap(t *testing.T) {
 	store.DriverHealthMut("pv-1").RecordSuccess()
 
 	st := newStateWithEnergyDispatch(dir, "ferroamp")
-	st.PVSurplusAbsorbSoCCapPct = 88
+	st.PVSurplusAbsorbSoCCapPct = 0.88
 
 	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
 	got := targets[0].TargetW
@@ -5692,7 +5692,7 @@ func TestPVSurplusAbsorberDoesNotReverseDischarge(t *testing.T) {
 	store.DriverHealthMut("pv-1").RecordSuccess()
 
 	st := newStateWithEnergyDispatch(dir, "ferroamp")
-	st.PVSurplusAbsorbSoCCapPct = 88
+	st.PVSurplusAbsorbSoCCapPct = 0.88
 
 	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
 	got := targets[0].TargetW
@@ -6338,7 +6338,7 @@ func TestPlannerPassiveArbitrageIdleSlotPreservesPlannedExportWithAbsorber(t *te
 		Strategy:               "passive_arbitrage",
 		PlannedGridW:           -2000,
 		HasPlannedGridW:        true,
-		LivePVSurplusSoCCapPct: 80,
+		LivePVSurplusSoCCapPct: 0.8,
 	}
 	// Meter exports only 100 W because the battery is already absorbing
 	// 1900 W. Without battery charge the site would export the planned 2 kW.
@@ -6376,7 +6376,7 @@ func TestPlannerArbitrageIdleSlotAbsorbsSurplusThatDisplacesGridCharge(t *testin
 		Strategy:               "arbitrage",
 		PlannedGridW:           2000, // plan forecast a load deficit
 		HasPlannedGridW:        true,
-		LivePVSurplusSoCCapPct: 80,
+		LivePVSurplusSoCCapPct: 0.8,
 	}
 	store := seedStore(-2000, []struct {
 		name          string

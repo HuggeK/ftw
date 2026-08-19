@@ -80,8 +80,8 @@ func meanPriceOre(actions []mpc.Action) float64 {
 func minSoCPct(actions []mpc.Action) float64 {
 	min := math.Inf(1)
 	for _, a := range actions {
-		if a.SoCPct < min {
-			min = a.SoCPct
+		if a.SoC < min {
+			min = a.SoC
 		}
 	}
 	if math.IsInf(min, 1) {
@@ -140,7 +140,7 @@ func reasonCode(a mpc.Action, meanPriceOre, minSoCPct float64, ceilingW *int64) 
 		// Idle at its deepest planned point during an expensive hour is
 		// the planner refusing to spend the reserve, which is a decision
 		// worth naming rather than calling nothing.
-		if priceAbove && a.SoCPct <= minSoCPct+0.5 {
+		if priceAbove && a.SoC <= minSoCPct+0.005 {
 			return ReasonReserveHeld
 		}
 		if gridExports {

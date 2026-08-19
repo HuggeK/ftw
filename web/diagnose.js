@@ -30,6 +30,12 @@
     return u.formatPrice(minor, cur, u.unitFor(cur).scale === 1 ? 0 : 2);
   }
 
+  // Plan/diagnose JSON SoC is a 0–1 fraction. Multiply only when showing "%".
+  function socPercent(frac) {
+    if (frac == null || !Number.isFinite(frac)) return null;
+    return frac * 100;
+  }
+
   function canvasColors() {
     return window.ftwThemeColors
       ? window.ftwThemeColors.palette()
@@ -288,7 +294,7 @@
     // where the plan said "idle the EV this hour" and operators
     // would never see the SoC trajectory.
     const lpActive = d.slots && d.slots.some(x =>
-      x.loadpoint_w || x.loadpoint_soc_pct);
+      x.loadpoint_w || x.loadpoint_soc);
     const lpBadges = lpActive ? [
       '<span class="diag-pill diag-ev">EV in plan</span>',
       params.loadpoint_surplus_only ? '<span class="diag-pill diag-lp-policy">surplus only</span>' : '',
@@ -310,7 +316,7 @@
         </div>
         <div class="detail-params">
           <span title="Mode"><b>${escapeHtml(params.mode || '—')}</b></span>
-          <span title="Initial SoC">SoC start ${params.initial_soc_pct != null ? params.initial_soc_pct.toFixed(1) : '—'}%</span>
+          <span title="Initial SoC">SoC start ${params.initial_soc != null ? (socPercent(params.initial_soc) || 0).toFixed(1) : '—'}%</span>
           <span title="Battery capacity">${params.capacity_wh ? (params.capacity_wh/1000).toFixed(1)+' kWh' : ''}</span>
           ${lpBadges}
         </div>
@@ -429,6 +435,8 @@
     const confCls = sl.confidence < 0.9 ? 'conf-low' : '';
     const gridCls = sl.grid_w > 0 ? 'val-import' : (sl.grid_w < 0 ? 'val-export' : 'val-neutral');
     const batCls = sl.battery_w > 0 ? 'val-charging' : (sl.battery_w < 0 ? 'val-discharging' : 'val-neutral');
+    const socPct = socPercent(sl.soc);
+    const lpSocPct = socPercent(sl.loadpoint_soc);
     return `<tr data-slot-idx="${i}">
       <td>${sl.idx}</td>
       <td>${fmtHHMM(sl.slot_start_ms)}</td>
@@ -439,8 +447,8 @@
       <td>${fmtW(sl.load_w)}</td>
       <td class="${batCls}">${fmtW(sl.battery_w)}</td>
       <td class="${gridCls}">${fmtW(sl.grid_w)}</td>
-      <td>${fmt1(sl.soc_pct)}%</td>
-      ${lpActive ? `<td>${fmtW(sl.loadpoint_w || 0)}</td><td>${fmt1(sl.loadpoint_soc_pct || 0)}%</td>` : ''}
+      <td>${socPct == null ? '—' : fmt1(socPct) + '%'}</td>
+      ${lpActive ? `<td>${fmtW(sl.loadpoint_w || 0)}</td><td>${lpSocPct == null ? '—' : fmt1(lpSocPct) + '%'}</td>` : ''}
       <td>${fmt1(sl.cost_ore)}</td>
       <td class="diag-reason-cell">${escapeHtml(sl.reason || '')}</td>
     </tr>`;
@@ -573,7 +581,7 @@
     ctx.beginPath();
     slots.forEach((s, i) => {
       const x = pad.l + i * barW + barW / 2;
-      const y = socY0 + socH - ((s.soc_pct || 0) / 100) * socH;
+      const y = socY0 + socH - ((socPercent(s.soc) || 0) / 100) * socH;
       if (i === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
     });

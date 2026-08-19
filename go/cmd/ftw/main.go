@@ -67,6 +67,7 @@ import (
 	"github.com/srcfl/ftw/go/internal/selfupdate"
 	"github.com/srcfl/ftw/go/internal/state"
 	"github.com/srcfl/ftw/go/internal/telemetry"
+	"github.com/srcfl/ftw/go/internal/units"
 )
 
 // Version gets injected at build time via -ldflags. Defaults to "dev" for
@@ -1071,7 +1072,7 @@ func main() {
 			newLon := newCfg.Weather.Longitude
 			if newLat != oldLat || newLon != oldLon {
 				if pvSvc != nil {
-					pvSvc.ClearSky = func(t time.Time) float64 { return forecast.ClearSkyW(newLat, newLon, t) }
+					pvSvc.ClearSky = func(t time.Time) float64 { return forecast.ClearSkyWm2(newLat, newLon, t) }
 				}
 				if forecastSvc != nil {
 					forecastSvc.Lat = newLat
@@ -1150,7 +1151,7 @@ func main() {
 	// pvSvc is pre-declared above so the reload Applier can update it.
 	if cfg.Weather != nil && cfg.Weather.Provider != "" && cfg.Weather.Provider != "none" {
 		lat, lon := cfg.Weather.Latitude, cfg.Weather.Longitude
-		clearSkyFn := func(t time.Time) float64 { return forecast.ClearSkyW(lat, lon, t) }
+		clearSkyFn := func(t time.Time) float64 { return forecast.ClearSkyWm2(lat, lon, t) }
 		cloudFn := func(t time.Time) (float64, bool) {
 			// Look up nearest forecast row covering `t`.
 			nowMs := t.UnixMilli()
@@ -1503,11 +1504,11 @@ func main() {
 					ID:               st.ID,
 					CapacityWh:       capWh,
 					Levels:           11,
-					MinPct:           0,
-					MaxPct:           maxPct,
-					InitialSoCPct:    initSoC,
+					SoCMin:           0,
+					SoCMax:           units.FractionFromLegacyPercent(maxPct),
+					InitialSoC:       units.FractionFromLegacyPercent(initSoC),
 					PluggedIn:        true,
-					TargetSoCPct:     targetPct,
+					TargetSoC:        units.FractionFromLegacyPercent(targetPct),
 					TargetSlotIdx:    targetSlot,
 					MaxChargeW:       st.MaxChargeW,
 					AllowedStepsW:    st.AllowedStepsW,
@@ -3557,7 +3558,7 @@ func planSlotsFromMPC(mpcSvc *mpc.Service) []calendar.PlanSlot {
 			End:        start.Add(time.Duration(ln) * time.Minute),
 			BatteryW:   a.BatteryW,
 			GridW:      a.GridW,
-			SoCPct:     a.SoCPct,
+			SoCPct:     a.SoC * 100,
 			Confidence: a.Confidence,
 		})
 	}
@@ -3587,7 +3588,7 @@ func buildLoadpointConfigs(src []config.Loadpoint) []loadpoint.Config {
 			MaxChargeW:        lp.MaxChargeW,
 			AllowedStepsW:     lp.AllowedStepsW,
 			VehicleCapacityWh: lp.VehicleCapacityWh,
-			PluginSoCPct:      lp.PluginSoCPct,
+			PluginSoCPct:      units.PercentFromFraction(lp.PluginSoC),
 			PhaseMode:         lp.PhaseMode,
 			PhaseSplitW:       lp.PhaseSplitW,
 			MinPhaseHoldS:     lp.MinPhaseHoldS,
@@ -3716,13 +3717,13 @@ func buildMPC(cfg *config.Config, st *state.Store, tel *telemetry.Store, capacit
 	if mode == "" {
 		mode = mpc.ModeSelfConsumption
 	}
-	socMin := pl.SoCMinPct
+	socMin := pl.SoCMin
 	if socMin <= 0 {
-		socMin = 10
+		socMin = 0.10
 	}
-	socMax := pl.SoCMaxPct
-	if socMax <= 0 || socMax > 100 {
-		socMax = 95
+	socMax := pl.SoCMax
+	if socMax <= 0 || socMax > 1 {
+		socMax = 0.95
 	}
 	if pl.SoCSafetyFloorPct != 0 || pl.SafetyFloorPenaltyOreKwhHour != 0 {
 		slog.Warn("config: soc_safety_floor_pct / safety_floor_penalty_ore_kwh_hour are deprecated and ignored — forecast-risk reserve is now handled by pv_forecast_safety_k (downside-PV planning)")
@@ -3743,10 +3744,10 @@ func buildMPC(cfg *config.Config, st *state.Store, tel *telemetry.Store, capacit
 		Mode:                mode,
 		SoCLevels:           41,
 		CapacityWh:          totalCap,
-		SoCMinPct:           socMin,
-		SoCMaxPct:           socMax,
+		SoCMin:              socMin,
+		SoCMax:              socMax,
 		PVChargeBonusOreKwh: pvBonus,
-		InitialSoCPct:       50,
+		InitialSoC:          0.50,
 		// ActionLevels = 81 → 225 W discretization step on a ±9 kW
 		// action range. Coarser values (21=900 W, 41=450 W) lose
 		// borderline-PV slots: on a 273 W net surplus the 450 W min
@@ -4199,7 +4200,7 @@ func (b mpcPlanBridge) LatestActions() []ha.PlanAction {
 			SlotLenMin:  a.SlotLenMin,
 			BatteryW:    a.BatteryW,
 			GridW:       a.GridW,
-			SoCPct:      a.SoCPct,
+			SoCPct:      a.SoC * 100,
 			PriceOre:    a.PriceOre,
 			SpotOre:     a.SpotOre,
 			CostOre:     a.CostOre,

@@ -8,7 +8,7 @@
 //                          current_soc_pct, target_soc_pct, target_time,
 //                          vehicle_*, soc_source).
 //   GET /api/mpc/plan    — current plan; actions[] include optional
-//                          loadpoint_w + loadpoint_soc_pct when an LP
+//                          loadpoint_w + loadpoint_soc (0–1) when an LP
 //                          is part of the DP. Only one LP at a time
 //                          today (mpc/service.go: "One loadpoint at a
 //                          time — multi-LP support is on the roadmap").
@@ -47,9 +47,9 @@
     return Math.round(w) + ' W';
   }
 
-  function fmtPct(p) {
-    if (p == null || !isFinite(p)) return '—';
-    return p.toFixed(1) + '%';
+  function fmtPct(frac) {
+    if (frac == null || !isFinite(frac)) return '—';
+    return (frac * 100).toFixed(1) + '%';
   }
 
   // Bare number — the column header carries the unit.
@@ -215,7 +215,7 @@
       return '<div class="lp-empty">No active plan.</div>';
     }
     // Plan only carries one LP today. Match by checking whether *any*
-    // action has a loadpoint_w / loadpoint_soc_pct field — if it does,
+    // action has a loadpoint_w / loadpoint_soc field — if it does,
     // assume those refer to this LP. Once multi-LP support lands the
     // plan will need to namespace these by LP id; for now the comment
     // in mpc/service.go is the source of truth.
@@ -225,7 +225,7 @@
       return `<div class="lp-empty">Plan is scheduling <code>${escapeHtml(planLpId)}</code>, not this loadpoint.</div>`;
     }
     const slots = plan.plan.actions
-      .filter(a => a.loadpoint_w != null || a.loadpoint_soc_pct != null)
+      .filter(a => a.loadpoint_w != null || a.loadpoint_soc != null)
       .slice(0, SCHEDULE_SLOTS);
     if (slots.length === 0) {
       return '<div class="lp-empty">Planner did not allocate this loadpoint in the current horizon ' +
@@ -238,7 +238,7 @@
         `<td>${fmtSlotTime(a.slot_start_ms)}</td>` +
         `<td>${fmtPriceOre(a.price_ore)}</td>` +
         `<td>${fmtW(a.loadpoint_w || 0)}</td>` +
-        `<td>${fmtPct(a.loadpoint_soc_pct)}</td>` +
+        `<td>${fmtPct(a.loadpoint_soc)}</td>` +
         `<td>${fmtW(a.battery_w)}</td>` +
         `<td>${escapeHtml(a.reason || '')}</td>` +
         '</tr>';

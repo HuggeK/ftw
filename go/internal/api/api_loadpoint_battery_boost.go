@@ -12,7 +12,7 @@ type batteryBoostRequest struct {
 	DurationS        int64   `json:"duration_s,omitempty"`
 	ExpiresAtMs      int64   `json:"expires_at_ms,omitempty"`
 	MinBatterySoCPct float64 `json:"min_battery_soc_pct"`
-	EVTargetSoCPct   float64 `json:"ev_target_soc_pct,omitempty"`
+	EVTargetSoC      float64 `json:"ev_target_soc_pct,omitempty"`
 	DepartureAtMs    int64   `json:"departure_at_ms,omitempty"`
 }
 
@@ -63,7 +63,7 @@ func (s *Server) handleLoadpointBatteryBoostEnable(w http.ResponseWriter, r *htt
 		StartedAt:        now,
 		ExpiresAt:        expires,
 		MinBatterySoCPct: req.MinBatterySoCPct,
-		EVTargetSoCPct:   req.EVTargetSoCPct,
+		EVTargetSoCPct:   req.EVTargetSoC,
 	}
 	if req.DepartureAtMs > 0 {
 		lease.DepartureAt = time.UnixMilli(req.DepartureAtMs)

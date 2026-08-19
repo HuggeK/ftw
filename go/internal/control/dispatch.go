@@ -10,6 +10,7 @@ import (
 
 	"github.com/srcfl/ftw/go/internal/mpc"
 	"github.com/srcfl/ftw/go/internal/telemetry"
+	"github.com/srcfl/ftw/go/internal/units"
 )
 
 // Mode is the operating mode of the control loop.
@@ -3593,8 +3594,8 @@ func pvSurplusAbsorbCapPct(state *State, dir SlotDirective) float64 {
 	if state == nil {
 		return 0
 	}
-	operatorCap := state.PVSurplusAbsorbSoCCapPct
-	plannerCap := dir.LivePVSurplusSoCCapPct
+	operatorCap := units.FractionFromLegacyPercent(state.PVSurplusAbsorbSoCCapPct)
+	plannerCap := units.FractionFromLegacyPercent(dir.LivePVSurplusSoCCapPct)
 	var capPct float64
 	switch {
 	case operatorCap > 0:
@@ -3602,8 +3603,8 @@ func pvSurplusAbsorbCapPct(state *State, dir SlotDirective) float64 {
 	case plannerCap > 0:
 		capPct = plannerCap
 	}
-	if capPct > 100 {
-		return 100
+	if capPct > 1 {
+		return 1
 	}
 	return capPct
 }
@@ -3624,7 +3625,7 @@ func pvSurplusAbsorbHeadroomW(batteries []batteryInfo, capPct, remainingS float6
 	if totalCapWh <= 0 {
 		return 0
 	}
-	headroomWh := capPct/100*totalCapWh - storedWh
+	headroomWh := capPct*totalCapWh - storedWh
 	if headroomWh <= 0 {
 		return 0
 	}
