@@ -396,7 +396,7 @@ type SlotDirective struct {
 	SlotStart       time.Time
 	SlotEnd         time.Time
 	BatteryEnergyWh float64 // total energy for the slot (site-signed)
-	SoCTargetPct    float64 // plan's SoC at SlotEnd — used by divergence detector
+	SoCTarget       float64 // plan's SoC at SlotEnd — used by divergence detector
 	Strategy        Mode    // echoed for logging + API
 
 	// PVLimitW is the recommended cap on aggregate PV inverter output
@@ -416,14 +416,14 @@ type SlotDirective struct {
 	// and docs/safety.md §8 for the asymmetry rationale.
 	GridW float64
 
-	// LivePVSurplusSoCCapPct enables economically justified live surplus
+	// LivePVSurplusSoCCap enables economically justified live surplus
 	// capture for this slot. It is the current planned SoC plus the stored
 	// energy from later grid-funded charge actions whose import price clears
 	// this slot's effective export revenue and minimum spread. Runtime may
 	// opportunistically move that future charge into live PV now, but only up
 	// to this SoC and only while the meter exports beyond plan. Zero means
 	// preserve the slot exactly.
-	LivePVSurplusSoCCapPct float64
+	LivePVSurplusSoCCap float64
 
 	// LoadpointEnergyWh carries per-loadpoint EV energy budgets for
 	// this slot. Keyed by Loadpoint.ID. Positive = charging energy
@@ -433,9 +433,9 @@ type SlotDirective struct {
 	// remaining_s` formula it uses for the battery.
 	LoadpointEnergyWh map[string]float64
 
-	// LoadpointSoCTargetPct is the plan's EV SoC at SlotEnd per
+	// LoadpointSoCTarget is the plan's EV SoC at SlotEnd per
 	// loadpoint. Used by the per-loadpoint divergence check.
-	LoadpointSoCTargetPct map[string]float64
+	LoadpointSoCTarget map[string]float64
 }
 
 // SlotDirectiveAt returns the energy-allocation directive for the slot
@@ -474,29 +474,29 @@ func (s *Service) SlotDirectiveAt(now time.Time) (SlotDirective, bool) {
 		// energy_wh = power_w * hours. a.SlotLenMin/60 gives hours.
 		energyWh := a.BatteryW * float64(a.SlotLenMin) / 60.0
 		d := SlotDirective{
-			DecisionID:             p.DecisionID,
-			SlotStart:              time.UnixMilli(a.SlotStartMs),
-			SlotEnd:                time.UnixMilli(endMs),
-			BatteryEnergyWh:        energyWh,
-			SoCTargetPct:           a.SoC,
-			Strategy:               params.Mode,
-			PVLimitW:               a.PVLimitW,
-			GridW:                  a.GridW,
-			LivePVSurplusSoCCapPct: livePVSurplusSoCCapPct(p.Actions, i, params),
+			DecisionID:          p.DecisionID,
+			SlotStart:           time.UnixMilli(a.SlotStartMs),
+			SlotEnd:             time.UnixMilli(endMs),
+			BatteryEnergyWh:     energyWh,
+			SoCTarget:           a.SoC,
+			Strategy:            params.Mode,
+			PVLimitW:            a.PVLimitW,
+			GridW:               a.GridW,
+			LivePVSurplusSoCCap: livePVSurplusSoCCap(p.Actions, i, params),
 		}
 		if len(a.LoadpointPowerW) > 0 {
 			d.LoadpointEnergyWh = make(map[string]float64, len(a.LoadpointPowerW))
-			d.LoadpointSoCTargetPct = make(map[string]float64, len(a.LoadpointPowerW))
+			d.LoadpointSoCTarget = make(map[string]float64, len(a.LoadpointPowerW))
 			for id, powerW := range a.LoadpointPowerW {
 				d.LoadpointEnergyWh[id] = powerW * float64(a.SlotLenMin) / 60.0
-				d.LoadpointSoCTargetPct[id] = a.LoadpointSoCByID[id]
+				d.LoadpointSoCTarget[id] = a.LoadpointSoCByID[id]
 			}
 		} else if a.LoadpointW > 0 && lpID != "" {
 			lpEnergyWh := a.LoadpointW * float64(a.SlotLenMin) / 60.0
 			d.LoadpointEnergyWh = map[string]float64{
 				lpID: lpEnergyWh,
 			}
-			d.LoadpointSoCTargetPct = map[string]float64{
+			d.LoadpointSoCTarget = map[string]float64{
 				lpID: a.LoadpointSoC,
 			}
 		}
@@ -505,7 +505,7 @@ func (s *Service) SlotDirectiveAt(now time.Time) (SlotDirective, bool) {
 	return SlotDirective{}, false
 }
 
-// livePVSurplusSoCCapPct returns a quantified ceiling for moving later
+// livePVSurplusSoCCap returns a quantified ceiling for moving later
 // grid-funded charging into live PV in the current slot. This is deliberately
 // derived from decisions already present in the plan rather than a blanket
 // "always self-consume" override:
@@ -518,7 +518,7 @@ func (s *Service) SlotDirectiveAt(now time.Time) (SlotDirective, bool) {
 //   - only the grid-funded part of later charge actions contributes headroom,
 //     so opportunistic capture cannot store more energy than the plan intended
 //     to buy from the grid.
-func livePVSurplusSoCCapPct(actions []Action, current int, p Params) float64 {
+func livePVSurplusSoCCap(actions []Action, current int, p Params) float64 {
 	if current < 0 || current >= len(actions) {
 		return 0
 	}

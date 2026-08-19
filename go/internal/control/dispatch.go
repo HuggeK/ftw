@@ -123,7 +123,7 @@ type SlotDirective struct {
 	SlotStart       time.Time
 	SlotEnd         time.Time
 	BatteryEnergyWh float64 // site-signed: + = charge, − = discharge
-	SoCTargetPct    float64
+	SoCTarget       float64
 	Strategy        string  // echoed for logging / API; mirrors mpc.Mode
 	PVLimitW        float64 // 0 = no curtail; > 0 = cap aggregate PV output
 
@@ -158,12 +158,12 @@ type SlotDirective struct {
 	PlannedGridW    float64
 	HasPlannedGridW bool
 
-	// LivePVSurplusSoCCapPct mirrors mpc.SlotDirective. When non-zero,
+	// LivePVSurplusSoCCap mirrors mpc.SlotDirective. When non-zero,
 	// the plan has proved that enough later grid-funded battery charge clears
 	// the economic threshold. Runtime may absorb live PV surprise now up to
 	// the current planned SoC plus that replaceable energy. Zero preserves
 	// deliberate export.
-	LivePVSurplusSoCCapPct float64
+	LivePVSurplusSoCCap float64
 
 	// LoadpointEnergyWh is the current slot's planned EV charging budget.
 	// Runtime uses planned EV energy to keep surplus-only EV from being
@@ -504,7 +504,7 @@ type State struct {
 	// and flipped via config. Default off preserves today's behavior.
 	UseEnergyDispatch bool
 
-	// PVSurplusAbsorbSoCCapPct is the operator override for the PV-surplus absorber
+	// PVSurplusAbsorbSoCCap is the operator override for the PV-surplus absorber
 	// underlay: in planner_cheap / planner_arbitrage, when live grid is
 	// exporting more than PVSurplusAbsorbThresholdW BEYOND what the
 	// planner's slot allocation would produce, AND the fleet's average
@@ -513,14 +513,14 @@ type State struct {
 	// the battery instead of crossing the meter at low spot price.
 	//
 	// 0 = no operator override. The planner may still enable capture for
-	// a slot via SlotDirective.LivePVSurplusSoCCapPct when doing so moves
+	// a slot via SlotDirective.LivePVSurplusSoCCap when doing so moves
 	// a more expensive future grid charge into live PV. >0 turns the
-	// absorber on unconditionally with that percentage as the SoC ceiling.
+	// absorber on unconditionally with that 0–1 SoC as the ceiling.
 	//
 	// Never reverses a discharge plan: when the planner has already
 	// committed to discharge this slot (targetTotalW < 0, e.g.
 	// evening-peak export), the absorber stays passive.
-	PVSurplusAbsorbSoCCapPct float64
+	PVSurplusAbsorbSoCCap float64
 
 	// PVSurplusAbsorbThresholdW is the dead-band on the absorber: how
 	// much live export beyond plan we tolerate before charging the
@@ -1739,7 +1739,7 @@ func ComputeDispatch(
 	arbitrageFamilyIdleLiveExportGate := false
 	arbitrageFamilyIdleAbsorbCapPct := 0.0
 	if arbitrageFamilyIdleSlot {
-		arbitrageFamilyIdleAbsorbCapPct = pvSurplusAbsorbCapPct(state, currentDirective)
+		arbitrageFamilyIdleAbsorbCapPct = pvSurplusAbsorbCap(state, currentDirective)
 	}
 	if arbitrageFamilyIdleSlot || coverLoadDischargeSlot {
 		baselineGridW := gridW - currentTotal
@@ -1920,7 +1920,7 @@ func ComputeDispatch(
 		// Order: runs BEFORE the surplus-only EV reserve cap below, so
 		// any addition the absorber makes is then re-capped if an EV is
 		// reserving PV headroom for itself.
-		absorbCapPct := pvSurplusAbsorbCapPct(state, currentDirective)
+		absorbCapPct := pvSurplusAbsorbCap(state, currentDirective)
 		if absorbCapPct > 0 && targetTotalW >= 0 {
 			threshold := state.PVSurplusAbsorbThresholdW
 			if threshold <= 0 {
@@ -3590,23 +3590,20 @@ func unexpectedIdleExportBeyondPlanW(surplus surplusAccounting, dir SlotDirectiv
 	return unexpectedW
 }
 
-func pvSurplusAbsorbCapPct(state *State, dir SlotDirective) float64 {
+func pvSurplusAbsorbCap(state *State, dir SlotDirective) float64 {
 	if state == nil {
 		return 0
 	}
-	operatorCap := units.FractionFromLegacyPercent(state.PVSurplusAbsorbSoCCapPct)
-	plannerCap := units.FractionFromLegacyPercent(dir.LivePVSurplusSoCCapPct)
-	var capPct float64
+	operatorCap := units.ClampFraction(state.PVSurplusAbsorbSoCCap)
+	plannerCap := units.ClampFraction(dir.LivePVSurplusSoCCap)
+	var cap float64
 	switch {
 	case operatorCap > 0:
-		capPct = operatorCap
+		cap = operatorCap
 	case plannerCap > 0:
-		capPct = plannerCap
+		cap = plannerCap
 	}
-	if capPct > 1 {
-		return 1
-	}
-	return capPct
+	return cap
 }
 
 // pvSurplusAbsorbHeadroomW converts the fleet's quantified SoC headroom into

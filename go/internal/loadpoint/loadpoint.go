@@ -604,8 +604,8 @@ func (m *Manager) Observe(id string, pluggedIn bool, powerW, deliveredWh float64
 	if pluggedIn {
 		if lp.sessionComplete && lp.targetSoC > 0 {
 			// Snap the inferred SoC to target; the planner reads
-			// currentSoC as the MPC LoadpointSpec.InitialSoCPct,
-			// so InitialSoCPct == TargetSoC → DP allocates 0 W.
+			// currentSoC as the MPC LoadpointSpec.InitialSoC,
+			// so InitialSoC == TargetSoC → DP allocates 0 W.
 			lp.currentSoC = lp.targetSoC
 		} else {
 			lp.currentSoC = estimateSoC(lp.sessionPluginSoC,
@@ -753,7 +753,7 @@ func (m *Manager) SetCurrentSoC(id string, socPct float64) bool {
 // SetCurrentSoC: the control loop calls it every tick with the SoC from
 // the vehicle driver paired to this loadpoint (e.g. Tesla via
 // TeslaBLEProxy), so the dashboard's current_soc and the planner's
-// InitialSoCPct both reflect BMS ground truth instead of the
+// InitialSoC both reflect BMS ground truth instead of the
 // delivered-Wh estimate, which is blind to the real pack (Easee and
 // other chargers can't read the car).
 //

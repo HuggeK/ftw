@@ -207,7 +207,7 @@ func Apply(
 		slog.Info("config reload: pv_surplus_absorb_soc_cap",
 			"old", oldCfg.Site.PVSurplusAbsorbSoCCap,
 			"new", newCfg.Site.PVSurplusAbsorbSoCCap)
-		ctrl.PVSurplusAbsorbSoCCapPct = newCfg.Site.PVSurplusAbsorbSoCCap
+		ctrl.PVSurplusAbsorbSoCCap = newCfg.Site.PVSurplusAbsorbSoCCap
 	}
 	if newCfg.Site.PVSurplusAbsorbThresholdW != oldCfg.Site.PVSurplusAbsorbThresholdW {
 		ctrl.PVSurplusAbsorbThresholdW = newCfg.Site.PVSurplusAbsorbThresholdW

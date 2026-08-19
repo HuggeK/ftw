@@ -725,8 +725,8 @@ type Site struct {
 	// still enable a slot when capture displaces a more expensive future
 	// grid-funded charge.
 	//
-	// Suggested 88 — leaves 2 pp margin below the planner's typical
-	// soc_max_pct = 90 so the absorber doesn't slam into the wall.
+	// Suggested 0.88 — leaves a little margin below the planner's typical
+	// soc_max = 0.90 so the absorber doesn't slam into the wall.
 	PVSurplusAbsorbSoCCap    float64 `yaml:"pv_surplus_absorb_soc_cap,omitempty" json:"pv_surplus_absorb_soc_cap,omitempty"`
 	PVSurplusAbsorbSoCCapPct float64 `yaml:"pv_surplus_absorb_soc_cap_pct,omitempty" json:"pv_surplus_absorb_soc_cap_pct,omitempty"`
 

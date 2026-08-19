@@ -924,7 +924,7 @@ func TestSlotDirectiveAt(t *testing.T) {
 					SlotLenMin:  slotLenMin,
 					SpotOre:     40,
 					BatteryW:    800, // 800 W × 15/60 h = 200 Wh for the slot
-					SoC: 0.455,
+					SoC:         0.455,
 					GridW:       -150, // plan expects 150 W export
 				},
 				{
@@ -933,7 +933,7 @@ func TestSlotDirectiveAt(t *testing.T) {
 					PriceOre:    120, // later grid charge costs more than export earns now
 					BatteryW:    2000,
 					GridW:       1500,
-					SoC: 0.8,
+					SoC:         0.8,
 				},
 			},
 		},
@@ -955,8 +955,8 @@ func TestSlotDirectiveAt(t *testing.T) {
 	if want := slotStart.Add(15 * time.Minute); !d.SlotEnd.Equal(want) {
 		t.Errorf("SlotEnd = %v, want %v", d.SlotEnd, want)
 	}
-	if d.SoCTargetPct != 0.455 {
-		t.Errorf("SoCTargetPct = %f, want 0.455", d.SoCTargetPct)
+	if d.SoCTarget != 0.455 {
+		t.Errorf("SoCTarget = %f, want 0.455", d.SoCTarget)
 	}
 	if d.Strategy != ModeArbitrage {
 		t.Errorf("Strategy = %v, want arbitrage", d.Strategy)
@@ -967,12 +967,12 @@ func TestSlotDirectiveAt(t *testing.T) {
 	if d.GridW != -150 {
 		t.Errorf("GridW = %f, want −150 (must propagate from Action.GridW)", d.GridW)
 	}
-	if math.Abs(d.LivePVSurplusSoCCapPct-0.4925) > 1e-9 {
-		t.Errorf("LivePVSurplusSoCCapPct = %f, want 0.4925 from 375 Wh of later grid-funded charge", d.LivePVSurplusSoCCapPct)
+	if math.Abs(d.LivePVSurplusSoCCap-0.4925) > 1e-9 {
+		t.Errorf("LivePVSurplusSoCCap = %f, want 0.4925 from 375 Wh of later grid-funded charge", d.LivePVSurplusSoCCap)
 	}
 }
 
-func TestLivePVSurplusSoCCapPctEconomicGate(t *testing.T) {
+func TestLivePVSurplusSoCCapEconomicGate(t *testing.T) {
 	base := []Action{
 		{SpotOre: 50, BatteryW: 0, SoC: 0.4},
 		{SlotLenMin: 15, PriceOre: 120, BatteryW: 2000, GridW: 1500, SoC: 0.75},
@@ -1004,7 +1004,7 @@ func TestLivePVSurplusSoCCapPctEconomicGate(t *testing.T) {
 			p := tc.params
 			p.CapacityWh = 10000
 			p.ChargeEfficiency = 1
-			if got := livePVSurplusSoCCapPct(actions, 0, p); got != tc.wantCap {
+			if got := livePVSurplusSoCCap(actions, 0, p); got != tc.wantCap {
 				t.Errorf("cap = %.1f, want %.1f", got, tc.wantCap)
 			}
 		})

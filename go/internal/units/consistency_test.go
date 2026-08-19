@@ -241,9 +241,10 @@ func TestCoreBannedSoCPercentFieldNames(t *testing.T) {
 		reflect.TypeOf(mpc.Params{}),
 		reflect.TypeOf(mpc.Action{}),
 		reflect.TypeOf(mpc.Plan{}),
+		reflect.TypeOf(mpc.SlotDirective{}),
 		reflect.TypeOf(forecast.Array{}),
 	}
-	banned := []string{"CurrentSoCPct", "TargetSoCPct", "PluginSoCPct", "VehicleSoCPct", "SoCPct", "SoCMinPct", "SoCMaxPct", "KWp"}
+	banned := []string{"CurrentSoCPct", "TargetSoCPct", "PluginSoCPct", "VehicleSoCPct", "SoCPct", "SoCMinPct", "SoCMaxPct", "SoCTargetPct", "LivePVSurplusSoCCapPct", "LoadpointSoCTargetPct", "KWp"}
 	for _, typ := range types {
 		for _, name := range banned {
 			if _, ok := typ.FieldByName(name); ok {

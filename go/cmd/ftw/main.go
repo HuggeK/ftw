@@ -139,17 +139,17 @@ func decimalDigits(s string) bool {
 // decision ID is report metadata; control does not use it for dispatch math.
 func controlSlotDirectiveFromMPC(d mpc.SlotDirective) control.SlotDirective {
 	return control.SlotDirective{
-		DecisionID:             d.DecisionID,
-		SlotStart:              d.SlotStart,
-		SlotEnd:                d.SlotEnd,
-		BatteryEnergyWh:        d.BatteryEnergyWh,
-		SoCTargetPct:           d.SoCTargetPct,
-		Strategy:               string(d.Strategy),
-		PVLimitW:               d.PVLimitW,
-		PlannedGridW:           d.GridW,
-		HasPlannedGridW:        true,
-		LivePVSurplusSoCCapPct: d.LivePVSurplusSoCCapPct,
-		LoadpointEnergyWh:      d.LoadpointEnergyWh,
+		DecisionID:          d.DecisionID,
+		SlotStart:           d.SlotStart,
+		SlotEnd:             d.SlotEnd,
+		BatteryEnergyWh:     d.BatteryEnergyWh,
+		SoCTarget:           d.SoCTarget,
+		Strategy:            string(d.Strategy),
+		PVLimitW:            d.PVLimitW,
+		PlannedGridW:        d.GridW,
+		HasPlannedGridW:     true,
+		LivePVSurplusSoCCap: d.LivePVSurplusSoCCap,
+		LoadpointEnergyWh:   d.LoadpointEnergyWh,
 	}
 }
 
