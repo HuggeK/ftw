@@ -139,17 +139,17 @@ func decimalDigits(s string) bool {
 // decision ID is report metadata; control does not use it for dispatch math.
 func controlSlotDirectiveFromMPC(d mpc.SlotDirective) control.SlotDirective {
 	return control.SlotDirective{
-		DecisionID:             d.DecisionID,
-		SlotStart:              d.SlotStart,
-		SlotEnd:                d.SlotEnd,
-		BatteryEnergyWh:        d.BatteryEnergyWh,
-		SoCTargetPct:           d.SoCTargetPct,
-		Strategy:               string(d.Strategy),
-		PVLimitW:               d.PVLimitW,
-		PlannedGridW:           d.GridW,
-		HasPlannedGridW:        true,
-		LivePVSurplusSoCCapPct: d.LivePVSurplusSoCCapPct,
-		LoadpointEnergyWh:      d.LoadpointEnergyWh,
+		DecisionID:          d.DecisionID,
+		SlotStart:           d.SlotStart,
+		SlotEnd:             d.SlotEnd,
+		BatteryEnergyWh:     d.BatteryEnergyWh,
+		SoCTarget:           d.SoCTarget,
+		Strategy:            string(d.Strategy),
+		PVLimitW:            d.PVLimitW,
+		PlannedGridW:        d.GridW,
+		HasPlannedGridW:     true,
+		LivePVSurplusSoCCap: d.LivePVSurplusSoCCap,
+		LoadpointEnergyWh:   d.LoadpointEnergyWh,
 	}
 }
 
@@ -1071,7 +1071,7 @@ func main() {
 			newLon := newCfg.Weather.Longitude
 			if newLat != oldLat || newLon != oldLon {
 				if pvSvc != nil {
-					pvSvc.ClearSky = func(t time.Time) float64 { return forecast.ClearSkyW(newLat, newLon, t) }
+					pvSvc.ClearSky = func(t time.Time) float64 { return forecast.ClearSkyWm2(newLat, newLon, t) }
 				}
 				if forecastSvc != nil {
 					forecastSvc.Lat = newLat
@@ -1150,7 +1150,7 @@ func main() {
 	// pvSvc is pre-declared above so the reload Applier can update it.
 	if cfg.Weather != nil && cfg.Weather.Provider != "" && cfg.Weather.Provider != "none" {
 		lat, lon := cfg.Weather.Latitude, cfg.Weather.Longitude
-		clearSkyFn := func(t time.Time) float64 { return forecast.ClearSkyW(lat, lon, t) }
+		clearSkyFn := func(t time.Time) float64 { return forecast.ClearSkyWm2(lat, lon, t) }
 		cloudFn := func(t time.Time) (float64, bool) {
 			// Look up nearest forecast row covering `t`.
 			nowMs := t.UnixMilli()
@@ -1320,14 +1320,14 @@ func main() {
 				// departure. It overrides planning inputs without mutating the
 				// operator's recurring loadpoint schedule; once the lease stops,
 				// the normal schedule is still exactly as it was.
-				effectiveTargetPct := st.TargetSoCPct
+				effectiveTarget := st.TargetSoC
 				effectiveTargetTime := st.TargetTime
 				boostActive := false
 				if lpController != nil {
 					if lease, status := lpController.BatteryBoost(st.ID, time.Now()); status.Active {
 						boostActive = true
-						if lease.EVTargetSoCPct > 0 {
-							effectiveTargetPct = lease.EVTargetSoCPct
+						if lease.EVTargetSoC > 0 {
+							effectiveTarget = lease.EVTargetSoC
 						}
 						if !lease.DepartureAt.IsZero() {
 							effectiveTargetTime = lease.DepartureAt
@@ -1342,7 +1342,7 @@ func main() {
 				// against a target the operator never asked for. With
 				// no schedule, EV is left to the loadpoint controller's
 				// reactive surplus-only behaviour.
-				if effectiveTargetPct <= 0 || effectiveTargetTime.IsZero() ||
+				if effectiveTarget <= 0 || effectiveTargetTime.IsZero() ||
 					!effectiveTargetTime.After(time.Now()) {
 					continue
 				}
@@ -1366,14 +1366,14 @@ func main() {
 				// loadpoint decoration agrees with us on which vehicle
 				// is "the one". Falls back to inferred SoC when nothing
 				// usable online matches.
-				initSoC := st.CurrentSoCPct
+				initSoC := st.CurrentSoC
 				socSource := "inferred"
 				var vehicleChargeLimit float64 // 0 = unknown
 				delivering := st.CurrentPowerW > loadpoint.DeliveringW
 				if pick := telemetry.PickBestVehicleForLoadpoint(tel, delivering, time.Now()); pick.Driver != "" {
-					initSoC = pick.SoCPct
+					initSoC = pick.SoC
 					socSource = "vehicle:" + pick.Driver
-					vehicleChargeLimit = pick.ChargeLimitPct
+					vehicleChargeLimit = pick.ChargeLimit
 				}
 				// Map target time → slot index using the DP's
 				// actual slot length (hour-of-prices vs. 15-min
@@ -1396,9 +1396,9 @@ func main() {
 				// so planning past it is wasted DP grid space. When
 				// the limit is unknown, fall back to the deadline
 				// target itself; never plan beyond what was requested.
-				maxPct := effectiveTargetPct
-				if vehicleChargeLimit > 0 && vehicleChargeLimit < maxPct {
-					maxPct = vehicleChargeLimit
+				maxSoC := effectiveTarget
+				if vehicleChargeLimit > 0 && vehicleChargeLimit < maxSoC {
+					maxSoC = vehicleChargeLimit
 				}
 				// Effective deadline target: when the operator asked
 				// for 100% but the vehicle (Tesla via TeslaBLEProxy
@@ -1409,19 +1409,19 @@ func main() {
 				// and MPC keeps committing grid charging chasing an
 				// unreachable goal. Cap target_pct to whatever the
 				// car will physically accept.
-				targetPct := effectiveTargetPct
-				if vehicleChargeLimit > 0 && vehicleChargeLimit < targetPct {
-					targetPct = vehicleChargeLimit
+				targetSoC := effectiveTarget
+				if vehicleChargeLimit > 0 && vehicleChargeLimit < targetSoC {
+					targetSoC = vehicleChargeLimit
 					slog.Info("mpc: target capped to vehicle charge limit",
-						"lp", st.ID, "operator_target_pct", effectiveTargetPct,
-						"vehicle_limit_pct", vehicleChargeLimit)
+						"lp", st.ID, "operator_target", effectiveTarget,
+						"vehicle_limit", vehicleChargeLimit)
 				}
-				// Guard against degenerate grids: if current SoC > maxPct
+				// Guard against degenerate grids: if current SoC > maxSoC
 				// (already over target), grow the ceiling to current so
 				// the DP can at least represent it (no charging will be
 				// scheduled). The deadline penalty handles the rest.
-				if initSoC > maxPct {
-					maxPct = initSoC
+				if initSoC > maxSoC {
+					maxSoC = initSoC
 				}
 				// Defer grid-funded EV planning when the deadline lies
 				// past the last published price slot AND is more than ~3 h
@@ -1454,9 +1454,9 @@ func main() {
 					}
 				}
 				slog.Debug("mpc: loadpoint spec",
-					"id", st.ID, "soc_pct", initSoC, "soc_source", socSource,
-					"target_pct", effectiveTargetPct, "target_slot", targetSlot,
-					"max_pct", maxPct, "vehicle_limit_pct", vehicleChargeLimit,
+					"id", st.ID, "soc", initSoC, "soc_source", socSource,
+					"target", effectiveTarget, "target_slot", targetSlot,
+					"max_soc", maxSoC, "vehicle_limit", vehicleChargeLimit,
 					"defer_grid_plan", deferGridPlan)
 				if deferGridPlan {
 					slog.Info("mpc: LP grid-funded planning deferred — target past published prices",
@@ -1503,11 +1503,11 @@ func main() {
 					ID:               st.ID,
 					CapacityWh:       capWh,
 					Levels:           11,
-					MinPct:           0,
-					MaxPct:           maxPct,
-					InitialSoCPct:    initSoC,
+					SoCMin:           0,
+					SoCMax:           maxSoC,
+					InitialSoC:       initSoC,
 					PluggedIn:        true,
-					TargetSoCPct:     targetPct,
+					TargetSoC:        targetSoC,
 					TargetSlotIdx:    targetSlot,
 					MaxChargeW:       st.MaxChargeW,
 					AllowedStepsW:    st.AllowedStepsW,
@@ -1759,7 +1759,7 @@ func main() {
 					return loadpoint.BatteryBoostStoppedBatteryUnavailable
 				}
 				usable++
-				floor := lease.MinBatterySoCPct / 100
+				floor := lease.MinBatterySoC
 				if staticFloor[name] > floor {
 					floor = staticFloor[name]
 				}
@@ -2773,7 +2773,7 @@ func main() {
 				if pick.Driver == "" || pick.Stale {
 					continue
 				}
-				lpMgr.AnchorVehicleSoC(st.ID, pick.SoCPct)
+				lpMgr.AnchorVehicleSoC(st.ID, pick.SoC)
 			}
 
 			if !freshness.Allowed() {
@@ -3557,7 +3557,7 @@ func planSlotsFromMPC(mpcSvc *mpc.Service) []calendar.PlanSlot {
 			End:        start.Add(time.Duration(ln) * time.Minute),
 			BatteryW:   a.BatteryW,
 			GridW:      a.GridW,
-			SoCPct:     a.SoCPct,
+			SoC:        a.SoC,
 			Confidence: a.Confidence,
 		})
 	}
@@ -3587,7 +3587,7 @@ func buildLoadpointConfigs(src []config.Loadpoint) []loadpoint.Config {
 			MaxChargeW:        lp.MaxChargeW,
 			AllowedStepsW:     lp.AllowedStepsW,
 			VehicleCapacityWh: lp.VehicleCapacityWh,
-			PluginSoCPct:      lp.PluginSoCPct,
+			PluginSoC:         lp.PluginSoC,
 			PhaseMode:         lp.PhaseMode,
 			PhaseSplitW:       lp.PhaseSplitW,
 			MinPhaseHoldS:     lp.MinPhaseHoldS,
@@ -3716,13 +3716,13 @@ func buildMPC(cfg *config.Config, st *state.Store, tel *telemetry.Store, capacit
 	if mode == "" {
 		mode = mpc.ModeSelfConsumption
 	}
-	socMin := pl.SoCMinPct
+	socMin := pl.SoCMin
 	if socMin <= 0 {
-		socMin = 10
+		socMin = 0.10
 	}
-	socMax := pl.SoCMaxPct
-	if socMax <= 0 || socMax > 100 {
-		socMax = 95
+	socMax := pl.SoCMax
+	if socMax <= 0 || socMax > 1 {
+		socMax = 0.95
 	}
 	if pl.SoCSafetyFloorPct != 0 || pl.SafetyFloorPenaltyOreKwhHour != 0 {
 		slog.Warn("config: soc_safety_floor_pct / safety_floor_penalty_ore_kwh_hour are deprecated and ignored — forecast-risk reserve is now handled by pv_forecast_safety_k (downside-PV planning)")
@@ -3743,10 +3743,10 @@ func buildMPC(cfg *config.Config, st *state.Store, tel *telemetry.Store, capacit
 		Mode:                mode,
 		SoCLevels:           41,
 		CapacityWh:          totalCap,
-		SoCMinPct:           socMin,
-		SoCMaxPct:           socMax,
+		SoCMin:              socMin,
+		SoCMax:              socMax,
 		PVChargeBonusOreKwh: pvBonus,
-		InitialSoCPct:       50,
+		InitialSoC:          0.50,
 		// ActionLevels = 81 → 225 W discretization step on a ±9 kW
 		// action range. Coarser values (21=900 W, 41=450 W) lose
 		// borderline-PV slots: on a 273 W net surplus the 450 W min
@@ -4199,7 +4199,7 @@ func (b mpcPlanBridge) LatestActions() []ha.PlanAction {
 			SlotLenMin:  a.SlotLenMin,
 			BatteryW:    a.BatteryW,
 			GridW:       a.GridW,
-			SoCPct:      a.SoCPct,
+			SoCPct:      a.SoC * 100,
 			PriceOre:    a.PriceOre,
 			SpotOre:     a.SpotOre,
 			CostOre:     a.CostOre,

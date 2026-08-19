@@ -53,7 +53,12 @@ function batteryIsPresent(status, actions) {
   ))) {
     return true;
   }
-  return actions.some((action) => Number.isFinite(action && action.soc_pct));
+  return actions.some((action) => Number.isFinite(action && action.soc));
+}
+
+function socPercent(frac) {
+  if (!Number.isFinite(frac)) return null;
+  return frac * 100;
 }
 
 export function unavailablePlannerCopy(reason) {
@@ -253,13 +258,15 @@ export function derivePlanBrief({
       };
 
   const finalAction = actions[actions.length - 1];
+  const nextSocPct = next ? socPercent(next.soc) : null;
+  const finalSocPct = finalAction ? socPercent(finalAction.soc) : null;
   const soc = hasBattery
     ? {
-        label: next && Number.isFinite(next.soc_pct)
-          ? `${next.soc_pct.toFixed(0)}% after next step`
+        label: nextSocPct != null
+          ? `${nextSocPct.toFixed(0)}% after next step`
           : "—",
-        detail: finalAction && Number.isFinite(finalAction.soc_pct)
-          ? `${finalAction.soc_pct.toFixed(0)}% at the end of the plan`
+        detail: finalSocPct != null
+          ? `${finalSocPct.toFixed(0)}% at the end of the plan`
           : "No battery forecast available",
       }
     : null;

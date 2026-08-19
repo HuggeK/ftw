@@ -63,8 +63,8 @@ describe("plan brief normalization", () => {
   it("chooses the live meaningful action for an active plan", () => {
     const plan = {
       actions: [
-        slot(-7, { battery_w: 2400, soc_pct: 48 }),
-        slot(8, { battery_w: 0, soc_pct: 49 }),
+        slot(-7, { battery_w: 2400, soc: 0.48 }),
+        slot(8, { battery_w: 0, soc: 0.49 }),
       ],
       solver: { engine: "cvxpy", backend: "osqp", status: "optimal" },
     };

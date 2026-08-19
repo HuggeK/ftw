@@ -601,7 +601,7 @@ func TestOptimizeSelfConsumptionDischargesWithSpreadTerminalPrice(t *testing.T) 
 		{SpotOreKwh: 80, TotalOreKwh: 300}, {SpotOreKwh: 80, TotalOreKwh: 300},
 	}
 	p := baseParams(ModeSelfConsumption)
-	p.InitialSoCPct = 80
+	p.InitialSoC = 0.8
 	p.ExportBonusOreKwh = 60
 	p.ExportFeeOreKwh = 6
 	p.TerminalSoCPrice = selfConsumptionTerminalPrice(prices, 60, 6)
@@ -636,7 +636,7 @@ func TestOnlineFleetParamsUsesCapacityWeightedOnlineSoC(t *testing.T) {
 	tel.DriverHealthMut("offline").SetOffline()
 
 	s := &Service{Tele: tel, FuseMaxW: 6000}
-	p, ok := s.onlineFleetParams(Params{InitialSoCPct: 50}, []BatteryFleetMember{
+	p, ok := s.onlineFleetParams(Params{InitialSoC: 0.5}, []BatteryFleetMember{
 		{Driver: "a", CapacityWh: 10000, MaxChargeW: 3000, MaxDischargeW: 4000},
 		{Driver: "b", CapacityWh: 30000, MaxChargeW: 5000, MaxDischargeW: 5000},
 		{Driver: "offline", CapacityWh: 50000, MaxChargeW: 9000, MaxDischargeW: 9000},
@@ -648,8 +648,8 @@ func TestOnlineFleetParamsUsesCapacityWeightedOnlineSoC(t *testing.T) {
 		t.Fatalf("CapacityWh = %.0f, want 40000", p.CapacityWh)
 	}
 	// (10 kWh * 20% + 30 kWh * 80%) / 40 kWh = 65%.
-	if math.Abs(p.InitialSoCPct-65) > 1e-9 {
-		t.Fatalf("InitialSoCPct = %.3f, want 65.000", p.InitialSoCPct)
+	if math.Abs(p.InitialSoC-0.65) > 1e-9 {
+		t.Fatalf("InitialSoC = %.3f, want 0.650", p.InitialSoC)
 	}
 	if p.MaxChargeW != 6000 {
 		t.Fatalf("MaxChargeW = %.0f, want fuse-clamped 6000", p.MaxChargeW)
@@ -690,7 +690,7 @@ func TestOnlineFleetParamsDropsCommandFaultedBattery(t *testing.T) {
 	tel.SetDriverCommandFault("refusing", true, "modbus write refused")
 
 	s := &Service{Tele: tel, FuseMaxW: 20000}
-	p, ok := s.onlineFleetParams(Params{InitialSoCPct: 50}, []BatteryFleetMember{
+	p, ok := s.onlineFleetParams(Params{InitialSoC: 0.5}, []BatteryFleetMember{
 		{Driver: "a", CapacityWh: 10000, MaxChargeW: 3000, MaxDischargeW: 4000},
 		{Driver: "refusing", CapacityWh: 50000, MaxChargeW: 9000, MaxDischargeW: 9000},
 	})
@@ -703,8 +703,8 @@ func TestOnlineFleetParamsDropsCommandFaultedBattery(t *testing.T) {
 	if len(p.Storages) != 1 || p.Storages[0].ID != "a" {
 		t.Fatalf("Storages = %+v, want only battery a", p.Storages)
 	}
-	if math.Abs(p.InitialSoCPct-20) > 1e-9 {
-		t.Fatalf("InitialSoCPct = %.3f, want 20.000 — the refusing battery's 95%% must not count", p.InitialSoCPct)
+	if math.Abs(p.InitialSoC-0.20) > 1e-9 {
+		t.Fatalf("InitialSoC = %.3f, want 0.200 — the refusing battery's 95%% must not count", p.InitialSoC)
 	}
 }
 
@@ -714,7 +714,7 @@ func TestOnlineFleetParamsRequiresOnlineSoCTelemetry(t *testing.T) {
 	tel.DriverHealthMut("no-soc").RecordSuccess()
 	s := &Service{Tele: tel}
 
-	_, ok := s.onlineFleetParams(Params{InitialSoCPct: 50}, []BatteryFleetMember{
+	_, ok := s.onlineFleetParams(Params{InitialSoC: 0.5}, []BatteryFleetMember{
 		{Driver: "no-soc", CapacityWh: 10000, MaxChargeW: 3000, MaxDischargeW: 3000},
 		{Driver: "missing", CapacityWh: 10000, MaxChargeW: 3000, MaxDischargeW: 3000},
 	})
@@ -881,7 +881,7 @@ func TestOptimizeSelfConsumptionDischargesDespiteHighTerminal(t *testing.T) {
 		{StartMs: 3600 * 1000, LenMin: 60, PriceOre: 300, SpotOre: 80, LoadW: 3000, PVW: -500, Confidence: 1},
 	}
 	p := baseParams(ModeSelfConsumption)
-	p.InitialSoCPct = 80
+	p.InitialSoC = 0.8
 	p.TerminalSoCPrice = 300 // mean import price — pre-strict this would have blocked discharge.
 
 	plan := Optimize(slots, p)
@@ -924,7 +924,7 @@ func TestSlotDirectiveAt(t *testing.T) {
 					SlotLenMin:  slotLenMin,
 					SpotOre:     40,
 					BatteryW:    800, // 800 W × 15/60 h = 200 Wh for the slot
-					SoCPct:      45.5,
+					SoC:         0.455,
 					GridW:       -150, // plan expects 150 W export
 				},
 				{
@@ -933,7 +933,7 @@ func TestSlotDirectiveAt(t *testing.T) {
 					PriceOre:    120, // later grid charge costs more than export earns now
 					BatteryW:    2000,
 					GridW:       1500,
-					SoCPct:      80,
+					SoC:         0.8,
 				},
 			},
 		},
@@ -955,8 +955,8 @@ func TestSlotDirectiveAt(t *testing.T) {
 	if want := slotStart.Add(15 * time.Minute); !d.SlotEnd.Equal(want) {
 		t.Errorf("SlotEnd = %v, want %v", d.SlotEnd, want)
 	}
-	if d.SoCTargetPct != 45.5 {
-		t.Errorf("SoCTargetPct = %f, want 45.5", d.SoCTargetPct)
+	if d.SoCTarget != 0.455 {
+		t.Errorf("SoCTarget = %f, want 0.455", d.SoCTarget)
 	}
 	if d.Strategy != ModeArbitrage {
 		t.Errorf("Strategy = %v, want arbitrage", d.Strategy)
@@ -967,15 +967,15 @@ func TestSlotDirectiveAt(t *testing.T) {
 	if d.GridW != -150 {
 		t.Errorf("GridW = %f, want −150 (must propagate from Action.GridW)", d.GridW)
 	}
-	if d.LivePVSurplusSoCCapPct != 49.25 {
-		t.Errorf("LivePVSurplusSoCCapPct = %f, want 49.25 from 375 Wh of later grid-funded charge", d.LivePVSurplusSoCCapPct)
+	if math.Abs(d.LivePVSurplusSoCCap-0.4925) > 1e-9 {
+		t.Errorf("LivePVSurplusSoCCap = %f, want 0.4925 from 375 Wh of later grid-funded charge", d.LivePVSurplusSoCCap)
 	}
 }
 
-func TestLivePVSurplusSoCCapPctEconomicGate(t *testing.T) {
+func TestLivePVSurplusSoCCapEconomicGate(t *testing.T) {
 	base := []Action{
-		{SpotOre: 50, BatteryW: 0, SoCPct: 40},
-		{SlotLenMin: 15, PriceOre: 120, BatteryW: 2000, GridW: 1500, SoCPct: 75},
+		{SpotOre: 50, BatteryW: 0, SoC: 0.4},
+		{SlotLenMin: 15, PriceOre: 120, BatteryW: 2000, GridW: 1500, SoC: 0.75},
 	}
 	tests := []struct {
 		name    string
@@ -983,7 +983,7 @@ func TestLivePVSurplusSoCCapPctEconomicGate(t *testing.T) {
 		params  Params
 		wantCap float64
 	}{
-		{name: "cap follows later grid-funded energy", wantCap: 43.75},
+		{name: "cap follows later grid-funded energy", wantCap: 0.4375},
 		{name: "profitable current export is preserved", mutate: func(a []Action) {
 			a[0].SpotOre = 150
 		}, wantCap: 0},
@@ -1004,7 +1004,7 @@ func TestLivePVSurplusSoCCapPctEconomicGate(t *testing.T) {
 			p := tc.params
 			p.CapacityWh = 10000
 			p.ChargeEfficiency = 1
-			if got := livePVSurplusSoCCapPct(actions, 0, p); got != tc.wantCap {
+			if got := livePVSurplusSoCCap(actions, 0, p); got != tc.wantCap {
 				t.Errorf("cap = %.1f, want %.1f", got, tc.wantCap)
 			}
 		})

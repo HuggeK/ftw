@@ -54,6 +54,7 @@ import (
 	"github.com/srcfl/ftw/go/internal/selfupdate"
 	"github.com/srcfl/ftw/go/internal/state"
 	"github.com/srcfl/ftw/go/internal/telemetry"
+	"github.com/srcfl/ftw/go/internal/units"
 	v2xpolicy "github.com/srcfl/ftw/go/internal/v2x"
 )
 
@@ -3387,11 +3388,11 @@ func (s *Server) handleLoadpoints(w http.ResponseWriter, r *http.Request) {
 // every tick — the failure mode observed with two Teslas in the same
 // household.
 //
-// CurrentSoCPct is intentionally NOT overwritten with the BMS reading.
-// The loadpoint controller uses CurrentSoCPct as its inference state;
+// CurrentSoC is intentionally NOT overwritten with the BMS reading.
+// The loadpoint controller uses CurrentSoC as its inference state;
 // overlaying it from the BMS would mean the UI shows BMS truth while
 // the controller's plan was computed from the inferred value the
-// previous tick — a presentation lie. VehicleSoCPct exposes the BMS
+// previous tick — a presentation lie. VehicleSoC exposes the BMS
 // value separately; the frontend renders both and labels which one
 // the controller used.
 func decorateLoadpointsWithVehicle(states []loadpoint.State, tel *telemetry.Store) {
@@ -3416,8 +3417,8 @@ func decorateLoadpointsWithVehicle(states []loadpoint.State, tel *telemetry.Stor
 			continue
 		}
 		states[i].VehicleDriver = pick.Driver
-		states[i].VehicleSoCPct = pick.SoCPct
-		states[i].VehicleChargeLimitPct = pick.ChargeLimitPct
+		states[i].VehicleSoC = pick.SoC
+		states[i].VehicleChargeLimit = pick.ChargeLimit
 		states[i].VehicleChargingState = pick.ChargingState
 		states[i].VehicleStale = pick.Stale
 		states[i].SoCSource = "vehicle"
@@ -3457,6 +3458,7 @@ func (s *Server) handleLoadpointTarget(w http.ResponseWriter, r *http.Request) {
 	// to nil for *struct pointers, which would lose the explicit-clear
 	// signal the UI needs.
 	var req struct {
+		SoC          *float64        `json:"soc,omitempty"`
 		SoCPct       *float64        `json:"soc_pct,omitempty"`
 		TargetTimeMs *int64          `json:"target_time_ms,omitempty"`
 		SurplusOnly  *bool           `json:"surplus_only,omitempty"`
@@ -3466,7 +3468,7 @@ func (s *Server) handleLoadpointTarget(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
-	if req.SoCPct == nil && req.TargetTimeMs == nil && req.SurplusOnly == nil && len(req.Schedule) == 0 {
+	if req.SoC == nil && req.SoCPct == nil && req.TargetTimeMs == nil && req.SurplusOnly == nil && len(req.Schedule) == 0 {
 		writeJSON(w, 400, map[string]string{"error": "no fields to update"})
 		return
 	}
@@ -3481,7 +3483,7 @@ func (s *Server) handleLoadpointTarget(w http.ResponseWriter, r *http.Request) {
 		}
 		scheduleChanged = true
 	}
-	if req.SoCPct != nil || req.TargetTimeMs != nil {
+	if req.SoC != nil || req.SoCPct != nil || req.TargetTimeMs != nil {
 		// SetTarget always takes both fields, so when the caller
 		// omitted one we have to look up the existing value to
 		// preserve it. Read-modify-write under the manager's lock
@@ -3492,9 +3494,16 @@ func (s *Server) handleLoadpointTarget(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 404, map[string]string{"error": "loadpoint not found"})
 			return
 		}
-		soc := st.TargetSoCPct
-		if req.SoCPct != nil {
-			soc = *req.SoCPct
+		soc := st.TargetSoC
+		if req.SoC != nil || req.SoCPct != nil {
+			var canonical, legacy float64
+			if req.SoC != nil {
+				canonical = *req.SoC
+			}
+			if req.SoCPct != nil {
+				legacy = *req.SoCPct
+			}
+			soc = units.DecodeJSONFraction(canonical, legacy)
 		}
 		deadline := st.TargetTime
 		if req.TargetTimeMs != nil {
@@ -3703,18 +3712,20 @@ func (s *Server) handleLoadpointSoC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
+		SoC    float64 `json:"soc"`
 		SoCPct float64 `json:"soc_pct"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
+	soc := units.DecodeJSONFraction(req.SoC, req.SoCPct)
 	// Confirm loadpoint exists before inspecting plug state.
 	if _, ok := s.deps.Loadpoints.State(id); !ok {
 		writeJSON(w, 404, map[string]string{"error": "loadpoint not found"})
 		return
 	}
-	if !s.deps.Loadpoints.SetCurrentSoC(id, req.SoCPct) {
+	if !s.deps.Loadpoints.SetCurrentSoC(id, soc) {
 		writeJSON(w, 409, map[string]string{
 			"error": "loadpoint not plugged in — SoC can only be set during an active session",
 		})

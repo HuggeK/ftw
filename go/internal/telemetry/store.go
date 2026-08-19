@@ -7,6 +7,8 @@ import (
 	"math"
 	"sync"
 	"time"
+
+	"github.com/srcfl/ftw/go/internal/units"
 )
 
 // DerType classifies what kind of reading a DER produces.
@@ -86,7 +88,7 @@ type DerReading struct {
 	DerType      DerType
 	RawW         float64
 	SmoothedW    float64
-	SoC          *float64  // optional; 0..1 for batteries/V2X, 0..100 for DerVehicle
+	SoC          *float64  // optional; 0..1 fraction for every DER including vehicles
 	SoCUpdatedAt time.Time // last fresh SoC receipt time; preserved across cached updates
 	Data         json.RawMessage
 	UpdatedAt    time.Time
@@ -331,6 +333,9 @@ func ValidateReading(t DerType, rawW float64, soc *float64) error {
 	if soc != nil && !finite(*soc) {
 		return fmt.Errorf("%s soc is non-finite: %v", t, *soc)
 	}
+	if soc != nil && !units.ValidFraction(*soc) {
+		return fmt.Errorf("%s soc must be a 0..1 fraction, got %.3f", t, *soc)
+	}
 	switch t {
 	case DerPV:
 		if rawW > 0 {
@@ -339,14 +344,6 @@ func ValidateReading(t DerType, rawW float64, soc *float64) error {
 	case DerEV:
 		if rawW < 0 {
 			return fmt.Errorf("ev power must be >= 0 in site convention, got %.3f W", rawW)
-		}
-	case DerBattery:
-		if soc != nil && (*soc < 0 || *soc > 1) {
-			return fmt.Errorf("battery soc must be a 0..1 fraction, got %.3f", *soc)
-		}
-	case DerV2X:
-		if soc != nil && (*soc < 0 || *soc > 1) {
-			return fmt.Errorf("v2x_charger vehicle soc must be a 0..1 fraction, got %.3f", *soc)
 		}
 	}
 	return nil

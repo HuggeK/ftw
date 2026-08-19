@@ -43,27 +43,33 @@
     return pvArraysModulePromise;
   }
 
+  // Legacy yaml/json key `kwp` is kilowatt-peak, except values ≥ 1000
+  // which were nameplate watts pasted into that field.
+  function ratedWattsFromLegacyKwp(kwp) {
+    var v = Number(kwp);
+    if (!(v > 0)) return 0;
+    return v >= 1000 ? v : v * 1000;
+  }
+
+  function migrateArrayRatedW(a) {
+    if (!a) return;
+    if (!(Number(a.rated_w) > 0) && Number(a.kwp) > 0) {
+      a.rated_w = ratedWattsFromLegacyKwp(a.kwp);
+    }
+    delete a.kwp;
+  }
+
   function renderPVArrays(ctx) {
     var host = document.getElementById("pv-arrays-list");
     if (!host) return;
     var escHtml = ctx.escHtml;
     var config = ctx.config;
     var arrays = (config.weather && config.weather.pv_arrays) || [];
+    arrays.forEach(migrateArrayRatedW);
     if (arrays.length === 0) {
       host.innerHTML = '<p style="color:var(--text-dim);font-size:0.75rem;margin:4px 0 8px">No arrays defined — model will learn orientation from telemetry.</p>';
       return;
     }
-    var ratedW = Number(config.weather && config.weather.pv_rated_w);
-    var wattsAsKwp = arrays.some(function (a) {
-      var kwp = Number(a.kwp);
-      if (!(kwp > 0)) return false;
-      if (kwp >= 1000) return true;
-      // Copied "PV rated (W)" into kWp (18960 W → 18960 kWp).
-      return ratedW >= 1000 && Math.abs(kwp - ratedW) / ratedW < 0.05;
-    });
-    var kwpWarn = wattsAsKwp
-      ? '<p role="alert" style="color:#f59e0b;font-size:0.8rem;margin:4px 0 8px">kWp is kilowatts-peak, not the watts from <b>PV rated (W)</b>. An 18.96 kW roof is <b>18.96</b>, not 18960 — pasting watts makes the PV forecast read as megawatts and provider changes will not fix it.</p>'
-      : "";
     var previewHtml = '<div class="pv-arrays-3d-slot" ' +
       'style="margin:4px 0 10px"><ftw-pv-arrays-3d></ftw-pv-arrays-3d></div>';
     var rows = arrays.map(function (a, i) {
@@ -72,8 +78,8 @@
           '<div style="flex:1.4"><label>Name</label>' +
             '<input type="text" data-pv-arr="' + i + '" data-field="name" value="' + escHtml(a.name || "") + '" placeholder="e.g. south roof">' +
           '</div>' +
-          '<div style="flex:1"><label>kWp</label>' +
-            '<input type="number" step="0.1" data-pv-arr="' + i + '" data-field="kwp" value="' + (a.kwp || 0) + '">' +
+          '<div style="flex:1"><label>Rated (W)</label>' +
+            '<input type="number" step="1" min="0" data-pv-arr="' + i + '" data-field="rated_w" value="' + (a.rated_w || 0) + '" placeholder="12960">' +
           '</div>' +
           '<div style="flex:1"><label>Tilt °</label>' +
             '<input type="number" step="1" min="0" max="90" data-pv-arr="' + i + '" data-field="tilt_deg" value="' + (a.tilt_deg || 0) + '">' +
@@ -84,7 +90,7 @@
           '<button class="btn-remove" data-pv-arr-remove="' + i + '" type="button" title="Remove">✕</button>' +
         '</div></fieldset>';
     });
-    host.innerHTML = kwpWarn + previewHtml + rows.join("");
+    host.innerHTML = previewHtml + rows.join("");
     var pushArraysToPreview = function () {
       var el = host.querySelector("ftw-pv-arrays-3d");
       if (el && typeof el.setArrays === "function") {
@@ -194,7 +200,7 @@
         '<button class="btn-add" id="pv-array-add" type="button">+ Add array</button>' +
         '<p style="color:var(--text-dim);font-size:0.75rem;margin:8px 0 0">' +
         'Tilt: 0° = flat roof, 35° = typical pitched roof, 90° = wall. Azimuth: 0 = N, 90 = E, 180 = S, 270 = W. ' +
-        'kWp is kilowatts-peak — a 10 kW roof is 10, not 10000 (that field is watts).' +
+        'Rated (W) is watts, same unit as PV rated.' +
         '</p>' +
         '</fieldset>';
     },
@@ -203,7 +209,7 @@
       renderPVArrays(ctx);
       var addBtn = document.getElementById("pv-array-add");
       if (addBtn) addBtn.addEventListener("click", function () {
-        ctx.config.weather.pv_arrays.push({ name: "", kwp: 0, tilt_deg: 35, azimuth_deg: 180 });
+        ctx.config.weather.pv_arrays.push({ name: "", rated_w: 0, tilt_deg: 35, azimuth_deg: 180 });
         renderPVArrays(ctx);
       });
     },

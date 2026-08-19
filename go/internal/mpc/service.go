@@ -396,7 +396,7 @@ type SlotDirective struct {
 	SlotStart       time.Time
 	SlotEnd         time.Time
 	BatteryEnergyWh float64 // total energy for the slot (site-signed)
-	SoCTargetPct    float64 // plan's SoC at SlotEnd — used by divergence detector
+	SoCTarget       float64 // plan's SoC at SlotEnd — used by divergence detector
 	Strategy        Mode    // echoed for logging + API
 
 	// PVLimitW is the recommended cap on aggregate PV inverter output
@@ -416,14 +416,14 @@ type SlotDirective struct {
 	// and docs/safety.md §8 for the asymmetry rationale.
 	GridW float64
 
-	// LivePVSurplusSoCCapPct enables economically justified live surplus
+	// LivePVSurplusSoCCap enables economically justified live surplus
 	// capture for this slot. It is the current planned SoC plus the stored
 	// energy from later grid-funded charge actions whose import price clears
 	// this slot's effective export revenue and minimum spread. Runtime may
 	// opportunistically move that future charge into live PV now, but only up
 	// to this SoC and only while the meter exports beyond plan. Zero means
 	// preserve the slot exactly.
-	LivePVSurplusSoCCapPct float64
+	LivePVSurplusSoCCap float64
 
 	// LoadpointEnergyWh carries per-loadpoint EV energy budgets for
 	// this slot. Keyed by Loadpoint.ID. Positive = charging energy
@@ -433,9 +433,9 @@ type SlotDirective struct {
 	// remaining_s` formula it uses for the battery.
 	LoadpointEnergyWh map[string]float64
 
-	// LoadpointSoCTargetPct is the plan's EV SoC at SlotEnd per
+	// LoadpointSoCTarget is the plan's EV SoC at SlotEnd per
 	// loadpoint. Used by the per-loadpoint divergence check.
-	LoadpointSoCTargetPct map[string]float64
+	LoadpointSoCTarget map[string]float64
 }
 
 // SlotDirectiveAt returns the energy-allocation directive for the slot
@@ -474,30 +474,30 @@ func (s *Service) SlotDirectiveAt(now time.Time) (SlotDirective, bool) {
 		// energy_wh = power_w * hours. a.SlotLenMin/60 gives hours.
 		energyWh := a.BatteryW * float64(a.SlotLenMin) / 60.0
 		d := SlotDirective{
-			DecisionID:             p.DecisionID,
-			SlotStart:              time.UnixMilli(a.SlotStartMs),
-			SlotEnd:                time.UnixMilli(endMs),
-			BatteryEnergyWh:        energyWh,
-			SoCTargetPct:           a.SoCPct,
-			Strategy:               params.Mode,
-			PVLimitW:               a.PVLimitW,
-			GridW:                  a.GridW,
-			LivePVSurplusSoCCapPct: livePVSurplusSoCCapPct(p.Actions, i, params),
+			DecisionID:          p.DecisionID,
+			SlotStart:           time.UnixMilli(a.SlotStartMs),
+			SlotEnd:             time.UnixMilli(endMs),
+			BatteryEnergyWh:     energyWh,
+			SoCTarget:           a.SoC,
+			Strategy:            params.Mode,
+			PVLimitW:            a.PVLimitW,
+			GridW:               a.GridW,
+			LivePVSurplusSoCCap: livePVSurplusSoCCap(p.Actions, i, params),
 		}
 		if len(a.LoadpointPowerW) > 0 {
 			d.LoadpointEnergyWh = make(map[string]float64, len(a.LoadpointPowerW))
-			d.LoadpointSoCTargetPct = make(map[string]float64, len(a.LoadpointPowerW))
+			d.LoadpointSoCTarget = make(map[string]float64, len(a.LoadpointPowerW))
 			for id, powerW := range a.LoadpointPowerW {
 				d.LoadpointEnergyWh[id] = powerW * float64(a.SlotLenMin) / 60.0
-				d.LoadpointSoCTargetPct[id] = a.LoadpointSoCPctByID[id]
+				d.LoadpointSoCTarget[id] = a.LoadpointSoCByID[id]
 			}
 		} else if a.LoadpointW > 0 && lpID != "" {
 			lpEnergyWh := a.LoadpointW * float64(a.SlotLenMin) / 60.0
 			d.LoadpointEnergyWh = map[string]float64{
 				lpID: lpEnergyWh,
 			}
-			d.LoadpointSoCTargetPct = map[string]float64{
-				lpID: a.LoadpointSoCPct,
+			d.LoadpointSoCTarget = map[string]float64{
+				lpID: a.LoadpointSoC,
 			}
 		}
 		return d, true
@@ -505,7 +505,7 @@ func (s *Service) SlotDirectiveAt(now time.Time) (SlotDirective, bool) {
 	return SlotDirective{}, false
 }
 
-// livePVSurplusSoCCapPct returns a quantified ceiling for moving later
+// livePVSurplusSoCCap returns a quantified ceiling for moving later
 // grid-funded charging into live PV in the current slot. This is deliberately
 // derived from decisions already present in the plan rather than a blanket
 // "always self-consume" override:
@@ -518,13 +518,13 @@ func (s *Service) SlotDirectiveAt(now time.Time) (SlotDirective, bool) {
 //   - only the grid-funded part of later charge actions contributes headroom,
 //     so opportunistic capture cannot store more energy than the plan intended
 //     to buy from the grid.
-func livePVSurplusSoCCapPct(actions []Action, current int, p Params) float64 {
+func livePVSurplusSoCCap(actions []Action, current int, p Params) float64 {
 	if current < 0 || current >= len(actions) {
 		return 0
 	}
 	cur := actions[current]
 	if cur.BatteryW < -IdleGateThresholdW || !finite(cur.SpotOre) ||
-		!finite(cur.SoCPct) || cur.SoCPct <= 0 ||
+		!finite(cur.SoC) || cur.SoC <= 0 ||
 		!finite(p.CapacityWh) || p.CapacityWh <= 0 {
 		return 0
 	}
@@ -558,14 +558,14 @@ func livePVSurplusSoCCapPct(actions []Action, current int, p Params) float64 {
 	if replaceableStoredWh <= 0 {
 		return 0
 	}
-	capPct := cur.SoCPct + replaceableStoredWh/p.CapacityWh*100
-	if p.SoCMaxPct > 0 && capPct > p.SoCMaxPct {
-		capPct = p.SoCMaxPct
+	cap := cur.SoC + replaceableStoredWh/p.CapacityWh
+	if p.SoCMax > 0 && cap > p.SoCMax {
+		cap = p.SoCMax
 	}
-	if capPct > 100 {
-		return 100
+	if cap > 1 {
+		return 1
 	}
-	return capPct
+	return cap
 }
 
 // SlotAt returns the plan's directive for the slot containing `now`.
@@ -1176,7 +1176,7 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 			return s.Latest()
 		}
 	} else {
-		p.InitialSoCPct = currentSoCPct(s.Tele, p.InitialSoCPct)
+		p.InitialSoC = currentSoC(s.Tele, p.InitialSoC)
 	}
 
 	// Export pricing is per-slot now: pass bonus/fee into Params so
@@ -1273,9 +1273,9 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	recoveryRequired := planningParamsRequireRecovery(p)
 	if recoveryRequired && s.Optimizer == nil {
 		slog.Error("mpc: battery state requires operating-bound recovery that Go DP cannot model; keeping previous plan",
-			"soc_start", p.InitialSoCPct,
-			"soc_min", p.SoCMinPct,
-			"soc_max", p.SoCMaxPct)
+			"soc_start", p.InitialSoC,
+			"soc_min", p.SoCMin,
+			"soc_max", p.SoCMax)
 		return s.Latest()
 	}
 
@@ -1287,7 +1287,7 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 		"capacity_wh", p.CapacityWh,
 		"soc_levels", p.SoCLevels,
 		"action_levels", p.ActionLevels,
-		"soc_start", p.InitialSoCPct,
+		"soc_start", p.InitialSoC,
 		"loadpoint_active", p.Loadpoint != nil,
 		"loadpoint_id", loadpointID,
 	)
@@ -1316,9 +1316,9 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 				candidate.DPShadow = nil
 				candidate.Baselines = nil
 				slog.Info("mpc: skipping Go DP shadows while battery state recovers into operating bounds",
-					"soc_start", p.InitialSoCPct,
-					"soc_min", p.SoCMinPct,
-					"soc_max", p.SoCMaxPct)
+					"soc_start", p.InitialSoC,
+					"soc_min", p.SoCMin,
+					"soc_max", p.SoCMax)
 			} else {
 				dpEvaluation := Optimize(slots, p)
 				dpEvaluation.Solver = &SolverInfo{
@@ -1428,9 +1428,9 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 			if recoveryRequired {
 				slog.Error("mpc: primary optimizer failed and Go DP cannot model operating-bound recovery; keeping previous plan",
 					"err", err,
-					"soc_start", p.InitialSoCPct,
-					"soc_min", p.SoCMinPct,
-					"soc_max", p.SoCMaxPct)
+					"soc_start", p.InitialSoC,
+					"soc_min", p.SoCMin,
+					"soc_max", p.SoCMax)
 				return s.Latest()
 			}
 			slog.Error("mpc: primary optimizer failed; using Go DP fallback", "err", err)
@@ -1539,7 +1539,7 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	slog.Info("mpc: replanned",
 		"decision_id", plan.DecisionID,
 		"slots", len(slots),
-		"soc_start", p.InitialSoCPct,
+		"soc_start", p.InitialSoC,
 		"cost_ore", plan.TotalCostOre,
 		"reason", reason,
 		"mean_price_ore", meanPrice,
@@ -2138,10 +2138,8 @@ func lookupPVInput(forecasts []state.ForecastPoint, ts int64) (float64, *state.F
 	return 0, nil
 }
 
-// currentSoCPct averages SoC across battery readings in the telemetry store.
-// Telemetry stores SoC as a fraction in [0, 1]; the MPC expects [0, 100].
-// Falls back to `fallback` (already in percent) if no readings are present.
-func currentSoCPct(t *telemetry.Store, fallback float64) float64 {
+// currentSoC averages battery SoC from telemetry (0–1).
+func currentSoC(t *telemetry.Store, fallback float64) float64 {
 	if t == nil {
 		return fallback
 	}
@@ -2160,7 +2158,7 @@ func currentSoCPct(t *telemetry.Store, fallback float64) float64 {
 	if n == 0 {
 		return fallback
 	}
-	return sum / float64(n) * 100.0
+	return sum / float64(n)
 }
 
 func (s *Service) onlineFleetParams(p Params, fleet []BatteryFleetMember) (Params, bool) {
@@ -2190,8 +2188,8 @@ func (s *Service) onlineFleetParams(p Params, fleet []BatteryFleetMember) (Param
 			ID:                  b.Driver,
 			CapacityWh:          b.CapacityWh,
 			InitialEnergyWh:     initialEnergyWh,
-			MinEnergyWh:         b.CapacityWh * p.SoCMinPct / 100,
-			MaxEnergyWh:         b.CapacityWh * p.SoCMaxPct / 100,
+			MinEnergyWh:         b.CapacityWh * p.SoCMin,
+			MaxEnergyWh:         b.CapacityWh * p.SoCMax,
 			MaxChargeW:          b.MaxChargeW,
 			MaxDischargeW:       b.MaxDischargeW,
 			ChargeEfficiency:    p.ChargeEfficiency,
@@ -2202,7 +2200,7 @@ func (s *Service) onlineFleetParams(p Params, fleet []BatteryFleetMember) (Param
 		return p, false
 	}
 	p.CapacityWh = totalCap
-	p.InitialSoCPct = sumSoCWh / totalCap * 100.0
+	p.InitialSoC = sumSoCWh / totalCap
 	p.MaxChargeW = maxCharge
 	p.MaxDischargeW = maxDischarge
 	if s.FuseMaxW > 0 {

@@ -36,6 +36,12 @@ import { setActiveCurrency, toDisplay, unitFor } from "./components/price-units.
       .replace(/'/g, '&#39;');
   }
 
+  // Plan JSON SoC is a 0–1 fraction. Multiply only when showing "%".
+  function socPercent(frac) {
+    if (frac == null || !Number.isFinite(frac)) return null;
+    return frac * 100;
+  }
+
   // Hard cut: the roof cannot make more than its nameplate. A stale
   // megawatt pv_w (kWp pasted as watts) must not paint the chart.
   function sitePVWCapped(pvW, nameplateW) {
@@ -644,14 +650,14 @@ import { setActiveCurrency, toDisplay, unitFor } from "./components/price-units.
       ctx.beginPath();
       first = true;
       // Anchor at start SoC at now
-      if (plan.initial_soc_pct != null) {
-        ctx.moveTo(xScale(now), socY(plan.initial_soc_pct));
+      if (plan.initial_soc != null) {
+        ctx.moveTo(xScale(now), socY(socPercent(plan.initial_soc)));
         first = false;
       }
       for (const a of plan.actions) {
         if (a.slot_start_ms > tMax) break;
         const x = xScale(a.slot_start_ms + a.slot_len_min * 60 * 1000);
-        const y = socY(a.soc_pct);
+        const y = socY(socPercent(a.soc) || 0);
         if (first) { ctx.moveTo(x, y); first = false; }
         else ctx.lineTo(x, y);
       }
@@ -746,7 +752,7 @@ import { setActiveCurrency, toDisplay, unitFor } from "./components/price-units.
         parts.push(
           `<span title="Battery state of charge right now — the plan starts from here">` +
           `<span class="s-label">start SoC </span>` +
-          `<span class="s-value">${plan.initial_soc_pct.toFixed(0)}%</span></span>`
+          `<span class="s-value">${(socPercent(plan.initial_soc) || 0).toFixed(0)}%</span></span>`
         );
         parts.push(
           `<span title="Total grid spend the plan expects over the full ${hh.toFixed(0)} h horizon. Negative means the plan expects to earn money (net export).">` +
@@ -872,7 +878,8 @@ import { setActiveCurrency, toDisplay, unitFor } from "./components/price-units.
         lines.push(`<div class="tip-row"><span title="Household consumption the plan assumes for this slot — floored against recent days and cut at the fuse">Load forecast</span><b>${(loadW / 1000).toFixed(1)} kW</b></div>`);
       }
       if (a.loadpoint_w != null && a.loadpoint_w > 0) {
-        const evSoc = a.loadpoint_soc_pct != null ? ` → ${a.loadpoint_soc_pct.toFixed(0)}%` : '';
+        const lpSoc = socPercent(a.loadpoint_soc);
+        const evSoc = lpSoc != null ? ` → ${lpSoc.toFixed(0)}%` : '';
         lines.push(`<div class="tip-row"><span title="Planned EV charging power for this slot">EV charging</span><b>${(a.loadpoint_w / 1000).toFixed(1)} kW${evSoc}</b></div>`);
       }
       if (a.battery_w != null) {
@@ -883,7 +890,8 @@ import { setActiveCurrency, toDisplay, unitFor } from "./components/price-units.
         const gdir = a.grid_w > 0 ? 'import' : 'export';
         lines.push(`<div class="tip-row"><span title="Net grid flow the plan expects. Import = buy from grid, export = sell back">Grid</span><b>${(Math.abs(a.grid_w) / 1000).toFixed(1)} kW ${gdir}</b></div>`);
       }
-      if (a.soc_pct != null) lines.push(`<div class="tip-row"><span title="Battery state of charge at the end of this slot">SoC (end)</span><b>${a.soc_pct.toFixed(0)}%</b></div>`);
+      const endSoc = socPercent(a.soc);
+      if (endSoc != null) lines.push(`<div class="tip-row"><span title="Battery state of charge at the end of this slot">SoC (end)</span><b>${endSoc.toFixed(0)}%</b></div>`);
       if (a.battery_w != null) {
         let action, actionHint;
         if (a.battery_w > 100) { action = 'Charging'; actionHint = 'import to cover load + top up battery'; }

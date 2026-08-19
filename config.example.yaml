@@ -163,7 +163,7 @@ caldav:
   password: ""
   calendar_path: /ftw/energy/
   poll_interval_s: 300
-  ev_default_target_soc_pct: 80
+  ev_default_target_soc: 0.80
   # ev_loadpoint_id: ""            # defaults to the first configured loadpoint
   # away_keywords: [away, vacation, holiday]
   # ev_keywords:   [ev, car, charge]
@@ -237,8 +237,8 @@ fleet_ping:
 #   mode: passive_arbitrage
 #   horizon_hours: 48
 #   interval_min: 15
-#   soc_min_pct: 10
-#   soc_max_pct: 95
+#   soc_min: 0.10
+#   soc_max: 0.95
 #   optimizer_solver: HIGHS
 #   optimizer_formulation: auto
 #   optimizer_transport: process # process | auto | unix; official Compose sets unix
