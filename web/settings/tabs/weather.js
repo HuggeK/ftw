@@ -45,27 +45,20 @@
     return maplibreLoading;
   }
 
-  // Terra Draw (MIT) supplies the drawing. Both bundles are UMD, so unlike an
-  // ES module they can carry a real integrity hash: one self-contained file
-  // each, with no sub-imports for SRI to silently miss.
-  var TERRA_DRAW = {
-    src: "https://unpkg.com/terra-draw@1.32.2/dist/terra-draw.umd.js",
-    integrity: "sha384-TYV8O/5VLLcJCLall6+2ipTEOgCQ0Fy4YkAoL3AU15s0qmNqs20zeWGiIJyMiztH",
-  };
-  var TERRA_DRAW_MAPLIBRE = {
-    src: "https://unpkg.com/terra-draw-maplibre-gl-adapter@1.4.1/dist/terra-draw-maplibre-gl-adapter.umd.js",
-    integrity: "sha384-A56++Zl2ljSDy1B+lcDdkRT3BVbzDkMolLzWffRCxiU5rGUWcUYDMvg/Dxr0JR+N",
-  };
+  // Terra Draw (MIT) supplies the drawing, vendored under /vendor/terra-draw
+  // for the same reason MapLibre above ships on the box: no third-party CDN
+  // JS, and the drawing tools load without internet. Both bundles are UMD —
+  // one self-contained file each.
+  var TERRA_DRAW_SRC = "/vendor/terra-draw/terra-draw.umd.js";
+  var TERRA_DRAW_MAPLIBRE_SRC = "/vendor/terra-draw/terra-draw-maplibre-gl-adapter.umd.js";
 
-  function loadScript(spec) {
+  function loadScript(src) {
     return new Promise(function (resolve, reject) {
       var script = document.createElement("script");
-      script.src = spec.src;
-      script.integrity = spec.integrity;
-      script.crossOrigin = "anonymous";
+      script.src = src;
       script.async = true;
       script.onload = function () { resolve(); };
-      script.onerror = function () { reject(new Error("could not load " + spec.src)); };
+      script.onerror = function () { reject(new Error("could not load " + src)); };
       document.head.appendChild(script);
     });
   }
@@ -78,8 +71,8 @@
     // is handed to it at construction — but the map library must already be
     // up, which loadMapLibre guarantees before any drawing can start.
     terraDrawLoading = loadMapLibre()
-      .then(function () { return loadScript(TERRA_DRAW); })
-      .then(function () { return loadScript(TERRA_DRAW_MAPLIBRE); })
+      .then(function () { return loadScript(TERRA_DRAW_SRC); })
+      .then(function () { return loadScript(TERRA_DRAW_MAPLIBRE_SRC); })
       .catch(function (e) { terraDrawLoading = null; throw e; });
     return terraDrawLoading;
   }
