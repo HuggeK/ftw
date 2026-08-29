@@ -102,9 +102,23 @@ def test_search_sends_the_collection_and_bbox():
 
     assert len(items) == 1
     (url, body), = session.posts
+    # The default catalog root is Lantmaeteriet's /stac, so the standard
+    # {base}/search lands on the same URL it always has.
     assert url.endswith("/stac/search")
     assert body["collections"] == [COLLECTION_LIDAR]
     assert body["bbox"] == [600000.0, 6500000.0, 600100.0, 6500100.0]
+
+
+def test_search_speaks_standard_stac_to_a_custom_catalog():
+    """Any STAC-conformant catalog works: base_url and collection ids are the
+    whole coupling, and search is the spec's POST {base}/search."""
+    session = FakeSession(search={"features": []})
+    client = GeotorgetClient(CREDS, session=session, base_url="https://stac.example.org/")
+    client.search("lidar-pointcloud", (5.0, 50.0, 6.0, 51.0))
+
+    (url, body), = session.posts
+    assert url == "https://stac.example.org/search"
+    assert body["collections"] == ["lidar-pointcloud"]
 
 
 def test_capture_date_is_read_from_stac_datetime():

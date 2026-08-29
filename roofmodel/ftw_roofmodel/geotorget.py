@@ -1,14 +1,26 @@
-"""Lantmaeteriet Geotorget access: authentication and STAC search.
+"""STAC catalog access: authentication, search, and asset download.
 
-Two products are used, both free open data (CC BY 4.0) but both gated behind a
-Geotorget account the operator orders themselves:
+The default catalog is Lantmaeteriet's Geotorget, where two products are used,
+both free open data (CC BY 4.0) but both gated behind a Geotorget account the
+operator orders themselves:
 
   * *Byggnad Nedladdning, vektor* -- building footprint polygons.
   * *Laserdata Nedladdning, Skog* -- airborne LiDAR, 1-2 points/m2, from 2018.
 
-Credentials are the operator's own and are never shipped, logged or echoed back
-through the API. FTW stores them the same way it stores `weather.api_key`, and
-redacts them in config responses.
+Authentication is HTTP Basic with the operator's own Geotorget account
+username and password: Lantmaeteriet provides no OAuth for its STAC download
+APIs, so the account credential is the only door. Credentials are the
+operator's own and are never shipped, logged or echoed back through the API.
+FTW stores them the same way it stores `weather.api_key`, and redacts them in
+config responses.
+
+Nothing below is Lantmaeteriet-specific beyond the defaults: search is the
+standard `POST {base}/search` of the STAC API spec and downloads follow asset
+hrefs, so any STAC-conformant catalog behind Basic auth (or none) works by
+pointing `base_url` and the collection ids elsewhere. The one non-standard
+wrinkle is the search bbox CRS -- the spec mandates WGS84, Lantmaeteriet
+expects SWEREF 99 TM -- which is why callers choose the bbox they send (see
+`--bbox-epsg` in __main__).
 
 Only `requests` is used. The STAC API is plain JSON over HTTP, so pulling in
 pystac-client would add a dependency for a search body we can write in six
@@ -22,7 +34,8 @@ import dataclasses
 import datetime as dt
 from typing import Any, Iterable
 
-DEFAULT_BASE_URL = "https://api.lantmateriet.se"
+# Root of the STAC API. The standard search endpoint is POST {base}/search.
+DEFAULT_BASE_URL = "https://api.lantmateriet.se/stac"
 
 # Collection ids as published in Lantmaeteriet's STAC catalogue. Both products
 # are STAC APIs over the same base URL and the same credentials; they differ
@@ -66,9 +79,10 @@ class Credentials:
     def validate(self) -> None:
         if not self.username or not self.password:
             raise MissingCredentials(
-                "Geotorget username and token are both required; order access at "
-                "https://geotorget.lantmateriet.se and set roofmodel.geotorget_username "
-                "and roofmodel.geotorget_token"
+                "a STAC username and password are both required; for Lantmäteriet, "
+                "order access at https://geotorget.lantmateriet.se and set "
+                "roofmodel.stac_username and roofmodel.stac_password to your "
+                "Geotorget account credentials"
             )
 
 
@@ -203,8 +217,13 @@ def _item_from_feature(feature: dict[str, Any]) -> StacItem:
     )
 
 
-class GeotorgetClient:
-    """Thin STAC client for Lantmaeteriet's download APIs."""
+class StacClient:
+    """Thin client for a STAC search-and-download API over HTTP Basic auth.
+
+    Defaults target Lantmaeteriet's Geotorget catalog, but nothing here
+    depends on it: base_url and the collection ids passed to `search` are the
+    whole coupling.
+    """
 
     def __init__(
         self,
@@ -232,29 +251,31 @@ class GeotorgetClient:
     def search(
         self,
         collection: str,
-        bbox_sweref: tuple[float, float, float, float],
+        bbox: tuple[float, float, float, float],
         limit: int = 20,
     ) -> list[StacItem]:
-        """POST /stac/search for one collection over a SWEREF 99 TM bbox.
+        """POST {base}/search for one collection over a bbox.
 
-        bbox is (min_easting, min_northing, max_easting, max_northing); the
-        catalogue is published in EPSG:3006, so no reprojection happens here.
+        The bbox is (min_x, min_y, max_x, max_y) in whatever CRS the catalog
+        expects -- the STAC spec says WGS84 lon/lat, Lantmaeteriet expects
+        SWEREF 99 TM -- so the caller chooses what to send and no reprojection
+        happens here.
         """
         body = {
             "collections": [collection],
-            "bbox": list(bbox_sweref),
+            "bbox": list(bbox),
             "limit": limit,
         }
-        url = f"{self._base_url}/stac/search"
+        url = f"{self._base_url}/search"
         try:
             resp = self._session.post(url, json=body, timeout=self._timeout)
         except Exception as exc:  # network, DNS, TLS
             raise GeotorgetError(f"STAC search failed: {exc}") from exc
         if resp.status_code in (401, 403):
             raise MissingCredentials(
-                f"Geotorget rejected the credentials for {collection} "
-                f"(HTTP {resp.status_code}). Check the account has ordered access "
-                "to this product."
+                f"the STAC catalog rejected the credentials for {collection} "
+                f"(HTTP {resp.status_code}). Check the username and password, and "
+                "that the account has ordered access to this product."
             )
         if resp.status_code != 200:
             raise GeotorgetError(f"STAC search returned HTTP {resp.status_code}")
@@ -276,3 +297,7 @@ def newest_capture(items: Iterable[StacItem]) -> dt.datetime | None:
     """Most recent known capture date across items, or None if none carry one."""
     dates = [i.captured_at for i in items if i.captured_at is not None]
     return max(dates) if dates else None
+
+
+# The client predates its generalization; the old name stays importable.
+GeotorgetClient = StacClient

@@ -101,7 +101,7 @@ func TestRoofModelBuildingsAcceptsAnExplicitCoordinate(t *testing.T) {
 	deps := depsAt(59.33, 18.07)
 	deps.RoofModel = roofmodel.FromConfig(&config.RoofModel{
 		Enabled: true, Command: "definitely-not-a-real-command",
-		GeotorgetUsername: "u", GeotorgetToken: "t",
+		StacUsername: "u", StacPassword: "p",
 	})
 
 	// Berlin is outside Lantmateriet coverage; if the query coordinate were
@@ -123,8 +123,10 @@ func TestRoofModelBuildingsAcceptsAnExplicitCoordinate(t *testing.T) {
 	}
 }
 
-// The Geotorget token is the operator's credential. Status may be reported;
-// the secret itself must never appear in a response.
+// The catalog password is the operator's credential. Status may be reported;
+// the secret itself must never appear in a response. This test deliberately
+// stores it under the legacy geotorget_token key: a config written before the
+// basic-auth redesign must stay every bit as private.
 func TestRoofModelNeverEchoesTheToken(t *testing.T) {
 	deps := depsAt(59.33, 18.07)
 	deps.Cfg.RoofModel = &config.RoofModel{

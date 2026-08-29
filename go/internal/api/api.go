@@ -2527,8 +2527,8 @@ func roofModelErrorStatus(err error) int {
 	return 502
 }
 
-// roofModelHasCredentials reports whether a Geotorget token is stored, without
-// revealing it.
+// roofModelHasCredentials reports whether STAC catalog credentials are
+// stored, without revealing them.
 func (s *Server) roofModelHasCredentials() bool {
 	if s.deps.CfgMu == nil {
 		return false
@@ -2539,7 +2539,7 @@ func (s *Server) roofModelHasCredentials() bool {
 		return false
 	}
 	rm := s.deps.Cfg.RoofModel
-	return rm.GeotorgetUsername != "" && rm.GeotorgetToken != ""
+	return rm.StacUser() != "" && rm.StacPass() != ""
 }
 
 // siteLocation returns the configured site coordinates.
