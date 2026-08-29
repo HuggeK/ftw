@@ -298,11 +298,12 @@ def search_buildings(
     longitude: float,
     radius_m: float = DEFAULT_SEARCH_RADIUS_M,
     limit: int = 50,
+    collection: str = COLLECTION_BUILDINGS,
+    bbox_epsg: int = 3006,
 ) -> list[Building]:
     """Building footprints near a site, nearest first."""
-    south, west, north, east = sweref.metre_box_around(latitude, longitude, radius_m)
-    bbox = sweref.bbox_wgs84_to_sweref99tm(south, west, north, east)
-    items = client.search(COLLECTION_BUILDINGS, bbox, limit=limit)
+    bbox = sweref.stac_search_bbox(latitude, longitude, radius_m, bbox_epsg)
+    items = client.search(collection, bbox, limit=limit)
     features: list[dict[str, Any]] = []
     for item in items:
         features.extend(_features_from_item(item, client))

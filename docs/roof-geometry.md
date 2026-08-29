@@ -4,9 +4,10 @@ FTW's PV forecast needs the tilt and azimuth of each roof face. Typing them in
 means measuring your own roof, and most people estimate. In Sweden the state
 already flew a laser over it, so FTW can read the numbers instead.
 
-This is **optional and Sweden-only**. Everywhere else, and whenever anything
-below is missing, the numeric fields in **Settings → Weather → PV arrays** stay
-the way they work today.
+This is **optional, and Sweden-only by default** (any standard STAC catalog
+can stand in — see [Other countries, other catalogs](#other-countries-other-catalogs)).
+Everywhere else, and whenever anything below is missing, the numeric fields in
+**Settings → Weather → PV arrays** stay the way they work today.
 
 ## What you need
 
@@ -24,6 +25,12 @@ both and FTW searches them the same way. They differ only in what the items
 point at, and FTW picks the right asset by its declared media type rather than
 by its name — a catalogue that renames `data` to `punktmoln` keeps working.
 
+Authentication is **HTTP Basic with your Geotorget account username and
+password**. Lantmäteriet provides no OAuth for these STAC APIs, so there is no
+issued token to paste — the account credential itself is what the catalog
+accepts. FTW stores the password like every other secret: it is written to the
+config file on the host, masked in every API response, and never logged.
+
 Ordering access is not instant — Lantmäteriet approves it — so do it before you
 plan to use this.
 
@@ -37,6 +44,35 @@ The `geo` extra pulls the LAZ reader. Without it everything except reading the
 point cloud works, which is enough to run the tests but not enough to derive a
 real roof. GeoPackage needs nothing extra: it is a SQLite file, and FTW reads it
 with the standard library.
+
+## Other countries, other catalogs
+
+The client speaks plain [STAC](https://stacspec.org/) — search is the spec's
+`POST {base}/search`, downloads follow asset hrefs, and authentication is
+ordinary HTTP Basic. Lantmäteriet is only the default. If another country
+publishes building footprints and LiDAR through a STAC API, point FTW at it:
+
+```yaml
+roofmodel:
+  enabled: true
+  stac_base_url: https://stac.example.org        # STAC API root
+  stac_buildings_collection: buildings-vector    # footprint polygons
+  stac_lidar_collection: lidar-pointcloud        # LAZ/COPC point clouds
+  stac_bbox_epsg: 4326                           # the spec's WGS84; 3006 = SWEREF
+  stac_username: you                             # omit both for an open catalog…
+  stac_password: "…"                             # …that needs no login
+```
+
+Setting `stac_base_url` also lifts the Sweden-only coordinate gate, since FTW
+cannot know what a third-party catalog covers.
+
+Two caveats. The search bbox CRS is per-catalog: the STAC spec mandates WGS84
+(`stac_bbox_epsg: 4326`), but Lantmäteriet expects SWEREF 99 TM, which is why
+the default stays `3006`. And the *data* itself must arrive in SWEREF 99 TM
+metres for now — the plane fitting works in that frame — so a foreign catalog
+needs its point clouds delivered in a matching projected CRS before the derived
+tilt/azimuth mean anything. Lifting that second limit means carrying a real
+projection library, which the module has so far deliberately avoided.
 
 ### Why picking a building also makes it fast
 
@@ -57,7 +93,7 @@ tile whole — slower, same answer. The result records which path ran as
 1. Open **Settings → Weather**.
 2. Put the map marker on your building.
 3. Under **Roof geometry from Lantmäteriet**, tick **Enable roof derivation**,
-   enter your Geotorget username and token, and **Save**.
+   enter your Geotorget username and password, and **Save**.
 4. Press **Find buildings here**. Footprints appear on the map and as a list.
 5. Click your building. It highlights green.
 6. Press **Read roof from LiDAR**.
@@ -123,7 +159,7 @@ is clear" are different claims.
 | What you see | What it means |
 |---|---|
 | "Roof derivation is off" | Tick the box, add credentials, Save, retry |
-| "Geotorget rejected the credentials" | Wrong token, or the account has not been granted that product |
+| "the STAC catalog rejected the credentials" | Wrong username or password, or the account has not been granted that product |
 | "No buildings found here" | The marker is not on a building, or you are outside Sweden |
 | "only N LiDAR returns fall on building" | The building is newer than the scan, or you picked the wrong footprint |
 | "No roof faces worth mounting panels on" | Everything found was north-facing or under 8 m² |

@@ -160,6 +160,24 @@ def bbox_wgs84_to_sweref99tm(
     return min(eastings), min(northings), max(eastings), max(northings)
 
 
+def stac_search_bbox(
+    lat: float, lon: float, radius_m: float, bbox_epsg: int = 3006
+) -> tuple[float, float, float, float]:
+    """Bounding box around a site, in the CRS a STAC catalog expects.
+
+    EPSG:3006 (the default) is what Lantmaeteriet's catalog takes; EPSG:4326
+    in lon/lat order is what the STAC spec itself mandates, for catalogs that
+    follow it. Anything else would need a projection stack this module
+    deliberately does not carry.
+    """
+    south, west, north, east = metre_box_around(lat, lon, radius_m)
+    if bbox_epsg == 4326:
+        return (west, south, east, north)
+    if bbox_epsg == 3006:
+        return bbox_wgs84_to_sweref99tm(south, west, north, east)
+    raise ValueError(f"unsupported bbox EPSG {bbox_epsg}; use 3006 or 4326")
+
+
 def metre_box_around(lat: float, lon: float, radius_m: float) -> tuple[float, float, float, float]:
     """Return a WGS84 (min_lat, min_lon, max_lat, max_lon) box of +/- radius_m.
 

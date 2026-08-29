@@ -25,6 +25,7 @@ from .buildings import (
     search_buildings,
 )
 from .geotorget import (
+    COLLECTION_BUILDINGS,
     COLLECTION_LIDAR,
     Credentials,
     GeotorgetClient,
@@ -187,6 +188,10 @@ def derive(
     module_w_per_m2: float = DEFAULT_MODULE_W_PER_M2,
     building_id: str | None = None,
     now: dt.datetime | None = None,
+    base_url: str = geotorget.DEFAULT_BASE_URL,
+    buildings_collection: str = COLLECTION_BUILDINGS,
+    lidar_collection: str = COLLECTION_LIDAR,
+    bbox_epsg: int = 3006,
 ) -> dict[str, Any]:
     """Derive a roof model for one site and return it as a JSON-ready dict.
 
@@ -194,14 +199,19 @@ def derive(
     clip the LiDAR to that footprint before segmenting. Without it the whole
     radius is segmented, which will happily return the neighbour's roof and lets
     coplanar buildings steal each other's points; see buildings.py.
+
+    The catalog parameters default to Lantmaeteriet; any STAC-conformant
+    catalog can stand in (see geotorget.py), as long as its data arrives in
+    SWEREF 99 TM -- the segmentation works in that frame.
     """
     if client is None:
-        client = GeotorgetClient(credentials)
+        client = GeotorgetClient(credentials, base_url=base_url)
 
     chosen: Building | None = None
     if building_id:
         candidates = search_buildings(
-            client, latitude=latitude, longitude=longitude, radius_m=radius_m
+            client, latitude=latitude, longitude=longitude, radius_m=radius_m,
+            collection=buildings_collection, bbox_epsg=bbox_epsg,
         )
         chosen = next((b for b in candidates if b.building_id == building_id), None)
         if chosen is None:
@@ -210,17 +220,17 @@ def derive(
                 "have been picked against a different coordinate"
             )
 
-    south, west, north, east = sweref.metre_box_around(latitude, longitude, radius_m)
-    bbox = sweref.bbox_wgs84_to_sweref99tm(south, west, north, east)
+    bbox = sweref.stac_search_bbox(latitude, longitude, radius_m, bbox_epsg)
 
     try:
-        lidar_items: list[StacItem] = client.search(COLLECTION_LIDAR, bbox)
+        lidar_items: list[StacItem] = client.search(lidar_collection, bbox)
     except GeotorgetError:
         raise
     if not lidar_items:
+        hint = "; Lantmaeteriet data is Sweden only" if lidar_collection == COLLECTION_LIDAR else ""
         raise RoofModelError(
-            f"no LiDAR tiles cover ({latitude:.5f}, {longitude:.5f}); "
-            "Lantmaeteriet data is Sweden only"
+            f"no LiDAR tiles cover ({latitude:.5f}, {longitude:.5f}) in "
+            f"collection {lidar_collection!r}{hint}"
         )
 
     points, fetch = _read_lidar(client, lidar_items, chosen)
@@ -248,8 +258,8 @@ def derive(
         "schema_version": SCHEMA_VERSION,
         "site": {"latitude": latitude, "longitude": longitude, "radius_m": radius_m},
         "source": {
-            "provider": "lantmateriet",
-            "collection": COLLECTION_LIDAR,
+            "provider": "lantmateriet" if base_url == geotorget.DEFAULT_BASE_URL else base_url,
+            "collection": lidar_collection,
             "item_count": len(lidar_items),
             "dataset_datetime": captured.isoformat() if captured else None,
             # "copc-window" means only the footprint's neighbourhood was moved

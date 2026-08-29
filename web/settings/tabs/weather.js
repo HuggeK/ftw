@@ -300,20 +300,23 @@
   function roofFieldset(ctx) {
     var field = ctx.field, help = ctx.help, config = ctx.config;
     if (!config.roofmodel) config.roofmodel = {};
-    var stored = config.roofmodel.has_geotorget_token;
+    var stored = config.roofmodel.has_stac_password;
     return '<fieldset><legend>Roof geometry from Lantmäteriet ' + help(
-        'Optional and Sweden-only. Reads the tilt and azimuth of each roof face from ' +
+        'Optional. Reads the tilt and azimuth of each roof face from ' +
         'Lantmäteriet\'s laser scanning data (Laserdata Skog) for a building you pick on ' +
         'the map, and fills in the PV arrays above. Needs a free Geotorget account with ' +
-        'access to "Byggnad Nedladdning, vektor" and "Laserdata Nedladdning, Skog".') +
+        'access to "Byggnad Nedladdning, vektor" and "Laserdata Nedladdning, Skog" — ' +
+        'sign in with the account\'s own username and password (Lantmäteriet offers no ' +
+        'OAuth for these APIs). Other countries\' STAC catalogs can be configured in ' +
+        'the config file via roofmodel.stac_base_url.') +
       '</legend>' +
       '<label><input type="checkbox" data-checkbox-path="roofmodel.enabled"' +
       (config.roofmodel.enabled ? " checked" : "") + '> Enable roof derivation</label>' +
       '<div class="field-row"><div>' +
-      field("Geotorget username", "roofmodel.geotorget_username", "text", "") +
+      field("Geotorget username", "roofmodel.stac_username", "text", "") +
       '</div><div>' +
-      field(stored ? "Geotorget token (stored — type to replace)" : "Geotorget token",
-            "roofmodel.geotorget_token", "password", "") +
+      field(stored ? "Geotorget password (stored — type to replace)" : "Geotorget password",
+            "roofmodel.stac_password", "password", "") +
       '</div></div>' +
       '<div style="display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 0">' +
       '<button class="btn-add" id="roof-find" type="button">Find buildings here</button>' +

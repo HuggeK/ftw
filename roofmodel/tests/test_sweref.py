@@ -110,6 +110,31 @@ def test_metre_box_brackets_its_centre():
     assert west < 18.07 < east
 
 
+def test_stac_search_bbox_sweref_matches_the_long_form():
+    from ftw_roofmodel.sweref import bbox_wgs84_to_sweref99tm, stac_search_bbox
+
+    south, west, north, east = metre_box_around(59.33, 18.07, 40.0)
+    assert stac_search_bbox(59.33, 18.07, 40.0) == bbox_wgs84_to_sweref99tm(
+        south, west, north, east
+    )
+
+
+def test_stac_search_bbox_wgs84_is_lon_lat_ordered():
+    """The STAC spec's bbox is [west, south, east, north] in degrees."""
+    from ftw_roofmodel.sweref import stac_search_bbox
+
+    west, south, east, north = stac_search_bbox(59.33, 18.07, 40.0, bbox_epsg=4326)
+    assert west < 18.07 < east
+    assert south < 59.33 < north
+
+
+def test_stac_search_bbox_refuses_a_crs_it_cannot_produce():
+    from ftw_roofmodel.sweref import stac_search_bbox
+
+    with pytest.raises(ValueError):
+        stac_search_bbox(59.33, 18.07, 40.0, bbox_epsg=3857)
+
+
 def test_degree_box_would_have_been_wrong_at_high_latitude():
     """Guards the reason metre_box_around exists: a fixed degree offset gives
     wildly different ground distances at Malmoe and Kiruna, so anyone tempted to
