@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -35,6 +36,28 @@ type Controller struct {
 	plan    PlanFunc
 	tel     TelemetryFunc
 	send    SenderFunc
+	// sendOutcome matches Registry.SendWithOutcome. Production wires it so
+	// the ev_set_current verdict closes Core health inside the registry's
+	// per-driver actor, before that actor accepts another EV command.
+	sendOutcome OutcomeSenderFunc
+	// sendCycle carries private continuation identity beside the payload. The
+	// driver never sees it; Registry.runLoop uses it to order pause/resume.
+	sendCycle CycleSenderFunc
+
+	// dispatchOutcome files the result of the periodic ev_set_current, and
+	// only that command. See DispatchOutcomeFunc for what it deliberately
+	// does not see. nil disables the reporting entirely.
+	dispatchOutcome DispatchOutcomeFunc
+	// driverOnline is Core's shared DriverHealth.IsOnline gate. A charger
+	// excluded after refused commands must not keep reaching send and clear
+	// its own refusal record before the retry window opens. nil keeps the
+	// controller usable without Core health wiring in narrow tests.
+	driverOnline func(driver string) bool
+	// commandTimeout bounds synchronous sends so one slow charger cannot hold
+	// the sequential loadpoint tick and starve every charger after it. The
+	// registry owns cross-command serialization and lifecycle cancellation.
+	commandTimeout  time.Duration
+	wallboxCycleSeq atomic.Uint64
 
 	// fuseEVMax is the joint fuse-budget allocator's verdict for how much
 	// W this controller may command to the EV this tick. Set by the
@@ -343,6 +366,13 @@ func (w *surplusWindow) push(v float64) float64 {
 	return sum / float64(w.n)
 }
 
+// MaxManualHold bounds a timed manual hold so a forgotten diagnostic
+// override cannot indefinitely displace planned dispatch. Persistent
+// operator holds are exempt: they end on Stop or unplug, never on time.
+// One constant for every door that installs a hold — the HTTP route and
+// the app session validate against this same number.
+const MaxManualHold = 30 * time.Minute
+
 // ManualHold pins a loadpoint to a specific dispatch payload until
 // ExpiresAt. PowerW is sent verbatim; PhaseMode / PhaseSplitW /
 // MinPhaseHoldS / Voltage / MaxAmpsPerPhase override the loadpoint's
@@ -412,6 +442,42 @@ type TelemetryFunc func(driver string) (EVSample, bool)
 // drivers.Registry.Send.
 type SenderFunc func(ctx context.Context, driver string, payload []byte) error
 
+// OutcomeSenderFunc forwards one command and runs outcome inside the
+// per-driver command owner after any default recovery, before its next queued
+// command. Only periodic ev_set_current uses this path.
+type OutcomeSenderFunc func(ctx context.Context, driver string, payload []byte, outcome func(error)) error
+
+// CycleSenderFunc sends one automatic wallbox-cycle step with an out-of-band
+// continuation id owned by the registry actor.
+type CycleSenderFunc func(ctx context.Context, driver string, payload []byte, cycleID uint64) error
+
+// DispatchOutcomeFunc reports what a charger made of the one command that
+// decides whether core can actuate it: the periodic `ev_set_current`. Core
+// uses it to stop counting on a charger that answers every poll and refuses
+// every command — the storage side of the same law lives in
+// go/cmd/ftw/driver_failure_default.go.
+//
+// Deliberately only that command. The controller emits four other kinds of
+// send, and a refusal of any of them says nothing about whether the charger
+// takes a setpoint:
+//
+//   - the 0 W safety standdown, which core sends while the site meter is
+//     stale. That is core withdrawing, not core actuating, and the staleness
+//     tracker already owns the transition;
+//   - `charge_start` to the bound *vehicle* driver, which a parked car
+//     refuses whenever it is asleep. wakeVehicleAuto has its own backoff for
+//     exactly that, and excluding the vehicle driver would take its SoC out
+//     of the plan because the car was napping;
+//   - `ev_pause`/`ev_resume` in a contactor cycle, which is documented as
+//     free for any charger that implements those actions — a charger that
+//     does not returns an error and is behaving correctly;
+//   - the operator's own force-start and refresh, which are not dispatch.
+//
+// Production calls this from the registry's per-driver actor before that actor
+// accepts another command. Implementations must stay bounded and perform no
+// I/O. Narrow tests without OutcomeSenderFunc call it on the dispatch goroutine.
+type DispatchOutcomeFunc func(driver string, err error, now time.Time)
+
 // NewController wires the dependencies. Passing nil for plan, tel,
 // or send disables the corresponding step — useful in tests.
 func NewController(mgr *Manager, plan PlanFunc, tel TelemetryFunc, send SenderFunc) *Controller {
@@ -423,6 +489,143 @@ func NewController(mgr *Manager, plan PlanFunc, tel TelemetryFunc, send SenderFu
 		batteryBoost:       map[string]BatteryBoostLease{},
 		batteryBoostStatus: map[string]BatteryBoostStatus{},
 	}
+}
+
+// SetDispatchOutcome wires the reporter for refused EV dispatch commands.
+// Pass nil to disable — the controller then behaves exactly as it did before,
+// logging the refusal and moving on.
+func (c *Controller) SetDispatchOutcome(f DispatchOutcomeFunc) {
+	if c == nil {
+		return
+	}
+	c.dispatchOutcome = f
+}
+
+// SetOutcomeSender installs the registry-owned completion path for periodic
+// charger dispatch. Pass nil to keep the direct SenderFunc test path.
+func (c *Controller) SetOutcomeSender(send OutcomeSenderFunc) {
+	if c == nil {
+		return
+	}
+	c.sendOutcome = send
+}
+
+// SetCycleSender installs the registry-owned pause/resume continuation path.
+// Pass nil to keep the plain SenderFunc path used by narrow controller tests.
+func (c *Controller) SetCycleSender(send CycleSenderFunc) {
+	if c == nil {
+		return
+	}
+	c.sendCycle = send
+}
+
+// SetDriverOnline wires Core's per-driver control eligibility. Returning
+// false preserves observation and schedule state but emits no command or
+// wake side effect for that loadpoint.
+func (c *Controller) SetDriverOnline(f func(driver string) bool) {
+	if c == nil {
+		return
+	}
+	c.driverOnline = f
+}
+
+func (c *Controller) driverCanDispatch(driver string) bool {
+	return c.driverOnline == nil || c.driverOnline(driver)
+}
+
+const defaultDriverCommandTimeout = 2 * time.Second
+
+// SetCommandTimeout sets the per-send ceiling for periodic charger dispatch
+// and the async wallbox cycle. Vehicle commands keep their caller deadline,
+// capped by vehicleWakeTimeout. Non-positive values restore the safe default.
+func (c *Controller) SetCommandTimeout(timeout time.Duration) {
+	if c == nil {
+		return
+	}
+	c.commandTimeout = timeout
+}
+
+func (c *Controller) sendDispatchWithDeadline(ctx context.Context, driver string, payload []byte) error {
+	if c == nil || c.send == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timeout := c.commandTimeout
+	if timeout <= 0 {
+		timeout = defaultDriverCommandTimeout
+	}
+	cmdCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return c.send(cmdCtx, driver, payload)
+}
+
+// sendVehicle keeps vehicle operations out of the short periodic-dispatch
+// deadline. The API supplies a 15-second caller deadline for operator work;
+// background wake paths receive the 30-second vehicleWakeTimeout cap.
+func (c *Controller) sendVehicle(ctx context.Context, driver string, payload []byte) error {
+	if c == nil || c.send == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	vehicleCtx, cancel := context.WithTimeout(ctx, vehicleWakeTimeout)
+	defer cancel()
+	return c.send(vehicleCtx, driver, payload)
+}
+
+func (c *Controller) sendOutcomeWithDeadline(
+	ctx context.Context,
+	driver string,
+	payload []byte,
+	outcome func(error),
+) error {
+	if c == nil || c.send == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timeout := c.commandTimeout
+	if timeout <= 0 {
+		timeout = defaultDriverCommandTimeout
+	}
+	cmdCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	if c.sendOutcome != nil {
+		return c.sendOutcome(cmdCtx, driver, payload, outcome)
+	}
+	err := c.send(cmdCtx, driver, payload)
+	if outcome != nil {
+		outcome(err)
+	}
+	return err
+}
+
+func (c *Controller) sendCycleWithDeadline(
+	ctx context.Context,
+	driver string,
+	payload []byte,
+	cycleID uint64,
+) error {
+	if c == nil || c.send == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timeout := c.commandTimeout
+	if timeout <= 0 {
+		timeout = defaultDriverCommandTimeout
+	}
+	cmdCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	if c.sendCycle != nil {
+		return c.sendCycle(cmdCtx, driver, payload, cycleID)
+	}
+	return c.send(cmdCtx, driver, payload)
 }
 
 // SetFuseEVMax wires the joint allocator's verdict from control.State.
@@ -658,7 +861,7 @@ func (c *Controller) SetBatSoCProvider(f func() (float64, bool)) {
 // threshold AND there's live PV to grab (battery discharge alone is
 // not surplus — that's just self-consumption or arbitrage the planner
 // is already orchestrating). Releases when SoC drops below
-// (threshold − BatSoCUnlockHystPp), or after a sustained run of
+// (threshold − BatSoCUnlockHyst), or after a sustained run of
 // zero/negative live surplus (batSoCPVGoneTicks).
 //
 // Returns false when no threshold is configured or the bat_soc reader
@@ -699,12 +902,11 @@ func (c *Controller) evalBatSoCArm(lpID string, threshold float64) bool {
 	} else {
 		c.batSoCNoPV[lpID] = 0
 	}
-	socPct := soc * 100
 	armed := prev
 	switch {
-	case socPct < threshold-BatSoCUnlockHystPp:
+	case soc < threshold-BatSoCUnlockHyst:
 		armed = false
-	case socPct >= threshold && !pvGone:
+	case soc >= threshold && !pvGone:
 		armed = true
 	case c.batSoCNoPV[lpID] >= batSoCPVGoneTicks:
 		// SoC may still be high but PV has been gone long enough that
@@ -772,13 +974,13 @@ func (c *Controller) surplusActive(lpCfg Config, sched Schedule) bool {
 	// available surplus and the deadline is missed. The explicit SurplusOnly
 	// config above still wins, so a "surplus-preferred with a deadline floor"
 	// combo is unaffected. Operator directive 2026-05-30.
-	if sched.SoCPct > 0 {
+	if sched.SoC > 0 {
 		return false
 	}
 	if c.gridDeferredFor(lpCfg.ID) {
 		return true
 	}
-	return c.evalBatSoCArm(lpCfg.ID, sched.SurplusUnlockBatSoCPct)
+	return c.evalBatSoCArm(lpCfg.ID, sched.SurplusUnlockBatSoC)
 }
 
 // AnyLoadpointSurplusActive reports whether any configured loadpoint
@@ -802,7 +1004,7 @@ func (c *Controller) AnyLoadpointSurplusActive() bool {
 			return true
 		}
 		sched, _ := c.manager.GetSchedule(cfg.ID)
-		if sched.SurplusUnlockBatSoCPct > 0 {
+		if sched.SurplusUnlockBatSoC > 0 {
 			c.batSoCArmedMu.Lock()
 			armed := c.batSoCArmed[cfg.ID]
 			c.batSoCArmedMu.Unlock()
@@ -856,7 +1058,7 @@ func (c *Controller) RefreshVehicle(ctx context.Context, lpID string) error {
 	c.wakeLast[lpID] = time.Now()
 	c.wakeMu.Unlock()
 	slog.Info("loadpoint manual wake (schedule edit)", "lp", lpID, "vehicle_driver", driver)
-	return c.send(ctx, driver, payload)
+	return c.sendVehicle(ctx, driver, payload)
 }
 
 // ForceStart outcome sentinels. The API layer maps each to a distinct
@@ -933,7 +1135,7 @@ func (c *Controller) ForceStartVehicle(ctx context.Context, lpID string) (string
 		slog.Warn("loadpoint force-start: payload marshal", "lp", lpID, "err", err)
 		return driver, err
 	}
-	sendErr := c.send(ctx, driver, payload)
+	sendErr := c.sendVehicle(ctx, driver, payload)
 	if sendErr != nil {
 		slog.Warn("loadpoint force-start (operator) — send failed",
 			"lp", lpID, "vehicle_driver", driver, "err", sendErr)
@@ -984,9 +1186,7 @@ func (c *Controller) wakeVehicleAuto(ctx context.Context, lpID string, reason st
 	}
 	slog.Info("loadpoint auto-wake (vehicle telemetry refresh)",
 		"lp", lpID, "vehicle_driver", driver, "reason", reason)
-	sendCtx, cancel := context.WithTimeout(ctx, vehicleWakeTimeout)
-	defer cancel()
-	if err := c.send(sendCtx, driver, payload); err != nil {
+	if err := c.sendVehicle(ctx, driver, payload); err != nil {
 		slog.Warn("loadpoint auto-wake send failed",
 			"lp", lpID, "vehicle_driver", driver, "err", err)
 	}
@@ -1251,18 +1451,33 @@ func (c *Controller) tickOne(ctx context.Context, now time.Time, lpCfg Config, d
 	if !wasPlugged {
 		c.resetSurplusSession(lpCfg.ID)
 	}
+	if !c.driverCanDispatch(lpCfg.DriverName) {
+		// Keep the observation above: the UI and session state should still
+		// show the connected car. Only actuation pauses while Core holds the
+		// driver out of control. In particular, do not report a synthetic
+		// outcome here; driverActuationTracker.update owns the timed retry.
+		return
+	}
 	if !dispatchAllowed {
 		// The observation above is deliberately retained: dashboards, SoC
 		// inference and plug/unplug state must stay live while the site-meter
 		// safety gate is closed. Do not advance manual-hold completion timers
 		// or auto-wake state while we are the reason current is withheld; a
 		// persistent hold or schedule must resume normally after recovery.
+		// The outcome is deliberately not reported to dispatchOutcome: this
+		// is core withdrawing under a stale site meter, not core actuating,
+		// and the staleness tracker already owns that transition. A charger
+		// that refuses the standdown must not be excluded for it — the fault
+		// being handled is the meter's.
+		// The standdown is still the box ordering zero; record it so the
+		// interruption latch knows this stop is ours.
+		c.manager.SetCommandedW(lpCfg.ID, 0)
 		payload, err := json.Marshal(map[string]any{
 			"action":  "ev_set_current",
 			"power_w": 0,
 		})
 		if err == nil && c.send != nil {
-			if err := c.send(ctx, lpCfg.DriverName, payload); err != nil {
+			if err := c.sendDispatchWithDeadline(ctx, lpCfg.DriverName, payload); err != nil {
 				slog.Warn("loadpoint safety standdown", "lp", lpCfg.ID,
 					"driver", lpCfg.DriverName, "err", err)
 			}
@@ -1467,7 +1682,7 @@ func (c *Controller) tickOne(ctx context.Context, now time.Time, lpCfg Config, d
 		// rationale in one testable place. Operator directive 2026-05-30.
 		phaseMode := resolvePhaseMode(
 			lpCfg.PhaseMode,
-			sched.SoCPct > 0,
+			sched.SoC > 0,
 			c.surplusLockedTo1P(lpCfg.ID),
 			surplusOn,
 			c.dwellSelectedPhaseMode(lpCfg.ID),
@@ -1496,6 +1711,13 @@ func (c *Controller) tickOne(ctx context.Context, now time.Time, lpCfg Config, d
 	}
 
 	c.applyPerPhaseFuseClamp(lpCfg, cmd)
+	// Tell the manager what was ordered, after every clamp has spoken.
+	// The interruption latch reads this to keep a pause the box chose —
+	// plan slot, Stop hold, surplus clamp — from ever reading as a
+	// charge that failed.
+	if w, ok := cmd["power_w"].(float64); ok {
+		c.manager.SetCommandedW(lpCfg.ID, w)
+	}
 	payload, err := json.Marshal(cmd)
 	if err != nil {
 		return
@@ -1503,9 +1725,30 @@ func (c *Controller) tickOne(ctx context.Context, now time.Time, lpCfg Config, d
 	if c.send == nil {
 		return
 	}
-	if err := c.send(ctx, lpCfg.DriverName, payload); err != nil {
+	// The one command whose outcome decides whether core can actuate this
+	// charger. A charger that answers every poll and refuses this holds
+	// whatever current it last accepted, and the plan goes on counting the
+	// EV load it is not drawing — the storage bug #800 fixed, one wire over.
+	sendErr := c.sendOutcomeWithDeadline(ctx, lpCfg.DriverName, payload, func(err error) {
+		if c.dispatchOutcome != nil {
+			c.dispatchOutcome(lpCfg.DriverName, err, now)
+		}
+	})
+	if sendErr != nil {
 		slog.Warn("loadpoint dispatch", "lp", lpCfg.ID,
-			"driver", lpCfg.DriverName, "err", err)
+			"driver", lpCfg.DriverName, "err", sendErr)
+	}
+	if sendErr != nil {
+		// Never start wake work from a command that did not complete. In
+		// particular, a timeout may still be unwinding inside the registry;
+		// its per-driver owner restores default before another command runs.
+		return
+	}
+	if !c.driverCanDispatch(lpCfg.DriverName) {
+		// The outcome callback can close Core's health gate synchronously.
+		// Stop this tick here as well: charge_start and the wallbox cycle are
+		// wake side effects of a dispatch that Core has just rejected.
+		return
 	}
 
 	// Auto-wake: if the matched vehicle reports `Stopped` /
@@ -1630,7 +1873,7 @@ func (c *Controller) maybeWakeVehicle(ctx context.Context, now time.Time, lpCfg 
 	}
 	slog.Info("loadpoint auto-wake", "lp", lpID, "vehicle_driver", driver,
 		"vehicle_state", state, "cmd_w", pw)
-	if err := c.send(ctx, driver, payload); err != nil {
+	if err := c.sendVehicle(ctx, driver, payload); err != nil {
 		slog.Warn("loadpoint auto-wake failed", "lp", lpID,
 			"vehicle_driver", driver, "err", err)
 	}
@@ -1665,19 +1908,29 @@ func (c *Controller) cycleWallbox(lpID, driverName string) {
 	if driverName == "" || c.send == nil {
 		return
 	}
+	gap := wallboxCycleGap
+	cycleID := c.wallboxCycleSeq.Add(1)
 	go func() {
 		pauseCmd, _ := json.Marshal(map[string]any{"action": "ev_pause"})
 		resumeCmd, _ := json.Marshal(map[string]any{"action": "ev_resume"})
-		if err := c.send(context.Background(), driverName, pauseCmd); err != nil {
+		if !c.driverCanDispatch(driverName) {
+			return
+		}
+		pauseErr := c.sendCycleWithDeadline(context.Background(), driverName, pauseCmd, cycleID)
+		if pauseErr != nil {
 			slog.Warn("loadpoint wallbox-cycle pause failed",
-				"lp", lpID, "driver", driverName, "err", err)
+				"lp", lpID, "driver", driverName, "err", pauseErr)
 			return
 		}
 		slog.Info("loadpoint wallbox-cycle: paused", "lp", lpID, "driver", driverName)
-		time.Sleep(wallboxCycleGap)
-		if err := c.send(context.Background(), driverName, resumeCmd); err != nil {
+		time.Sleep(gap)
+		if !c.driverCanDispatch(driverName) {
+			return
+		}
+		resumeErr := c.sendCycleWithDeadline(context.Background(), driverName, resumeCmd, cycleID)
+		if resumeErr != nil {
 			slog.Warn("loadpoint wallbox-cycle resume failed",
-				"lp", lpID, "driver", driverName, "err", err)
+				"lp", lpID, "driver", driverName, "err", resumeErr)
 			return
 		}
 		slog.Info("loadpoint wallbox-cycle: resumed", "lp", lpID, "driver", driverName)

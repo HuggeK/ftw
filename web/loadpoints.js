@@ -5,10 +5,10 @@
 // Data sources:
 //   GET /api/loadpoints  — array of LP states (id, driver, surplus_only,
 //                          plugged_in, max_charge_w, allowed_steps_w,
-//                          current_soc_pct, target_soc_pct, target_time,
+//                          current_soc, target_soc, target_time,
 //                          vehicle_*, soc_source).
 //   GET /api/mpc/plan    — current plan; actions[] include optional
-//                          loadpoint_w + loadpoint_soc_pct when an LP
+//                          loadpoint_w + loadpoint_soc (0–1) when an LP
 //                          is part of the DP. Only one LP at a time
 //                          today (mpc/service.go: "One loadpoint at a
 //                          time — multi-LP support is on the roadmap").
@@ -47,9 +47,9 @@
     return Math.round(w) + ' W';
   }
 
-  function fmtPct(p) {
-    if (p == null || !isFinite(p)) return '—';
-    return p.toFixed(1) + '%';
+  function fmtPct(frac) {
+    if (frac == null || !isFinite(frac)) return '—';
+    return (frac * 100).toFixed(1) + '%';
   }
 
   // Bare number — the column header carries the unit.
@@ -93,16 +93,22 @@
     return h > 0 ? `${h} h ${m} min` : `${m} min`;
   }
 
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
   const BOOST_STOP_LABELS = {
     cancelled: 'Cancelled by operator',
     expired: 'Time limit reached',
     vehicle_unplugged: 'Vehicle unplugged',
     ev_target_reached: 'EV target reached',
     departure_reached: 'Departure time reached',
-    operator_hold: 'Loadpoint hold took priority',
+    operator_hold: 'Charger hold took priority',
     surplus_only: 'Surplus-only policy took priority',
     site_safety_block: 'Site meter safety stopped boost',
-    loadpoint_driver_unavailable: 'Loadpoint driver unavailable',
+    loadpoint_driver_unavailable: 'Charger driver unavailable',
     battery_unavailable: 'Home battery unavailable',
     battery_reserve_reached: 'Home battery reserve reached',
     battery_hold: 'Battery hold took priority',
@@ -114,20 +120,20 @@
   function batteryBoostBlock(lp) {
     const boost = lp.battery_boost || { state: 'inactive', active: false };
     if (boost.active) {
-      const target = boost.ev_target_soc_pct > 0 ? ` · EV target ${boost.ev_target_soc_pct.toFixed(0)}%` : '';
+      const target = boost.ev_target_soc > 0 ? ` · EV target ${fmtPct(boost.ev_target_soc)}` : '';
       return '<div class="lp-boost lp-boost-active">' +
         '<div class="lp-boost-title">Battery boost ' + badge('ACTIVE', true) + '</div>' +
-        `<div class="lp-boost-copy">${fmtRemaining(boost.expires_at_ms)} left · home reserve ${boost.min_battery_soc_pct.toFixed(0)}%${target}</div>` +
-        `<button class="lp-boost-cancel" type="button" data-lp="${lp.id}">Stop boost</button>` +
+        `<div class="lp-boost-copy">${fmtRemaining(boost.expires_at_ms)} left · home reserve ${fmtPct(boost.min_battery_soc)}${target}</div>` +
+        `<button class="lp-boost-cancel" type="button" data-lp="${escapeHtml(lp.id)}">Stop boost</button>` +
         '</div>';
     }
     const stopped = boost.stop_reason
-      ? `<div class="lp-boost-reason">Last stop: ${BOOST_STOP_LABELS[boost.stop_reason] || boost.stop_reason}</div>`
+      ? `<div class="lp-boost-reason">Last stop: ${BOOST_STOP_LABELS[boost.stop_reason] || escapeHtml(boost.stop_reason)}</div>`
       : '';
     const blocked = !lp.plugged_in || lp.manual_active || lp.surplus_only;
     let why = '';
     if (!lp.plugged_in) why = 'Plug in a vehicle first.';
-    else if (lp.manual_active) why = 'Release the loadpoint hold first.';
+    else if (lp.manual_active) why = 'Release the charger hold first.';
     else if (lp.surplus_only) why = 'Turn off surplus-only first.';
     return '<div class="lp-boost">' +
       '<div class="lp-boost-title">Battery boost</div>' +
@@ -138,7 +144,7 @@
         '<label>EV target %<input class="lp-boost-target" type="number" min="1" max="100" step="1" placeholder="optional"></label>' +
         '<label>Departure<input class="lp-boost-departure" type="datetime-local"></label>' +
       '</div>' +
-      `<button class="lp-boost-enable" type="button" data-lp="${lp.id}" ${blocked ? 'disabled' : ''}>Enable boost</button>` +
+      `<button class="lp-boost-enable" type="button" data-lp="${escapeHtml(lp.id)}" ${blocked ? 'disabled' : ''}>Enable boost</button>` +
       (why ? `<span class="lp-boost-blocked">${why}</span>` : '') + stopped +
       '<div class="lp-boost-msg" aria-live="polite"></div>' +
       '</div>';
@@ -155,40 +161,40 @@
 
   function configBlock(lp) {
     const d = fmtDeadline(lp.target_time);
-    const target = (lp.target_soc_pct > 0)
-      ? `${lp.target_soc_pct.toFixed(0)}%${d ? ' by ' + d : ''}`
+    const target = (lp.target_soc > 0)
+      ? `${fmtPct(lp.target_soc)}${d ? ' by ' + d : ''}`
       : 'opportunistic';
     const vehicle = (lp.vehicle_driver)
-      ? `${lp.vehicle_driver}${lp.vehicle_charging_state ? ' · ' + lp.vehicle_charging_state : ''}${lp.vehicle_stale ? ' · stale' : ''}`
+      ? `${escapeHtml(lp.vehicle_driver)}${lp.vehicle_charging_state ? ' · ' + escapeHtml(lp.vehicle_charging_state) : ''}${lp.vehicle_stale ? ' · stale' : ''}`
       : '—';
-    // When soc_source is "vehicle", the BMS reading (vehicle_soc_pct)
+    // When soc_source is "vehicle", the BMS reading (vehicle_soc)
     // is ground truth and what the operator expects to see — render
-    // that. current_soc_pct stays as the controller's inference state
+    // that. current_soc stays as the controller's inference state
     // (the planner's input for stability across ticks) and is shown
     // in parens as "(inferred: 65.1%)" so the discrepancy is visible
     // when it exists. When soc_source is "inferred" the inference
     // value is the only one we have, so display it directly.
     let soc = '—';
-    if (lp.soc_source === 'vehicle' && lp.vehicle_soc_pct != null) {
-      soc = `${lp.vehicle_soc_pct.toFixed(0)}% (vehicle)`;
-      if (lp.current_soc_pct != null &&
-          Math.abs(lp.vehicle_soc_pct - lp.current_soc_pct) >= 1) {
-        soc += ` · inferred ${lp.current_soc_pct.toFixed(1)}%`;
+    if (lp.soc_source === 'vehicle' && lp.vehicle_soc != null) {
+      soc = `${fmtPct(lp.vehicle_soc)} (vehicle)`;
+      if (lp.current_soc != null &&
+          Math.abs(lp.vehicle_soc - lp.current_soc) >= 0.01) {
+        soc += ` · inferred ${fmtPct(lp.current_soc)}`;
       }
-    } else if (lp.current_soc_pct != null) {
-      soc = `${lp.current_soc_pct.toFixed(1)}%${lp.soc_source ? ' (' + lp.soc_source + ')' : ''}`;
+    } else if (lp.current_soc != null) {
+      soc = `${fmtPct(lp.current_soc)}${lp.soc_source ? ' (' + escapeHtml(lp.soc_source) + ')' : ''}`;
     }
     // Inline manual SoC correction. The backend (POST /api/loadpoints/{id}/soc)
     // re-anchors the inferred SoC, so it only works during an active session —
     // show the ✎ affordance only when plugged in.
     let socCell = soc;
     if (lp.plugged_in) {
-      const cur = (lp.current_soc_pct != null) ? lp.current_soc_pct.toFixed(1) : '';
-      socCell = `${soc} <button class="lp-soc-edit" type="button" data-lp="${lp.id}" data-cur="${cur}" title="Set SoC manually" ` +
+      const cur = (lp.current_soc != null) ? (lp.current_soc * 100).toFixed(1) : '';
+      socCell = `${soc} <button class="lp-soc-edit" type="button" data-lp="${escapeHtml(lp.id)}" data-cur="${cur}" title="Set SoC manually" ` +
         `style="background:none;border:none;cursor:pointer;color:var(--accent-e);font-size:0.9em;padding:0 4px">✎</button>`;
     }
     const rows = [
-      ['Driver',       lp.driver_name || '—'],
+      ['Driver',       lp.driver_name ? escapeHtml(lp.driver_name) : '—'],
       ['Plugged in',   badge(lp.plugged_in ? 'YES' : 'NO', lp.plugged_in)],
       ['Surplus only', badge(lp.surplus_only ? 'ON' : 'OFF', lp.surplus_only)],
       ['Live power',   fmtW(lp.current_power_w)],
@@ -209,20 +215,20 @@
       return '<div class="lp-empty">No active plan.</div>';
     }
     // Plan only carries one LP today. Match by checking whether *any*
-    // action has a loadpoint_w / loadpoint_soc_pct field — if it does,
+    // action has a loadpoint_w / loadpoint_soc field — if it does,
     // assume those refer to this LP. Once multi-LP support lands the
     // plan will need to namespace these by LP id; for now the comment
     // in mpc/service.go is the source of truth.
     const planLpId = plan.plan.loadpoint_id || null;
     const isOurs = !planLpId || planLpId === lp.id;
     if (!isOurs) {
-      return `<div class="lp-empty">Plan is scheduling <code>${planLpId}</code>, not this loadpoint.</div>`;
+      return `<div class="lp-empty">Plan is scheduling <code>${escapeHtml(planLpId)}</code>, not this charger.</div>`;
     }
     const slots = plan.plan.actions
-      .filter(a => a.loadpoint_w != null || a.loadpoint_soc_pct != null)
+      .filter(a => a.loadpoint_w != null || a.loadpoint_soc != null)
       .slice(0, SCHEDULE_SLOTS);
     if (slots.length === 0) {
-      return '<div class="lp-empty">Planner did not allocate this loadpoint in the current horizon ' +
+      return '<div class="lp-empty">Planner did not allocate this charger in the current horizon ' +
              '(no target SoC + no surplus_only opportunistic slots).</div>';
     }
     const rows = slots.map(a => {
@@ -232,9 +238,9 @@
         `<td>${fmtSlotTime(a.slot_start_ms)}</td>` +
         `<td>${fmtPriceOre(a.price_ore)}</td>` +
         `<td>${fmtW(a.loadpoint_w || 0)}</td>` +
-        `<td>${fmtPct(a.loadpoint_soc_pct)}</td>` +
+        `<td>${fmtPct(a.loadpoint_soc)}</td>` +
         `<td>${fmtW(a.battery_w)}</td>` +
-        `<td>${a.reason || ''}</td>` +
+        `<td>${escapeHtml(a.reason || '')}</td>` +
         '</tr>';
     }).join('');
     return '<div class="lp-schedule-wrap">' +
@@ -252,8 +258,8 @@
   }
 
   function loadpointCard(lp, plan) {
-    return `<div class="lp-card" data-lp-id="${lp.id}">` +
-      `<div class="lp-card-header"><h3>${lp.id}</h3></div>` +
+    return `<div class="lp-card" data-lp-id="${escapeHtml(lp.id)}">` +
+      `<div class="lp-card-header"><h3>${escapeHtml(lp.id)}</h3></div>` +
       '<div class="lp-card-body">' +
       '<div>' + configBlock(lp) + batteryBoostBlock(lp) + '</div>' +
       scheduleTable(lp, plan) +
@@ -289,7 +295,7 @@
     });
 
     if (!lps || lps.length === 0) {
-      grid.innerHTML = '<div class="lp-empty">No loadpoints configured.</div>';
+      grid.innerHTML = '<div class="lp-empty">No chargers configured.</div>';
     } else {
       grid.innerHTML = lps.map(lp => loadpointCard(lp, plan)).join('');
     }
@@ -312,7 +318,7 @@
     const sub = document.getElementById('loadpoints-subtitle');
     if (sub) {
       const planMode = plan && plan.plan ? plan.plan.mode : 'no plan';
-      sub.textContent = `${lps.length} loadpoint${lps.length === 1 ? '' : 's'} · planner: ${planMode}`;
+      sub.textContent = `${lps.length} charger${lps.length === 1 ? '' : 's'} · planner: ${planMode}`;
     }
   }
 
@@ -326,7 +332,7 @@
     cell.innerHTML =
       `<input type="number" class="lp-soc-input" min="0" max="100" step="0.1" value="${cur}" ` +
       `style="width:64px;font-family:var(--mono)"> ` +
-      `<button class="lp-soc-save" type="button" data-lp="${socEditingId}" title="Save">✓</button> ` +
+      `<button class="lp-soc-save" type="button" data-lp="${escapeHtml(socEditingId)}" title="Save">✓</button> ` +
       `<button class="lp-soc-cancel" type="button" title="Cancel">✗</button> ` +
       `<span class="lp-soc-msg" style="color:var(--red-e,#c23b3b);font-size:0.8em;margin-left:6px"></span>`;
     const inp = cell.querySelector('.lp-soc-input');
@@ -344,7 +350,7 @@
     apiFetch('/api/loadpoints/' + encodeURIComponent(btn.dataset.lp) + '/soc', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ soc_pct: val }),
+      body: JSON.stringify({ soc: val / 100 }),
     })
       .then(r => r.json().then(j => ({ ok: r.ok, body: j })))
       .then(res => {
@@ -379,8 +385,8 @@
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         duration_s: duration,
-        min_battery_soc_pct: reserve,
-        ev_target_soc_pct: target,
+        min_battery_soc: reserve / 100,
+        ev_target_soc: target ? target / 100 : 0,
         departure_at_ms: departure,
       }),
     })

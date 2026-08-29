@@ -23,7 +23,7 @@ func (s *Server) handleComponents(w http.ResponseWriter, r *http.Request) {
 			"protocol_version":     components.OptimizerProtocolVersion,
 			"protocol_min_version": components.OptimizerProtocolMinVersion,
 		},
-		"drivers":                 map[string]any{"host_api": components.DriverHostAPIVersion},
+		"drivers": map[string]any{"host_api": components.DriverHostAPIVersion},
 	}
 	if s.deps.MPC != nil && s.deps.MPC.Optimizer != nil {
 		optimizer := map[string]any{
@@ -65,6 +65,9 @@ func (s *Server) handleComponents(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.deps.DriverRepository != nil {
 		result["drivers"] = s.deps.DriverRepository.Status()
+	}
+	if s.deps.Bundle != nil {
+		result["bundle"] = s.deps.Bundle
 	}
 	if s.deps.SelfUpdate != nil {
 		result["updates"] = map[string]any{

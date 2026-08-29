@@ -52,6 +52,27 @@
     };
   }
 
+  // In a single-image bundle (the Home Assistant add-on) Core and the
+  // Optimizer ship and update together under one bundled FTW release, and
+  // the host platform owns update and rollback. Showing per-container
+  // versions and update buttons there would only mislead.
+  function bundleDisplay(d) {
+    d = d || {};
+    var bundle = d.bundle || {};
+    // Deliberately literal: /api/components' Bundle is generic over Kind, but
+    // the collapsed row is not — a new bundle kind needs its own branch here,
+    // and falls back to the per-component view until it gets one.
+    if (bundle.kind !== "home_assistant_addon") return null;
+    var ftwVersion = (d.core || {}).version || "dev";
+    return {
+      ftwVersion: ftwVersion,
+      bundleVersion: bundle.version || "",
+      note: "FTW " + ftwVersion + " is bundled with the Home Assistant add-on" +
+        (bundle.version ? " " + bundle.version : "") +
+        ". Home Assistant manages updates and rollback.",
+    };
+  }
+
   function bar(percent) {
     var p = Math.max(0, Math.min(100, Number(percent) || 0));
     return '<div class="sys-bar"><div class="sys-bar-fill" style="width:' + p.toFixed(1) + '%"></div></div>';
@@ -75,6 +96,20 @@
 		'  .sys-help-actions { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }' +
 		'  .sys-help-secondary { margin:10px 0 0; color:var(--text-dim); font-size:0.8rem; }' +
         '</style>' +
+        '<fieldset>' +
+        '<legend>LAN password</legend>' +
+        '<p class="sys-meta" id="sys-lan-auth-status">…</p>' +
+        '<label for="sys-lan-auth-password">Password</label>' +
+        '<input type="password" id="sys-lan-auth-password" autocomplete="new-password">' +
+        '<label for="sys-lan-auth-confirm">Confirm</label>' +
+        '<input type="password" id="sys-lan-auth-confirm" autocomplete="new-password">' +
+        '<div class="sys-help-actions" style="margin-top:10px">' +
+        '  <button class="btn-add" type="button" id="sys-lan-auth-enable">Enable</button>' +
+        '  <button class="btn-add" type="button" id="sys-lan-auth-disable">Disable</button>' +
+        '</div>' +
+        '<p class="sys-help-secondary" id="sys-lan-auth-msg"></p>' +
+        '<p class="sys-help-secondary">Asks for this password on the LAN before settings and writes. Live status stays visible. curl still uses Bearer.</p>' +
+        '</fieldset>' +
         '<fieldset>' +
         '<legend>Host</legend>' +
         '<div class="sys-grid">' +
@@ -225,17 +260,34 @@
           var planTime = optimizerState.lastPlanAtMs
             ? " Last plan: " + new Date(optimizerState.lastPlanAtMs).toLocaleString() + "."
             : "";
-          el.innerHTML =
-            '<div class="sys-row"><span class="sys-label">Core</span><span>' + escHtml(core.version || "dev") +
-              ' · ' + escHtml(release.channel || "native") + '</span><span class="sys-value">safety</span></div>' +
-            '<div class="sys-row"><span class="sys-label">Optimizer</span><span>' + escHtml(optimizerState.label) +
-              '</span><span><button class="btn-add" id="sys-update-optimizer" type="button">Update</button>' +
-              ((previousImages.optimizer || (updateStatus.previous_image_id && updateStatus.component === "optimizer")) ? ' <button class="btn-add" id="sys-rollback-optimizer" type="button">Rollback</button>' : '') + '</span></div>' +
-            (optimizerState.warning ? '<div class="sys-alert" role="alert"><strong>' + escHtml(optimizerState.warning) + '</strong>' + escHtml(planTime) + '</div>' : '') +
+          var bundled = bundleDisplay(d);
+          var warningHTML = optimizerState.warning
+            ? '<div class="sys-alert" role="alert"><strong>' + escHtml(optimizerState.warning) + '</strong>' + escHtml(planTime) + '</div>'
+            : '';
+          var driversHTML =
             '<div class="sys-row"><span class="sys-label">Drivers</span><span>host API ' +
               escHtml(drivers.driver_host_api || drivers.host_api || 1) + ' · ' + active +
-              ' managed</span><button class="btn-add" id="sys-refresh-drivers" type="button">Refresh</button></div>' +
-            '<div class="sys-meta" id="sys-component-action" style="grid-column:1/-1"></div>';
+              ' managed</span><button class="btn-add" id="sys-refresh-drivers" type="button">Refresh</button></div>';
+          var actionHTML = '<div class="sys-meta" id="sys-component-action" style="grid-column:1/-1"></div>';
+          if (bundled) {
+            el.innerHTML =
+              '<div class="sys-row"><span class="sys-label">FTW</span><span>' + escHtml(bundled.ftwVersion) +
+                '</span><span class="sys-value">bundled</span></div>' +
+              warningHTML +
+              driversHTML +
+              '<div class="sys-meta" style="grid-column:1/-1">' + escHtml(bundled.note) + '</div>' +
+              actionHTML;
+          } else {
+            el.innerHTML =
+              '<div class="sys-row"><span class="sys-label">Core</span><span>' + escHtml(core.version || "dev") +
+                ' · ' + escHtml(release.channel || "native") + '</span><span class="sys-value">safety</span></div>' +
+              '<div class="sys-row"><span class="sys-label">Optimizer</span><span>' + escHtml(optimizerState.label) +
+                '</span><span><button class="btn-add" id="sys-update-optimizer" type="button">Update</button>' +
+                ((previousImages.optimizer || (updateStatus.previous_image_id && updateStatus.component === "optimizer")) ? ' <button class="btn-add" id="sys-rollback-optimizer" type="button">Rollback</button>' : '') + '</span></div>' +
+              warningHTML +
+              driversHTML +
+              actionHTML;
+          }
           var status = document.getElementById("sys-component-action");
           var optimizerBtn = document.getElementById("sys-update-optimizer");
           if (optimizerBtn) optimizerBtn.onclick = function () {
@@ -269,11 +321,92 @@
         });
       }
 
+      function setLanMsg(txt) {
+        var el = document.getElementById("sys-lan-auth-msg");
+        if (el) el.textContent = txt || "";
+      }
+
+      function lanStatusText(d) {
+        if (!d || typeof d !== "object") return "Status unavailable";
+        if (d.lan_auth && d.configured) return "On — password is set";
+        if (d.lan_auth && !d.configured) return "On — no password stored";
+        if (!d.lan_auth && d.configured) return "Off — password is stored";
+        return "Off";
+      }
+
+      function refreshLanAuth() {
+        apiFetch("/api/auth/status").then(function (r) { return r.json(); }).then(function (d) {
+          var statusEl = document.getElementById("sys-lan-auth-status");
+          if (statusEl) statusEl.textContent = lanStatusText(d);
+          var disableBtn = document.getElementById("sys-lan-auth-disable");
+          if (disableBtn) disableBtn.disabled = !d.lan_auth;
+        }).catch(function () {
+          var statusEl = document.getElementById("sys-lan-auth-status");
+          if (statusEl) statusEl.textContent = "Status unavailable";
+        });
+      }
+
+      var enableBtn = document.getElementById("sys-lan-auth-enable");
+      if (enableBtn) enableBtn.onclick = function () {
+        var pwEl = document.getElementById("sys-lan-auth-password");
+        var cfEl = document.getElementById("sys-lan-auth-confirm");
+        var pw = pwEl ? pwEl.value : "";
+        var cf = cfEl ? cfEl.value : "";
+        if (pw.length < 10) {
+          setLanMsg("Password must be at least 10 characters");
+          return;
+        }
+        if (pw !== cf) {
+          setLanMsg("Password and confirm do not match");
+          return;
+        }
+        enableBtn.disabled = true;
+        setLanMsg("");
+        apiFetch("/api/auth/password", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ password: pw, enabled: true }),
+        }).then(function (r) {
+          return r.json().then(function (body) {
+            if (!r.ok) throw new Error(body.error || "enable failed");
+            if (pwEl) pwEl.value = "";
+            if (cfEl) cfEl.value = "";
+            setLanMsg("LAN password is on");
+            refreshLanAuth();
+          });
+        }).catch(function (err) {
+          setLanMsg(err.message || "enable failed");
+        }).then(function () {
+          enableBtn.disabled = false;
+        });
+      };
+
+      var disableBtn = document.getElementById("sys-lan-auth-disable");
+      if (disableBtn) disableBtn.onclick = function () {
+        disableBtn.disabled = true;
+        setLanMsg("");
+        apiFetch("/api/auth/password", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: false }),
+        }).then(function (r) {
+          return r.json().then(function (body) {
+            if (!r.ok) throw new Error(body.error || "disable failed");
+            setLanMsg("LAN password is off");
+            refreshLanAuth();
+          });
+        }).catch(function (err) {
+          setLanMsg(err.message || "disable failed");
+          disableBtn.disabled = false;
+        });
+      };
+
       refresh();
       refreshComponents();
+      refreshLanAuth();
       if (window._systemStatusTimer) clearInterval(window._systemStatusTimer);
       window._systemStatusTimer = setInterval(refresh, 5000);
     },
   };
-  S.tabs.system._pure = { optimizerStatus: optimizerStatus };
+  S.tabs.system._pure = { optimizerStatus: optimizerStatus, bundleDisplay: bundleDisplay };
 })();

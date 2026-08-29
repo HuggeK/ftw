@@ -288,20 +288,100 @@ func TestStorePreservesSoCWhenMissing(t *testing.T) {
 	s := NewStore()
 	soc := 0.97
 	s.Update("ferroamp", DerBattery, -1500, &soc, nil)
-	if r := s.Get("ferroamp", DerBattery); r == nil || r.SoC == nil || *r.SoC != 0.97 {
+	r := s.Get("ferroamp", DerBattery)
+	if r == nil || r.SoC == nil || *r.SoC != 0.97 {
 		t.Fatalf("first update: SoC not stored, got %+v", r)
+	}
+	if r.SoCUpdatedAt.IsZero() || !r.SoCUpdatedAt.Equal(r.UpdatedAt) {
+		t.Fatalf("first update: SoC source time = %v, reading time = %v", r.SoCUpdatedAt, r.UpdatedAt)
+	}
+	firstSoCUpdatedAt := r.SoCUpdatedAt
+	if samples := s.FlushSamples(); len(samples) != 2 || samples[1].Metric != "battery_soc" {
+		t.Fatalf("first update samples = %+v, want power plus fresh SoC", samples)
 	}
 	// Next tick: power update only, no SoC.
 	s.Update("ferroamp", DerBattery, -1450, nil, nil)
-	r := s.Get("ferroamp", DerBattery)
+	r = s.Get("ferroamp", DerBattery)
 	if r == nil || r.SoC == nil || *r.SoC != 0.97 {
 		t.Errorf("SoC should be preserved across nil-update, got %+v", r)
+	}
+	if !r.SoCUpdatedAt.Equal(firstSoCUpdatedAt) {
+		t.Errorf("power-only update changed SoC source time: got %v want %v", r.SoCUpdatedAt, firstSoCUpdatedAt)
+	}
+	if samples := s.FlushSamples(); len(samples) != 1 || samples[0].Metric != "battery_w" {
+		t.Fatalf("power-only samples = %+v, want no synthetic SoC sample", samples)
 	}
 	// Fresh SoC overwrites.
 	soc2 := 0.95
 	s.Update("ferroamp", DerBattery, -1400, &soc2, nil)
-	if r := s.Get("ferroamp", DerBattery); r == nil || r.SoC == nil || *r.SoC != 0.95 {
+	r = s.Get("ferroamp", DerBattery)
+	if r == nil || r.SoC == nil || *r.SoC != 0.95 {
 		t.Errorf("fresh SoC should overwrite, got %+v", r)
+	}
+	if r == nil || !r.SoCUpdatedAt.Equal(r.UpdatedAt) {
+		t.Fatalf("fresh SoC source time = %v, reading time = %v", r.SoCUpdatedAt, r.UpdatedAt)
+	}
+	if samples := s.FlushSamples(); len(samples) != 2 || samples[1].Metric != "battery_soc" {
+		t.Fatalf("fresh update samples = %+v, want power plus SoC", samples)
+	}
+}
+
+func TestStorePreservesVehicleSoCWhenDriverReplaysCache(t *testing.T) {
+	s := NewStore()
+	freshSoC := 0.61
+	s.Update("tesla", DerVehicle, 0, &freshSoC, json.RawMessage(`{"soc_fresh":true}`))
+	first := s.Get("tesla", DerVehicle)
+	if first == nil || first.SoC == nil || first.SoCUpdatedAt.IsZero() {
+		t.Fatalf("fresh vehicle update = %+v", first)
+	}
+	firstSoCUpdatedAt := first.SoCUpdatedAt
+	if samples := s.FlushSamples(); len(samples) != 2 || samples[1].Metric != "vehicle_soc" {
+		t.Fatalf("fresh vehicle samples = %+v, want power plus SoC", samples)
+	}
+
+	cachedSoC := 0.62 // cached replays must not replace the last proven value
+	s.Update("tesla", DerVehicle, 0, &cachedSoC, json.RawMessage(`{"soc_fresh":false}`))
+	got := s.Get("tesla", DerVehicle)
+	if got == nil || got.SoC == nil || *got.SoC != freshSoC {
+		t.Fatalf("cached vehicle replay replaced SoC: %+v", got)
+	}
+	if !got.SoCUpdatedAt.Equal(firstSoCUpdatedAt) {
+		t.Fatalf("cached replay changed SoC observation time: got %v want %v", got.SoCUpdatedAt, firstSoCUpdatedAt)
+	}
+	if samples := s.FlushSamples(); len(samples) != 1 || samples[0].Metric != "vehicle_w" {
+		t.Fatalf("cached vehicle samples = %+v, want no synthetic SoC sample", samples)
+	}
+}
+
+func TestStoreFailsClosedOnInvalidVehicleSoCFreshness(t *testing.T) {
+	for _, data := range []json.RawMessage{
+		json.RawMessage(`{"soc_fresh":"yes"}`),
+		json.RawMessage(`{"soc_fresh":null}`),
+		json.RawMessage(`{`),
+	} {
+		s := NewStore()
+		soc := 0.61
+		s.Update("vehicle", DerVehicle, 0, &soc, data)
+		got := s.Get("vehicle", DerVehicle)
+		if got == nil || got.SoC != nil || !got.SoCUpdatedAt.IsZero() {
+			t.Fatalf("invalid freshness %q produced a fresh observation: %+v", data, got)
+		}
+		if samples := s.FlushSamples(); len(samples) != 1 || samples[0].Metric != "vehicle_w" {
+			t.Fatalf("invalid freshness %q samples = %+v, want power only", data, samples)
+		}
+	}
+}
+
+func TestStoreDropsCachedVehicleSoCWithoutFreshPredecessor(t *testing.T) {
+	s := NewStore()
+	cachedSoC := 0.61
+	s.Update("vehicle", DerVehicle, 0, &cachedSoC, json.RawMessage(`{"soc_fresh":false}`))
+	got := s.Get("vehicle", DerVehicle)
+	if got == nil || got.SoC != nil || !got.SoCUpdatedAt.IsZero() {
+		t.Fatalf("cached SoC without a fresh predecessor = %+v, want no SoC", got)
+	}
+	if samples := s.FlushSamples(); len(samples) != 1 || samples[0].Metric != "vehicle_w" {
+		t.Fatalf("cached first samples = %+v, want power only", samples)
 	}
 }
 
@@ -355,6 +435,22 @@ func TestSumOnlineEVWSumsAllOnline(t *testing.T) {
 	s.DriverHealthMut("easee-2").RecordSuccess()
 	if got := s.SumOnlineEVW(); got != 7200 {
 		t.Errorf("want 7200, got %f", got)
+	}
+}
+
+// A charger that cannot take a command is still drawing. DeviceFault must
+// not drop that watts from the house-vs-car split — that is how the phone
+// app showed EV at 0 W while the LAN dashboard showed 11 kW.
+func TestSumOnlineEVWCountsAFaultedDriver(t *testing.T) {
+	s := NewStore()
+	s.Update("easee", DerEV, 11400, nil, nil)
+	s.DriverHealthMut("easee").RecordSuccess()
+	s.SetDriverDeviceFault("easee", true, "setpoint refused")
+	if s.DriverHealth("easee").IsOnline() {
+		t.Fatal("precondition: a faulted charger is not online for control")
+	}
+	if got := s.SumOnlineEVW(); got != 11400 {
+		t.Errorf("faulted charger draw = %f, want 11400", got)
 	}
 }
 
@@ -500,5 +596,47 @@ func TestWatchdogPerDriverOverride(t *testing.T) {
 	}
 	if !flipped["tesla"] {
 		t.Errorf("tesla should flip stale at 6 min under 5-min override; transitions=%+v", transitions)
+	}
+}
+
+func TestValidateReadingSiteConventionAndFractions(t *testing.T) {
+	soc := 0.55
+	if err := ValidateReading(DerPV, -1200, nil); err != nil {
+		t.Fatalf("valid PV: %v", err)
+	}
+	if err := ValidateReading(DerPV, 50, nil); err == nil {
+		t.Fatal("positive PV must be rejected")
+	}
+	if err := ValidateReading(DerEV, -10, nil); err == nil {
+		t.Fatal("negative EV must be rejected")
+	}
+	if err := ValidateReading(DerEV, 4140, nil); err != nil {
+		t.Fatalf("charging EV: %v", err)
+	}
+	if err := ValidateReading(DerBattery, 2000, &soc); err != nil {
+		t.Fatalf("battery charge + fraction SoC: %v", err)
+	}
+	pct := 55.0
+	if err := ValidateReading(DerBattery, 0, &pct); err == nil {
+		t.Fatal("percent SoC must be rejected at the telemetry boundary")
+	}
+	neg := -0.01
+	if err := ValidateReading(DerBattery, 0, &neg); err == nil {
+		t.Fatal("negative SoC must be rejected")
+	}
+	over := 1.02
+	if err := ValidateReading(DerBattery, 0, &over); err == nil {
+		t.Fatal("SoC 1.02 must be rejected (not silently folded to 1%)")
+	}
+	nan := math.NaN()
+	if err := ValidateReading(DerMeter, nan, nil); err == nil {
+		t.Fatal("NaN power must be rejected")
+	}
+	if err := ValidateReading(DerBattery, 0, &nan); err == nil {
+		t.Fatal("NaN SoC must be rejected")
+	}
+	inf := math.Inf(1)
+	if err := ValidateReading(DerMeter, inf, nil); err == nil {
+		t.Fatal("+Inf power must be rejected")
 	}
 }

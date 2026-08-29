@@ -59,11 +59,10 @@ import { FtwElement, ftwDebugDelay } from "./ftw-element.js";
 // idle/balanced" threshold (in watts, magnitude). Used by:
 //   - this component (beam activation, sub-label "idle / charging /
 //     generating", aggregated-bubble greyscale, self-powered %)
-//   - web/app.js per-planet object construction (mirrors via
-//     window.FTW_FLOW_IDLE_W set below — non-module script, can't
-//     import; falls back to the same literal if this module hasn't
-//     loaded yet)
-//
+//   - energy-flow-readings.js (and the phone app's copy of that mapping)
+//     via window.FTW_FLOW_IDLE_W. Classic app.js cannot import; it falls
+//     back to the same literal if this module has not loaded yet.
+
 // Inclusive comparison everywhere: |kW| <= threshold ⇒ idle, strictly
 // > threshold ⇒ active. So at exactly 42 W the planet is idle AND the
 // beam is inactive — no mixed state at the boundary.
@@ -234,6 +233,15 @@ class FtwEnergyFlow extends FtwElement {
     .sv-hub-value  { font-family: var(--mono); font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }
     .sv-hub-label  { font-family: var(--mono); font-size: 9px; letter-spacing: 0.1em; }
     .sv-hub-sub    { font-family: var(--mono); font-size: 9px; letter-spacing: 0.06em; font-variant-numeric: tabular-nums; }
+    /* static — the caller's claim that these readings are not live (the
+       FTW app shows a cached snapshot before it reconnects). Animation is
+       a statement about *now*, so everything that moves holds still: CSS
+       dashes and rings pause here, and afterRender() skips the particle
+       loop entirely. Numbers and colours keep saying what they said. */
+    :host([static]) svg *,
+    :host([static]) .ring {
+      animation-play-state: paused !important;
+    }
     .ef-clickable { cursor: pointer; outline: none; }
     .ef-clickable:focus-visible > circle { stroke-width: 3; filter: drop-shadow(0 0 4px var(--accent-e, #f5b942)); }
     /* One dash cycle advances by exactly (dash + gap). The fwd/rev pair
@@ -453,6 +461,9 @@ class FtwEnergyFlow extends FtwElement {
     }
   `;
 
+  static get observedAttributes() { return ["static"]; }
+  attributeChangedCallback() { this.update(); }
+
   constructor() {
     super();
     // Start with empty clusters; render shows placeholder slots until the
@@ -549,7 +560,10 @@ class FtwEnergyFlow extends FtwElement {
   // `planets` leaves the previous cluster intact (useful during
   // transient /api/status errors so the diagram doesn't blank out).
   setReadings(r) {
-    if (r.load != null)         this._readings.load    = r.load;
+    // `in` so an explicit null (stale meter, unknown house load) replaces
+    // a previous number. `!= null` would keep drawing the last 0 W as if
+    // the house were idle.
+    if ("load" in r)              this._readings.load    = r.load;
     if (Array.isArray(r.planets)) this._readings.planets = r.planets;
     // Optional today's-totals payload pushed through to the central
     // hub render. selfPoweredPctToday is the share of consumption
@@ -736,6 +750,9 @@ class FtwEnergyFlow extends FtwElement {
         if (g) { e.preventDefault(); fire(g); }
       });
     }
+    // Static means "not now": a cached view must hold still, because a
+    // moving particle is a claim that power is flowing at this moment.
+    if (this.hasAttribute("static")) return;
     const nodes = this.shadowRoot.querySelectorAll('.ef-p');
     if (!nodes.length || !this._particles.length) return;
     // Wire each DOM node to its param slot. `render()` assigned indices
@@ -819,21 +836,24 @@ class FtwEnergyFlow extends FtwElement {
 
   render() {
     const { load } = this._readings;
+    const loadKnown = load != null && Number.isFinite(Number(load));
 
     // Self-powered % for the visible site demand — house load plus any
     // active EV charger. When EV is excluded, a 9 kW car charge can make a
     // PV+battery-covered house display 0 % simply because grid import exceeds
     // the house-only load. The energy-flow diagram shows the EV as part of the
     // live balance, so the denominator should match what is on screen.
+    // Unknown load (stale meter) is not 0 % — that would claim the house
+    // is fully self-powered while we cannot see it.
     let selfPoweredPct = null;
-    {
+    if (loadKnown) {
       let gridImport = 0;
       for (const p of (this._readings.planets || [])) {
-        if (p.role === "grid" && p.toHub) gridImport += Math.max(0, p.kw || 0);
+        if (p.role === "grid" && !p.placeholder && p.toHub) gridImport += Math.max(0, p.kw || 0);
       }
       let evDemandKw = 0;
       for (const p of (this._readings.planets || [])) {
-        if (p.role === "ev") evDemandKw += Math.max(0, p.kw || 0);
+        if (p.role === "ev" && !p.placeholder) evDemandKw += Math.max(0, p.kw || 0);
       }
       const consumptionKw = (Math.abs(load) || 0) + evDemandKw;
       if (!isIdleKw(consumptionKw)) {
@@ -1131,8 +1151,11 @@ class FtwEnergyFlow extends FtwElement {
         <!-- HOUSE / hub: load reading lives here. Kept outside both
              aggregation layers because the hub value (instantaneous
              house load) is identical in both views, so there's no
-             reason to duplicate it. -->
-        <g class="ef-hub">
+             reason to duplicate it. Clickable like a planet, so the host
+             can open the house's own live reading — the click handler
+             reads data-role and fires ftw-planet-click with role "load". -->
+        <g class="ef-hub ef-clickable" data-role="load" data-name="" data-id=""
+           tabindex="0" role="button" aria-label="${loadKnown ? "House load, live" : "House load, no data"}">
           <circle cx="${CX}" cy="${P.cy}" r="${P.hubR}"
                   fill="var(--hero-house-fill)"
                   stroke="var(--hero-house-stroke)" stroke-width="1.5"/>
@@ -1148,7 +1171,7 @@ class FtwEnergyFlow extends FtwElement {
           </g>
           <text x="${CX}" y="${P.hubValueY}" text-anchor="middle"
                 fill="var(--hero-load-text)" class="sv-hub-value">
-            ${fmtKw(load)}
+            ${loadKnown ? fmtKw(load) : "—"}
           </text>
           ${selfPoweredPct !== null ? `
           <text x="${CX}" y="${P.hubSelfNowY}" text-anchor="middle"

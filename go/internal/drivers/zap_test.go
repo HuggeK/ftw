@@ -84,7 +84,7 @@ func readingData(t *testing.T, reading *telemetry.DerReading) map[string]any {
 	return data
 }
 
-func TestZapOfficialLocalAPIMapsAllDERs(t *testing.T) {
+func TestZapReadsP1MeterOnly(t *testing.T) {
 	stub := zapAPIStub{
 		crypto: map[string]any{
 			"deviceName":   "software_zap",
@@ -122,39 +122,21 @@ func TestZapOfficialLocalAPIMapsAllDERs(t *testing.T) {
 			"INV-1": map[string]any{
 				"pv": map[string]any{
 					"W": -2500, "rated_power_W": 8000, "total_generation_Wh": 10000,
-					"mppt1_V": 410.2, "mppt1_A": -6.1, "heatsink_C": 42.5,
 				},
 				"battery": map[string]any{
 					"W": 500, "rated_power_W": 5000, "SoC_nom_fract": 0.75,
-					"V": 48.2, "A": 10.4, "heatsink_C": 25.0,
-					"lower_limit_W": -4500, "upper_limit_W": 5000,
-					"total_charge_Wh": 8000, "total_discharge_Wh": 7200,
 				},
 			},
 			"INV-2": map[string]any{"pv": map[string]any{
 				"W": -1250, "rated_power_W": 6000, "total_generation_Wh": 20000,
 			}},
 			"V2X-1": map[string]any{"v2x_charger": map[string]any{
-				"W": -3000, "ac_W": -3000, "rated_power_W": 11000, "vehicle_soc_fract": 0.60,
-				"status": "discharging", "protocol": "ISO_15118_20", "control_mode": "dynamic_bpt",
-				"connector_status": "occupied", "charging_state": "discharging",
-				"plug_connected": true, "V": 230.5, "A": -13.0, "Hz": 49.98,
-				"L1_V": 232.8, "L1_A": -13.0, "L1_W": -3026,
-				"L2_V": 230.9, "L2_A": 0.0, "L2_W": 0,
-				"L3_V": 230.2, "L3_A": 0.0, "L3_W": 0,
-				"dc_W": -3150, "dc_V": 400, "dc_A": -7.875,
-				"ev_target_energy_req_Wh": 5300, "ev_max_energy_req_Wh": 18100,
-				"ev_min_energy_req_Wh": -25800, "session_charge_Wh": 50,
-				"session_discharge_Wh": 1250, "total_charge_Wh": 142000,
-				"total_discharge_Wh": 5100,
+				"W": -3000, "vehicle_soc_fract": 0.60,
 			}},
 		},
 	}
 
 	tel, env, _ := loadZapForTest(t, stub, nil)
-	if !env.BatteryTelemetryOnly {
-		t.Fatal("Zap read_only catalog metadata must automatically admit battery telemetry")
-	}
 	makeName, serial := env.Identity()
 	if makeName != "Sourceful" || serial != "zap-04772a97" {
 		t.Fatalf("identity = %q/%q, want Sourceful/zap-04772a97", makeName, serial)
@@ -172,61 +154,155 @@ func TestZapOfficialLocalAPIMapsAllDERs(t *testing.T) {
 		t.Fatalf("meter energy aliases = %+v", meterData)
 	}
 
-	pv := tel.Get("sourceful-zap", telemetry.DerPV)
-	if pv == nil || pv.RawW != -3750 {
-		t.Fatalf("PV = %+v, want aggregate -3750W", pv)
+	if got := tel.Get("sourceful-zap", telemetry.DerPV); got != nil {
+		t.Fatalf("Zap must not ingest PV from attached inverters: %+v", got)
 	}
-	pvData := readingData(t, pv)
-	if pvData["lifetime_wh"] != float64(30000) || pvData["total_generation_wh"] != float64(30000) {
-		t.Fatalf("PV lifetime = %+v, want 30000Wh", pvData)
+	if got := tel.Get("sourceful-zap", telemetry.DerBattery); got != nil {
+		t.Fatalf("Zap must not ingest battery from attached inverters: %+v", got)
 	}
-	if pvData["rated_power_w"] != float64(14000) {
-		t.Fatalf("PV aggregate rating = %v, want 14000W", pvData["rated_power_w"])
+	if got := tel.Get("sourceful-zap", telemetry.DerV2X); got != nil {
+		t.Fatalf("Zap must not ingest V2X from attached chargers: %+v", got)
 	}
 
-	battery := tel.Get("sourceful-zap", telemetry.DerBattery)
-	if battery == nil || battery.RawW != 500 || battery.SoC == nil || *battery.SoC != 0.75 {
-		t.Fatalf("battery = %+v, want +500W charge at 75%%", battery)
-	}
-	batteryData := readingData(t, battery)
-	if batteryData["discharge_capable"] != true || batteryData["charge_capable"] != true {
-		t.Fatalf("battery capability mapping = %+v", batteryData)
-	}
-	if batteryData["capacity_wh"] != float64(10000) || batteryData["total_charge_wh"] != float64(8000) {
-		t.Fatalf("battery capacity/energy mapping = %+v", batteryData)
-	}
-
-	v2x := tel.Get("sourceful-zap", telemetry.DerV2X)
-	if v2x == nil || v2x.RawW != -3000 || v2x.SoC == nil || *v2x.SoC != 0.60 {
-		t.Fatalf("V2X = %+v, want -3000W at 60%%", v2x)
-	}
-	v2xData := readingData(t, v2x)
-	if v2xData["connected"] != true || v2xData["dc_w"] != float64(-3150) {
-		t.Fatalf("V2X mapping = %+v", v2xData)
-	}
-	if v2xData["protocol"] != "ISO_15118_20" || v2xData["control_mode"] != "dynamic_bpt" ||
-		v2xData["connector_status"] != "occupied" || v2xData["charging_state"] != "discharging" ||
-		v2xData["ac_w"] != float64(-3000) || v2xData["ac_v"] != 230.5 ||
-		v2xData["l1_w"] != float64(-3026) {
-		t.Fatalf("V2X electrical/protocol mapping = %+v", v2xData)
-	}
-	if v2xData["ev_target_energy_req_wh"] != float64(5300) ||
-		v2xData["ev_min_energy_req_wh"] != float64(-25800) ||
-		v2xData["capacity_wh"] != float64(77000) {
-		t.Fatalf("V2X energy/capacity mapping = %+v", v2xData)
-	}
-
-	// Zap's `enabled` flag is a Novacore publish switch, not a local-read
-	// switch. All four DER kinds above deliberately use enabled=false.
-	if _, _, ok := tel.LatestMetric("sourceful-zap", "pv_w_inv_1"); !ok {
-		t.Fatal("expected per-inverter PV diagnostic for multi-PV Zap")
-	}
-	if value, _, ok := tel.LatestMetric("sourceful-zap", "v2x_ev_min_energy_req_wh"); !ok || value != -25800 {
-		t.Fatalf("V2X signed energy diagnostic = %v %v, want -25800 Wh", value, ok)
+	count, _, ok := tel.LatestMetric("sourceful-zap", "other_resources")
+	if !ok || count != 3 {
+		t.Fatalf("other_resources = %v %v, want 3 (PV, battery, charger)", count, ok)
 	}
 }
 
-func TestZapPVOnlyWorksWithoutP1Meter(t *testing.T) {
+func mixedZapSite() zapAPIStub {
+	return zapAPIStub{
+		crypto: map[string]any{
+			"deviceName":   "software_zap",
+			"serialNumber": "zap-04772a97",
+			"publicKey":    "04a1b2c3",
+		},
+		devices: map[string]any{"count": 4, "devices": []any{
+			map[string]any{
+				"type": "p1_uart", "device_type": "energy_meter", "sn": "p1-main",
+				"ders": []any{map[string]any{"type": "meter", "enabled": false}},
+			},
+			map[string]any{
+				"type": "modbus_tcp", "device_type": "inverter", "sn": "INV-1",
+				"ders": []any{
+					map[string]any{"type": "pv", "enabled": false, "rated_power": 8000},
+					map[string]any{"type": "battery", "enabled": false, "rated_power": 5000, "capacity": 10000},
+				},
+			},
+			map[string]any{
+				"type": "modbus_tcp", "device_type": "inverter", "sn": "INV-2",
+				"ders": []any{map[string]any{"type": "pv", "enabled": false, "rated_power": 6000}},
+			},
+			map[string]any{
+				"type": "mqtt", "device_type": "v2x_charger", "sn": "V2X-1",
+				"ders": []any{map[string]any{"type": "v2x_charger", "enabled": false, "capacity": 77000}},
+			},
+		}},
+		snapshots: map[string]any{
+			"p1-main": map[string]any{"meter": map[string]any{
+				"W": -33, "L1_W": 208, "L2_W": -62, "L3_W": -179,
+				"L1_V": 230.1, "L2_V": 229.9, "L3_V": 230.4,
+				"L1_A": 1.1, "L2_A": 0.8, "L3_A": 0.9, "Hz": 50.01,
+				"total_import_Wh": 123456, "total_export_Wh": 65432,
+			}},
+			"INV-1": map[string]any{
+				"pv": map[string]any{
+					"W": -2500, "rated_power_W": 8000, "total_generation_Wh": 10000,
+				},
+				"battery": map[string]any{
+					"W": 500, "rated_power_W": 5000, "SoC_nom_fract": 0.75,
+				},
+			},
+			"INV-2": map[string]any{"pv": map[string]any{
+				"W": -1250, "rated_power_W": 6000, "total_generation_Wh": 20000,
+			}},
+			"V2X-1": map[string]any{"v2x_charger": map[string]any{
+				"W": -3000, "vehicle_soc_fract": 0.60,
+			}},
+		},
+	}
+}
+
+func TestZapReadsPVWhenOptedIn(t *testing.T) {
+	tel, _, _ := loadZapForTest(t, mixedZapSite(), map[string]any{"read_pv": true})
+
+	meter := tel.Get("sourceful-zap", telemetry.DerMeter)
+	if meter == nil || meter.RawW != -33 {
+		t.Fatalf("meter = %+v, want -33W export", meter)
+	}
+
+	pv := tel.Get("sourceful-zap", telemetry.DerPV)
+	if pv == nil {
+		t.Fatal("expected aggregated PV from Zap-listed inverters")
+	}
+	if pv.RawW != -3750 {
+		t.Fatalf("pv = %+v, want -3750W (INV-1 + INV-2)", pv)
+	}
+	pvData := readingData(t, pv)
+	if pvData["rated_w"] != float64(14000) {
+		t.Fatalf("pv rated_w = %+v, want 14000", pvData["rated_w"])
+	}
+	if pvData["lifetime_wh"] != float64(30000) {
+		t.Fatalf("pv lifetime_wh = %+v, want 30000", pvData["lifetime_wh"])
+	}
+
+	if got := tel.Get("sourceful-zap", telemetry.DerBattery); got != nil {
+		t.Fatalf("read_pv must not ingest battery: %+v", got)
+	}
+	if got := tel.Get("sourceful-zap", telemetry.DerV2X); got != nil {
+		t.Fatalf("Zap must not ingest V2X: %+v", got)
+	}
+
+	count, _, ok := tel.LatestMetric("sourceful-zap", "other_resources")
+	if !ok || count != 2 {
+		t.Fatalf("other_resources = %v %v, want 2 (battery, charger)", count, ok)
+	}
+}
+
+func TestZapReadsBatteryWhenOptedIn(t *testing.T) {
+	tel, _, _ := loadZapForTest(t, mixedZapSite(), map[string]any{"read_battery": true})
+
+	bat := tel.Get("sourceful-zap", telemetry.DerBattery)
+	if bat == nil {
+		t.Fatal("expected battery telemetry from Zap-listed inverter")
+	}
+	if bat.RawW != 500 {
+		t.Fatalf("battery W = %+v, want 500", bat)
+	}
+	data := readingData(t, bat)
+	if data["soc"] != 0.75 {
+		t.Fatalf("battery soc = %+v, want 0.75 fraction", data["soc"])
+	}
+
+	if got := tel.Get("sourceful-zap", telemetry.DerPV); got != nil {
+		t.Fatalf("read_battery must not ingest PV: %+v", got)
+	}
+	if got := tel.Get("sourceful-zap", telemetry.DerV2X); got != nil {
+		t.Fatalf("Zap must not ingest V2X: %+v", got)
+	}
+}
+
+func TestZapReadsPVFromInverterOnlySiteWhenOptedIn(t *testing.T) {
+	stub := zapAPIStub{
+		devices: map[string]any{"devices": []any{map[string]any{
+			"type": "modbus_tcp", "device_type": "inverter", "sn": "PV-ONLY",
+			"ders": []any{map[string]any{"type": "pv", "enabled": false, "rated_power": 5000}},
+		}}},
+		snapshots: map[string]any{"PV-ONLY": map[string]any{"pv": map[string]any{
+			"W": -2400, "rated_power_W": 5000,
+		}}},
+	}
+	tel, _, _ := loadZapForTest(t, stub, map[string]any{"read_pv": true})
+	pv := tel.Get("sourceful-zap", telemetry.DerPV)
+	if pv == nil || pv.RawW != -2400 {
+		t.Fatalf("inverter-only Zap with read_pv = %+v, want -2400W", pv)
+	}
+	if got := tel.Get("sourceful-zap", telemetry.DerMeter); got != nil {
+		t.Fatalf("unexpected synthetic meter on inverter-only Zap: %+v", got)
+	}
+}
+
+func TestZapDoesNotProxyInverterWithoutMeter(t *testing.T) {
 	stub := zapAPIStub{
 		devices: map[string]any{"devices": []any{map[string]any{
 			"type": "modbus_tcp", "device_type": "inverter", "sn": "PV-ONLY",
@@ -237,11 +313,15 @@ func TestZapPVOnlyWorksWithoutP1Meter(t *testing.T) {
 		}}},
 	}
 	tel, _, _ := loadZapForTest(t, stub, nil)
-	if got := tel.Get("sourceful-zap", telemetry.DerPV); got == nil || got.RawW != -2400 {
-		t.Fatalf("PV-only Zap reading = %+v, want -2400W", got)
+	if got := tel.Get("sourceful-zap", telemetry.DerPV); got != nil {
+		t.Fatalf("inverter-only Zap must not emit PV: %+v", got)
 	}
 	if got := tel.Get("sourceful-zap", telemetry.DerMeter); got != nil {
-		t.Fatalf("unexpected synthetic meter on PV-only Zap: %+v", got)
+		t.Fatalf("unexpected synthetic meter on inverter-only Zap: %+v", got)
+	}
+	count, _, ok := tel.LatestMetric("sourceful-zap", "other_resources")
+	if !ok || count != 1 {
+		t.Fatalf("other_resources = %v %v, want 1", count, ok)
 	}
 }
 
@@ -257,45 +337,6 @@ func TestZapDoesNotInventZeroForMissingRequiredPower(t *testing.T) {
 	tel, _, _ := loadZapForTest(t, stub, nil)
 	if got := tel.Get("sourceful-zap", telemetry.DerMeter); got != nil {
 		t.Fatalf("missing meter.W must not become a synthetic zero: %+v", got)
-	}
-}
-
-func TestZapRejectsPowerOverflowAgainstNameplate(t *testing.T) {
-	stub := zapAPIStub{
-		devices: map[string]any{"devices": []any{map[string]any{
-			"type": "modbus_tcp", "device_type": "inverter", "sn": "INV-OFFLINE",
-			"ders": []any{map[string]any{"type": "pv", "rated_power": 5000}},
-		}}},
-		snapshots: map[string]any{"INV-OFFLINE": map[string]any{"pv": map[string]any{
-			"W": -65535, "rated_power_W": 5000,
-		}}},
-	}
-	tel, _, _ := loadZapForTest(t, stub, nil)
-	if got := tel.Get("sourceful-zap", telemetry.DerPV); got != nil {
-		t.Fatalf("overflow sentinel must not reach site PV: %+v", got)
-	}
-}
-
-func TestZapDisableFlagsAvoidDuplicateNativeDrivers(t *testing.T) {
-	stub := zapAPIStub{
-		devices: map[string]any{"devices": []any{map[string]any{
-			"type": "modbus_tcp", "device_type": "inverter", "sn": "HYBRID",
-			"ders": []any{
-				map[string]any{"type": "pv", "rated_power": 5000},
-				map[string]any{"type": "battery", "rated_power": 5000, "capacity": 10000},
-			},
-		}}},
-		snapshots: map[string]any{"HYBRID": map[string]any{
-			"pv":      map[string]any{"W": -1000, "rated_power_W": 5000},
-			"battery": map[string]any{"W": 500, "rated_power_W": 5000, "SoC_nom_fract": 0.5},
-		}},
-	}
-	tel, _, _ := loadZapForTest(t, stub, map[string]any{"disable_pv": true, "disable_battery": true})
-	if got := tel.Get("sourceful-zap", telemetry.DerPV); got != nil {
-		t.Fatalf("disable_pv still emitted %+v", got)
-	}
-	if got := tel.Get("sourceful-zap", telemetry.DerBattery); got != nil {
-		t.Fatalf("disable_battery still emitted %+v", got)
 	}
 }
 

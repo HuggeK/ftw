@@ -9,10 +9,11 @@ import cvxpy as cp
 import numpy as np
 
 from . import SCHEMA_VERSION
+from .deadline import SolveDeadline, SolveDeadlineExceeded
 from .protocol import ProtocolError, finite_number, positive_number, require_dict, require_list
 
 
-OPTIMAL_STATUSES = {cp.OPTIMAL, cp.OPTIMAL_INACCURATE, cp.USER_LIMIT}
+OPTIMAL_STATUSES = {cp.OPTIMAL, cp.OPTIMAL_INACCURATE}
 
 
 @dataclass
@@ -39,6 +40,144 @@ class ThermalVars:
     temperature: cp.Variable
     lower_slack: cp.Variable
     upper_slack: cp.Variable
+
+
+class ReplayConsistencyError(RuntimeError):
+    """The reported storage state cannot be replayed from reported power."""
+
+
+_REPLAY_TOLERANCE_FRACTION = 0.0002
+_REPLAY_TOLERANCE_MIN_WH = 1.0
+_STORAGE_NUMERIC_TOLERANCE_WH = 1e-6
+_STORAGE_INITIAL_ABOVE_MAXIMUM_KEY = "_optimizer_initial_above_maximum"
+
+
+def _storage_starts_above_maximum(storages: Any) -> bool:
+    return any(
+        bool(spec.get(_STORAGE_INITIAL_ABOVE_MAXIMUM_KEY, False))
+        or float(spec["initial_energy_wh"])
+        > float(spec.get("max_energy_wh", spec["capacity_wh"]))
+        for spec in storages
+    )
+
+
+def _within_storage_numeric_tolerance(value: float, bound: float) -> bool:
+    """Accept one micro-Wh of decimal input plus float representation error."""
+    return value - bound <= _STORAGE_NUMERIC_TOLERANCE_WH + max(
+        math.ulp(value), math.ulp(bound)
+    )
+
+
+def _normalize_storage_specs(
+    storages: Any,
+) -> tuple[tuple[dict[str, Any], ...], tuple[bool, ...]]:
+    """Clamp only solver-scale bound noise and retain the original guard signal."""
+    normalized: list[dict[str, Any]] = []
+    starts_above_maximum: list[bool] = []
+    for i, raw in enumerate(storages):
+        spec = require_dict(raw, f"storages[{i}]")
+        capacity = positive_number(spec.get("capacity_wh"), f"storages[{i}].capacity_wh")
+        minimum = finite_number(spec.get("min_energy_wh", 0), f"storages[{i}].min_energy_wh")
+        maximum = finite_number(
+            spec.get("max_energy_wh", capacity), f"storages[{i}].max_energy_wh"
+        )
+        initial = finite_number(spec.get("initial_energy_wh"), f"storages[{i}].initial_energy_wh")
+        if not (
+            0 <= minimum <= maximum <= capacity + _STORAGE_NUMERIC_TOLERANCE_WH
+            and 0 <= initial <= capacity + _STORAGE_NUMERIC_TOLERANCE_WH
+        ):
+            raise ProtocolError(f"storages[{i}] energy bounds are inconsistent")
+
+        model_maximum = maximum
+        if model_maximum > capacity and _within_storage_numeric_tolerance(
+            model_maximum, capacity
+        ):
+            model_maximum = capacity
+        initial_above_maximum = bool(
+            spec.get(_STORAGE_INITIAL_ABOVE_MAXIMUM_KEY, False)
+        ) or initial > model_maximum
+        model_initial = initial
+        if initial_above_maximum and _within_storage_numeric_tolerance(
+            initial, model_maximum
+        ):
+            model_initial = model_maximum
+
+        model_spec = dict(spec)
+        if model_maximum != maximum:
+            model_spec["max_energy_wh"] = model_maximum
+        if model_initial != initial:
+            model_spec["initial_energy_wh"] = model_initial
+        model_spec[_STORAGE_INITIAL_ABOVE_MAXIMUM_KEY] = initial_above_maximum
+        normalized.append(model_spec)
+        starts_above_maximum.append(initial_above_maximum)
+    return tuple(normalized), tuple(starts_above_maximum)
+
+
+def _canonicalize_storage_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalize storage state once before any policy or scenario builder runs."""
+    storage_specs, _ = _normalize_storage_specs(
+        require_list(payload.get("storages", []), "storages")
+    )
+    canonical = dict(payload)
+    canonical["storages"] = [dict(spec) for spec in storage_specs]
+    return canonical
+
+
+def _storage_replay_tolerance_wh(spec: dict[str, Any]) -> float:
+    return max(
+        _REPLAY_TOLERANCE_MIN_WH,
+        float(spec["capacity_wh"]) * _REPLAY_TOLERANCE_FRACTION,
+    )
+
+
+def _validate_storage_replay(
+    actions: list[dict[str, Any]],
+    slots: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    storages: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+) -> None:
+    if len(actions) != len(slots):
+        raise ReplayConsistencyError(
+            f"action count {len(actions)} does not match slot count {len(slots)}"
+        )
+    energy = {
+        str(spec["id"]): float(spec["initial_energy_wh"]) for spec in storages
+    }
+    for slot_index, (slot, action) in enumerate(zip(slots, actions)):
+        dt_h = float(slot["len_min"]) / 60.0
+        storage_power = action.get("storage_power_w", {})
+        storage_energy = action.get("storage_energy_wh", {})
+        for spec in storages:
+            storage_id = str(spec["id"])
+            if storage_id not in storage_power or storage_id not in storage_energy:
+                raise ReplayConsistencyError(
+                    f"slot {slot_index} storage {storage_id} output is missing"
+                )
+            power = float(storage_power[storage_id])
+            reported = float(storage_energy[storage_id])
+            if not math.isfinite(power) or not math.isfinite(reported):
+                raise ReplayConsistencyError(
+                    f"slot {slot_index} storage {storage_id} output is non-finite"
+                )
+            if power >= 0:
+                replayed = energy[storage_id] + power * dt_h * float(
+                    spec.get("charge_efficiency", 0.95)
+                )
+            else:
+                replayed = energy[storage_id] + power * dt_h / float(
+                    spec.get("discharge_efficiency", 0.95)
+                )
+            tolerance = _storage_replay_tolerance_wh(spec)
+            if (
+                replayed < -tolerance
+                or replayed > float(spec["capacity_wh"]) + tolerance
+                or abs(reported - replayed) > tolerance
+            ):
+                raise ReplayConsistencyError(
+                    f"slot {slot_index} storage {storage_id} energy "
+                    f"{reported:.6f} is inconsistent with replay "
+                    f"{replayed:.6f} (tolerance {tolerance:.6f})"
+                )
+            energy[storage_id] = replayed
 
 
 def _vector(value: Any, n: int, field: str) -> np.ndarray:
@@ -73,6 +212,58 @@ def _mode(payload: dict[str, Any]) -> str:
     return mode
 
 
+def _arbitrage_spread_ore_kwh(settings: dict[str, Any], mode: str) -> float:
+    """Return the configured discharge hurdle only for arbitrage policies.
+
+    Parse the setting in every mode so malformed requests still fail at the
+    same contract boundary. Self-consumption and cheap-charge use physical
+    cycle costs only; their discharge is a service decision, not arbitrage.
+    """
+
+    spread = max(
+        0.0,
+        finite_number(
+            settings.get("min_arbitrage_spread_ore_kwh", 0),
+            "settings.min_arbitrage_spread_ore_kwh",
+        ),
+    )
+    if mode not in {"arbitrage", "passive_arbitrage"}:
+        return 0.0
+    return spread
+
+
+def _requires_direction_binary(formulation: str, relaxation_unsafe: bool) -> bool:
+    """Keep mutually exclusive physical flows when a relaxation can profit."""
+
+    return formulation == "milp" or relaxation_unsafe
+
+
+def _storage_relaxation_is_unsafe(
+    effective_import: np.ndarray,
+    effective_export: np.ndarray,
+    pv_charge_bonus_ore: float,
+    storages: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+) -> bool:
+    """Return whether charge and discharge must stay mutually exclusive."""
+
+    if not storages:
+        return False
+    negative_terminal_value = any(
+        finite_number(
+            spec.get("terminal_price_ore_kwh", 0),
+            f"storages[{i}].terminal_price_ore_kwh",
+        )
+        < -1e-9
+        for i, spec in enumerate(storages)
+    )
+    return bool(
+        np.any(effective_import < -1e-9)
+        or np.any(effective_export < -1e-9)
+        or pv_charge_bonus_ore > 0
+        or negative_terminal_value
+    )
+
+
 def _export_price(slot: dict[str, Any], settings: dict[str, Any]) -> float:
     flat = finite_number(settings.get("export_ore_per_kwh", 0), "settings.export_ore_per_kwh")
     if flat > 0:
@@ -86,21 +277,46 @@ def _export_price(slot: dict[str, Any], settings: dict[str, Any]) -> float:
     return price
 
 
-def _solver_options(settings: dict[str, Any], solver: str) -> dict[str, Any]:
-    time_limit = positive_number(settings.get("time_limit_s", 2.0), "settings.time_limit_s")
+def _solver_options(
+    settings: dict[str, Any],
+    solver: str,
+    deadline: SolveDeadline | None = None,
+) -> dict[str, Any]:
+    configured_limit = positive_number(
+        settings.get("time_limit_s", 2.0),
+        "settings.time_limit_s",
+    )
+    if deadline is None:
+        time_limit = max(0.05, configured_limit)
+    else:
+        time_limit = min(
+            configured_limit,
+            deadline.remaining_s(f"{solver} solve"),
+        )
     if solver == cp.HIGHS:
         return {
-            "time_limit": max(0.05, time_limit),
+            "time_limit": time_limit,
             "mip_rel_gap": max(
                 0.0,
                 finite_number(settings.get("mip_rel_gap", 0.005), "settings.mip_rel_gap"),
             ),
         }
-    return {"time_limit": max(0.05, time_limit)}
+    return {"time_limit": time_limit}
 
 
-def solve(payload: dict[str, Any]) -> dict[str, Any]:
+def solve(
+    payload: dict[str, Any],
+    deadline: SolveDeadline | None = None,
+    *,
+    _force_storage_direction: bool = False,
+    _started: float | None = None,
+) -> dict[str, Any]:
+    started = time.perf_counter() if _started is None else _started
+    payload = _canonicalize_storage_payload(payload)
     settings = require_dict(payload.get("settings", {}), "settings")
+    if deadline is None:
+        deadline = SolveDeadline.from_payload(payload, started_at=started)
+    deadline.check("optimizer model build")
     commercial = require_dict(
         payload.get("commercial_constraints", {}),
         "commercial_constraints",
@@ -120,15 +336,55 @@ def solve(payload: dict[str, Any]) -> dict[str, Any]:
         # and thermal state can be evaluated against equally stateful telemetry.
         from .recourse import solve_storage_recourse
 
-        return solve_storage_recourse(payload)
+        return solve_storage_recourse(payload, deadline)
     if scenario_policy == "multistage":
         from .multistage import solve_storage_multistage
 
-        return solve_storage_multistage(payload)
+        return solve_storage_multistage(payload, deadline)
     if scenario_policy != "shared":
         raise ProtocolError("settings.scenario_policy must be shared, recourse, or multistage")
 
-    started = time.perf_counter()
+    configured_shared_backend = str(settings.get("shared_backend", "auto"))
+    if configured_shared_backend not in {"auto", "highs", "cvxpy"}:
+        raise ProtocolError("settings.shared_backend must be auto, highs, or cvxpy")
+    shared_backend = "cvxpy" if _force_storage_direction else configured_shared_backend
+    direct_fallback_reason = ""
+    direct_storage_guard = _force_storage_direction
+    if shared_backend in {"auto", "highs"}:
+        from .direct_highs import (
+            DirectHighsError,
+            SIMULTANEOUS_STORAGE_CYCLE_ERROR,
+        )
+        from .shared_highs import DirectSharedIneligible, solve_shared_highs
+
+        try:
+            response = solve_shared_highs(payload, started, deadline)
+            _validate_storage_replay(
+                response["plan"]["actions"],
+                require_list(payload.get("slots", []), "slots"),
+                require_list(payload.get("storages", []), "storages"),
+            )
+            return response
+        except SolveDeadlineExceeded:
+            raise
+        except DirectSharedIneligible as exc:
+            if shared_backend == "highs":
+                raise ProtocolError(str(exc)) from exc
+            deadline.check("shared backend fallback")
+        except Exception as exc:
+            if shared_backend == "highs":
+                raise
+            deadline.check("shared backend fallback")
+            # The direct path is optional in auto mode. Let the reference
+            # model validate the request again as it builds the fallback.
+            direct_fallback_reason = str(exc) or type(exc).__name__
+            direct_storage_guard = isinstance(
+                exc, ReplayConsistencyError
+            ) or (
+                isinstance(exc, DirectHighsError)
+                and str(exc) == SIMULTANEOUS_STORAGE_CYCLE_ERROR
+            )
+
     slots = [require_dict(v, f"slots[{i}]") for i, v in enumerate(require_list(payload["slots"], "slots"))]
     n = len(slots)
     mode = _mode(payload)
@@ -253,7 +509,6 @@ def solve(payload: dict[str, Any]) -> dict[str, Any]:
     formulation = settings.get("formulation", "auto")
     if formulation not in {"auto", "milp", "relaxed"}:
         raise ProtocolError("settings.formulation must be auto, milp, or relaxed")
-    force_milp = formulation == "milp"
     pv_charge_bonus_ore = max(
         0.0,
         finite_number(
@@ -264,13 +519,22 @@ def solve(payload: dict[str, Any]) -> dict[str, Any]:
     constraints: list[cp.Constraint] = []
     discrete = False
 
+    storage_specs, storage_above_maximum = _normalize_storage_specs(
+        require_list(payload.get("storages", []), "storages")
+    )
+    unsafe_cycle = _storage_relaxation_is_unsafe(
+        eff_import,
+        eff_export,
+        pv_charge_bonus_ore,
+        storage_specs,
+    )
+    unsafe_meter_split = bool(np.any(eff_import < eff_export - 1e-9))
     storages: list[StorageVars] = []
     asset_ids: set[str] = set()
     total_charge: cp.Expression = cp.Constant(np.zeros(n))
     total_discharge: cp.Expression = cp.Constant(np.zeros(n))
     service_slack: cp.Expression = cp.Constant(0.0)
-    for i, raw in enumerate(require_list(payload.get("storages", []), "storages")):
-        spec = require_dict(raw, f"storages[{i}]")
+    for i, spec in enumerate(storage_specs):
         asset_id = spec.get("id")
         if not isinstance(asset_id, str) or not asset_id or asset_id in asset_ids:
             raise ProtocolError(f"storages[{i}].id must be non-empty and unique")
@@ -314,17 +578,21 @@ def solve(payload: dict[str, Any]) -> dict[str, Any]:
         # it may never worsen, and once cleared it can never return. In-bound
         # starts have zero recovery allowance, preserving hard min/max bounds.
         service_slack += cp.sum(lower_recovery[1:] + upper_recovery[1:]) / (capacity * n)
-        unsafe_cycle = bool(np.any(eff_import < 0)) or pv_charge_bonus_ore > 0
-        if force_milp or (formulation == "auto" and unsafe_cycle):
+        initial_above_max = storage_above_maximum[i]
+        if (
+            direct_storage_guard
+            or initial_above_max
+            or _requires_direction_binary(formulation, unsafe_cycle)
+        ):
             direction = cp.Variable(n, boolean=True, name=f"storage_{i}_charge_mode")
             constraints += [charge <= max_charge * direction, discharge <= max_discharge * (1 - direction)]
             discrete = True
         target = spec.get("target_energy_wh")
-        deadline = int(spec.get("target_slot", n - 1))
+        target_slot = int(spec.get("target_slot", n - 1))
         if target is not None:
-            deadline = min(n - 1, max(0, deadline))
+            target_slot = min(n - 1, max(0, target_slot))
             shortfall = cp.Variable(nonneg=True, name=f"storage_{i}_shortfall")
-            constraints.append(energy[deadline + 1] + shortfall >= finite_number(target, f"storages[{i}].target_energy_wh"))
+            constraints.append(energy[target_slot + 1] + shortfall >= finite_number(target, f"storages[{i}].target_energy_wh"))
             service_slack += shortfall / capacity
             spec["_shortfall"] = shortfall
         total_charge += charge
@@ -426,9 +694,9 @@ def solve(payload: dict[str, Any]) -> dict[str, Any]:
         shortfall: cp.Variable | None = None
         target = spec.get("target_energy_wh")
         if target is not None:
-            deadline = min(n - 1, max(0, int(spec.get("target_slot", n - 1))))
+            target_slot = min(n - 1, max(0, int(spec.get("target_slot", n - 1))))
             shortfall = cp.Variable(nonneg=True, name=f"flex_{i}_shortfall")
-            constraints.append(energy[deadline + 1] + shortfall >= finite_number(target, f"flex_loads[{i}].target_energy_wh"))
+            constraints.append(energy[target_slot + 1] + shortfall >= finite_number(target, f"flex_loads[{i}].target_energy_wh"))
             service_slack += shortfall / capacity
         total_flex += power
         flex_loads.append(FlexVars(spec, power, energy, selection, shortfall))
@@ -561,8 +829,7 @@ def solve(payload: dict[str, Any]) -> dict[str, Any]:
             grid_import <= np.where(import_limit > 0, import_limit, max_site_power),
             grid_export <= np.where(export_limit > 0, export_limit, max_site_power),
         ]
-        unsafe_meter_split = bool(np.any(eff_import < eff_export - 1e-9))
-        if force_milp or (formulation == "auto" and unsafe_meter_split):
+        if _requires_direction_binary(formulation, unsafe_meter_split):
             direction = cp.Variable(n, boolean=True, name=f"scenario_{si}_import_mode")
             constraints += [grid_import <= max_site_power * direction, grid_export <= max_site_power * (1 - direction)]
             discrete = True
@@ -642,13 +909,6 @@ def solve(payload: dict[str, Any]) -> dict[str, Any]:
         ]
         discrete = True
 
-    has_surplus_only = any(bool(flex.spec.get("surplus_only", False)) for flex in flex_loads)
-    if has_surplus_only and storage_charge_active is not None:
-        # A connected surplus-only loadpoint also forbids grid-funded home-
-        # battery charging, even in a slot where the EV happens to be off.
-        for sv in scenario_vars:
-            constraints.append(sv["import"] <= max_site_power * (1 - storage_charge_active))
-
     for flex in flex_loads:
         if flex.selection is None:
             active = flex.power / max(1.0, float(flex.spec["_max_charge_w"]))
@@ -673,9 +933,10 @@ def solve(payload: dict[str, Any]) -> dict[str, Any]:
 
     cycle_cost = cp.Constant(0.0)
     terminal_credit = cp.Constant(0.0)
+    arbitrage_spread = _arbitrage_spread_ore_kwh(settings, mode)
     for storage in storages:
         cycle_ore = max(0.0, finite_number(storage.spec.get("cycle_cost_ore_kwh", 0), "storage.cycle_cost_ore_kwh"))
-        cycle_ore += max(0.0, finite_number(settings.get("min_arbitrage_spread_ore_kwh", 0), "settings.min_arbitrage_spread_ore_kwh"))
+        cycle_ore += arbitrage_spread
         cycle_cost += cycle_ore * cp.sum(cp.multiply(dt_h, storage.discharge)) / 1000.0
         throughput_ore = max(
             0.0,
@@ -727,12 +988,18 @@ def solve(payload: dict[str, Any]) -> dict[str, Any]:
 
     def run_problem(problem: cp.Problem, solver_name: str) -> None:
         solver = cp.HIGHS if solver_name == "HIGHS" else cp.CLARABEL
-        problem.solve(solver=solver, warm_start=True, **_solver_options(settings, solver))
+        problem.solve(
+            solver=solver,
+            warm_start=True,
+            **_solver_options(settings, solver, deadline),
+        )
+        deadline.check(f"{solver_name} solve")
 
     solver_used = preferred_solver
     try:
         run_problem(slack_problem, solver_used)
     except cp.error.SolverError:
+        deadline.check("service solver fallback")
         if discrete or solver_used == "CLARABEL":
             raise
         solver_used = "CLARABEL"
@@ -746,6 +1013,7 @@ def solve(payload: dict[str, Any]) -> dict[str, Any]:
     try:
         run_problem(cost_problem, solver_used)
     except cp.error.SolverError:
+        deadline.check("economic solver fallback")
         if discrete or solver_used == "CLARABEL":
             raise
         solver_used = "CLARABEL"
@@ -817,7 +1085,22 @@ def solve(payload: dict[str, Any]) -> dict[str, Any]:
                 mip_gap = float(value)
                 break
     solve_ms = (time.perf_counter() - started) * 1000.0
-    return {
+    try:
+        _validate_storage_replay(actions, slots, [storage.spec for storage in storages])
+    except ReplayConsistencyError as exc:
+        if direct_storage_guard:
+            raise
+        deadline.check("storage replay fallback")
+        response = solve(
+            payload,
+            deadline,
+            _force_storage_direction=True,
+            _started=started,
+        )
+        response["solver"]["fallback"] = True
+        response["solver"]["fallback_reason"] = str(exc)
+        return response
+    response = {
         "schema_version": SCHEMA_VERSION,
         "request_id": str(payload["request_id"]),
         "ok": True,
@@ -852,3 +1135,7 @@ def solve(payload: dict[str, Any]) -> dict[str, Any]:
             "actions": actions,
         },
     }
+    if direct_fallback_reason:
+        response["solver"]["fallback"] = True
+        response["solver"]["fallback_reason"] = direct_fallback_reason
+    return response

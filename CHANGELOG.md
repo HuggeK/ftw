@@ -1,5 +1,779 @@
 # Changelog
 
+## 2.4.0
+
+### Minor Changes
+
+- bf2c142: Rename the Loadpoints tab and dashboard section to Chargers, and give it an
+  OCPP panel: the exact backend URL to enter on a charger, live state for every
+  connected charge point (vendor, dialect, vehicle, power, session energy), and
+  the connected charge points offered in the charger-driver dropdown so an OCPP
+  charger can be bound to the planner without editing YAML. Backed by a new
+  GET /api/ocpp/chargers endpoint. Docs now recommend a DHCP reservation for the
+  FTW host before commissioning chargers.
+- c1bf48c: The planner now has a household preference object on the Plan card: follow-the-forecast (cautious / balanced / bold) and a battery-export permission (unknown / not allowed / allowed). Balanced is today's default. Unknown export does not sell from the battery. Sites that were on Active arbitrage must confirm before selling again. Settings keep house reserve on top and bury engine knobs; weather no longer asks for array orientation on the normal path.
+- bf2c142: FTW now asks each OCPP charger whether it can be steered, and says so. Shortly
+  after a charger connects, core reads its `SupportedFeatureProfiles` (1.6) or
+  `SmartChargingCtrlr.Available` (2.0.1), records the raw answer, and shows a
+  Control column on Settings → Chargers: "smart charging", "telemetry only" (with
+  a warning explaining the charger will meter but never plan), or "not reported"
+  for a charger that stayed silent. Also exposed as `steerable` and
+  `feature_profiles` on `GET /api/ocpp/chargers`. The verdict is advisory —
+  commands are still attempted, so a charger that under-reports its own
+  capabilities is never locked out of control.
+- bf2c142: Add OCPP 1.6J support so EV chargers connect to FTW directly instead of through
+  a vendor cloud. An OCPP charger needs no driver: the protocol is vendor-neutral,
+  so one server in core handles every charger that speaks it.
+  
+  Chargers dial FTW rather than the other way round, so there is nothing to add
+  under `drivers:`. A charge point becomes a device on its first BootNotification,
+  keyed by the last segment of the URL it connected to, and dispatch treats it
+  like any other EV reading.
+  
+  This reinstates `go/internal/ocpp`, retired as unused in #578, and wires it into
+  the process behind a new `ocpp` config section. It matters because Charge Amps
+  has no FTW driver at all and every current model speaks OCPP, while Easee and
+  Zaptec can be commissioned once through their vendor portal and then run with no
+  cloud in the runtime path.
+  
+  FTW throttles, pauses and resumes an OCPP charger like any other EV charger.
+  Every command is a current limit rather than a remote start or stop, because
+  `RemoteStopTransaction` is unreliable on Charge Amps hardware — units
+  acknowledge the stop and resume charging on their own, while a 0 A charging
+  profile is honoured consistently and keeps the session meter intact across a
+  pause. Below the IEC 61851 minimum of 6 A the charger is told 0 A rather than
+  being rounded up to current the site fuse was not asked to carry.
+  
+  The server is off by default. Enabling it requires a username and password, and
+  FTW refuses to start without them: the OCPP library builds its listen address
+  from the port alone, so the socket is reachable on every interface and basic
+  auth is the only gate. Keep the port closed at your router.
+- bf2c142: OCPP charge points now start quarantined. A charge point that no charger entry
+  (loadpoint) names connects as "pending": it shows on Settings → Chargers with
+  its vendor, dialect and live state so it can be adopted, but its telemetry is
+  withheld from the site — no DerEV reading, no driver health, no metrics — and
+  it is never commanded. This stops any device that merely knows the shared OCPP
+  password from fabricating EV load and steering dispatch (the DerEV sum
+  suppresses home-battery discharge). Adopting a charger = adding a charger
+  entry with its id as the charger driver and saving — charger entries
+  hot-reload, so adoption and un-adoption take effect on the save.
+- bf2c142: Serve OCPP 2.0.1 alongside 1.6J, so newer chargers connect without a driver too.
+  
+  Each version listens on its own port. A charger picks its dialect during the
+  WebSocket handshake, before any message is sent, and the underlying library
+  keeps one message handler per listener — so a single port cannot serve both.
+  Set `ocpp.port_v201` to enable 2.0.1; leaving it unset keeps 1.6J only.
+  
+  Only the message encoding differs. Both dialects share one charger map, one
+  telemetry path and one control path, so a 2.0.1 charger is metered, throttled
+  and paused exactly like a 1.6 one, and dispatch cannot tell them apart.
+  
+  2.0.1 restructures the messages more than the names suggest: StartTransaction
+  and StopTransaction collapse into a single TransactionEvent, transaction ids
+  become strings, connector status loses its charging meaning, and meter samples
+  arrive inside transaction events as well as on their own. The new handler
+  normalises all of that back to the same charger state.
+  
+  OCPP 2.1 is not supported. No production-grade Go implementation of it exists:
+  the library FTW uses covers 1.6 and 2.0.1 and has no 2.1 support, and the Go
+  projects that do claim 2.1 are early-stage validators and emulators rather than
+  servers. Adding it later is one more handler and one more listener; the
+  version-neutral core does not change.
+- a95a971: Tesla Wall Connector Gen 3 can be added as a local EV charger. The setup wizard and Settings → EV take the box's LAN address; FTW reads plug state, power and session energy over HTTP with no Tesla account. The wall connector cannot take a current setpoint — steer a Tesla through tesla_vehicle. Experimental until a live Gen 3 has been exercised.
+- bf2c142: Vehicle profiles for chargers shared by several cars. A new `vehicles:` config
+  list (also editable under Settings → Chargers → Vehicles) holds each car's
+  battery capacity, identifiers and charging policy — PV-surplus-only and/or a
+  target SoC the planner fills toward in the cheapest tariff hours. When an OCPP
+  charging session identifies the car (the RFID idTag on 1.6, a MacAddress or
+  eMAID idToken on 2.0.1), the charger switches to that car's capacity and
+  policy for the session; capacity reverts on plug-out. A session matching no
+  profile changes nothing — the visitor default — and the identity it presented
+  is shown in the Chargers tab so it can be pasted into a profile.
+
+## 2.3.2
+
+### Patch Changes
+
+- 0bcb0ed: "Show pairing code" works from a LAN browser again when no house password is set. The gate that sent owners to the box made sense only alongside the password: with the password off, the whole dashboard already accepts every LAN client, so the refusal blocked the household without slowing anyone else. Turning the house password on restores the strict rule — owner codes then require the password or the box itself. Promoting a phone to owner and the first pairing on an empty box follow the same rule.
+
+## 2.3.1
+
+### Patch Changes
+
+- 203e8ca: A config with two `is_site_meter: true` drivers no longer stops the box from starting. The box boots with the first declared driver as the site meter — the same one older versions silently used — ignores the flag on the rest, and logs a clear error naming both drivers so the mistake is visible in the log and the help report. Saving such a config from Settings is still rejected. A driver install that accidentally added a second site meter used to crash-loop the box before the web UI came up, leaving SSH as the only way back in.
+- 931ed6a: The pairing code — and the reason you cannot have one — now appears directly under the button that asked for it. Both used to render below the help paragraphs, usually under the settings window's fold, so pressing "Show pairing code" on a LAN browser looked like nothing happened while the answer ("making another owner is done on the box, or after the house password is on") sat unseen further down, styled like help text. Refusals are now red and the window scrolls the result into view.
+- 0b85747: FTW now holds at most one Modbus TCP connection per device. Many inverters accept a single session and drop the old one on every new connect, so a second driver on the same gateway, a driver test, or a fingerprint probe used to knock the live driver's session out mid-control; they now share the one session, each with its own unit id, and the socket closes only when the last user is gone. When something outside FTW keeps taking the device's only session, the box now says so — a rate-limited warning names the likely cause instead of flooding the log with a reconnect line per poll.
+
+## 2.3.0
+
+### Minor Changes
+
+- 7ac7be9: The phone app can now notify you when a device goes quiet or the house draws more than the fuse allows. Same thresholds as before (ten minutes of silence, thirty seconds over the rating) so a blip is not a lock-screen.
+- 54f0163: Sourceful Zap can again read PV and battery from devices it already talks to, as an opt-in under Settings → Devices. The default stays P1/HAN only. The driver never writes.
+- 53ca4ae: Zaptec Go, Go 2 and Pro can be added as a cloud EV charger. The setup wizard and Settings → EV offer Zaptec next to Easee; the same email and password list chargers on the account and drive current, pause and resume through Zaptec Cloud. The integration is experimental until a live charger has been exercised.
+
+### Patch Changes
+
+- 31742d7: Harden SI units and charging identities: SoC doors fold NaN/overflow instead of leaking percent or Inf, HA discovery slugs illegal driver names with a collision tag while leaving already-legal mixed-case ids unchanged, and synthetic history stores 0–1 SoC.
+- bab685a: Modbus give-up recovery no longer reload-loops a missing driver file or a device that never answered, and a failed `driver_init` during that reload keeps the previous VM so default-mode still works.
+- 33bd6ca: The weather location map loads again. OpenStreetMap's volunteer tiles now require a Referer, and the box was sending none.
+- 983c7ab: A short Modbus network blip no longer leaves a battery or meter offline until the box is restarted. Drivers that skip a register after a few failed reads used to skip every register after a "no route to host" moment; the host now reloads that driver and resumes polling once the link is back.
+- 5caddc1: The Plan chart reconstructs battery SoC from stored energy or battery power when a slot omits soc, instead of drawing a flat 0% line.
+- db39491: The live stats strip and today's self-powered share stay honest when a meter or inverter is offline: no fake 0 W, and a day that already happened still shows its percentage.
+- b1384b3: A meter that has stopped reporting no longer shows as 0 W balanced. Grid and house load go blank, and solar or battery that went quiet with it stay on the diagram as no data instead of vanishing.
+
+## 2.2.1
+
+### Patch Changes
+
+- 77c9514: The phone app now shows EV charging as its own number, the same way the local page does. A charger that is drawing but cannot take a command no longer hides that draw inside "house", and the battery no longer discharges into the car when cover-EV is off.
+- 9fdc46d: The house password can only be turned on from loopback inside the process. Saving Settings can no longer flip that lock through the whole config document. On Docker Desktop that means `compose exec`, not a host curl to localhost.
+- e2187f4: An owner pairing code can only be minted on the box itself, or after the house password is on. The same gate covers promoting a phone to owner and the first pairing on an empty box, which would otherwise become an owner. A viewer invite still works from the LAN once an owner exists.
+- 60fbf35: FTW now rejects corrupt, non-finite, and non-positive exchange rates before they can enter price data.
+- 5adda2f: A hostname with no dot is no longer treated as local. If the driver catalog cannot be read, or a configured driver is missing from it, config secrets stay hidden. Driver test and fingerprint refuse loopback, localhost, and link-local targets on MQTT, Modbus, HTTP, WebSocket and TCP.
+
+## 2.2.0
+
+### Minor Changes
+
+- f258a4d: Core stores power in watts, energy in watt-hours, SoC as 0–1, and PV arrays as rated watts. kWp and 0–100 percents remain only at UI, Home Assistant, appproto, calendar titles, and the forecast.solar URL. Loadpoint, calendar, vehicle telemetry, and V2X envelopes use 0–1 without `_pct` names. Pasting watts into the old kWp field is converted on config load. Heat-pump diagnostics emit W/Wh.
+
+### Patch Changes
+
+- 19f9264: An MQTT driver that stops draining its subscription no longer grows the inbound queue without limit. The buffer is bounded at 1024 messages, dropping the oldest half on overflow — the same rule the websocket and TCP capabilities already follow — so a stalled driver on a busy broker can no longer exhaust memory on the box.
+- 810fef9: The dashboard escapes driver names and planner reasons before putting them in HTML, so a crafted name cannot run script in the browser.
+- 1642fe3: Load forecast slots are hard-cut to the site fuse and cannot sit far below recent days. A 100 W overnight prediction on a lived-in house is lifted to the existing 25% prior floor before it reaches the planner.
+- 762e135: When planning cannot start, the Plan view now says why — a missing battery, no prices, or the planner being off — instead of asking you to pick a strategy you already picked.
+- f65007e: Public hosts now need the API token for diagnose, series, EV detail, driver list, fleet ping, and similar reads. The live dashboard (status, energy, prices, plan, loadpoints) stays open.
+- 1642fe3: A PV forecast can no longer exceed the site nameplate. Pasting watts into array kWp (18960 W → 18960 kWp) is treated as 18.96 kW, and both the stored forecast and the plan are hard-cut at rated watts.
+- b8cd2b6: A slew rate of 0 W/cycle no longer freezes battery dispatch. The limiter anchors on the battery's measured power, so a zero budget snapped every target back to whatever the battery was already doing and the site held that power until restart. Non-positive now means "no external ramp limit", the same as `slew_enabled: false`.
+
+## 2.1.0
+
+### Minor Changes
+
+- 928c9d5: Optional `api.lan_auth` asks for a house password on the LAN before config, logs, dumps and writes. Off by default. Loopback and the phone app stay as they are.
+- eec4c86: When LAN auth is on, the dashboard asks for the house password and keeps a session cookie. Settings → System turns the lock on and off.
+- 60685f6: Core now actually sends the solar surplus to a driver whose Solar PV feed is armed. Every control tick computes the site's solar-attributable export — the smaller of live PV generation and grid export, after subtracting battery/V2X discharge so stored energy is never advertised as sunshine — and hands it, site-signed, to every driver whose operator enabled the write path (the `solar_pv` action, e.g. the NIBE S-series surplus feed). Dispatch runs behind the existing site-meter freshness gate: stale telemetry stops the feed and the driver's default mode / dead-man switch clears the device register. Standing refusals (pump-side enable still off) log once per transition instead of every tick.
+- 60685f6: A driver's opt-in write path can be turned on from Settings, instead of by
+  hand-editing two keys in config.yaml.
+
+  Everything in the catalog reads. One driver can also write — the NIBE S-series
+  solar surplus feed — and arming it meant setting `config.write.solar_pv` on the
+  driver _and_ `capabilities.http.allow_write` on the host, neither of which the
+  settings screen offered. An owner could install the driver from a card in the
+  UI and then had no way to use the one thing it was built for.
+
+  A driver now names its write paths in its `DRIVER` block
+  (`write_capabilities = { "solar_pv" }`), and Settings → Devices grows a _Solar
+  PV surplus feed_ panel on the drivers that declare one: a switch and the
+  maximum surplus to report. A driver that declares nothing gets no panel and no
+  markup, so read-only drivers are untouched and nothing about writing is written
+  into their config.
+
+  The panel keeps the safety properties the YAML had, where an operator can see
+  them. One switch moves both gates, because holding one without the other never
+  wrote anything anyway — the host refuses the verb without the grant, and the
+  driver disables the feed without the verb — so a half-armed config reads as
+  off. The feed will not arm without a maximum above 0: that ceiling is what
+  stops a sign error or a telemetry spike from telling a pump there are 100 kW
+  going spare, and clearing it disarms a running feed. What the pump needs at its
+  own end — installer menu 7.5.15 set to read/write, its Solar PV input on —
+  cannot be checked from FTW, so the panel says so rather than letting the writes
+  fail silently as `read only value`.
+
+  The local-API help text also stopped telling NIBE owners to enable the API in
+  the myUplink app. It is generated on the pump's own screen; there is no app and
+  no cloud account in that path.
+
+### Patch Changes
+
+- 1be6c0c: Active arbitrage can buy from the grid again while a surplus-only EV is plugged in.
+
+  Surplus-only still keeps the car off the grid and still forbids feeding it from the home battery. Those two rules already stop "cheap grid laundered through the Pixii into the car". The extra rule that also forbade charging the house battery from the grid, for the whole time the car sat on the charger, is gone — including the automatic surplus-only that kicks in when the EV deadline is past published prices.
+
+  Unpublished hours after the day-ahead cut-off no longer jump to the hour-of-week climatology (often 60–80 öre right after a 200 öre evening). They start from the last known spot and fade toward the typical curve over about six hours, so the planner does not skip charging on a price crash that has not happened yet.
+
+  The load twin's overnight prior is 650 W instead of 300 W, which is closer to a current Swedish house on a cold start or a repaired night bucket.
+
+- 359e080: The setup wizard now installs a discovered device by its self-broadcast mDNS
+  (.local) name instead of its raw IP when the device advertises one, so the
+  connection survives DHCP lease changes. When only an IP address is used, the
+  wizard and device settings now tell the operator to reserve that IP for the
+  device in the router's DHCP settings.
+- d17141a: Startup no longer hard-fails when GitHub/GHCR is unreachable. `docker compose pull` fetches images from ghcr.io (GitHub Container Registry), and every start path gated `up` on it: `scripts/install.sh` (under `set -e`) aborted before `up -d`, and the Raspberry Pi first-boot provisioner retried the pull forever and never reached `up -d`. During a GitHub outage that left the box unable to start.
+
+  The pull is now best-effort and the stack starts from the locally-present last-known-good images instead: install falls through to `up -d` after a failed pull, and first-boot brings the stack up on local images first, only reaching GHCR for a genuinely missing image. A truly fresh host with no local image still needs GHCR reachable — pre-baking images into the OS image is the follow-up for that.
+
+- 3afa0b4: A brief GitHub outage no longer sticks as the last update-check error for hours. The checker retries 5xx and 429 replies a few times, does not cache a failed check, and the Updates dialog retries on its own and says Check for updates will try again.
+
+## 2.0.0
+
+### Major Changes
+
+- 3de15a0: Home Link is removed. Remote access is the FTW app.
+
+  **What you lose.** Every passkey enrolled with Home Link stops working, and
+  there is no migration: the box is no longer a WebAuthn relying party, so those
+  credentials now verify against nothing. The browser route is gone with them —
+  your `<name>.home.sourceful.energy` address, the page it served and the relay
+  behind it no longer exist. The local UI's Remote tab and the
+  `/api/home-link/*` endpoints are gone. If you were reading your house from a
+  browser away from home, that stops working on this release and the app is the
+  only way back.
+
+  **What you get.** One remote path instead of two. In Settings → FTW app, the
+  box makes a short-lived, single-use QR code. It carries the box's key optically
+  so no server ever sees it, and afterwards the phone reconnects on its own key —
+  a photographed code cannot pair a second phone. You can remove one paired phone
+  at a time from the same tab; removal drops its live session at once. The relay
+  holds no keys and cannot read a frame, and the name the box joins under changes
+  every hour, so the protocol carries no stable household ID. The relay still
+  sees source IP, timing and connection continuity, which can correlate a
+  household across those rotations. Nothing about local control, setup, history
+  or fallback planning changes.
+
+  An existing `home_link:` block in your `config.yaml` is ignored — the box boots
+  without you editing anything. Home Link's rows in `state.db` are left where
+  they are and authorise nothing. `ftw home-link-adopt` is now
+  `ftw gateway-identity-adopt`; it does the same thing to the same files, and the
+  machine identity it binds is untouched by any of this.
+
+- 138d244: **BREAKING CHANGE:** Sourceful Zap in FTW is now the P1/HAN site meter only. The driver no longer ingests PV, battery or V2X from devices attached to Zap. If Zap lists an inverter, battery or charger, add that device in FTW with its own driver. Sites that used Zap as a proxy for those resources will lose that telemetry until they do.
+
+### Minor Changes
+
+- 8c84981: The box now counts itself. Once a day it tells Sourceful its FTW version and channel, which driver types it runs, roughly how much battery it has, its price zone and roughly how old the install is — enough to answer "of the boxes on beta, how many run sungrow", which is what decides where engineering effort goes.
+
+  The ping carries no gateway ID, no key, no serial, no site name, no counter and no timestamp: nothing in the message says which box sent it. Values are bucketed rather than reported, the version travels only when it is a release tag, so a developer's build reports as unknown rather than as itself, and the send time is drawn fresh each day rather than sitting in one slot. A failed send is forgotten rather than retried.
+
+  Driver names have their own rule, because a driver file is called whatever the thing that installed it called it, and anyone can install their own. A name travels only if it is on one of two lists, and neither list is the contents of a directory on the box. One is the drivers this build ships with, compiled into the binary from the bundled-driver pin rather than found on disk, so every box on a release carries the same list and nothing a running box does adds to it. The other is the box's own record of the install, asked file by file: did this exact filename arrive under a signature made with FTW's own key? Everything else reports as "other": a driver somebody wrote, a file copied into place, a file renamed afterwards, one from any repository but FTW's however carefully it signs its own manifests, and — until it is installed again — one that was already on the box before this release started keeping the record. Settings can say where installed drivers are kept, including inside the directory the bundled ones sit in, and it changes nothing: a directory can take a name off the second list, never put one on it. The one way through is editing the box's own database by hand, which this does not claim to stop.
+
+  Two limits are stated rather than glossed over, in the package doc and on the screen. The six fields still describe a household, so a beta box in a small price zone with a big battery may be the only one of its kind; and Sourceful sees the address the box sends from, as any website does. The payload is what this design makes useless as an identifier, not the connection. The Fleet statistics panel in Settings shows the exact message this box would send, built by the same call that sends it, so the claim is checkable instead of promised; while sharing is switched off that screen says nothing is being sent. On by default; the switch takes effect without a restart.
+
+- 3de15a0: Pair a phone from Settings → FTW app.
+
+  The box could mint an enrollment payload but nothing showed it, so there was no
+  way to pair a phone at all. There is now a button that mints a single-use code
+  and draws it as a QR, and a local-only endpoint behind it.
+
+  The code is minted on request rather than shown continuously: a QR left on a
+  screen for a week is a QR that everyone who walked past has photographed. It is
+  never offered as copyable text either — the payload carries the pairing code and
+  the rendezvous secret, so the camera is the only path it should take.
+
+- 3de15a0: The box now speaks the FTW app's protocol for real. It mints its own Noise static key, a long-lived rendezvous secret and single-use pairing codes, prints them as the QR payload the app parses, and holds an outbound connection to the content-blind relay under a handle that changes every hour. The rotating handle removes a stable protocol ID; it does not hide the source IP, timing or connection pattern, which the relay can use to correlate a household. Up to four phones share the uplink; each gets its own encrypted session, and the box tells them apart by which one's key authenticates a frame, because the relay cannot say. A phone is let in by a pairing code once and by its own key thereafter, so reconnecting never needs a new code and a photographed code cannot pair a second device.
+
+  The app link is on when an existing config omits the `app_link` section, so
+  upgraded stable boxes join the supported relay without a manual YAML edit.
+  `app_link.enabled: false` remains an explicit opt-out.
+
+  `controlRev` now means something: it is a fingerprint of the site's controllable state, so it moves when the mode or a target does and holds still through the per-tick churn. A command that expected an older revision is refused, and a session that falls behind is resynced with a fresh snapshot rather than left refusing every command until it reconnects. Site mode changes from every door now go through one function, so none can arrive having set the mode without dropping the manual hold and resetting the PI integrator.
+
+- 309f131: Add the FoxESS H3-Smart and 1K5 driver to the offline recovery bundle. Its telemetry and control paths have been tested on 1K5-HI-10-V1 hardware; H3-Smart hardware remains untested.
+- bbc92ee: An EV charging schedule can now be saved from the app. The schedule gets its own route — `PUT /api/loadpoints/{id}/schedule` stores one, `DELETE` clears it — priced Configure where its sibling target route stays Actuate. The split is the point: a schedule is a standing instruction about future days, so one that arrives late is the same instruction, only later, which is what Configure means. The one-shot fields on the target route — target, soc, force_start — move energy now, so they stay on Actuate and the passthrough keeps refusing them. The on-box page keeps saving through the target route unchanged; both routes share one apply path.
+
+  A schedule also learns which days it covers. `days` is a 7-bit mask, bit 0 Monday through bit 6 Sunday; omitted or zero means every day, so every stored schedule and every old client keeps its behaviour. Without it, "full by 07:00" on a work commute also charged for Saturday. The weekday is the household's, read in the box's own time zone: a deadline at 00:30 Saturday in Stockholm is still Friday in UTC, and skipping Saturday has to mean the household's Saturday. The stored time-of-day stays UTC minutes, so a DST change shifts the local deadline by an hour until the schedule is saved again; storing local minutes instead needs a migration and a UI save-path change, and is deferred on purpose.
+
+- 007061d: Resolve device `.local` names, so devices can be configured by name instead of a DHCP-assigned IP.
+
+  Go never resolves `.local` itself: it hands those names to libc only when cgo is
+  available, and FTW builds with `CGO_ENABLED=0`, so a configured `zap.local`
+  became a unicast DNS query to the site router and failed. That is true on every
+  base image and every libc — shipping `libnss-mdns` changes what `getent` and
+  `curl` resolve inside the container, not what this process resolves.
+
+  FTW now asks the host's own mDNS responder, `avahi-daemon`, over its
+  simple-protocol socket — the same daemon and the same socket
+  `libnss_mdns4_minimal.so.2` uses, so a name resolves identically whether FTW
+  dials it or an operator checks it from a shell in the container. Where that
+  socket cannot be reached, FTW queries the LAN directly instead. The socket has
+  to be bind-mounted, and under the Home Assistant Supervisor an add-on cannot
+  mount arbitrary host paths at all, so the direct path is what makes the feature
+  work there; it is also the default in Compose, where mounting a host runtime
+  directory is left to the operator. A successful lookup logs which one answered.
+
+  Every driver transport uses it — Modbus TCP, MQTT (driver and Home Assistant
+  bridge), HTTP including TLS-pinned clients, WebSocket and raw TCP.
+  HTTP and WebSocket requests to `.local` hosts bypass configured proxies so
+  device credentials and control payloads cannot leave through them. Ordinary
+  DNS names keep the configured proxy path.
+
+  Resolution happens per dial rather than once at startup, so a device that moves
+  to a new DHCP lease is found again on the next reconnect without a config edit.
+  Answers are cached (30–120 s, following the record TTL where there is one) so
+  reconnect loops do not flood the LAN. If every cached address fails to connect,
+  FTW drops that unchanged entry and resolves once more. Failures are cached
+  briefly so a device that is still booting is retried soon. A failed resolution
+  logs `mDNS resolution failed` and names the mechanism, instead of surfacing as
+  a generic dial error.
+
+  Only `.local` names take this path; literal IPs and ordinary DNS names dial
+  exactly as before. Multicast still has to reach the LAN, which the Linux
+  Compose topology has via `network_mode: host`. Under `docker-compose.macos.yml`
+  the container is bridged, so configure devices by IP there.
+
+  Direct queries use each active multicast interface. IPv4 and IPv6 are
+  supported; link-local IPv6 addresses carry their interface zone and unscoped
+  answers are rejected. The resolver also rejects non-response DNS packets,
+  wrong answer classes or families, invalid sources, and Avahi replies whose
+  interface, name, address family or address does not match the request. mDNS is
+  unauthenticated, so `capabilities.allow_unverified_local: true` for a driver —
+  or `homeassistant.allow_unverified_local: true` for the Home Assistant bridge —
+  gates whether FTW acts on an answer it obtained itself. It gates the resolution
+  path, not the connection: without it a `.local` name still goes to the system
+  resolver exactly as it does today, which is what keeps working installs working
+  under Home Assistant, where Supervisor answers `.local` through its own DNS
+  service. Host allowlists do not prove server identity, and a TLS pin does not
+  bypass the gate yet. Literal IP and ordinary DNS endpoints are unchanged.
+
+  Network scanning now reports the name a device answers for itself. It used to
+  ask unicast reverse DNS first and only fall back to mDNS, which meant the
+  router's label for the lease — `zap-000064963cd51edc.localdomain` on a UniFi
+  network — was what reached the setup wizard, and the wizard fell back to the
+  raw IP because that is not a `.local` name. Both queries now run together. FTW
+  resolves every `.local` candidate forward, including reverse mDNS answers, and
+  keeps it only when it maps back to the scanned address. This also covers
+  responders that publish a forward `A` record without a reverse PTR, which RFC
+  6762 makes optional. Unverified non-local names are still shown as display
+  text.
+
+- e29f8d7: New `sim-pcs` development simulator: a Modbus TCP server modeling a multi-rack commercial battery plant, one rack per Modbus unit ID, each with first-order power response, SoC integration with efficiency and full/empty cutoffs, and a documented SunSpec-style register map. A control HTTP port injects rack faults, comms loss and SoC pins so the upcoming plant module and e2e suite can exercise per-unit allocation and derating without hardware. Wired into `make build` and `make run-sim`.
+
+### Patch Changes
+
+- fb34584: The FTW app can reach the box's own HTTP API over its session, and the box now knows which phone is asking. An `api.req` carries a method, a path under `/api/`, a parsed query and an optional body; the answer comes back as a status, then chunks, then an end. It runs in process through the same handler the LAN listener serves, trust boundary included. This is a security improvement rather than a relaxation: that API is already served on the home LAN with no authentication at all, and this door is pinned to an enrolled device.
+
+  Who is asking now exists as a value. `appenroll.Authorise` returns the grant it has always known — device, role, enrolment epoch — instead of throwing it away on a yes-or-no answer, and it reaches the HTTP layer on the request context, never on the wire: `api.req` has no headers field, so there is no client byte that could become a caller claim. `api.SecureMutations` becomes `api.Authenticate`, which keeps a caller a session already authenticated and mints a local owner for anything off the LAN. That second branch writes down what the LAN already is; authenticating it later is a change to that one branch, because every handler from here on reads `apiauth.From`.
+
+  A viewer cannot write, and the box is what refuses it. `cmd` finally checks the scope its own operation table has declared since the day it was written and never read, so `site.mode.set` from a viewer is rejected with the mode controller untouched. Configuration through the HTTP door needs the owner role and a step-up.
+
+  Every registered route names what it costs, beside the handler it governs, and the request's method is never consulted. The method is not asked because it does not know: `GET /api/caldav/credentials` hands out a password that is a write channel back into dispatch, and `POST /api/self_tune/start` pauses control and drives every battery through ±3000 W for minutes. Both read as ordinary from their verb alone.
+
+  Anything that moves energy stays on `cmd`, naming the command to send instead where one exists — a command carries an expiry and the box revalidates against fresh state, and an HTTP request carries neither. Fifteen routes are local: their answer holds a credential or a whole file, or doing them needs somebody standing at the box, and the app is told so with `E_LOCAL_ONLY`. `POST /api/config` is refused for a third reason: it replaces the whole configuration, so a phone a year behind the box would silently drop every field it never knew about.
+
+  The cost of naming every route is that a read view written in the app next year needs the box to have heard of the path. That is the direction worth being wrong in, and two things hold it there: `api.handle` takes the tier as a required argument, so leaving it out does not compile and an unknown value stops the box at startup; and a route that reaches the gate with no tier the gate knows is refused rather than served. The gate is one switch with a branch for every tier and a closed default — it replaced a chain of cases with no read branch at all, which is how a credential reached a shared viewer's phone.
+
+  Revocation bites at once. The grant is re-read on every privileged request, so a socket cannot outlive a revoke, and tearing down a session now cancels the call it is making rather than only the next one. An answer in a media type the session cannot carry is refused before a byte streams, an oversized one stops at the ceiling and says it was truncated, and a handler that panics costs one request instead of the box.
+
+- da6a101: Paired phones can be seen and removed. Settings → The FTW app now lists every paired device — a short key prefix with paired/last-seen stamps, most recently seen first — with a Remove that takes effect immediately: the key is forgotten and any live session is terminated with the reason the app already knows how to show. The stored device list gains timestamps; the old bare-key file still reads, so an update never unpairs a house. The count endpoint's "never a list" stance is deliberately reversed: this page can already mint a pairing code, the strictly stronger power, and without a list there was no way to lock a stray key out at all.
+- 41324a5: The FTW app gets history, and the plan no longer kills the session. History tiles are served from the energy ledger over the app protocol — same tile geometry, ids and etags as the app computes, so unchanged tiles are never resent; mean power per bucket, MISSING where nothing was metered, retention gaps named instead of served as silence. The plan answer is truncated to the slots that fit the largest bulk bucket: the optimizer's 193 slots encode past 16 kB, and the encode error used to drop the whole session — which the app experienced as the box hanging up whenever the plan view opened.
+- 450b2b5: The FTW app can be turned on from Settings instead of by hand-editing YAML. The app tab now carries a checkbox, and saving it raises the restart dialog the box already shows for settings that only take effect at startup. Because the uplink is connected at startup, what is saved and what is running can differ for a minute, and the tab says which of the two it is in rather than going quiet: the pairing button stays disabled until the box reports the uplink actually running, so nobody presses it and gets nothing back.
+- 71b2be4: The FTW app can draw electricity prices. The box answers `price.get` over the app protocol with the slots covering a window, spot and total as whole minor units per kWh — rounded once, here, so the app and the box's own dashboard cannot end up disagreeing about what 18.7 öre is. `price.spot` is advertised only when a zone is configured and rows are stored, so a house with no price feed gets no empty chart instead of a broken one.
+
+  An answer that does not cover the window asked for says so, at either edge or in the middle. Tomorrow's rates publish in the afternoon, a failed midday fetch leaves a hole, and a box that first heard from the market at breakfast holds nothing for the hours before it; all three come back marked stale rather than as a market that went quiet. A window is read eight days at a time — the price table is never pruned and the app derives its window from the phone's clock, so a wrong clock used to mean a query over every row the box had ever stored.
+
+- fb34584: A household can share its home, and the box is what enforces the difference. An enrolment now carries a role — `owner` or `viewer`, from `contract/registry.yaml`, with the role table generated rather than hand-written on either side. A row loaded from a file written before roles existed reads as an owner, so an update never silently demotes every paired phone.
+
+  An invite is not a new cryptographic object. It is the same single-use pairing code with a different role behind it, so the QR payload does not change shape and the app's scanner learns nothing about sharing: a guest scans what an owner scans and is told what they are in `hello_ok`. The role is remembered by the box and stamped when the code is spent, never carried in the payload, because a role its holder can edit is not a role. One code is live at a time, across kinds, so asking for a guest pass cancels a pairing code still on a screen.
+
+  Two rules stop a household locking itself out, both in `appenroll` rather than in the API layer. The first enrolment on a box is an owner whatever code it used, because a box with no owner can never be administered again. The last owner cannot be stepped down through local Settings or an app session. An app session also cannot remove it; local Settings can, because the same page can pair a new phone.
+
+  The app's last-owner refusal now carries a code as well as a sentence. The app owns every word it shows and needs a name to branch on. A 409 alone is a conflict and nothing more specific, so the app read a `code` key — which the API had never sent, leaving the one refusal a household can meet through the app as the one refusal it could not explain. The code is `E_LAST_OWNER_PROTECTED` from `contract/registry.yaml`, through the generated constant, never a literal at the call site.
+
+  Sharing has no screen of its own: a guest's phone is a paired phone, so it is a row in the same device list, with the same Remove. Locking out a stray key and taking a guest's access away are one action. A role change takes effect on a session that is already open, because both doors re-read the grant on every privileged request — a demoted owner loses their writes at the next one and keeps the readings they still have every right to see.
+
+  A household does all of that from the app, and the box decides what the app may hand out. These routes have two doors and the doors prove different things: the LAN proves somebody is in the building, and an app session proves a phone is enrolled while saying nothing about where it is. So a session sees the roster, invites a viewer and locks a phone out — gated on `ftw.members.read` and `ftw.members.write`, neither of which a viewer's grant carries — and making another owner, by minting an owner's code or by promoting a row, still needs somebody at the box.
+
+  The role is no longer defaulted anywhere. A request that named none used to mint an owner, on the reasoning that a page which has not been updated should keep meaning what it used to mean. What that reasoning costs is a default that hands over a house whenever a field goes missing, and the field did go missing: the app sent its role in a query string this endpoint does not read, so every "invite someone to view" arrived here naming no role. It is a 400 now. What a caller did not say is a question, not a blank to fill in on their behalf.
+
+  There is now a way back in without a camera: a code the box shows, `XXXX-XXXX`, forty bits in Crockford base32 so I, L and O fold back to 1 and 0 for whoever wrote down what they heard. It is redeemed where a scanned code is, inside Noise handshake message 1, so there is no new endpoint and no new carrier. It re-admits a phone that already knows this box; a phone that has never seen it still has to scan, because the box's own key travels only in the square, and the page says that rather than offering a path that cannot work. What makes forty spoken bits safe is not their size: it is minted only on the LAN, shown only on the box's own page, spent once, five minutes long, and burned by five wrong guesses. The counter is on the code and not on the caller, because an address-keyed counter would inherit the relay's own bug, where the documented TLS terminator makes the whole fleet one address.
+
+- 393ecdf: Keep an idle FTW app relay connection alive when the relay sends its regular
+  WebSocket heartbeat.
+- 9d170ac: The box can now speak the FTW web app's client protocol. A new `appproto` package handles the handshake, the telemetry stream, commands and the dispatch plan: version negotiation degrades an old app to a frozen field subset instead of refusing it, telemetry rides a fixed-size lane that sends a tick even when nothing changed, source freshness travels in deltas so a device that goes quiet mid-session is visible immediately, and commands are separated into a receipt from the dispatcher and a result read back from the driver. Shared names — field ids, capabilities, scopes and error codes — are generated from `contract/registry.yaml` rather than typed out, and a test fails when the two drift. This is the protocol used by the app link in this release.
+- dcfc1c8: The box can now speak the app's wire: frame codec, Noise IK responder and encrypted transport, in `go/internal/appwire`. Telemetry frames are padded to a fixed bucket and refuse to grow, so a 1 Hz stream does not leak the household's load pattern through its length. Unknown message types and unknown map keys are ignored in both directions, so an app pinned in a service worker degrades instead of showing a white screen. Verified against the official Noise test vector and against bytes generated by the app itself.
+- 49f6369: Move the bundled-driver pin to device-drivers@f4ab266e. The recovery snapshot
+  now carries the reviewed version bumps for CTEK API v1 and v2 (0.3.2) and
+  Sungrow (1.5.8). These upstream changes only update driver versions; telemetry
+  and control code stays unchanged.
+- 16ddcf8: Cancel no-longer-needed direct-HiGHS solves in the Unix optimizer sidecar so
+  the newest request can start before the old solve deadline.
+- 5213dd5: Cancel Core's request for an older MPC replan as soon as a newer request
+  starts or the service stops. Superseded Core work no longer falls back to Go
+  DP or publishes a plan, shadow result, or diagnostic.
+- 4b7ad49: Core now keeps a driver out of control when the driver registry has blocked writes pending a safe default, tracks refused battery, PV, and EV actions separately on hybrid devices, and prevents a wallbox resume from crossing a newer command, default, exclusion, or driver shutdown. Charger sends now have a deadline so one slow device cannot hold the other loadpoints' control tick.
+- 836880d: EV charging is on the app wire. Field 10, `ev_w`, carries the summed charger draw — frozen in meaning like fields 1–9, conditional in presence like battery_soc: a site without a charger sends nothing and the app draws no EV node rather than a dead one. Charger drivers now also appear in the app's source table, so their freshness is visible. The energy-flow component gains a `static` attribute that holds every animation still — the FTW app sets it while showing a cached snapshot, because a moving particle is a claim that power is flowing right now.
+- c3d3701: Promote the validated Core and updater beta images to stable without rebuilding them, while keeping the running release tag correct on both channels.
+
+  Core 2.0.0 and its updater are the components promoted by this release. The
+  optimizer keeps its independent release line:
+  `ghcr.io/srcfl/ftw-optimizer:latest` remains v1.3.2, while optimizer v1.4.0
+  remains on `ghcr.io/srcfl/ftw-optimizer:beta`.
+
+- f9794cf: Make the bundled Huawei and Ferroamp Modbus hybrid drivers telemetry-only.
+  Their former 0 W battery commands released the inverter to its own control
+  instead of holding the battery idle. Ferroamp battery control remains available
+  through its hardware-tested MQTT driver.
+- 60057bb: Reject invalid MPC physics before either solver and keep the prior plan. Use one PV uncertainty snapshot per replan, and do not use the Go fallback while a battery is recovering into its operating SoC range.
+- 5b9ec17: Reject invalid raw MPC fuse and export limits before slot clamping can hide them from solver input validation.
+- 546c8b1: Make the box-to-app link faster and cheaper. The first telemetry subscription can travel with the hello, hidden apps receive the promised 0.2 Hz cadence, and the box dashboard stops its two-second status poll while hidden. History work no longer blocks other app messages and reads each tile from SQLite once. Large API answers stream through a fixed chunk buffer instead of repeatedly copying the remaining body.
+- 71b2be4: The price chart can now be handed its data instead of fetching it. A `fed` attribute turns off both the request to /api/prices and the five-minute poll behind it, and `setPrices()` pushes a window in. The FTW app draws this same chart over its encrypted session to the box and has no HTTP origin to fetch from, so without this it would have to keep a fork — and a forked chart is one that stops matching the box's own.
+
+  A slot fed with its own total is shown as sent rather than recomputed from the box's tariff and VAT, since the caller may hold different ones, and the subtitle says "total to import" rather than naming parts it cannot see. The dashboard is unchanged: without the attribute the component fetches, polls and labels exactly as before.
+
+- c6b325d: Fleet statistics now live with the FTW app settings. Fleet sharing stays on by default for existing boxes and remains a separate switch, so it can stay on when the app relay is off. The panel still shows the exact daily payload and its privacy limits.
+- f36cd79: Keep storage and meter direction guards when prices, PV rewards, or terminal values would let a relaxed optimizer profit from simultaneous charge and discharge or import and export. Retry a cost-neutral hidden storage cycle with a direction guard, and keep progressive hedging off mixed-integer models.
+- 6f01e77: Show the single bundled FTW version in Settings → System when running as the Home Assistant add-on (`FTW_BUNDLE=home_assistant_addon`), instead of the per-container Core/Optimizer breakdown and update buttons that Supervisor-managed installs cannot use. Keep the global update badge hidden when self-update is off, even if component status arrives after the disable response.
+- b8cb4ad: The help report now shows the latest accepted plan ID and the plan ID used on
+  the last battery control tick. It flags a mismatch instead of mixing two plan
+  revisions without saying so.
+- 152dc84: Give HTTP drivers a hardware-stable device identity. An HTTP driver's MAC was
+  never resolved, so a LAN device that had not yet reported a serial fell back to
+  no identity at all and its persistent state (battery model, RLS twin,
+  calibration history) was orphaned whenever its address changed. The registry now
+  ARP-resolves the driver's own configured address, exactly as it already does for
+  MQTT and Modbus.
+
+  Only the driver's own `host`/`url` is probed, never the merged HTTP allowlist,
+  so vendor cloud endpoints are never treated as identity candidates. ARP lookups
+  are also now skipped for addresses that provably cannot appear in an ARP table
+  (loopback, carrier-grade-NAT/tunnel, multicast and broadcast), saving 150 ms of
+  pointless dialing. Public addresses stay eligible, so devices on a segment with
+  an ISP-routed block keep the MAC-derived identity they have today.
+
+- 6cb3b82: Refuse to render the dashboard inside another site's page, and send nosniff plus no-referrer on every HTTP response.
+- 121868a: Raspberry Pi Imager: the repository manifest now declares the hardware it
+  supports, so the documented install flow reaches the FTW image instead of
+  dead-ending on an empty device chooser.
+
+  Imager 2.x opens on "Select your Raspberry Pi device" and builds that list
+  solely from `imager.devices` in whichever manifest it was pointed at — a
+  custom repository replaces the stock manifest rather than extending it. FTW
+  published neither an `imager` object nor a `devices` array, so `HWListModel`
+  bailed with "missing imager", the device list stayed empty, and **Next**
+  stayed disabled: the OS list had loaded, so the offline escape hatch
+  (`osListUnavailable && hwlist.count === 0`) did not apply. Nothing on the
+  device step could be clicked and the FTW entry was never reached.
+
+  The entry itself was also untagged. Imager keeps a `devices`-less OS entry
+  only when the selected device matches inclusively, so a Pi 5 — which matches
+  exclusively — would have filtered FTW out even once a device was selectable.
+  `devices` is required by Imager's published schema for a direct-image entry.
+
+  The manifest now ships `imager.devices` (Pi 5, Pi 4, and "No filtering") and
+  tags the FTW entry `pi5-64bit` / `pi4-64bit`, matching the arm64 image it
+  actually builds. Both workflows that publish the manifest assert the two
+  lists are present and agree, so an entry tagged for a device the chooser
+  never offers fails CI rather than shipping unreachable.
+
+- 91ae207: Keep the newest MPC replan when solves finish out of order. Each request now
+  keeps its mode and reason together, and an older result cannot replace a plan
+  started after it.
+- cecb4d3: The FTW app can charge the car. Two new command operations go through the session's door: `loadpoint.hold` pins a loadpoint to a fixed charging power — the same manual hold the operator UI installs over HTTP — and `loadpoint.boost` lets the house battery boost the car under the same bounded lease the HTTP route grants. `clear` releases a hold and `cancel` withdraws a boost, each a distinct signal rather than a zero setpoint, because 0 W is itself a valid hold that pauses the charger. Both ops sit behind every gate the door already holds — expiry, revision, guards, idempotency, scope — plus the dispatch block, since both move energy and stale meter data stops dispatch through this door like any other.
+
+  One code path, not two. The ops call the very controller methods the HTTP routes call, validate the boost lease with the same function the HTTP route answers 400 from, and share the hold-duration cap through a single constant in the loadpoint package. The result reports what the box reads back — the power actually held, the boost actually running — never the echo of the request, and anything applied pushes a fresh plan so the app is not left showing the old intent beside the new state. A box with no loadpoint controller answers `E_UNAVAILABLE`, the session's word for the 503 the HTTP routes give, and `der.ev` stays unsaid so the app hides the buttons rather than drawing dead ones.
+
+- 55d7f37: A mode change from the app is confirmed as soon as it is applied. The forced replan runs off the command path: the Python optimizer can take longer than the app waits for a result, so a change that had already been applied and read back was reported "unconfirmed" purely because the planner was slow. The replan keeps running under a context that survives the session, so a phone dropping its socket right after tapping cannot abort it.
+- 6947210: Keep the hourly weather row that covers the current MPC slot, prevent pre-forecast PV carry-forward, and keep cloud fallback on the nearest row.
+- c095702: Record the source and local availability of each MPC slot's price input and weather row in diagnostics.
+- 1bab766: A box can turn notifications on again when its ntfy is only half-filled. Web push is engine-owned now — keyed by the subscriptions a phone stores, not by the `provider` field — so "notifications on, no provider configured" is a real, working state. But a box carrying the old default (provider `ntfy`, server `https://ntfy.sh`, no topic — the shape most boxes have) was refused at the door: enabling notifications answered `notifications.ntfy.topic required`, and web push could never reach the phone.
+
+  The one ntfy setting nothing works without is the topic; it has no default, and nothing publishes without it. So ntfy counts as active only once a topic is set. Below that it is inactive, not an error: the box enables notifications and delivers over web push, and `NewProvider` installs no ntfy transport that would fail every send — it logs the inactive ntfy once, so the drop is warned rather than silent. A topic with no server to carry it is still a mistake, and still refused. A box that genuinely set both keeps sending over ntfy exactly as before.
+
+- 120278a: Optimizer backtests now compare one causal first action per non-overlapping measured interval. They no longer add overlapping horizon costs, exclude PV-curtail cases that replay cannot model, and label measured-data grid-cost repricing as a counterfactual rather than delivered savings.
+- 15acbd1: Bound each optimizer request to one worker deadline so expired queued work no longer blocks newer plans or resets its budget between solver phases.
+- d5f1744: Fix two optimizer result rules. The minimum arbitrage spread now applies only in arbitrage modes, so self-consumption and cheap-charge plans can serve load without an unrelated discharge cost. CVXPY plans that stop at the solver time limit now fail unless the solver reports an accepted optimal status.
+- 31af437: Keep stable releases draft until their assets and paired Core/updater aliases verify, and preserve the installed release tag with Compose list-form environments.
+- abb850d: Core now cancels blocked Lua work, read-only HTTP, or sleep before it runs the driver's autonomous default. Mutating HTTP stays ordered until the host transport returns, and a dedicated default queue keeps the safety request ahead of stale control commands without calling one driver in parallel.
+- 203434a: Deadband and holdoff fuse relief now starts from each battery's live power,
+  stays within its command limits, and can cancel safe charge without draining
+  an empty or discharge-blocked pack.
+- 16d33fd: Preserve the last fresh SoC time across power-only and explicitly cached vehicle updates. Do not duplicate long-format SoC samples for those updates. Vehicle control now ages SoC from that observation time and rejects driver-marked stale data.
+- 914eb74: Keep explicit zero battery charge and discharge limits disabled through dispatch.
+- f55eaa2: The price chart is shorter in the FTW app on a phone. It kept the shape the dashboard uses, which is right for a page about prices and wrong for the app's Plan screen, where a sentence, the mode choice and the hour-by-hour timeline share the screen with it: the chart alone painted 247 px of a 375×812 phone, so nothing else was ever on screen with it. It now paints 151 px, and the whole price block has gone from 57 % of the viewport to 45 %. Only the viewBox height moves — the rendered scale comes from the width — so the axis figures, the NOW marker and the peak and low markers come out at exactly the size they did before. `fed` is what tells the app apart from the dashboard, and the dashboard's Energy tab is unchanged at every width.
+
+  Fixed for both: the bottom y-axis figure lost its leading zero on a phone, rendering "0.00 ö" as ".00 ö". Each label is anchored just inside the left gutter and grows leftwards, and the gutter was a fixed 84 units while the phone's axis font is nearly three times the desktop one — so the widest label ran past the edge of the SVG and the browser clipped it. Even "335 ö" lost a hairline. The gutter is now measured from the labels the chart is about to write, which also covers the currencies whose unit is three characters wide.
+
+- fdef0da: The price chart's tooltip now reads the day it is drawing. The chart shows the horizon its toggle selects — today, tomorrow, or both — but the tooltip looked its slot up in every slot the box had sent, so with **Tomorrow** showing, the bar under your finger was tomorrow's and the price beside it was today's. Both days start at midnight, so the clock time printed correctly over the wrong day's number: on a phone, a bar at the top of a 96 öre axis read "9.00 öre". The slots being drawn now travel with the geometry that hit-tests them, since those are the two things that have to agree.
+- e6698eb: Require the same local-or-token check for config, logs, support dumps, device identity, integration status, notification history and local paths that already guards backups and CalDAV passwords. Live status, energy, prices and plan reads stay open.
+- 434122a: Require remote API authentication before listing or downloading backups or revealing managed CalDAV credentials.
+- 372ef5e: The box can reach a lock screen. A web-push provider joins the notifications engine — hand-rolled VAPID (RFC 8292) and aes128gcm encryption (RFC 8291) on the standard library, one keypair generated on first run beside state.db the way nova.key is — and the engine grows from one transport to many, so a household using ntfy loses nothing when the app enables push. Subscriptions are state, not config: `GET /api/notifications/vapid` hands out the public key and nothing else, `POST /api/notifications/subscriptions` stores a browser's endpoint against the phone that authenticated (never against what the body claims), and revoking that phone sweeps its subscriptions in the same breath. A push service answering 404 or 410 deletes the row it just declared dead. `PUT /api/notifications/rules` is the narrow rules write the passthrough can carry — per-type upserts that cannot wipe a setting their sender never knew about, which is why the whole-config route refuses to travel — and `GET /api/notifications/rules` shows the same document without the write's step-up ceremony: the effective set, seeded defaults when nothing is stored yet, rendered without storing anything.
+
+  Three new facts can reach the phone, worded by `contract/push-catalogue.yaml` — the app's file, paired byte for byte like the registry, and the only place the box may take lock-screen prose from: the charging session completing (published at the loadpoint's own once-per-session latch, with the session meter's kWh), charging interrupted (only after ten steady minutes, a confirmed stop, cable still in, and never when the box itself ordered the pause — a plan parking the car through expensive hours pages nobody), and an update having installed (the first boot of a new version, once).
+
+  And the one sentence the box cannot send about itself — "your box is out of reach" — it now writes down in advance: rendered from the catalogue, encrypted per subscription before it ever leaves home, and handed to the relay as dead man's rows the uplink claims on every connection. Each row carries its own VAPID Authorization header, signed by the box because the relay never holds the key, and re-signed every six hours while connected so the 24-hour signature is always fresh if the switch fires. The relay holds ciphertext it cannot read and posts it once if the box misses its deadline; a reconnect cancels the countdown, and a deleted subscription takes its row with it.
+
+- c61f42f: The pairing QR can be scanned. The vendored encoder produced symbols no reader could decode above type 6: version information was never written, which the standard requires from type 7, and the timing line was drawn before the alignment patterns, so the centres that sit on row 6 and column 6 were skipped as already taken. Both faults are invisible — the symbol looks like a QR code and decodes as nothing. It stayed hidden because every payload the box had until now was short; the calendar link is a type 4, and the app pairing URL is 165 characters and lands on type 9. The settings tab also called the encoder as if it were a constructor, so it drew nothing at all. Covered by a test that decodes what the encoder produces, rather than counting modules — which is what the previous tests did, and why they passed throughout.
+- daded6e: The contract registry now names the command operations. `site.mode.set` and `battery.hold` were hand-written twice — here beside the dispatcher, and in the app's simulator — with the scope each demands written twice more, and nothing compared the four. The registry's new `ops` block is the one place the pair is written down: the generator renders it as `RegistryOps`, and a test holds `defaultOps()` to it, the same arrangement mode tiers already have. Containment rather than equality, deliberately — the registry may name an op ahead of the box, and `battery.hold` is exactly that today: an app may say it, this box rejects it with `E_UNKNOWN_OP`, and nothing acts.
+
+  The registry also takes in the last of the app's own error codes. Its header has always said every app-raised code has a home there; three did not — `E_NO_ACK`, `E_NO_ANSWER` and `E_BAD_BODY` sat in the app alone, outside the check that keeps prose and retry rules honest. They now sit in `client_errors` beside `E_RESPONSE_TOO_LARGE`. The box generates nothing from that block and must never send one of them; the copy here exists because the file is one file in two repositories, byte for byte.
+
+- e45cc62: Reject EV charge targets with a negative deadline slot so the primary and fallback planners cannot interpret the same input differently.
+- 803ca06: Anonymous daily fleet reports now go to `relay.ftw.energy`, which keeps only daily totals for 90 days. Settings calls the feature fleet statistics, keeps sharing on by default, and lets the box opt out without a restart.
+
+  The sender refuses redirects, refreshes the signed installed-driver list for each report, and shows the endpoint used by the running process.
+
+- c9c7919: A household can get back to no phones paired, from the box's own page. Until now the last owner could not be removed at all: the device list drew a sentence where the Remove button goes — add another before removing this one — so a home that lost its only phone, or wanted to start clean, had no way down to an empty list from anywhere.
+
+  The refusal was right about one door and wrong about the other. What it guards against is a phone emptying the roster from anywhere in the world: remove the last owner over a session and nobody can administer the box, and nothing done remotely can mend that. Standing at the box is a different position. Whoever reads that page is in the building, and the same page mints a fresh pairing code — the way back in is the button above the list. Refusing there protected nothing and stranded the household the rule was written for.
+
+  So `appenroll.Revoke` now takes the presence of whoever is asking, and refuses the last owner over a session only. The decision stays in enrollment rather than moving up to a screen; what is new is that the box is told which door the request came through. That fact comes from the caller the box named when it admitted the request — a LAN caller is minted as a local owner, an app session carries the kind `app` — and never from a field a remote caller could set. Removing the last owner through the app is still `E_LAST_OWNER_PROTECTED`, the same sentence and the same code.
+
+  Stepping the last owner down is still refused at both doors, the box's own page included. Removing the last phone leaves a list somebody at the box can fill again; demoting it leaves a list of phones that can only look, which is the lockout rather than a way out of it.
+
+  The box's device list follows. The last owner's row carries the Remove button every other row has, and the warning lands where it belongs — at the press, saying what is on the other side of it. A household down to one phone is told that nothing will see or change this home until a phone is paired again, with a code from this page. One with guests still paired is told those phones will be left able to look and change nothing. Both are what happens, which the old sentence was not: it described a rule the box no longer keeps.
+
+- d947370: Overview now shows monetary savings for today, the last 7 days, and month to date. The values compare real grid cost with buying the recorded home load without PV or battery, use the site's currency, and mark gaps in price data.
+- f675be8: Reject long telemetry gaps in historical cost reports, show history and price coverage, and label savings as total site value.
+- 2d775af: Self (manual) now includes EV charging when it drives the site meter toward
+  zero. It no longer needs `battery_covers_ev` to stop charging the home battery
+  while the full site imports. Other modes keep the setting. A surplus-only
+  loadpoint still blocks home-battery discharge into its EV without blocking
+  coverage of regular EVs.
+- 0985e3c: The optional optimizer now uses highspy instead of CVXPY by default for
+  eligible shared storage plans, sending a sparse linear model straight to
+  HiGHS. It keeps the same shared-action constraints, service-first solve,
+  scenario risk cost and replay checks as the CVXPY model. It checks meter flow
+  against the post-curtailment baseline and retries an exact mixed-integer HiGHS
+  model within the same time budget when a relaxed candidate crosses import and
+  export. Auto mode uses this path only for continuous, cycle-safe HIGHS requests
+  with storage alone; commercial constraints, flexible loads, thermal loads,
+  guarded tariffs and direct-solver failures stay on CVXPY.
+- d8f534d: Stop progressive hedging after its initial scenario solves when their decisions already meet the configured residual tolerance. This avoids a redundant solver iteration that could exhaust the time limit and discard a valid plan.
+- 4620091: Keep battery slew from restoring charge or discharge that the live-meter
+  clamp removed, while mixed battery fleets stay on the aggregate meter target.
+  A battery that ignores commands can no longer pin dispatch on the wrong side
+  of the controller's target.
+- efd0f08: The stable software identity resolves again. It is anchored on the permanent MAC of whichever interface carries the box's uplink, and the question was asked against `uplink.home.sourceful.energy` — Home Link, retired in August 2026, DNS record and all — so every resolution died at the lookup before a route was ever read. The question now goes to `relay.ftw.energy`, which the box dials anyway. The MAC is the identity and the host never was, so the same box derives the same identity over the live name.
+- 68c95ff: Carry a stable decision ID for newly accepted Core MPC plans through diagnostics and restart restore.
+- 1bab766: A passkey prompt no longer fires on every configure call. The box refused each configure-tier write until the app carried a fresh step-up, and it remembered nothing about the ceremony that had just run, so a settings screen that subscribes, saves its rules and sends a test cost three Face IDs — and another for every failed attempt.
+
+  A genuine ceremony now opens a short grace window on that session: five minutes, measured on the box's uptime clock, the same monotonic clock a command's expiry is checked against, so a wall-clock jump cannot widen it. Inside the window, further configure calls from the same session are accepted without a fresh ceremony; outside it, the next write pays one again. The window runs only from a real ceremony and is never extended by a call it waved through, so it outlives a ceremony by at most five minutes and no run of writes holds it open unattended. It is bound to the one enrolled device the session serves, so no phone inherits another's. The property is unchanged — a privileged action still needs recent human presence — and only the re-prompting inside that window is gone.
+
+- 1f1d1d0: New notification kinds reach boxes that chose their rules before the kinds existed. The rules document served a stored configuration verbatim, so the first household to ever save a rule was also the last that could ever see a kind added later — the charging and update notifications were invisible on any box with a pre-existing notifications section. The effective document now appends any known type the stored list lacks, at its default and disabled; the stored entries themselves are never touched and nothing is written by reading.
+- 8f29c21: The energy flow's house hub is clickable, like its planets. It carries `data-role="load"` and fires the same `ftw-planet-click` event, so a host can open the house's own live reading from a tap on the centre — the app draws a live line for it, the way it already does for grid, solar and battery. Purely additive: nothing that ignores the event changes.
+- c86c9e8: Config validation now rejects `fuse.phases` above 3. Dispatch only reads three phase currents while the aggregate power limit used every configured phase, so a larger value overstated the usable fuse budget. It also rejects more than one driver with `is_site_meter: true`; the first match previously won without warning. Existing invalid configs must be corrected before the next restart: set `fuse.phases` to 1, 2 or 3 and keep exactly one site meter.
+- ab18152: Notice when a new Debian stable leaves the container base behind.
+
+  The images pin a codename (`debian:trixie-slim`, `python:3.12-slim-trixie`)
+  rather than `stable`, so a major-version jump can never arrive silently on a
+  rebuild. Nothing noticed when a new stable shipped, and Dependabot cannot: it
+  orders numeric tags, and a suite codename has no numeric component to order.
+
+  A weekly check now reads the pin out of the three Dockerfiles and compares it
+  with Debian's own `stable` release, failing when the pin falls behind or when
+  the three images stop agreeing on one suite.
+
+  No runtime behaviour changes.
+
+- a00c512: Escape loadpoint names and planner text in the dashboard, and ship Leaflet with the box instead of loading it from a CDN.
+- 32ac187: Create saved config temp files with an owner-only Windows ACL before writing credentials, including when an atomic save replaces an existing config.
+
+## 1.16.1
+
+### Patch Changes
+
+- 65cad56: Idle mode now stops the batteries instead of stopping the commands.
+
+  Selecting idle used to issue no command at all. A battery holds the last
+  setpoint it accepted until it is given another one, so switching to idle while
+  a battery ran at 5 kW left it running at 5 kW, and what happened after that was
+  the vendor's decision rather than ours: a Ferroamp EnergyHub's forced mode
+  expires, and on 2026-06-10 one reverted to its own behaviour and charged 2.6 kW
+  from the grid while FTW believed it was idling, while a Sungrow holds until
+  told otherwise. Idle now commands 0 W to every battery it may command and
+  re-sends it on every control tick, so the hold is ours and cannot decay.
+
+  The mode key stays `idle` — the `/api/modes` and Home Assistant contract is
+  unchanged, and so is every automation built on it. The button is now labelled
+  "Stop batteries", and its tooltip says what the mode does: the fuse-saver still
+  overrides the hold and discharges a battery when the site is about to trip its
+  main fuse, and EV charging and PV curtailment are unaffected and keep their own
+  controls. To leave a battery to another controller entirely, use the per-driver
+  `observe_only` setting, which excludes it from dispatch altogether.
+
+## 1.16.0
+
+### Minor Changes
+
+- fad4752: An operator can now send a driver's declared command and hold it for a bounded
+  time. `POST /api/drivers/{name}/control` takes `{control, value, duration_s}`;
+  `DELETE` on the same path ends the hold early. The active hold appears on
+  `/api/drivers/{name}` so a UI can show what is set and until when.
+
+  Deliberately outside control v2. A signed package binds a RuntimePolicy and
+  goes through `CommandV2` with its write scope, lease and evidence, unchanged.
+  A bundled or local driver has no policy, and synthesising one would be worse
+  than doing nothing: `HostEnv.permissionAllowed` grants everything only while
+  the policy is nil, so a policy without permissions silently blocks the driver's
+  own MQTT, and `LuaDriver.Command` refuses a control v2 driver on the legacy
+  path — v2 wants `driver_command_v2` entrypoints no community driver has. This
+  path leaves the policy layer untouched and validates against the catalog
+  declaration instead.
+
+  What that costs, stated plainly: no host-enforced write scope, no host-verified
+  evidence. What it keeps is the part that protects hardware. Core clamps every
+  value to the declared bounds rather than trusting the Lua to do it — a driver
+  that forgets to clamp is exactly the driver this protects — and the driver's
+  own declaration is the whole allowlist, so an undeclared control is a 400
+  rather than a 200 for a command the Lua silently ignored.
+
+  Every hold ends by itself, and ending means calling the driver's own
+  `driver_default_mode` rather than writing a value Core invented: only the
+  driver knows what neutral is. Default 4 h, maximum 24 h, and nothing survives a
+  restart. On process start or driver re-add, a legacy driver must also confirm
+  that default before control opens; a failed confirmation keeps control blocked
+  and retries with a bounded backoff. An offset left behind by a browser tab that
+  closed is a house heated wrong for weeks.
+
+- 603a0d4: Drivers can declare the commands an operator may send, and Core reads them.
+  A `controls` list in the `DRIVER` block names the command, gives it a label,
+  describes its single input — type, bounds, step, unit — and states what counts
+  as proof the device took it. `/api/drivers/{name}` and `/api/drivers/catalog`
+  surface it.
+
+  This is the description, not the path: nothing sends these commands yet. It
+  exists because there is currently no way to describe one at all. Settings →
+  Devices renders a hand-written branch per driver family, so a driver with a
+  real control surface — the Heishamon heat pump's curve offset, verified
+  against hardware since June — has no way to reach a person, and its author is
+  told to write a Home Assistant automation instead (srcfl/ftw#520).
+
+  Signed packages already carry this shape in `RuntimeCommand`, but only for
+  drivers shipping through the signed channel. Bundled and local drivers have no
+  policy, so the `DRIVER` block is where their declaration has to live.
+
+  A declaration the UI could not render is dropped rather than surfaced half
+  formed: no id, an input type outside number/boolean/string, or a number
+  missing either bound. A slider with one end is a guess, not a control. Drivers
+  that declare nothing are unchanged, and the JSON key stays absent for them, so
+  a client can tell "reports only" from "declares an empty list".
+
+- 53b5af5: The Heating view can now set a heat pump's curve offset. A pump whose driver
+  declares a control gets a row on its card: the value in force, when the hold
+  ends, and buttons to move it or release it. A pump that declares nothing looks
+  exactly as it did.
+
+  It lives on the Heating card rather than in Settings → Devices because that is
+  where the pump's own state already is — the offset sits next to the
+  temperatures it moves. Settings is for connecting a device, not for running it.
+
+  Rendered entirely from the declaration: label, bounds, step and unit come from
+  the driver, and nothing in the view knows a driver by name. Stepper buttons
+  rather than a slider or a number field, because the card is re-rendered every
+  30 s and a control holding input state would lose a half-typed value on each
+  refresh.
+
+  With no hold the row reads "Auto" rather than a number. Nothing in the browser
+  knows what offset the pump has settled on internally, and printing 0 would
+  claim knowledge we do not have. Held state is carried by the text and the
+  weight of the value, never by colour: the theme's green/red pair is not
+  separable under deuteranopia.
+
+  A driver that declares `evidence: "write_ack"` instead of `"readback"` says so
+  in the row — "the pump does not confirm this setting". The weaker guarantee
+  belongs where the operator is standing.
+
+- 2defa8e: Move the whole container stack to one base: Debian 13 "trixie" slim.
+
+  Core was `alpine:3.22`, the updater sidecar was `docker:27-cli` (also alpine),
+  and the optimizer was `python:3.12-slim-bookworm` — two libcs, three unrelated
+  base images and three security streams in one deployment. Core, updater and
+  optimizer now all sit on `debian:trixie-slim`, verified to share a single base
+  layer, so a host pulls that rootfs once and there is one suite to track. It also
+  matches the Raspberry Pi OS release the SD image is built from.
+
+  What the move buys: glibc, so the image can run ordinary prebuilt vendor
+  binaries, which musl cannot; a full userland, which makes `docker exec`
+  debugging on a live site practical; and `libnss-mdns` wired into
+  `/etc/nsswitch.conf`, so `.local` names resolve for glibc tools inside the
+  container — `getent hosts zap.local`, `curl`, `wget` — once an avahi socket is
+  mounted. Alpine has no NSS plugin mechanism at all, so none of that was
+  available before.
+
+  That covers tools in the image, not the FTW process itself: the binary is built
+  `CGO_ENABLED=0` and so never consults NSS. It stays fully static and still
+  cross-compiles on the build platform.
+
+  `wget` is now installed explicitly and asserted by the container boundary test.
+  It is contractual rather than incidental: `ftw-updater` `docker exec`s it inside
+  the core image to decide whether an update commits, and updaters already
+  deployed in the field will keep doing so. The zoneinfo database is also embedded
+  in the binary as a fallback, so a base image without `tzdata` can never silently
+  push `time.Local` to UTC and mis-time price and plan windows.
+
+  Size: the core image grows from about 53 MB to about 133 MB uncompressed. The
+  updater is unchanged at about 203 MB — `docker:27-cli` was never a small image —
+  and now shares its base with the other two, so the per-host download is well
+  below the nominal sum.
+
+  Data ownership is unchanged: the process still runs as the bare numeric uid 100
+  / gid 101, and gid 101 is still what grants access to the optimizer's socket.
+
+  The optimizer is versioned independently and moves to 1.4.0, because its image
+  is a materially different artifact once the base changes. Its release workflow
+  verifies that a published image's revision label matches the commit it claims,
+  so the new base could not have shipped under the old version number at all.
+
+  The base is pinned to the `trixie` codename rather than a `stable` alias so a
+  major-version jump can never arrive silently on a rebuild. A new scheduled
+  `debian base currency` workflow watches for a newer Debian stable and opens a
+  tracking issue when one appears.
+
+- 10fd54b: A read-only driver may now sign in before it reads.
+
+  A driver that reads a vendor cloud cannot read anything until it has exchanged
+  a token, and it exchanges one with a POST issued from `driver_init` or
+  `driver_poll` — the phases the write scope refuses, correctly, since nothing
+  there carries a command lease. Such a driver could therefore only be published
+  control-capable, and its catalog entry then claimed a control path it does not
+  have.
+
+  `RuntimePolicy` now carries `auth_post_path` from the signed driver manifest,
+  and `host.http_post` skips the write scope only for a URL whose path equals it.
+  The exemption requires a read-only policy, a declared path, `http.post` still
+  granted, and an exact path match, and it does not consume the write budget — a
+  token refresh is driven by expiry rather than by a caller. A driver that
+  declares nothing behaves exactly as before.
+
+- a55328d: Let an operator place a short manual hold on one home battery. The hold binds to the battery hardware, stops when that battery is not safe to control, clears on restart or stale site data, and keeps all core power, SoC, slew, and fuse limits in force.
+- 6380af0: PV forecasts are now orientation-aware. When per-plane geometry is configured
+  (the Weather tab's PV arrays: tilt/azimuth/kWp), a radiation-bearing forecast
+  provider's global horizontal irradiance is projected onto each panel plane via
+  the physics `sunpos` model and summed, instead of the previous flat
+  `rated × (W/m² / 1000)` estimate that ignored panel orientation. Sites with no
+  arrays configured keep the existing behaviour, and providers that already return
+  site-calibrated watts (Forecast.Solar) are left untouched.
+
+  Providers that publish only global horizontal irradiance get an Erbs correlation
+  to split it into direct and diffuse components before projection, so a
+  south-facing 35° roof and a flat one no longer receive the same forecast.
+
+### Patch Changes
+
+- 7803081: The setup wizard's driver picker no longer dead-ends when a device has no catalog entry. A "My device is not listed…" option explains that more drivers can be installed from the signed repository after setup (Settings → Devices), links to requesting a driver that doesn't exist yet, and lets onboarding continue without the device.
+- b348685: Saving a config through the API now applies it exactly like a file edit. Previously POST /api/config hot-applied only a hand-picked subset of control fields and swapped the shared config pointer itself, which blinded the config watcher's own diff — so a site meter set for the first time (the setup wizard's normal path) never reached the running controller: the dashboard showed Grid 0 W and an inflated Load, and dispatch had no site boundary until a process restart. Both paths now run one shared apply, so hot-reload of the site meter, slew enable, DC-link protection, inverter groups, fuse parameters and the mpc/loadmodel sync all work from the UI too.
+- 20b3ea7: Settings → Remote no longer offers passkey setup it cannot start. The section's gating toggled a `hidden` class no stylesheet defines, so the setup controls stayed visible and clickable while the gateway identity wasn't adopted — clicking opened a blank tab that immediately closed itself (a white flicker), and the error text was overwritten by the next status poll. The gating now uses the DOM hidden property, the click refuses with a durable explanation before any tab opens, and enrollment failures land in an error element the poller doesn't rewrite.
+- 2aa74bc: Home Link now logs the wrapped local uplink failure, retry attempt, and retry delay while keeping the public runtime error as the fixed `connection-failed` code.
+- e04d900: One slow driver can no longer stall dispatch for the whole site. Every command the control tick sends now carries its own deadline, derived from `site.control_interval_s` (half the interval, capped at 2 s and floored at 250 ms). Before this, the tick handed the driver registry the process-lifetime context, which has no deadline, and the driver goroutine runs the device call inline — so a cloud driver waiting on an HTTP or OAuth request that never answered held up every other battery on the site, and the reactive fuse guard with them. A command that runs out of time is logged at Warn with the driver name, so a chronically slow driver shows up in the log instead of quietly eating tick cadence.
+- f4eedde: A site sitting inside the reactive deadband is now protected. The reactive control arm stops early when grid power is close enough to its target, and that exit walked away from the cycle before the fuse guard and the fuse-saver ran — so on a site whose grid error was small, no protection ran at all. Two things bind on numbers the deadband never reads. An operator peak ceiling below the plan's grid target: the plan asks for 8 kW of import, the meter delivers 8 kW, the error is zero, and every watt above the ceiling is billed at the peak tariff the operator set it to avoid. And a single phase over the breaker while the three-phase sum sits still — a single-phase EV charger on L1 against three-phase solar export. Both now force the battery to bridge, the same way idle mode and the dispatch holdoff already did. A deadband tick with nothing binding still commands nothing.
+- 4007fdb: A battery can no longer keep charging against a charge block that the site has already closed. The reactive control arm stops early when grid power is close enough to its target, and it issued no command when it did — but a battery holds its last setpoint until it gets another one, so an earlier charge command kept running. The trap is that the charge itself is what keeps the meter near target: on a planner slot that forbids charging, a battery absorbing a 2 kW solar surplus holds the meter at −50 W, the error stays inside the deadband, and the tick that would have stopped the charge walks away for as long as the sun holds. The surplus the slot exists to export goes into the pack instead. The same silence kept a battery charging after its own driver reported that it cannot charge. Such a tick now commands zero, and a deadband tick with nothing blocked still commands nothing.
+- a4f1300: The rule that a driver which cannot actuate leaves dispatch and gets its autonomous default now covers EV chargers and PV inverters, not just batteries. Until now only the storage loop filed what a driver made of its command: the PV curtail loop threw the error away and the loadpoint controller only logged it. So a wallbox that answered every poll and refused every setpoint held its last current while the plan kept booking the charge, and an inverter that refused every cap kept exporting into a negative price while the plan booked the saving — the same silent failure, one wire over. Which command counts on each path is chosen for what refusing it proves: the PV cap counts but the curtail release does not, and on the EV side the periodic setpoint counts while the safety standdown, the vehicle wake and the contactor cycle do not. A parked car refusing a wake, or a charger that has no pause action, is behaving correctly and stays in dispatch.
+- 7a1252a: A driver that cannot actuate now receives its autonomous default mode, and leaves dispatch and the plan while it can't. Two cases were missed before. A driver that reports a device fault — a Ferroamp EnergyHub in Fault Mode with its relays open, a Pixii mid-calibration — kept polling, so the staleness watchdog saw nothing wrong and never asked it for its safe state; it was dropped from dispatch and held its last setpoint indefinitely. And a driver that answered every poll but rejected every command stayed marked healthy, so it stayed in the dispatch set and in the MPC fleet, and the power the plan counted on but never got became grid import instead. Three refused commands in a row now take a driver out of control until it accepts one again, with one command let through every five minutes so a device that recovers on its own comes back without an operator. Both cases send the driver's own declared default exactly once per transition, and both re-arm on recovery. `observe_only` drivers still receive no command of any kind.
+- 963fb0d: A settings save now survives a power cut, and stops leaving the config world-readable. `config.yaml` is the file the gateway boots from, and every save from the UI rewrote it with no fsync of the temp file and no fsync of the containing directory — a rename is only atomic for bytes that already reached the disk, so losing power mid-save could publish a truncated or zero-length config and leave an unattended gateway unbootable. The save now fsyncs the temp file, renames, then fsyncs the directory, and reports a failure instead of claiming a config was saved that the next power cut can still take away. The file is also written 0600 rather than 0644: it holds MQTT passwords, API keys and OAuth refresh tokens.
+- 1cb49e3: Canonicalize solver-scale state-of-charge noise to the exact operating maximum before building optimizer models, while keeping storage plans replay-consistent when a battery starts above its configured maximum.
+- 2aa23c3: Recording a metric name for the first time no longer stalls the API. The time-series intern cache held its exclusive lock across the allocating SQLite INSERT, so on a slow SD card every reader of the metric catalog, metric and driver lists, or any chart series queued behind a disk write issued from inside the control tick — the same shape as the 2026-07-16 prune incident, expressed as a lock instead of a channel. Allocation now writes with no cache lock held and takes the lock only to publish the resulting id, and the boot-time hydrate scans the two intern tables into local maps before swapping them in. Concurrent allocation of the same name still resolves to one row and one id.
+- 1e5eb03: Format bare and already-bracketed IPv6 literals, including Nova zone IDs, correctly for CTEK, Nova, and driver-fingerprint endpoints.
+- b16016e: The peak-shaving import limit is now checked against the site's fuse. It
+  used to be stored exactly as sent, from the API and from the Home
+  Assistant number alike, so a limit above the breaker was accepted and
+  then never bound: every import clamp already stops at the fuse, so the
+  operator read their number back from the status page and believed a
+  tariff peak was defended that nothing was defending. A negative limit was
+  worse than useless — the shaving arm treats it as an error to correct and
+  commands the battery to push power out, from a setting named for import.
+  Both are refused now, with a message naming the value sent and the
+  ceiling that beat it. A limit of 0 still means what it always meant in
+  peak shaving, "correct everything above zero import"; peak shaving is
+  switched off by leaving the mode, not by zeroing its threshold. A site
+  whose fuse is not described in the config keeps the old behaviour. When a
+  config reload lowers the fuse under a limit that was legal when it was
+  set, the log says so.
+- 1bee6e4: The per-phase fuse guard now sizes its correction from the site's own phase count and voltage. When one phase runs over the breaker, the guard converts that overage into battery watts, and it used to assume every site had three phases and 230 V per phase. On a single-phase site that asked the battery for three times the relief the site needed, enough to push the meter through zero and into a violation the other way; the phase count and voltage the operator configured now do the conversion. The guard also reads only the phases the site has: current reported on an L2 that a single-phase site does not own no longer fires it. A site whose fuse is described by amps alone gets no per-phase clamp rather than one computed from invented numbers — the same rule the fuse safety margin already follows. Three-phase 230 V sites, which is what configuration defaults to, are unaffected.
+- c85bfe1: The slew limiter can no longer re-open a charge block another stage closed. Because the limiter anchors each target on the battery's measured output rather than on the previous command, a battery physically charging pulled its own command back up after the tick had already pinned the fleet to 0 W — so a passive-arbitrage idle slot with the meter exporting 2000 W and the battery at +2000 W commanded 1500 W of charging on a tick that forbids charging, and a battery reporting `charge_capable=false` was commanded to charge anyway while a capable sibling absorbed the same share. A charge floor now runs after the limiter, mirroring the discharge-side floor already there: the site-wide charge block (planner_self's export-surplus gate, planner_self's stale plan, the arbitrage-family idle live-export gate) and a driver's own charge-capability report both survive to the hardware.
+- bd18d7a: Learned PV and load state is now stored with a fingerprint of the feature vector it was fitted against, and is discarded when that fingerprint no longer matches. Coefficients only mean something against the features that produced them: change the number of time-of-day harmonics, the bucket a moment maps to, or what clear-sky irradiance refers to, and the old model keeps predicting — with a plausible-looking error — from a fit that describes a different world. Nothing in the stored numbers gave that away before. The fingerprint is derived from the feature functions themselves, so a code change to the features moves it without anyone having to remember. On a mismatch the model logs both fingerprints and cold-starts, which both models recover from; wrong coefficients they do not recover from. Existing state is carried over unchanged on upgrade.
+
 ## 1.15.2
 
 ### Patch Changes

@@ -88,7 +88,39 @@ describe("render", () => {
     const html = tab.render(stubCtx());
     assert.ok(html.includes('id="planner-active-strategy"'));
     assert.ok(html.includes('id="planner-hedge-line"'));
-    assert.ok(html.includes("Set from the Plan card on the dashboard"));
+  });
+
+  it("puts enabled, house reserve, and soc_max above a closed engine disclosure", () => {
+    const html = tab.render(stubCtx());
+    const detailsAt = html.indexOf("<details");
+    assert.ok(detailsAt > 0);
+    const top = html.slice(0, detailsAt);
+    const rest = html.slice(detailsAt);
+    assert.ok(top.includes('data-checkbox-path="planner.enabled"'));
+    assert.ok(top.includes("[field:planner.soc_min]"));
+    assert.ok(top.includes("[field:planner.soc_max]"));
+    assert.ok(!top.includes("[select:planner.engine]"));
+    assert.ok(!top.includes("CLARABEL"));
+    assert.ok(!top.includes("[select:planner.optimizer_solver]"));
+    assert.match(rest, /<details class="engine-details">/);
+    assert.doesNotMatch(html, /<details[^>]*\sopen\b/);
+    assert.ok(rest.includes("Engine controls — leave these unless you are debugging."));
+    assert.ok(rest.includes("[select:planner.engine]"));
+    assert.ok(rest.includes("[select:planner.optimizer_solver]"));
+    assert.ok(rest.includes("[field:planner.optimizer_cvar_weight]"));
+  });
+
+  it("does not bind pv_forecast_safety_k when YAML left it unset", () => {
+    const html = tab.render(stubCtx());
+    assert.ok(!html.includes("[field:planner.pv_forecast_safety_k]"));
+  });
+
+  it("binds pv_forecast_safety_k inside engine details when YAML set it", () => {
+    const ctx = stubCtx();
+    ctx.config.planner = { pv_forecast_safety_k: 0.25 };
+    const html = tab.render(ctx);
+    const rest = html.slice(html.indexOf("<details"));
+    assert.ok(rest.includes("[field:planner.pv_forecast_safety_k]"));
   });
 
   it("renders mathematical optimizer controls", () => {
@@ -105,5 +137,31 @@ describe("render", () => {
     assert.ok(html.includes("[field:planner.optimizer_multistage.near_horizon_slots]"));
     assert.ok(html.includes("[field:planner.optimizer_multistage.service_cvar_weight]"));
     assert.ok(html.includes('data-checkbox-path="planner.optimizer_recourse_shadow"'));
+  });
+
+  it("binds SoC bounds as 0–1 fractions", () => {
+    const html = tab.render(stubCtx());
+    assert.ok(html.includes("[field:planner.soc_min]"));
+    assert.ok(html.includes("[field:planner.soc_max]"));
+    assert.ok(!html.includes("planner.soc_min_pct"));
+    assert.ok(!html.includes("planner.soc_max_pct"));
+  });
+
+  it("promotes legacy soc_min_pct / soc_max_pct into 0–1 fields", () => {
+    const ctx = stubCtx();
+    ctx.config.planner = { soc_min_pct: 10, soc_max_pct: 90 };
+    tab.render(ctx);
+    assert.equal(ctx.config.planner.soc_min, 0.1);
+    assert.equal(ctx.config.planner.soc_max, 0.9);
+    assert.equal(ctx.config.planner.soc_min_pct, undefined);
+    assert.equal(ctx.config.planner.soc_max_pct, undefined);
+  });
+
+  it("keeps an already-set soc_min over a leftover percent key", () => {
+    const ctx = stubCtx();
+    ctx.config.planner = { soc_min: 0.15, soc_min_pct: 10, soc_max: 0.92, soc_max_pct: 90 };
+    tab.render(ctx);
+    assert.equal(ctx.config.planner.soc_min, 0.15);
+    assert.equal(ctx.config.planner.soc_max, 0.92);
   });
 });

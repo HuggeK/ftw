@@ -43,6 +43,10 @@ describe("setup wizard EV charger — provider options (Job 1)", () => {
       "a provider table must drive the #ev-provider options");
     assert.match(JS, /value:\s*['"]easee['"]/,
       "Easee (the cloud HTTP provider) must be selectable");
+    assert.match(JS, /value:\s*['"]zaptec['"]/,
+      "Zaptec (the cloud HTTP provider) must be selectable");
+    assert.match(JS, /value:\s*['"]tesla-wc['"]/,
+      "Tesla Wall Connector (local HTTP) must be selectable");
     assert.match(JS, /value:\s*['"]ctek['"]/,
       "CTEK (the local Modbus provider) must be selectable");
     assert.match(JS, /populateEVProviders/,
@@ -54,6 +58,10 @@ describe("setup wizard EV charger — provider options (Job 1)", () => {
       "the HTTP credentials block must be revealed for cloud providers");
     assert.match(JS, /ev-fields-modbus/,
       "the Modbus block must be revealed for local providers");
+    assert.match(JS, /ev-fields-http-local/,
+      "the LAN HTTP block must be revealed for Tesla Wall Connector");
+    assert.match(HTML, /id=["']ev-http-host["']/,
+      "the Tesla Wall Connector host field must exist in the wizard");
   });
 });
 
@@ -68,6 +76,13 @@ describe("setup wizard EV charger — buildConfig shapes the block per provider"
   it("emits username/password/serial for HTTP providers", () => {
     assert.match(JS, /ev\.username\s*=/, "easee carries a username");
     assert.match(JS, /ev\.serial\s*=/, "easee carries the looked-up charger serial");
+  });
+
+  it("emits http.base_url for local HTTP providers", () => {
+    assert.match(JS, /http-local/,
+      "Tesla Wall Connector uses the http-local transport");
+    assert.match(JS, /ev\.http\s*=\s*\{\s*base_url:/,
+      "tesla-wc must serialise as ev_charger.http.base_url");
   });
 
   it("does not regress to hard-coded 'Easee' in the review summary", () => {
@@ -126,11 +141,31 @@ describe("setup wizard — read-only battery gateways", () => {
       "operators should see why Zap has no battery-capacity control field");
   });
 
+  it("treats an EV-only local HTTP driver as a host field, not a cloud account", () => {
+    assert.match(DEVICES_JS, /entryCaps\.indexOf\("ev"\) >= 0 && hosts\.length === 0/,
+      "Tesla Wall Connector has ev + no catalog http_hosts and must get config.host");
+  });
+
   it("lets a gateway battery source be disabled when a native driver owns the same battery", () => {
     assert.match(DEVICES_JS, /class="drv-disable-battery"/);
     assert.match(DEVICES_JS, /drivers\.' \+ idx \+ '\.config\.disable_battery/);
     assert.match(DEVICES_JS, /caps\.indexOf\("meter"\) >= 0 && caps\.indexOf\("battery"\) >= 0/);
     assert.match(DEVICES_JS, /prevents Combined from counting its power twice/);
+  });
+
+  it("tells the operator that Zap is the P1/HAN meter by default", () => {
+    assert.match(JS, /P1\/HAN site meter by default/,
+      "setup must say Zap is the meter unless the operator opts in");
+    assert.match(DEVICES_JS, /class="zap-p1-note"/);
+    assert.match(DEVICES_JS, /Zap never writes/);
+  });
+
+  it("offers opt-in Zap PV and battery reads in Devices", () => {
+    assert.match(DEVICES_JS, /class="drv-read-pv"/);
+    assert.match(DEVICES_JS, /drivers\.' \+ idx \+ '\.config\.read_pv/);
+    assert.match(DEVICES_JS, /class="drv-read-battery"/);
+    assert.match(DEVICES_JS, /drivers\.' \+ idx \+ '\.config\.read_battery/);
+    assert.match(DEVICES_JS, /Read PV from devices on this Zap/);
   });
 });
 
@@ -142,5 +177,58 @@ describe("price provider defaults", () => {
 
   it("uses Sourceful as the Settings default while retaining alternatives", () => {
     assert.match(PRICE_JS, /\["sourceful", "elprisetjustnu", "entsoe", "none"\], "sourceful"/);
+  });
+});
+
+describe("setup wizard driver picker — not-listed escape hatch (#757)", () => {
+  it("appends the not-listed option after the catalog entries", () => {
+    assert.match(JS, /NOT_LISTED\s*=\s*['"]__not_listed__['"]/,
+      "the sentinel must be a value that can never parse as a catalog index");
+    assert.match(JS, /My device is not listed/,
+      "the picker must offer the escape hatch in its own words");
+  });
+
+  it("handles the sentinel before parsing a catalog index", () => {
+    assert.match(JS, /sel\.value\s*===\s*NOT_LISTED[\s\S]*?parseInt\(sel\.value,\s*10\)/,
+      "onDriverSelected must branch on the sentinel before parseInt runs on it");
+  });
+
+  it("ships the guidance panel with both forward paths", () => {
+    assert.match(HTML, /id=["']driver-not-listed["']/,
+      "the panel the sentinel reveals must exist in the markup");
+    assert.match(HTML, /Settings\s*&rarr;\s*Devices/,
+      "it must say where repository drivers install after setup");
+    assert.match(HTML, /device-drivers\/issues/,
+      "it must link to requesting a driver that does not exist yet");
+    assert.match(HTML, /skipUnlistedDevice\(\)/,
+      "it must let onboarding continue without the device");
+  });
+
+  it("skips to the devices summary only when a device already exists", () => {
+    assert.match(JS, /skipUnlistedDevice[\s\S]*?configuredDrivers\.length > 0 \? 6 : 7/,
+      "an empty summary step is a second dead-end; go straight to integrations");
+  });
+});
+
+describe("setup wizard — mDNS-first device addressing", () => {
+  it("carries the discovered hostname into the selected device", () => {
+    assert.match(JS, /hostname:\s*dev\.hostname/,
+      "useScanDevice must not drop the scan's mDNS/DNS hostname");
+  });
+
+  it("prefers a self-broadcast .local name over the raw IP when prefilling", () => {
+    assert.match(JS, /isMDNSName\(selectedDevice\.hostname\)\s*\?\s*selectedDevice\.hostname\s*:\s*selectedDevice\.ip/,
+      "the host field must prefill the mDNS name when the device broadcasts one");
+    assert.match(JS, /\\\.local\\\.\?\$/,
+      "only RFC 6762 .local names qualify — other DNS names depend on the router");
+  });
+
+  it("tells the operator to reserve a raw IP in the router's DHCP pool", () => {
+    assert.match(HTML, /id=["']drv-host-hint["']/,
+      "the addressing hint element must exist under the host field");
+    assert.match(JS, /Reserve it for the device in your router/,
+      "an IP-literal host must surface the DHCP-reservation warning");
+    assert.match(JS, /addEventListener\(['"]input['"],\s*updateHostHint\)/,
+      "the hint must track manual edits of the host field");
   });
 });

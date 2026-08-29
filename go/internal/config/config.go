@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/srcfl/ftw/go/internal/optimizercontract"
@@ -35,18 +36,169 @@ type Config struct {
 	EVCharger        *EVCharger         `yaml:"ev_charger,omitempty" json:"ev_charger,omitempty"`
 	CalDAV           *CalDAV            `yaml:"caldav,omitempty" json:"caldav,omitempty"`
 	Loadpoints       []Loadpoint        `yaml:"loadpoints,omitempty" json:"loadpoints,omitempty"`
+	Vehicles         []Vehicle          `yaml:"vehicles,omitempty" json:"vehicles,omitempty"`
 	V2X              *V2XPolicy         `yaml:"v2x,omitempty" json:"v2x,omitempty"`
 	Notifications    *Notifications     `yaml:"notifications,omitempty" json:"notifications,omitempty"`
-	HomeLink         *HomeLink          `yaml:"home_link,omitempty" json:"home_link,omitempty"`
+	AppLink          *AppLink           `yaml:"app_link,omitempty" json:"app_link,omitempty"`
+	FleetPing        *FleetPing         `yaml:"fleet_ping,omitempty" json:"fleet_ping,omitempty"`
 	Nova             *Nova              `yaml:"nova,omitempty" json:"nova,omitempty"`
 	DeviceRepository *DeviceRepository  `yaml:"device_repository,omitempty" json:"device_repository,omitempty"`
+	OCPP             *OCPP              `yaml:"ocpp,omitempty" json:"ocpp,omitempty"`
+
+	// LoadWarnings collects recoverable problems Parse repaired instead of
+	// refusing the file: an on-disk config an older version accepted must
+	// still boot, or the operator loses the UI they would fix it with. The
+	// write path (Settings save, bootstrap) never populates this — it calls
+	// Validate directly and stays strict. Never serialized.
+	LoadWarnings []string `yaml:"-" json:"-"`
 }
 
-// HomeLink enables the outbound-only encrypted remote read service. The relay
-// and browser origins are fixed by the protocol and cannot be changed in site
-// config.
-type HomeLink struct {
+// OCPP configures the built-in OCPP 1.6J and 2.0.1 Central System. Chargers connect to
+// us, so there is no driver and no per-charger config entry — a charge point
+// appears as a device the moment it sends its first BootNotification, keyed by
+// the identity segment of the URL it dialled.
+//
+// Disabled by default, and enabling it requires credentials. The listener
+// cannot be restricted to one interface: the OCPP library builds its own
+// listen address from the port alone, so the socket is reachable on every
+// interface the host has. Basic auth is the only thing standing in front of
+// it, which is why an empty Username or Password is rejected rather than
+// silently accepted.
+type OCPP struct {
+	Enabled            bool   `yaml:"enabled" json:"enabled"`
+	Port               int    `yaml:"port,omitempty" json:"port,omitempty"`
+	PortV201           int    `yaml:"port_v201,omitempty" json:"port_v201,omitempty"`
+	Path               string `yaml:"path,omitempty" json:"path,omitempty"`
+	Username           string `yaml:"username,omitempty" json:"username,omitempty"`
+	Password           string `yaml:"password,omitempty" json:"password,omitempty"`
+	HeartbeatIntervalS int    `yaml:"heartbeat_interval_s,omitempty" json:"heartbeat_interval_s,omitempty"`
+}
+
+// Validate rejects an enabled server that would accept anonymous charge
+// points. A nil or disabled section is fine — OCPP is opt-in.
+func (o *OCPP) Validate() error {
+	if o == nil || !o.Enabled {
+		return nil
+	}
+	if o.Username == "" || o.Password == "" {
+		return errors.New("ocpp: username and password are required when enabled, because the listener cannot be bound to a single interface")
+	}
+	if o.Port < 0 || o.Port > 65535 {
+		return fmt.Errorf("ocpp.port must be between 0 and 65535, got %d", o.Port)
+	}
+	if o.PortV201 < 0 || o.PortV201 > 65535 {
+		return fmt.Errorf("ocpp.port_v201 must be between 0 and 65535, got %d", o.PortV201)
+	}
+	// Each version needs its own listener, so they cannot share a port.
+	if o.PortV201 > 0 && o.PortV201 == o.Port {
+		return fmt.Errorf("ocpp.port_v201 must differ from ocpp.port, both are %d", o.Port)
+	}
+	if o.HeartbeatIntervalS < 0 {
+		return fmt.Errorf("ocpp.heartbeat_interval_s must be >= 0, got %d", o.HeartbeatIntervalS)
+	}
+	return nil
+}
+
+// AppLink controls the outbound connection the FTW app reaches this box
+// through. It defaults on when the section is absent; an explicit false is the
+// opt-out. One switch is enough because the relay is content-blind and fixed
+// by the protocol, so there is no endpoint or transport to choose.
+type AppLink struct {
 	Enabled bool `yaml:"enabled" json:"enabled"`
+}
+
+// On is the single reading of the app-link switch. A nil section means an old
+// config that has never made the choice, so it follows the default. An empty
+// section has Enabled's false zero value and remains an opt-out.
+func (a *AppLink) On() bool {
+	if a == nil {
+		return true
+	}
+	return a.Enabled
+}
+
+// FleetPing configures the once-a-day count of how many boxes run FTW, on
+// which version and with which drivers. On by default, because the numbers
+// are what decide where engineering effort goes and a fleet nobody can see is
+// a fleet guessed about instead.
+//
+// It can be on by default because what it carries is a shape rather than an
+// identity: no id, no key, no counter and no timestamp. Not because it is
+// beyond reproach — the fields still describe a household and the endpoint
+// sees the source IP. Settings renders the exact payload and says both, so
+// this can be weighed rather than believed. See go/internal/fleetping.
+type FleetPing struct {
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// Endpoint is where the ping goes. Configurable so a deployment can point
+	// it at itself or at nothing, and because a hard-coded address in a
+	// package that sends data out is worth being able to see and change.
+	Endpoint string `yaml:"endpoint,omitempty" json:"endpoint,omitempty"`
+}
+
+// DefaultFleetPingEndpoint is the fleet-report door on FTW's relay. The relay
+// adds the report to daily totals and discards the request; a failed ping is
+// forgotten, never retried.
+const DefaultFleetPingEndpoint = "https://relay.ftw.energy/fleet"
+
+// On reports whether the ping is switched on, and is the only place that
+// answers it.
+//
+// Nil means never configured, which is the state every existing box is in, and
+// applyDefaults reads it as on. Config posted to /api/config does not pass
+// through applyDefaults — configreload.Apply swaps it in as it arrives — so a
+// second reading of nil here would silently stop the ping the first time a
+// household saved settings from a screen that never sent the section.
+func (f *FleetPing) On() bool {
+	if f == nil {
+		return true
+	}
+	return f.Enabled
+}
+
+// Resolved is where the ping goes.
+//
+// The fallback lives here rather than in applyDefaults, so the address is never
+// written into a household's config.yaml. A baked-in copy would keep posting to
+// this address after FTW moved the collector, and the aggregate would
+// quietly lose every box that had ever saved its settings.
+func (f *FleetPing) Resolved() string {
+	if f == nil || f.Endpoint == "" {
+		return DefaultFleetPingEndpoint
+	}
+	return f.Endpoint
+}
+
+// Validate rejects an endpoint that would undo what the payload is careful
+// about. Nil-safe: an absent section is a valid one.
+func (f *FleetPing) Validate() error {
+	if f == nil || f.Endpoint == "" {
+		return nil
+	}
+	return ValidateFleetPingEndpoint(f.Endpoint)
+}
+
+// ValidateFleetPingEndpoint refuses anything that is not a plain HTTPS URL.
+//
+// Plain HTTP would put the site's shape in the clear for every network between
+// the house and the relay — a worse leak than the ones the payload is designed
+// around. Credentials, a query and a fragment are refused because none of them
+// addresses a collector: a URL carrying one is far more likely a mistake than a
+// choice, and credentials in a config field are a mistake whatever they are for.
+// The path is not policed, because a path is how a collector names its own
+// endpoint. None of this makes the address secret — Settings shows the endpoint
+// this box will post to, whatever it is.
+func ValidateFleetPingEndpoint(endpoint string) error {
+	u, err := url.Parse(strings.TrimSpace(endpoint))
+	if err != nil {
+		return fmt.Errorf("fleet_ping.endpoint %q is not a URL", endpoint)
+	}
+	if u.Scheme != "https" || u.Host == "" {
+		return fmt.Errorf("fleet_ping.endpoint must be an https URL, got %q", endpoint)
+	}
+	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return errors.New("fleet_ping.endpoint must carry no credentials, query or fragment")
+	}
+	return nil
 }
 
 // DeviceRepository configures independently distributed Lua drivers. Remote
@@ -167,13 +319,23 @@ type Nova struct {
 // Loadpoint is one EV charge point the planner can reason about.
 // The planner and go/internal/loadpoint optimize battery + EV jointly.
 type Loadpoint struct {
-	ID                string    `yaml:"id" json:"id"`
-	DriverName        string    `yaml:"driver_name" json:"driver_name"`
-	MinChargeW        float64   `yaml:"min_charge_w,omitempty" json:"min_charge_w,omitempty"`
-	MaxChargeW        float64   `yaml:"max_charge_w,omitempty" json:"max_charge_w,omitempty"`
-	AllowedStepsW     []float64 `yaml:"allowed_steps_w,omitempty" json:"allowed_steps_w,omitempty"`
-	VehicleCapacityWh float64   `yaml:"vehicle_capacity_wh,omitempty" json:"vehicle_capacity_wh,omitempty"`
-	PluginSoCPct      float64   `yaml:"plugin_soc_pct,omitempty" json:"plugin_soc_pct,omitempty"`
+	ID            string    `yaml:"id" json:"id"`
+	DriverName    string    `yaml:"driver_name" json:"driver_name"`
+	MinChargeW    float64   `yaml:"min_charge_w,omitempty" json:"min_charge_w,omitempty"`
+	MaxChargeW    float64   `yaml:"max_charge_w,omitempty" json:"max_charge_w,omitempty"`
+	AllowedStepsW []float64 `yaml:"allowed_steps_w,omitempty" json:"allowed_steps_w,omitempty"`
+	// VehicleCapacityWh is the usable battery capacity of ONE vehicle — the
+	// car this charger usually serves. It feeds the SoC estimate and the
+	// planner's energy sizing; charging works without it, and a wrong value
+	// costs planning accuracy, never safety. When several cars share the
+	// charger, add Vehicles profiles: a charging session that identifies
+	// the car (RFID idTag on 1.6, MacAddress/eMAID idToken on 2.0.1)
+	// switches the loadpoint to that car's capacity and policy for the
+	// session. A session matching no profile leaves this value in charge —
+	// the visitor default.
+	VehicleCapacityWh float64 `yaml:"vehicle_capacity_wh,omitempty" json:"vehicle_capacity_wh,omitempty"`
+	PluginSoC         float64 `yaml:"plugin_soc,omitempty" json:"plugin_soc,omitempty"`
+	PluginSoCPct      float64 `yaml:"plugin_soc_pct,omitempty" json:"plugin_soc_pct,omitempty"`
 
 	// PhaseMode selects how the controller picks between 1Φ and 3Φ
 	// delivery: "3p" (default) | "1p" | "auto". Empty == "3p" for
@@ -182,6 +344,88 @@ type Loadpoint struct {
 	PhaseSplitW   float64 `yaml:"phase_split_w,omitempty" json:"phase_split_w,omitempty"`
 	MinPhaseHoldS int     `yaml:"min_phase_hold_s,omitempty" json:"min_phase_hold_s,omitempty"`
 	SurplusOnly   bool    `yaml:"surplus_only,omitempty" json:"surplus_only,omitempty"`
+}
+
+// Vehicle is a car profile the loadpoint can switch to when a charging
+// session identifies the vehicle. Identification comes from the OCPP
+// transaction: the RFID idTag on 1.6 (names the card — works only if the
+// card lives in the car), a MacAddress (autocharge) or eMAID (ISO 15118
+// Plug & Charge) idToken on 2.0.1 (names the actual vehicle). A session
+// whose identity matches no profile leaves the loadpoint's own settings
+// untouched — that is the visitor default. Tracked upstream in issue #835.
+type Vehicle struct {
+	// ID is the stable slug other config and logs refer to.
+	ID string `yaml:"id" json:"id"`
+	// Name is the human label the UI shows; falls back to ID.
+	Name string `yaml:"name,omitempty" json:"name,omitempty"`
+	// CapacityWh is this car's usable battery capacity. Applied to the
+	// loadpoint for the session so SoC estimation and planner energy
+	// sizing follow the car actually plugged in. 0 = leave unchanged.
+	CapacityWh float64 `yaml:"capacity_wh,omitempty" json:"capacity_wh,omitempty"`
+	// Identifiers are the identity strings that mean "this car": RFID tag
+	// uids, MAC addresses, eMAIDs. Compared case-insensitively, trimmed.
+	Identifiers []string `yaml:"identifiers,omitempty" json:"identifiers,omitempty"`
+	// SurplusOnly, when the car is identified, sets the loadpoint's
+	// PV-surplus-only flag to exactly this value — charge this car from
+	// surplus PV alone (true) or allow grid charging (false).
+	SurplusOnly bool `yaml:"surplus_only,omitempty" json:"surplus_only,omitempty"`
+	// TargetSoC > 0 sets a charge target for the session (0–1), which is
+	// what hands the loadpoint to the planner: it fills toward the target
+	// in the cheapest tariff slots. 0 = no target, loadpoint keeps its own.
+	TargetSoC    float64 `yaml:"target_soc,omitempty" json:"target_soc,omitempty"`
+	TargetSoCPct float64 `yaml:"target_soc_pct,omitempty" json:"target_soc_pct,omitempty"`
+}
+
+// VehicleByIdentifier finds the vehicle profile claiming an identity string,
+// or nil. Matching is case-insensitive on trimmed identifiers, so an eMAID
+// or MAC compares the way the wire formats vary.
+func (c *Config) VehicleByIdentifier(identifier string) *Vehicle {
+	want := strings.ToLower(strings.TrimSpace(identifier))
+	if want == "" {
+		return nil
+	}
+	for i := range c.Vehicles {
+		for _, id := range c.Vehicles[i].Identifiers {
+			if strings.ToLower(strings.TrimSpace(id)) == want {
+				return &c.Vehicles[i]
+			}
+		}
+	}
+	return nil
+}
+
+// validateVehicles keeps vehicle profiles unambiguous: unique ids, sane
+// numbers, and no identifier claimed by two cars — the identify-then-apply
+// path must never have to guess which profile wins.
+func (c *Config) validateVehicles() error {
+	ids := make(map[string]bool, len(c.Vehicles))
+	claimed := make(map[string]string, len(c.Vehicles))
+	for _, v := range c.Vehicles {
+		if v.ID == "" {
+			return errors.New("vehicle: id is required")
+		}
+		if ids[v.ID] {
+			return fmt.Errorf("vehicle %q: duplicate id", v.ID)
+		}
+		ids[v.ID] = true
+		if v.CapacityWh < 0 {
+			return fmt.Errorf("vehicle %q: capacity_wh must be >= 0", v.ID)
+		}
+		if v.TargetSoC < 0 || v.TargetSoC > 1 {
+			return fmt.Errorf("vehicle %q: target_soc must be within 0..1", v.ID)
+		}
+		for _, ident := range v.Identifiers {
+			key := strings.ToLower(strings.TrimSpace(ident))
+			if key == "" {
+				return fmt.Errorf("vehicle %q: empty identifier", v.ID)
+			}
+			if owner, dup := claimed[key]; dup {
+				return fmt.Errorf("vehicle %q: identifier %q already claimed by vehicle %q", v.ID, ident, owner)
+			}
+			claimed[key] = v.ID
+		}
+	}
+	return nil
 }
 
 // V2XPolicy is the opt-in policy envelope for automatic V2X use. The
@@ -199,7 +443,8 @@ type V2XPolicy struct {
 	// required for reserve/departure energy math when the driver does not.
 	VehicleCapacityWh float64 `yaml:"vehicle_capacity_wh,omitempty" json:"vehicle_capacity_wh,omitempty"`
 
-	// SoC percentages are YAML-facing 0..100 values. Telemetry stays 0..1.
+	MinReserveSoC         float64 `yaml:"min_reserve_soc,omitempty" json:"min_reserve_soc,omitempty"`
+	DepartureTargetSoC    float64 `yaml:"departure_target_soc,omitempty" json:"departure_target_soc,omitempty"`
 	MinReserveSoCPct      float64 `yaml:"min_reserve_soc_pct,omitempty" json:"min_reserve_soc_pct,omitempty"`
 	DepartureTargetSoCPct float64 `yaml:"departure_target_soc_pct,omitempty" json:"departure_target_soc_pct,omitempty"`
 
@@ -224,14 +469,14 @@ type V2XPolicy struct {
 // handler on POST /api/config. Providers that don't need auth (e.g. local
 // Modbus) leave Username + Password empty.
 type EVCharger struct {
-	Provider string `yaml:"provider" json:"provider"` // "easee" | "ctek"
+	Provider string `yaml:"provider" json:"provider"` // "easee" | "zaptec" | "tesla-wc" | "ctek"
 
 	// Connection — populate the block matching the provider's transport.
 	HTTP   *EVChargerHTTP   `yaml:"http,omitempty" json:"http,omitempty"`
 	Modbus *EVChargerModbus `yaml:"modbus,omitempty" json:"modbus,omitempty"`
 
-	// Optional auth — required by cloud HTTP providers like Easee,
-	// unused by local Modbus providers like CTEK.
+	// Optional auth — required by cloud HTTP providers like Easee and
+	// Zaptec, unused by local providers (CTEK Modbus, Tesla Wall Connector).
 	Username string `yaml:"username,omitempty" json:"username,omitempty"`
 	Password string `yaml:"-" json:"password,omitempty"` // persisted in state.db, not YAML
 
@@ -302,8 +547,7 @@ type CalDAV struct {
 	// names no specific one. Empty = the first/only configured loadpoint.
 	EVLoadpointID string `yaml:"ev_loadpoint_id,omitempty" json:"ev_loadpoint_id,omitempty"`
 
-	// EVDefaultTargetSoCPct is used when an EV event's title carries no
-	// explicit percentage. Default 80.
+	EVDefaultTargetSoC    float64 `yaml:"ev_default_target_soc,omitempty" json:"ev_default_target_soc,omitempty"`
 	EVDefaultTargetSoCPct float64 `yaml:"ev_default_target_soc_pct,omitempty" json:"ev_default_target_soc_pct,omitempty"`
 
 	// AwayKeywords / EVKeywords classify an event by its title. Matching is
@@ -378,7 +622,7 @@ var (
 	DefaultCalDAVUsername     = "fortytwowatts"
 	DefaultCalDAVPollS        = 300
 	DefaultCalDAVHorizonDays  = 7
-	DefaultCalDAVEVTargetSoC  = 80.0
+	DefaultCalDAVEVTargetSoC  = 0.8
 	DefaultAwayKeywords       = []string{"away", "vacation", "holiday"}
 	DefaultEVKeywords         = []string{"ev", "car", "charge"}
 )
@@ -395,8 +639,8 @@ func (cv *CalDAV) Validate() error {
 	if cv.HorizonDays < 0 {
 		return errors.New("caldav.horizon_days must be >= 0")
 	}
-	if cv.EVDefaultTargetSoCPct < 0 || cv.EVDefaultTargetSoCPct > 100 {
-		return errors.New("caldav.ev_default_target_soc_pct must be in [0, 100]")
+	if cv.EVDefaultTargetSoC < 0 || cv.EVDefaultTargetSoC > 1 {
+		return errors.New("caldav.ev_default_target_soc must be in [0, 1]")
 	}
 	return nil
 }
@@ -424,16 +668,29 @@ func (e *EVCharger) Validate() error {
 	switch e.Provider {
 	case "":
 		return errors.New("ev_charger.provider: required")
-	case "easee":
-		// Username/Password are NOT enforced here. The runtime easee
+	case "easee", "zaptec":
+		// Username/Password are NOT enforced here. The runtime cloud
 		// driver logs + idles when creds are missing, and the API picker
-		// requires both before calling Easee Cloud. Letting a partial
+		// requires both before calling the vendor cloud. Letting a partial
 		// ev_charger block load is the original contract — the wizard
 		// writes provider intent first, then captures creds in a second
 		// API call.
 		if e.Modbus != nil {
-			return errors.New("ev_charger.modbus: not valid for provider easee (HTTP transport)")
+			return fmt.Errorf("ev_charger.modbus: not valid for provider %s (HTTP transport)", e.Provider)
 		}
+	case "tesla-wc":
+		// Local HTTP: LAN origin in http.base_url, no cloud account.
+		// Empty base_url is allowed so the wizard can write provider
+		// intent before the host is filled in.
+		if e.Modbus != nil {
+			return errors.New("ev_charger.modbus: not valid for provider tesla-wc (HTTP transport)")
+		}
+		// Switching from Easee/Zaptec leaves username/password on the
+		// posted document, and POST /api/config restores ev_charger_password
+		// from state.db. Drop them so the provider switch can save.
+		e.Username = ""
+		e.Password = ""
+		e.EmailLegacy = ""
 	case "ctek":
 		if e.Modbus == nil || e.Modbus.Host == "" {
 			return errors.New("ev_charger.modbus.host: required for provider ctek")
@@ -451,7 +708,7 @@ func (e *EVCharger) Validate() error {
 			return errors.New("ev_charger: username/password not valid for provider ctek")
 		}
 	default:
-		return fmt.Errorf("ev_charger.provider %q: not supported (valid: easee, ctek)", e.Provider)
+		return fmt.Errorf("ev_charger.provider %q: not supported (valid: easee, zaptec, tesla-wc, ctek)", e.Provider)
 	}
 	return nil
 }
@@ -481,6 +738,12 @@ type OptimizerMultistage struct {
 type Planner struct {
 	Enabled bool   `yaml:"enabled" json:"enabled"`
 	Mode    string `yaml:"mode,omitempty" json:"mode,omitempty"`
+	// ForecastTrust is the first-boot household slider: cautious | balanced | bold.
+	// After first boot the live value lives in SQLite (forecast_trust), like mode.
+	ForecastTrust string `yaml:"forecast_trust,omitempty" json:"forecast_trust,omitempty"`
+	// BatteryExport is the first-boot battery-sale permission:
+	// unknown | not_allowed | allowed. Live value is SQLite battery_export.
+	BatteryExport string `yaml:"battery_export,omitempty" json:"battery_export,omitempty"`
 	// Engine selects the primary optimizer: "python" (default) runs the
 	// CVXPY/HiGHS worker; "dp" is the legacy in-process rollback engine.
 	Engine string `yaml:"engine,omitempty" json:"engine,omitempty"`
@@ -505,6 +768,8 @@ type Planner struct {
 	BaseLoadW                             float64              `yaml:"base_load_w,omitempty" json:"base_load_w,omitempty"`
 	HorizonHours                          int                  `yaml:"horizon_hours,omitempty" json:"horizon_hours,omitempty"`
 	IntervalMin                           int                  `yaml:"interval_min,omitempty" json:"interval_min,omitempty"`
+	SoCMin                                float64              `yaml:"soc_min,omitempty" json:"soc_min,omitempty"`
+	SoCMax                                float64              `yaml:"soc_max,omitempty" json:"soc_max,omitempty"`
 	SoCMinPct                             float64              `yaml:"soc_min_pct,omitempty" json:"soc_min_pct,omitempty"`
 	SoCMaxPct                             float64              `yaml:"soc_max_pct,omitempty" json:"soc_max_pct,omitempty"`
 
@@ -625,8 +890,9 @@ type Site struct {
 	// still enable a slot when capture displaces a more expensive future
 	// grid-funded charge.
 	//
-	// Suggested 88 — leaves 2 pp margin below the planner's typical
-	// soc_max_pct = 90 so the absorber doesn't slam into the wall.
+	// Suggested 0.88 — leaves a little margin below the planner's typical
+	// soc_max = 0.90 so the absorber doesn't slam into the wall.
+	PVSurplusAbsorbSoCCap    float64 `yaml:"pv_surplus_absorb_soc_cap,omitempty" json:"pv_surplus_absorb_soc_cap,omitempty"`
 	PVSurplusAbsorbSoCCapPct float64 `yaml:"pv_surplus_absorb_soc_cap_pct,omitempty" json:"pv_surplus_absorb_soc_cap_pct,omitempty"`
 
 	// PVSurplusAbsorbThresholdW is the trigger threshold for the
@@ -797,13 +1063,17 @@ type DriverControlOptIn struct {
 
 // Capabilities explicitly scope what host resources a driver can access.
 type Capabilities struct {
-	MQTT       *MQTTConfig     `yaml:"mqtt,omitempty" json:"mqtt,omitempty"`
-	Modbus     *ModbusConfig   `yaml:"modbus,omitempty" json:"modbus,omitempty"`
-	Serial     *SerialConfig   `yaml:"serial,omitempty" json:"serial,omitempty"`
-	HTTP       *HTTPCapability `yaml:"http,omitempty" json:"http,omitempty"`
-	WebSocket  *WSCapability   `yaml:"websocket,omitempty" json:"websocket,omitempty"`
-	TCP        *TCPCapability  `yaml:"tcp,omitempty" json:"tcp,omitempty"`
-	Standalone bool            `yaml:"standalone,omitempty" json:"standalone,omitempty"`
+	// AllowUnverifiedLocal permits a driver to use an mDNS answer obtained by
+	// FTW. When false, the transport leaves .local names to the system resolver.
+	// A name allowlist does not prove server identity.
+	AllowUnverifiedLocal bool            `yaml:"allow_unverified_local,omitempty" json:"allow_unverified_local,omitempty"`
+	MQTT                 *MQTTConfig     `yaml:"mqtt,omitempty" json:"mqtt,omitempty"`
+	Modbus               *ModbusConfig   `yaml:"modbus,omitempty" json:"modbus,omitempty"`
+	Serial               *SerialConfig   `yaml:"serial,omitempty" json:"serial,omitempty"`
+	HTTP                 *HTTPCapability `yaml:"http,omitempty" json:"http,omitempty"`
+	WebSocket            *WSCapability   `yaml:"websocket,omitempty" json:"websocket,omitempty"`
+	TCP                  *TCPCapability  `yaml:"tcp,omitempty" json:"tcp,omitempty"`
+	Standalone           bool            `yaml:"standalone,omitempty" json:"standalone,omitempty"`
 }
 
 // MQTTConfig grants access to one MQTT broker.
@@ -812,6 +1082,10 @@ type MQTTConfig struct {
 	Port     int    `yaml:"port,omitempty" json:"port,omitempty"` // default 1883
 	Username string `yaml:"username,omitempty" json:"username,omitempty"`
 	Password string `yaml:"password,omitempty" json:"password,omitempty"`
+	// AllowUnverifiedLocal is copied from capabilities.allow_unverified_local
+	// by the core before this config reaches the transport factory. It is
+	// runtime-only and never comes from this nested YAML block.
+	AllowUnverifiedLocal bool `yaml:"-" json:"-"`
 }
 
 // ModbusConfig grants access to one Modbus TCP endpoint.
@@ -819,6 +1093,10 @@ type ModbusConfig struct {
 	Host   string `yaml:"host" json:"host"`
 	Port   int    `yaml:"port,omitempty" json:"port,omitempty"`       // default 502
 	UnitID int    `yaml:"unit_id,omitempty" json:"unit_id,omitempty"` // default 1
+	// AllowUnverifiedLocal is copied from capabilities.allow_unverified_local
+	// by the core before this config reaches the transport factory. It is
+	// runtime-only and never comes from this nested YAML block.
+	AllowUnverifiedLocal bool `yaml:"-" json:"-"`
 }
 
 // SerialConfig grants read-only access to one local serial device.
@@ -887,7 +1165,8 @@ func (d Driver) EffectiveModbus() *ModbusConfig {
 
 // API is the HTTP server config.
 type API struct {
-	Port int `yaml:"port" json:"port"`
+	Port    int  `yaml:"port" json:"port"`
+	LANAuth bool `yaml:"lan_auth,omitempty" json:"lan_auth,omitempty"`
 }
 
 // HomeAssistant is the MQTT bridge config.
@@ -898,6 +1177,9 @@ type HomeAssistant struct {
 	Username         string `yaml:"username,omitempty" json:"username,omitempty"`
 	Password         string `yaml:"password,omitempty" json:"password,omitempty"`
 	PublishIntervalS int    `yaml:"publish_interval_s,omitempty" json:"publish_interval_s,omitempty"`
+	// AllowUnverifiedLocal permits the bridge to use an mDNS answer obtained by
+	// FTW. When false, the transport leaves .local names to the system resolver.
+	AllowUnverifiedLocal bool `yaml:"allow_unverified_local,omitempty" json:"allow_unverified_local,omitempty"`
 }
 
 // StateConf is the persistent state DB config.
@@ -978,9 +1260,10 @@ type Weather struct {
 	// predictions when each plane is described separately than when
 	// everything is averaged into a single tilt/azimuth.
 	//
-	// When set, PVArrays overrides the legacy single-array fields.
-	// Providers that can't use site geometry (met_no, open_meteo)
-	// ignore this entirely and just use PVRatedW.
+	// When set, PVArrays overrides the legacy single-array fields for
+	// geometry-aware providers. GHI providers such as open_meteo project
+	// radiation onto these planes; incomplete entries are ignored and the
+	// provider falls back to its flat estimate.
 	PVArrays []PVArray `yaml:"pv_arrays,omitempty" json:"pv_arrays,omitempty"`
 
 	// HeatingWPerDegC adds load proportional to max(18°C − outdoor_temp, 0).
@@ -993,12 +1276,32 @@ type Weather struct {
 // PVArray is one physically-distinct panel group. Multi-plane
 // residential installs typically have two or three (e.g. south roof
 // + east roof + garage) with different tilt/azimuth. The sum of all
-// KWp values should match the total PV nameplate at the site.
+// rated_w values should match the total PV nameplate at the site.
+// kwp is a legacy YAML key folded into rated_w on load.
 type PVArray struct {
-	Name       string  `yaml:"name,omitempty" json:"name,omitempty"`
-	KWp        float64 `yaml:"kwp" json:"kwp"`
-	TiltDeg    float64 `yaml:"tilt_deg" json:"tilt_deg"`
-	AzimuthDeg float64 `yaml:"azimuth_deg" json:"azimuth_deg"`
+	Name       string   `yaml:"name,omitempty" json:"name,omitempty"`
+	RatedW     float64  `yaml:"rated_w,omitempty" json:"rated_w,omitempty"`
+	KWp        float64  `yaml:"kwp,omitempty" json:"kwp,omitempty"`
+	TiltDeg    *float64 `yaml:"tilt_deg" json:"tilt_deg"`
+	AzimuthDeg *float64 `yaml:"azimuth_deg" json:"azimuth_deg"`
+}
+
+// CompleteGeometry returns one usable PV plane. Tilt and azimuth are
+// pointers so an omitted field cannot be confused with a valid 0° value.
+// Invalid or partial entries are intentionally not fatal: callers use the
+// flat forecast path when no complete plane remains.
+func (a PVArray) CompleteGeometry() (tiltDeg, azimuthDeg, ratedW float64, ok bool) {
+	ratedW = a.RatedWatts()
+	if ratedW <= 0 || math.IsNaN(ratedW) || math.IsInf(ratedW, 0) ||
+		a.TiltDeg == nil || a.AzimuthDeg == nil {
+		return 0, 0, 0, false
+	}
+	tiltDeg, azimuthDeg = *a.TiltDeg, *a.AzimuthDeg
+	if math.IsNaN(tiltDeg) || math.IsInf(tiltDeg, 0) || tiltDeg < 0 || tiltDeg > 90 ||
+		math.IsNaN(azimuthDeg) || math.IsInf(azimuthDeg, 0) || azimuthDeg < 0 || azimuthDeg > 360 {
+		return 0, 0, 0, false
+	}
+	return tiltDeg, azimuthDeg, ratedW, true
 }
 
 // Battery is per-battery overrides (keyed by driver name in the top-level map).
@@ -1030,6 +1333,13 @@ func (c Config) MaskSecrets() Config {
 		cp := *out.HomeAssistant
 		cp.Password = ""
 		out.HomeAssistant = &cp
+	}
+	// The OCPP password is the only thing standing in front of a listener that
+	// is reachable on every interface, so it must never leave over the API.
+	if out.OCPP != nil {
+		cp := *out.OCPP
+		cp.Password = ""
+		out.OCPP = &cp
 	}
 	if out.Price != nil {
 		cp := *out.Price
@@ -1103,6 +1413,12 @@ func (incoming *Config) PreserveMaskedSecrets(existing *Config) {
 	if incoming.CalDAV != nil && existing.CalDAV != nil && incoming.CalDAV.Password == "" {
 		incoming.CalDAV.Password = existing.CalDAV.Password
 	}
+	// Masked out on the way to the UI, so an unchanged password comes back
+	// empty. Without this a save from the settings tab would blank it, and an
+	// enabled server would then fail validation on the next reload.
+	if incoming.OCPP != nil && existing.OCPP != nil && incoming.OCPP.Password == "" {
+		incoming.OCPP.Password = existing.OCPP.Password
+	}
 	if incoming.HomeAssistant != nil && existing.HomeAssistant != nil && incoming.HomeAssistant.Password == "" {
 		incoming.HomeAssistant.Password = existing.HomeAssistant.Password
 	}
@@ -1159,16 +1475,84 @@ func Load(path string) (*Config, error) {
 
 // Parse parses config bytes and validates. baseDir resolves driver Lua paths.
 func Parse(data []byte, baseDir string) (*Config, error) {
-	var c Config
-	if err := yaml.Unmarshal(data, &c); err != nil {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
 		return nil, fmt.Errorf("yaml: %w", err)
 	}
+	var c Config
+	if err := doc.Decode(&c); err != nil {
+		return nil, fmt.Errorf("yaml: %w", err)
+	}
+	// An omitted app_link section follows the new default. An explicit YAML
+	// null was a valid opt-out before that default changed, so retain it as an
+	// explicit disabled section instead of letting applyDefaults turn it on.
+	if topLevelYAMLNull(&doc, "app_link") {
+		c.AppLink = &AppLink{Enabled: false}
+	}
 	applyDefaults(&c)
+	c.demoteExtraSiteMeters()
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
 	c.ResolveDriverPaths(baseDir)
 	return &c, nil
+}
+
+// demoteExtraSiteMeters keeps the first declared is_site_meter driver and
+// clears the flag on the rest, recording a LoadWarning per demotion.
+//
+// Load-time only. Duplicate site meters are an operator mistake Validate
+// rejects on the write path, but a file already on disk was often written
+// by an older version that silently used the first match
+// (SiteMeterDriver's order) — refusing it at boot crash-loops the process
+// before the HTTP listener binds, and the operator loses the very UI they
+// would fix the config with (field incident 2026-08-29: a driver install
+// on v1.15.0 left two site meters; the box updated to v2.3.0 and went
+// dark until SSH). Demoting reproduces exactly what the older version
+// dispatched against, and the warning makes the ambiguity visible where
+// silence caused it to be missed.
+func (c *Config) demoteExtraSiteMeters() {
+	kept := ""
+	for i := range c.Drivers {
+		d := &c.Drivers[i]
+		if !d.IsSiteMeter {
+			continue
+		}
+		if kept == "" {
+			kept = d.Name
+			continue
+		}
+		d.IsSiteMeter = false
+		c.LoadWarnings = append(c.LoadWarnings, fmt.Sprintf(
+			"config: drivers %q and %q both set is_site_meter: true; keeping %q as the site meter and ignoring the flag on %q — fix config.yaml so exactly one driver has it",
+			kept, d.Name, kept, d.Name))
+	}
+}
+
+func topLevelYAMLNull(doc *yaml.Node, key string) bool {
+	if doc == nil || doc.Kind != yaml.DocumentNode || len(doc.Content) != 1 {
+		return false
+	}
+	// Node values leave ignored subtrees opaque while yaml.v3 applies merge
+	// precedence to the root keys.
+	var values map[string]yaml.Node
+	if err := doc.Content[0].Decode(&values); err != nil {
+		return true
+	}
+	value, ok := values[key]
+	if !ok {
+		return false
+	}
+	node := &value
+	seen := make(map[*yaml.Node]bool)
+	for node != nil && node.Kind == yaml.AliasNode {
+		if seen[node] {
+			return true
+		}
+		seen[node] = true
+		node = node.Alias
+	}
+	return node == nil || node.ShortTag() == "!!null"
 }
 
 // DriversDirOverride redirects resolution of relative "drivers/<name>.lua"
@@ -1323,6 +1707,22 @@ func applyDefaults(c *Config) {
 			}}
 		}
 	}
+	if c.AppLink == nil {
+		// The app relay carries only end-to-end encrypted frames under a handle
+		// that changes every hour. It still sees connection metadata. Existing
+		// sites with no app_link section join the supported remote path after
+		// upgrading; an explicit enabled:false block remains the operator opt-out.
+		c.AppLink = &AppLink{Enabled: true}
+	}
+	if c.FleetPing == nil {
+		// Absent means never configured, which is the state every existing
+		// box is in. Enabled is the owner's call; an explicit
+		// `fleet_ping: {enabled: false}` block is the opt-out and survives
+		// this because only a missing section is filled in.
+		c.FleetPing = &FleetPing{Enabled: true}
+	}
+	// Endpoint is deliberately left blank: Resolved() supplies the default at
+	// use, so the collector's address is never written into a household's YAML.
 	if c.Site.ControlIntervalS == 0 {
 		// 2 s matches Ferroamp's ehub MQTT cadence (~1 Hz) without
 		// dispatching twice on the same telemetry sample, and halves
@@ -1506,6 +1906,7 @@ func isLegacyDefaultDriverRepository(repo DriverRepositorySource) bool {
 
 // Validate ensures the config is internally consistent and safe to run with.
 func (c *Config) Validate() error {
+	c.NormalizeUnits()
 	if c.State != nil && c.State.ColdRetentionDays < 0 {
 		return fmt.Errorf("state.cold_retention_days must be >= 0, got %d", c.State.ColdRetentionDays)
 	}
@@ -1516,6 +1917,15 @@ func (c *Config) Validate() error {
 		}
 	}
 	if err := c.CalDAV.Validate(); err != nil {
+		return err
+	}
+	if err := c.FleetPing.Validate(); err != nil {
+		return err
+	}
+	if err := c.OCPP.Validate(); err != nil {
+		return err
+	}
+	if err := c.validateVehicles(); err != nil {
 		return err
 	}
 
@@ -1580,6 +1990,12 @@ func (c *Config) Validate() error {
 	if len(c.Drivers) > 0 && siteMeters == 0 {
 		return errors.New("at least one driver must be is_site_meter: true")
 	}
+	// SiteMeterDriver() returns the first match, so a second is_site_meter
+	// entry was silently ignored — the operator thinks meter B is the site
+	// boundary while dispatch trusts meter A. Make the ambiguity an error.
+	if siteMeters > 1 {
+		return fmt.Errorf("exactly one driver may set is_site_meter: true (found %d)", siteMeters)
+	}
 
 	if c.Site.ControlIntervalS < 0 {
 		return errors.New("site.control_interval_s must be >= 0")
@@ -1607,6 +2023,14 @@ func (c *Config) Validate() error {
 	}
 	if c.Fuse.Phases <= 0 {
 		return errors.New("fuse.phases must be > 0")
+	}
+	// The phase-current safety model ([3]float64 arrays, meter_l1..l3_a
+	// metrics) covers 1..3 conductors. A larger value used to be silently
+	// truncated to 3 by the dispatch freshness gate while MaxPowerW still
+	// counted every configured phase. That overstated the usable aggregate
+	// fuse budget. Reject it instead.
+	if c.Fuse.Phases > 3 {
+		return errors.New("fuse.phases must be 1, 2 or 3")
 	}
 	if c.Fuse.Voltage <= 0 {
 		return errors.New("fuse.voltage must be > 0")
@@ -1636,14 +2060,26 @@ func (c *Config) Validate() error {
 		if n.Enabled {
 			switch n.Provider {
 			case "", "ntfy":
-				if n.Ntfy == nil {
-					return errors.New("notifications.ntfy required when provider=ntfy and enabled")
-				}
-				if strings.TrimSpace(n.Ntfy.Server) == "" {
-					return errors.New("notifications.ntfy.server required when enabled")
-				}
-				if strings.TrimSpace(n.Ntfy.Topic) == "" {
-					return errors.New("notifications.ntfy.topic required when enabled")
+				// Web push is engine-owned — keyed by stored push
+				// subscriptions, not by this field — so "enabled" no
+				// longer implies a working ntfy. The box delivers over web
+				// push with no provider configured at all. Ntfy is a
+				// secondary, opt-in channel, and its one indispensable
+				// setting is the topic: it has no default and nothing can
+				// be published without it. So ntfy counts as *active* only
+				// once a topic is set. Until then it is inactive, and a box
+				// carrying the legacy default (provider "ntfy", server
+				// "https://ntfy.sh", blank topic — present on real boxes)
+				// can still enable notifications. NewProvider makes the
+				// same call at runtime and logs the inactive ntfy, so the
+				// drop is warned, not silent.
+				if n.Ntfy != nil && strings.TrimSpace(n.Ntfy.Topic) != "" {
+					// A topic means the operator does intend ntfy; a topic
+					// with no server to publish it to is a real mistake
+					// still worth catching.
+					if strings.TrimSpace(n.Ntfy.Server) == "" {
+						return errors.New("notifications.ntfy.server required when notifications.ntfy.topic is set")
+					}
 				}
 			default:
 				return fmt.Errorf("notifications.provider %q not supported", n.Provider)
@@ -1691,6 +2127,16 @@ func (c *Config) Validate() error {
 	}
 	if c.Planner != nil {
 		p := c.Planner
+		if p.ForecastTrust != "" {
+			if _, ok := ParseForecastTrust(p.ForecastTrust); !ok {
+				return fmt.Errorf("planner.forecast_trust must be cautious, balanced, or bold, got %q", p.ForecastTrust)
+			}
+		}
+		if p.BatteryExport != "" {
+			if _, ok := ParseBatteryExport(p.BatteryExport); !ok {
+				return fmt.Errorf("planner.battery_export must be unknown, not_allowed, or allowed, got %q", p.BatteryExport)
+			}
+		}
 		switch p.Engine {
 		case "", "python", "dp":
 		default:
@@ -1805,12 +2251,12 @@ func (c *Config) validateV2XPolicy(driverNames map[string]bool) error {
 		return fmt.Errorf("v2x.driver_name %q: no such driver", p.DriverName)
 	}
 	for name, value := range map[string]float64{
-		"v2x.vehicle_capacity_wh":      p.VehicleCapacityWh,
-		"v2x.max_charge_w":             p.MaxChargeW,
-		"v2x.max_discharge_w":          p.MaxDischargeW,
-		"v2x.cycle_cost_ore_kwh":       p.CycleCostOreKWh,
-		"v2x.min_reserve_soc_pct":      p.MinReserveSoCPct,
-		"v2x.departure_target_soc_pct": p.DepartureTargetSoCPct,
+		"v2x.vehicle_capacity_wh":  p.VehicleCapacityWh,
+		"v2x.max_charge_w":         p.MaxChargeW,
+		"v2x.max_discharge_w":      p.MaxDischargeW,
+		"v2x.cycle_cost_ore_kwh":   p.CycleCostOreKWh,
+		"v2x.min_reserve_soc":      p.MinReserveSoC,
+		"v2x.departure_target_soc": p.DepartureTargetSoC,
 	} {
 		if math.IsNaN(value) || math.IsInf(value, 0) {
 			return fmt.Errorf("%s must be finite", name)
@@ -1828,25 +2274,25 @@ func (c *Config) validateV2XPolicy(driverNames map[string]bool) error {
 	if p.CycleCostOreKWh < 0 {
 		return errors.New("v2x.cycle_cost_ore_kwh must be >= 0")
 	}
-	if p.MinReserveSoCPct < 0 || p.MinReserveSoCPct > 100 {
-		return errors.New("v2x.min_reserve_soc_pct must be in [0,100]")
+	if p.MinReserveSoC < 0 || p.MinReserveSoC > 1 {
+		return errors.New("v2x.min_reserve_soc must be in [0,1]")
 	}
-	if p.DepartureTargetSoCPct < 0 || p.DepartureTargetSoCPct > 100 {
-		return errors.New("v2x.departure_target_soc_pct must be in [0,100]")
+	if p.DepartureTargetSoC < 0 || p.DepartureTargetSoC > 1 {
+		return errors.New("v2x.departure_target_soc must be in [0,1]")
 	}
-	if p.Enabled && p.MinReserveSoCPct <= 0 {
-		return errors.New("v2x.min_reserve_soc_pct must be > 0 when v2x.enabled")
+	if p.Enabled && p.MinReserveSoC <= 0 {
+		return errors.New("v2x.min_reserve_soc must be > 0 when v2x.enabled")
 	}
 	if p.DepartureTime != "" {
 		if err := validateV2XDepartureTime(p.DepartureTime); err != nil {
 			return err
 		}
 	}
-	if (p.DepartureTargetSoCPct > 0) != (p.DepartureTime != "") {
-		return errors.New("v2x.departure_target_soc_pct and v2x.departure_time must be set together")
+	if (p.DepartureTargetSoC > 0) != (p.DepartureTime != "") {
+		return errors.New("v2x.departure_target_soc and v2x.departure_time must be set together")
 	}
-	if p.DepartureTargetSoCPct > 0 && p.DepartureTargetSoCPct < p.MinReserveSoCPct {
-		return errors.New("v2x.departure_target_soc_pct must be >= v2x.min_reserve_soc_pct")
+	if p.DepartureTargetSoC > 0 && p.DepartureTargetSoC < p.MinReserveSoC {
+		return errors.New("v2x.departure_target_soc must be >= v2x.min_reserve_soc")
 	}
 	return nil
 }
@@ -1871,8 +2317,37 @@ func (c *Config) SiteMeterDriver() string {
 	return ""
 }
 
-// SaveAtomic writes config to disk via tmp-file + rename. Safe from partial writes.
+// configFileMode is owner-only because config.yaml carries MQTT passwords,
+// API keys and OAuth refresh tokens. Rename replaces the destination inode, so
+// whatever mode the temp file has is the mode the saved config ends up with.
+const configFileMode os.FileMode = 0o600
+
+// saveMu serializes config saves. The settings handlers do not hold a write
+// lock across a save, so two overlapping requests would otherwise both write
+// the shared temp path and rename half of each other's bytes over config.yaml.
+var saveMu sync.Mutex
+
+// durableWriter holds the two sync calls that make a save survive power loss.
+// They are fields so a test can prove the ordering and force a sync failure;
+// production always uses defaultDurableWriter.
+type durableWriter struct {
+	syncFile func(*os.File) error
+	syncDir  func(string) error
+}
+
+var defaultDurableWriter = durableWriter{
+	syncFile: (*os.File).Sync,
+	syncDir:  syncDir,
+}
+
+// SaveAtomic writes config to disk via tmp-file + rename. Safe from partial
+// writes and from power loss: the temp file is fsynced before the rename and
+// the containing directory is fsynced after it.
 func SaveAtomic(path string, c *Config) error {
+	return saveAtomic(defaultDurableWriter, path, c)
+}
+
+func saveAtomic(w durableWriter, path string, c *Config) error {
 	// Driver paths are resolved to absolute-ish paths at Load() time.
 	// Convert them back to config-relative before writing so that
 	// repeated save cycles don't accumulate extra "../" prefixes.
@@ -1890,11 +2365,50 @@ func SaveAtomic(path string, c *Config) error {
 	if err != nil {
 		return fmt.Errorf("yaml marshal: %w", err)
 	}
+	saveMu.Lock()
+	defer saveMu.Unlock()
+
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
+	// Clear any temp left by an interrupted save, then create with O_EXCL.
+	// OpenFile only applies the mode when it creates the file, so reusing a
+	// stale 0644 temp would hand the secrets in config.yaml to every user on
+	// the box; O_EXCL also refuses to follow a symlink planted at that path.
+	if err := os.Remove(tmp); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("clear stale tmp: %w", err)
+	}
+	f, err := createConfigTemp(tmp, configFileMode)
+	if err != nil {
+		return fmt.Errorf("create tmp: %w", err)
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmp)
 		return fmt.Errorf("write tmp: %w", err)
 	}
-	return os.Rename(tmp, path)
+	// fsync before rename: a rename is only atomic for bytes that have already
+	// reached the disk. Without this, a power cut mid-save can publish a
+	// truncated or zero-length config.yaml — the file the gateway boots from,
+	// on a device that is expected to come back up unattended.
+	if err := w.syncFile(f); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return fmt.Errorf("sync tmp: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("close tmp: %w", err)
+	}
+	if err := replaceConfigTemp(tmp, path); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("rename tmp: %w", err)
+	}
+	// fsync the directory so the rename itself survives power loss. The
+	// caller's contract is "the config is now saved", so this failure is
+	// reported rather than swallowed.
+	if err := w.syncDir(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("sync config dir: %w", err)
+	}
+	return nil
 }
 
 func relDriverPath(baseDir, p string) string {

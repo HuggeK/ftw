@@ -19,11 +19,12 @@ import (
 // ---- test helpers ----
 
 type fakePub struct {
-	mu    sync.Mutex
-	msgs  []Message
-	errOn int // fail after this many (0 means never)
-	count int
-	fail  bool
+	mu        sync.Mutex
+	msgs      []Message
+	errOn     int // fail after this many (0 means never)
+	count     int
+	fail      bool
+	published chan struct{}
 }
 
 func (f *fakePub) Publish(_ context.Context, m Message) error {
@@ -34,6 +35,12 @@ func (f *fakePub) Publish(_ context.Context, m Message) error {
 		return fmt.Errorf("boom")
 	}
 	f.msgs = append(f.msgs, m)
+	if f.published != nil {
+		select {
+		case f.published <- struct{}{}:
+		default:
+		}
+	}
 	return nil
 }
 
@@ -62,6 +69,20 @@ func newSvc(cfg *config.Notifications, pub Publisher) (*Service, *clock) {
 	s := New(cfg, pub, nil)
 	s.now = clk.now
 	return s, clk
+}
+
+func waitForFuseEvaluation(t *testing.T, svc *Service, started <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("fuse reader was not called")
+	}
+	// The reader is called while evaluateFuse holds svc.mu. Taking the same
+	// lock after the reader signal makes the test wait for the full evaluation,
+	// not just for the goroutine to start.
+	svc.mu.Lock()
+	svc.mu.Unlock()
 }
 
 func healthOk(lastSuccess time.Time) map[string]telemetry.DriverHealth {
@@ -399,6 +420,22 @@ func TestStrategyRegistry(t *testing.T) {
 	}
 }
 
+// A topic-less ntfy (the legacy default carried by real boxes) is inactive:
+// NewProvider installs no config-selected transport, so the service runs on
+// its engine-owned web push alone rather than a transport that fails every
+// dispatch. Holds whether the provider field is the legacy "ntfy" or "".
+func TestNewProviderTopiclessNtfyInactive(t *testing.T) {
+	for _, provider := range []string{"ntfy", ""} {
+		if p := NewProvider(&config.Notifications{
+			Enabled:  true,
+			Provider: provider,
+			Ntfy:     &config.NtfyConfig{Server: "https://ntfy.sh"},
+		}); p != nil {
+			t.Errorf("provider %q: topic-less ntfy must be inactive; got %+v", provider, p)
+		}
+	}
+}
+
 func TestEventBusSubscribe(t *testing.T) {
 	pub := &fakePub{}
 	svc, clk := newSvc(baseCfg(), pub)
@@ -513,30 +550,36 @@ func TestFuseOverLimitFiresAfterThresholdAndResets(t *testing.T) {
 	cfg.Events = append(cfg.Events, config.NotificationRule{
 		Type: EventFuseOverLimit, Enabled: true, ThresholdS: 30, Priority: 5, CooldownS: 900,
 	})
-	pub := &fakePub{}
+	pub := &fakePub{published: make(chan struct{}, 1)}
 	svc, clk := newSvc(cfg, pub)
 	bus := events.NewBus()
 	svc.Subscribe(bus)
 
 	// Reader starts with L1 at 20 A, limit 16 A.
 	var l1 float64 = 20.0
+	fuseEvaluationStarted := make(chan struct{}, 1)
 	svc.SetFuseReader(func() (map[string]float64, float64, bool) {
+		fuseEvaluationStarted <- struct{}{}
 		return map[string]float64{"L1": l1, "L2": 10, "L3": 11}, 16.0, true
 	})
+	tick := func() {
+		bus.Publish(events.HealthTick{Health: map[string]telemetry.DriverHealth{}, Now: clk.now()})
+		waitForFuseEvaluation(t, svc, fuseEvaluationStarted)
+	}
 
 	// First tick: over the limit, but threshold hasn't sustained.
-	bus.Publish(events.HealthTick{Health: map[string]telemetry.DriverHealth{}, Now: clk.now()})
-	time.Sleep(20 * time.Millisecond)
+	tick()
 	if n := len(pub.Messages()); n != 0 {
 		t.Fatalf("before threshold: got %d msgs", n)
 	}
 
 	// Advance past threshold — should fire once.
 	clk.advance(40 * time.Second)
-	bus.Publish(events.HealthTick{Health: map[string]telemetry.DriverHealth{}, Now: clk.now()})
-	deadline := time.Now().Add(time.Second)
-	for len(pub.Messages()) < 1 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
+	tick()
+	select {
+	case <-pub.published:
+	case <-time.After(time.Second):
+		t.Fatal("fuse notification was not published")
 	}
 	msgs := pub.Messages()
 	if len(msgs) != 1 {
@@ -551,24 +594,21 @@ func TestFuseOverLimitFiresAfterThresholdAndResets(t *testing.T) {
 
 	// Still over — latch prevents a second fire in the same outage.
 	clk.advance(5 * time.Second)
-	bus.Publish(events.HealthTick{Health: map[string]telemetry.DriverHealth{}, Now: clk.now()})
-	time.Sleep(20 * time.Millisecond)
+	tick()
 	if n := len(pub.Messages()); n != 1 {
 		t.Fatalf("still-over: expected 1, got %d", n)
 	}
 
 	// Back under: the window + latch reset.
 	l1 = 12
-	bus.Publish(events.HealthTick{Health: map[string]telemetry.DriverHealth{}, Now: clk.now()})
-	time.Sleep(20 * time.Millisecond)
+	tick()
 
 	// New outage — cooldown still blocks a quick refire.
 	l1 = 20
 	clk.advance(40 * time.Second)
-	bus.Publish(events.HealthTick{Health: map[string]telemetry.DriverHealth{}, Now: clk.now()})
+	tick()
 	clk.advance(60 * time.Second)
-	bus.Publish(events.HealthTick{Health: map[string]telemetry.DriverHealth{}, Now: clk.now()})
-	time.Sleep(20 * time.Millisecond)
+	tick()
 	if n := len(pub.Messages()); n != 1 {
 		t.Fatalf("cooldown did not block refire: got %d msgs", n)
 	}
@@ -701,3 +741,86 @@ func TestConcurrentOffline_IgnoresColdStartDrivers(t *testing.T) {
 }
 
 func addr(t time.Time) *time.Time { return &t }
+
+// The phone's driver.offline kind uses the same silence threshold as the
+// operator rule, but the lock-screen sentence is the catalogue's — never
+// the ntfy template.
+func TestCatalogueDriverOfflineRendersFromCatalogue(t *testing.T) {
+	pub := &fakePub{}
+	svc, clk := newSvc(pushCfg(config.NotificationRule{
+		Type: PushDriverOffline, Enabled: true, ThresholdS: 600, Priority: 4, CooldownS: 3600,
+	}), pub)
+	last := clk.now()
+	clk.advance(400 * time.Second)
+	svc.Observe(healthOk(last))
+	if n := len(pub.Messages()); n != 0 {
+		t.Fatalf("below threshold: got %d msgs", n)
+	}
+	clk.advance(400 * time.Second)
+	svc.Observe(healthStale(last))
+	msgs := pub.Messages()
+	if len(msgs) != 1 {
+		t.Fatalf("above threshold: got %d msgs", len(msgs))
+	}
+	if msgs[0].Title != "A device went quiet" {
+		t.Fatalf("title = %q", msgs[0].Title)
+	}
+	if msgs[0].Body != "ferroamp stopped answering." {
+		t.Fatalf("body = %q", msgs[0].Body)
+	}
+}
+
+func TestCatalogueDriverOfflineStaysSilentWhenDisabled(t *testing.T) {
+	pub := &fakePub{}
+	svc, clk := newSvc(pushCfg(config.NotificationRule{
+		Type: PushDriverOffline, Enabled: false, ThresholdS: 600,
+	}), pub)
+	last := clk.now()
+	clk.advance(1000 * time.Second)
+	svc.Observe(healthStale(last))
+	if n := len(pub.Messages()); n != 0 {
+		t.Fatalf("disabled catalogue kind dispatched %d messages", n)
+	}
+}
+
+func TestCatalogueFuseOverLimitRendersFromCatalogue(t *testing.T) {
+	cfg := pushCfg(config.NotificationRule{
+		Type: PushFuseOverLimit, Enabled: true, ThresholdS: 30, Priority: 5, CooldownS: 900,
+	})
+	pub := &fakePub{published: make(chan struct{}, 1)}
+	svc, clk := newSvc(cfg, pub)
+	bus := events.NewBus()
+	svc.Subscribe(bus)
+
+	fuseEvaluationStarted := make(chan struct{}, 1)
+	svc.SetFuseReader(func() (map[string]float64, float64, bool) {
+		fuseEvaluationStarted <- struct{}{}
+		return map[string]float64{"L1": 20.0, "L2": 10, "L3": 11}, 16.0, true
+	})
+	tick := func() {
+		bus.Publish(events.HealthTick{Health: map[string]telemetry.DriverHealth{}, Now: clk.now()})
+		waitForFuseEvaluation(t, svc, fuseEvaluationStarted)
+	}
+
+	tick()
+	if n := len(pub.Messages()); n != 0 {
+		t.Fatalf("before threshold: got %d msgs", n)
+	}
+	clk.advance(40 * time.Second)
+	tick()
+	select {
+	case <-pub.published:
+	case <-time.After(time.Second):
+		t.Fatal("catalogue fuse notification was not published")
+	}
+	msgs := pub.Messages()
+	if len(msgs) != 1 {
+		t.Fatalf("after threshold: got %d msgs", len(msgs))
+	}
+	if msgs[0].Title != "The house is drawing too much" {
+		t.Fatalf("title = %q", msgs[0].Title)
+	}
+	if msgs[0].Body != "L1 is over the fuse rating." {
+		t.Fatalf("body = %q", msgs[0].Body)
+	}
+}

@@ -21,13 +21,48 @@ the signed driver channel, stays off without `write.solar_pv: true` plus
 `capabilities.http.allow_write: true`, and needs a core with
 `host.http_patch`.
 
+Once a driver that declares that path is installed (`write_capabilities` in
+its `DRIVER` block), **Settings → Devices** grows a *Solar PV surplus feed*
+panel on it: one switch and the maximum surplus to report. The switch sets
+both gates together, because either alone does nothing, and the feed stays
+off until the maximum is above 0 — that ceiling is what bounds every value
+FTW can send. A driver that declares no write path gets no panel. What the
+pump needs at its own end cannot be checked from FTW, so the panel states it:
+
+1. **Installer menu 7.5.15** — Local REST API set to **read/write**.
+2. **Menu 4.2.2 "solar electricity"** — turn on the external Solar PV
+   source, named **"Modbus TCP/IP Ext. (Solar PV)"** on the pump (register
+   2107; names read live off an S735). FTW deliberately never writes this
+   register — turning the feature on is the owner's consent, given at the
+   device, and the driver holds every non-zero value back until it reads 1.
+   Menu 4.2.2 is a plus function under menu 4.2: if it is not visible, add
+   the solar-electricity function from installer menu 7.2.1 (add/remove
+   accessories). The same menu holds what the pump *does* with the value —
+   "include own consumption" (register 2108) and the "(Solar PV)" offsets
+   for heating, cooling and pool.
+
+The tell that the pump is listening: the read-only point *Total average
+power (Solar PV)* (register 2178, emitted as
+`hp_total_average_power_solar_pv`) starts tracking the fed value instead of
+sitting at 0.
+
+Once armed, core feeds the driver every control tick with the site's
+solar-attributable export: the smaller of live PV generation and grid export,
+after subtracting battery/V2X discharge (stored energy is never advertised to
+the pump as sunshine). The value comes from FTW's own telemetry, so the site
+needs a PV source FTW can see and a site meter; a site without PV telemetry
+feeds a standing 0. A stale site meter stops dispatch and reverts the driver
+to its default mode, which clears the pump-side register — the same clear the
+driver's own dead-man switch enforces if commands stop arriving.
+
 **Decommissioning a write-enabled setup.** Every automatic safeguard around
 the feed (dead-man's switch, default-mode clear, startup orphan sweep) runs
 inside FTW — none of them can fire once FTW is gone, and the pump's own
 timeout for a silently stopped feed is undocumented. Before uninstalling FTW
 or permanently disabling the feed, turn the **Solar PV input (2107) off on
-the pump** — or set the Local REST API back to **read-only (menu 7.5.15)**
-— so no stale surplus value can stand with nobody left to clear it.
+the pump** (menu 4.2.2) — or set the Local REST API back to **read-only
+(menu 7.5.15)** — so no stale surplus value can stand with nobody left to
+clear it.
 
 ## Why the local API (vs. the cloud or raw Modbus)
 
@@ -36,8 +71,8 @@ its own metadata: modbus register, unit, **exact divisor**, and a writable
 flag. That means:
 
 - **Exact scaling.** A temperature with `divisor: 10` becomes °C precisely; a
-  power with `divisor: 100` becomes kW precisely. No °C×10 guessing like the
-  cloud driver has to do.
+  power with `divisor: 100` scales to the vendor unit, then kW/kWh convert
+  to W/Wh at emit. No °C×10 guessing like the cloud driver has to do.
 - **The whole register map.** Every point lands in the long-format
   TS DB via `host.emit_metric`. To keep
   a Pi-sized database bounded, headline metrics are sampled every minute while
@@ -46,17 +81,19 @@ flag. That means:
 
 ## One-time setup on the pump
 
-1. In the NIBE **myUplink** app, enable the **Local REST API** for the pump and
-   note the generated **username** and **password**.
-2. The app shows the API's certificate **fingerprint** ("fingeravtryck"). You
-   will pin this. You can also read it yourself:
+1. On the **pump's own screen**, enable the **Local REST API** (installer menu
+   **7.5**, the section that also holds 7.5.15 below) and note the **username**
+   and **password** it generates. No app and no myUplink account are involved —
+   confirmed on an S735.
+2. Pin the API's certificate **fingerprint**. Read it off the pump yourself:
 
    ```bash
    openssl s_client -connect <pump-ip>:8443 -servername <pump-ip> </dev/null 2>/dev/null \
      | openssl x509 -noout -fingerprint -sha256
    ```
 
-   Use the hex value (colons and case don't matter — they're normalised).
+   Use the hex value (colons and case don't matter — they're normalised). The
+   myUplink app shows the same value as "fingeravtryck" if you have it.
 3. Leave the Local REST API in **read-only** mode (installer menu 7.5.15)
    unless you are deliberately enabling the Solar PV write path.
 
@@ -113,8 +150,8 @@ instance via `param_power_id`, `param_hw_temp_id`, `param_indoor_temp_id`,
 | `hp_hw_top_temp_c` | °C | Hot water top BT7 (11) |
 | `hp_outdoor_temp_c` | °C | Outdoor BT1 (4) |
 | `hp_indoor_temp_c` | °C | Room BT50 (158) — absent if no room sensor |
-| `hp_energy_consumed_kwh` | kWh | Tot. consumption (28393) |
-| `hp_energy_produced_kwh` | kWh | Tot. production (28392) |
+| `hp_energy_consumed_kwh` | Wh | Tot. consumption (28393) — name still `_kwh`; value is Wh |
+| `hp_energy_produced_kwh` | Wh | Tot. production (28392) — name still `_kwh`; value is Wh |
 | `hp_degree_minutes` | DM | Degree minutes (781) |
 
 Every other point auto-emits as `hp_<sanitized title>` with its unit, so the

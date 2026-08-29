@@ -38,9 +38,12 @@ type CatalogEntry struct {
 	Description        string         `json:"description,omitempty"`
 	Homepage           string         `json:"homepage,omitempty"`
 	ConnectionDefaults map[string]any `json:"connection_defaults,omitempty"`
+	// AuthPostPath is the URL path a read-only driver signs in at. A driver
+	// that reads a vendor cloud has to POST for a token before it can read,
+	// and that POST is not actuation. Only meaningful with ReadOnly.
+	AuthPostPath string `json:"auth_post_path,omitempty"`
 	// ReadOnly means the driver never accepts dispatch commands. The catalog
-	// UI uses it to avoid presenting battery capacity as a control opt-in and
-	// to enable battery_telemetry_only for gateway-style drivers.
+	// UI uses it to avoid presenting battery capacity as a control opt-in.
 	ReadOnly bool `json:"read_only,omitempty"`
 	// ReadOnlyDeclared distinguishes an explicit false value from old metadata
 	// that did not state whether the driver can control hardware.
@@ -58,6 +61,10 @@ type CatalogEntry struct {
 	VerificationNotes  string   `json:"verification_notes,omitempty"`
 	TestedModels       []string `json:"tested_models,omitempty"` // e.g. ["Home", "Charge"]
 
+	// Controls are the operator-facing commands the driver declares. Empty
+	// for every driver that only reports. See catalog_controls.go.
+	Controls []CatalogControl `json:"controls,omitempty"`
+
 	// ConfigSecrets lists driver-specific config keys that the Settings
 	// UI / setup wizard should render as password inputs and store
 	// under config.<key>. Used for things like Auth-Tokens that the
@@ -66,6 +73,19 @@ type CatalogEntry struct {
 	// reads `config.<key>` like any other entry — this is purely a
 	// hint for the UI layer.
 	ConfigSecrets []string `json:"config_secrets,omitempty"`
+
+	// WriteCapabilities names the opt-in write paths a driver implements,
+	// so the Settings UI can offer a switch for one instead of leaving it
+	// to hand-edited YAML. Each entry is a stable identifier the UI knows
+	// how to render a control for (today: "solar_pv" — the NIBE S-series
+	// surplus feed behind `config.write.solar_pv` + `capabilities.http.
+	// allow_write`).
+	//
+	// A driver that declares nothing gets no write UI, which is the point:
+	// the switch appears only where the installed driver states it has a
+	// write path, rather than FTW matching on a filename or vendor name.
+	// Read-only remains the default for every driver in the catalog.
+	WriteCapabilities []string `json:"write_capabilities,omitempty"`
 }
 
 // LoadCatalog scans dir (and any direct sub-directories) for .lua driver
@@ -194,6 +214,8 @@ func parseCatalogEntry(path string) (CatalogEntry, error) {
 	e.VerificationNotes = pickString(block, "verification_notes")
 	e.TestedModels = pickList(block, "tested_models")
 	e.ConfigSecrets = pickList(block, "config_secrets")
+	e.WriteCapabilities = pickList(block, "write_capabilities")
+	e.Controls = pickControls(block)
 	return e, nil
 }
 
@@ -237,7 +259,7 @@ func IsEVOrVehicleDriver(catalog []CatalogEntry, luaPath string) bool {
 
 // IsReadOnlyDriver reports whether the matched Lua catalog entry explicitly
 // declares read_only=true. Control-pool construction uses this as a safety
-// boundary for telemetry gateways such as Sourceful Zap.
+// boundary for read-only telemetry drivers such as Sourceful Zap.
 func IsReadOnlyDriver(catalog []CatalogEntry, luaPath string) bool {
 	if luaPath == "" {
 		return false

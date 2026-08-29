@@ -18,6 +18,7 @@ func newControlStateFromConfig(cfg *config.Config) *control.State {
 	ctrl.MinDispatchIntervalS = cfg.Site.MinDispatchIntervalS
 	ctrl.InverterGroups = inverterGroupsFrom(cfg.Drivers)
 	ctrl.SupportsPVCurtail = supportsPVCurtailFrom(cfg.Drivers)
+	ctrl.SolarFeedDrivers = solarFeedDriversFrom(cfg.Drivers)
 	ctrl.DriverLimits = driverLimitsFrom(cfg.Drivers, cfg.Batteries)
 	// Per-phase fuse params for the per-phase clamp inside applyFuseGuard
 	// + forceFuseDischarge. Reads l1_a/l2_a/l3_a from the meter driver
@@ -30,7 +31,7 @@ func newControlStateFromConfig(cfg *config.Config) *control.State {
 	// `<= 0 -> default` shortcut clobbered the disable case.
 	ctrl.SiteFuseSafetyA = cfg.Fuse.EffectiveSafetyMarginA()
 	// PV surplus absorber underlay (opt-in). cap == 0 keeps it off.
-	ctrl.PVSurplusAbsorbSoCCapPct = cfg.Site.PVSurplusAbsorbSoCCapPct
+	ctrl.PVSurplusAbsorbSoCCap = cfg.Site.PVSurplusAbsorbSoCCap
 	ctrl.PVSurplusAbsorbThresholdW = cfg.Site.PVSurplusAbsorbThresholdW
 	// DC-link protective curtail — opt-in, default off. SoC threshold
 	// and margin fall back to dispatch defaults (0.80 / 1000 W) when

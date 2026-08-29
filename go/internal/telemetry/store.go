@@ -7,6 +7,8 @@ import (
 	"math"
 	"sync"
 	"time"
+
+	"github.com/srcfl/ftw/go/internal/units"
 )
 
 // DerType classifies what kind of reading a DER produces.
@@ -24,9 +26,11 @@ const (
 	// DerVehicle is a read-only reading from the connected vehicle
 	// itself (e.g. via TeslaBLEProxy), distinct from DerEV which is
 	// the charger. Carries SoC + `charge_limit_pct`/`charging_state`/
-	// `time_to_full_min`/`stale` in Data. RawW is always 0 — vehicle
-	// readings don't conflict with dispatch math, they only inform
-	// the loadpoint manager's SoC-source selection and the UI.
+	// `time_to_full_min`/`stale` in Data. `soc_fresh=false` marks a
+	// cached replay rather than a new upstream observation. RawW is
+	// always 0 — vehicle readings don't conflict with dispatch math,
+	// they only inform the loadpoint manager's SoC-source selection
+	// and the UI.
 	DerVehicle
 )
 
@@ -80,13 +84,14 @@ func ParseDerType(s string) (DerType, error) {
 
 // DerReading is one DER telemetry snapshot (raw + smoothed + optional SoC).
 type DerReading struct {
-	Driver    string
-	DerType   DerType
-	RawW      float64
-	SmoothedW float64
-	SoC       *float64 // optional; 0..1 for batteries/V2X, 0..100 for DerVehicle
-	Data      json.RawMessage
-	UpdatedAt time.Time
+	Driver       string
+	DerType      DerType
+	RawW         float64
+	SmoothedW    float64
+	SoC          *float64  // optional; 0..1 fraction for every DER including vehicles
+	SoCUpdatedAt time.Time // last fresh SoC receipt time; preserved across cached updates
+	Data         json.RawMessage
+	UpdatedAt    time.Time
 }
 
 // DriverStatus describes the health of one driver.
@@ -129,16 +134,49 @@ type DriverHealth struct {
 	// detection — there is no separate "degraded" state.
 	WatchdogTimeoutOverride time.Duration
 
-	// DeviceFault is set by a driver (via host.set_device_fault) when it can
-	// reach the device but the device is in a fault state where it cannot
-	// actuate — e.g. a Ferroamp EnergyHub in Fault Mode with its relays open.
-	// It is orthogonal to Status: the driver keeps emitting fresh telemetry
-	// (so the watchdog sees it as alive and RecordSuccess keeps Status=ok),
-	// but IsOnline() returns false so the dispatcher and the MPC plan exclude
-	// it — otherwise we keep commanding a dead battery and the un-delivered
-	// power silently becomes grid import. DeviceFaultReason is operator-facing.
+	// DeviceFault means the driver reaches the device but the device
+	// cannot actuate — e.g. a Ferroamp EnergyHub in Fault Mode with its
+	// relays open. It is orthogonal to Status: the driver keeps emitting
+	// fresh telemetry (so the watchdog sees it as alive and RecordSuccess
+	// keeps Status=ok), but IsOnline() returns false so the dispatcher and
+	// the MPC plan exclude it — otherwise we keep commanding a dead battery
+	// and the un-delivered power silently becomes grid import.
+	// DeviceFaultReason is operator-facing.
+	//
+	// Read it; do not assign it. It is derived from the two sources below
+	// so that both reach every consumer — /api/health, the driver
+	// inventory, the support report — through one field.
 	DeviceFault       bool
 	DeviceFaultReason string
+
+	// The two writers behind DeviceFault, kept apart so neither can undo
+	// the other. A driver re-asserts its own view on every poll; without
+	// the split, a core-set fault would be cleared by the next poll of a
+	// driver that believes the device is fine, and the two would flip the
+	// derived flag back and forth for as long as the fault lasted.
+	//
+	// driverFault: the driver's own verdict, via host.set_device_fault.
+	// commandFault: core's verdict, when the driver has refused the
+	// commands core sent it. Refusing to actuate is the same condition
+	// seen from the other end of the wire.
+	driverFault        bool
+	driverFaultReason  string
+	commandFault       bool
+	commandFaultReason string
+}
+
+// refreshDeviceFault recomputes the derived fault from its two sources.
+// The driver's own reason wins when both are set: it saw the device.
+func (h *DriverHealth) refreshDeviceFault() {
+	h.DeviceFault = h.driverFault || h.commandFault
+	switch {
+	case h.driverFault:
+		h.DeviceFaultReason = h.driverFaultReason
+	case h.commandFault:
+		h.DeviceFaultReason = h.commandFaultReason
+	default:
+		h.DeviceFaultReason = ""
+	}
 }
 
 // RecordSuccess resets error state and marks the driver healthy. Call
@@ -182,27 +220,52 @@ func (h *DriverHealth) RecordError(err string) {
 	}
 }
 
-// SetOffline marks the driver offline (e.g. by watchdog).
+// SetOffline marks the driver offline. WatchdogScan is the only runtime
+// caller: staleness is the one condition that takes a driver offline, so
+// this is the single place that writes StatusOffline. Tests use it to put
+// a driver in that state directly.
 func (h *DriverHealth) SetOffline() {
 	h.Status = StatusOffline
 }
 
-// SetDeviceFault flags (or clears) a device-level fault — the driver reaches
-// the device but it can't actuate. Independent of Status so a driver that
-// keeps emitting from cache doesn't flap it back on every RecordSuccess.
+// SetDeviceFault records the driver's own verdict that the device can't
+// actuate. Independent of Status so a driver that keeps emitting from cache
+// doesn't flap it back on every RecordSuccess.
 func (h *DriverHealth) SetDeviceFault(faulted bool, reason string) {
-	h.DeviceFault = faulted
+	h.driverFault = faulted
+	h.driverFaultReason = ""
 	if faulted {
-		h.DeviceFaultReason = reason
-	} else {
-		h.DeviceFaultReason = ""
+		h.driverFaultReason = reason
 	}
+	h.refreshDeviceFault()
+}
+
+// SetCommandFault records core's verdict that the device can't actuate,
+// because it refused the commands core sent it. Kept apart from
+// SetDeviceFault so a driver still reporting itself healthy cannot clear it.
+func (h *DriverHealth) SetCommandFault(faulted bool, reason string) {
+	h.commandFault = faulted
+	h.commandFaultReason = ""
+	if faulted {
+		h.commandFaultReason = reason
+	}
+	h.refreshDeviceFault()
 }
 
 // IsOnline reports whether the driver is usable for control. A stale-flagged
-// driver (Status offline) OR one its driver flagged as device-faulted is not.
+// driver (Status offline) OR one that cannot actuate is not.
 func (h *DriverHealth) IsOnline() bool {
 	return h.Status != StatusOffline && !h.DeviceFault
+}
+
+// TelemetryLive reports whether this driver's last reading is still a
+// measurement of now. DeviceFault does not fail it: that flag means the
+// device cannot take a command, not that its meter went quiet. A charger
+// that refuses setpoints while still drawing 11 kW is live load, and the
+// house-vs-car split, the app's EV node, and BatteryCoversEV all have to
+// see it. StatusOffline is the watchdog's word that the reading is stale.
+func (h *DriverHealth) TelemetryLive() bool {
+	return h != nil && h.Status != StatusOffline
 }
 
 // MetricSample is one (driver, metric, ts, value) tuple buffered for the
@@ -280,6 +343,9 @@ func ValidateReading(t DerType, rawW float64, soc *float64) error {
 	if soc != nil && !finite(*soc) {
 		return fmt.Errorf("%s soc is non-finite: %v", t, *soc)
 	}
+	if soc != nil && !units.ValidFraction(*soc) {
+		return fmt.Errorf("%s soc must be a 0..1 fraction, got %.3f", t, *soc)
+	}
 	switch t {
 	case DerPV:
 		if rawW > 0 {
@@ -289,14 +355,6 @@ func ValidateReading(t DerType, rawW float64, soc *float64) error {
 		if rawW < 0 {
 			return fmt.Errorf("ev power must be >= 0 in site convention, got %.3f W", rawW)
 		}
-	case DerBattery:
-		if soc != nil && (*soc < 0 || *soc > 1) {
-			return fmt.Errorf("battery soc must be a 0..1 fraction, got %.3f", *soc)
-		}
-	case DerV2X:
-		if soc != nil && (*soc < 0 || *soc > 1) {
-			return fmt.Errorf("v2x_charger vehicle soc must be a 0..1 fraction, got %.3f", *soc)
-		}
 	}
 	return nil
 }
@@ -305,12 +363,39 @@ func finite(v float64) bool {
 	return !math.IsNaN(v) && !math.IsInf(v, 0)
 }
 
+// freshSoCObservation reports whether this emit contains a new SoC
+// observation. Legacy drivers omit soc_fresh, so a non-nil SoC stays fresh by
+// default. Vehicle drivers that replay a cached value set soc_fresh=false.
+// Invalid explicit freshness data fails closed.
+func freshSoCObservation(t DerType, soc *float64, data json.RawMessage) bool {
+	if soc == nil {
+		return false
+	}
+	if t != DerVehicle || len(data) == 0 {
+		return true
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return false
+	}
+	raw, ok := fields["soc_fresh"]
+	if !ok {
+		return true
+	}
+	var fresh bool
+	if err := json.Unmarshal(raw, &fresh); err != nil {
+		return false
+	}
+	return fresh
+}
+
 // Update feeds a new reading. Applies Kalman smoothing and stores both raw
 // and smoothed values.
 func (s *Store) Update(driver string, t DerType, rawW float64, soc *float64, data json.RawMessage) {
 	if err := ValidateReading(t, rawW, soc); err != nil {
 		return
 	}
+	socFresh := freshSoCObservation(t, soc, data)
 	k := key(driver, t)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -320,24 +405,34 @@ func (s *Store) Update(driver string, t DerType, rawW float64, soc *float64, dat
 		s.filters[k] = f
 	}
 	smoothed := f.Update(rawW)
-	// Preserve last-known SoC when the new emit doesn't include one.
+	now := time.Now()
+	var socUpdatedAt time.Time
+	if socFresh {
+		socUpdatedAt = now
+	}
+	// Preserve last-known SoC when the new emit doesn't include one or marks a
+	// non-nil value as a cached replay.
 	// Some devices (e.g. Ferroamp ESO) publish SoC less frequently than
 	// the power-flow telemetry; a missing field this tick doesn't mean
-	// the battery has no SoC, just that we haven't heard a fresh number.
-	if soc == nil {
+	// the battery has no SoC. Keep its original observation time so callers and
+	// persisted metrics can still distinguish it from a fresh number.
+	if !socFresh {
 		if prev, ok := s.readings[k]; ok && prev.SoC != nil {
 			soc = prev.SoC
+			socUpdatedAt = prev.SoCUpdatedAt
+		} else {
+			soc = nil
 		}
 	}
-	now := time.Now()
 	s.readings[k] = &DerReading{
-		Driver:    driver,
-		DerType:   t,
-		RawW:      rawW,
-		SmoothedW: smoothed,
-		SoC:       soc,
-		Data:      data,
-		UpdatedAt: now,
+		Driver:       driver,
+		DerType:      t,
+		RawW:         rawW,
+		SmoothedW:    smoothed,
+		SoC:          soc,
+		SoCUpdatedAt: socUpdatedAt,
+		Data:         data,
+		UpdatedAt:    now,
 	}
 
 	// Auto-buffer the standard fields (raw, not smoothed — we store ground
@@ -347,7 +442,7 @@ func (s *Store) Update(driver string, t DerType, rawW float64, soc *float64, dat
 	s.pending = append(s.pending,
 		MetricSample{Driver: driver, Metric: t.String() + "_w", TsMs: tsMs, Value: rawW},
 	)
-	if soc != nil {
+	if socFresh {
 		s.pending = append(s.pending,
 			MetricSample{Driver: driver, Metric: t.String() + "_soc", TsMs: tsMs, Value: *soc},
 		)
@@ -465,15 +560,16 @@ func (s *Store) ReadingsByType(t DerType) []*DerReading {
 	return out
 }
 
-// SumOnlineEVW returns the summed SmoothedW across every online EV
-// driver. Used by the status endpoint, the loadmodel sampler, the MPC
-// divergence check, and the control loop's grid bias — all four need
-// the same "what is the EV charger drawing right now (and it's
-// trustworthy)" signal, derived the same way.
+// SumOnlineEVW returns the summed SmoothedW across every EV driver that
+// is still reporting. Used by the status endpoint, the loadmodel sampler,
+// the MPC divergence check, the app snapshot, and the control loop's
+// grid bias — all of them need the same "what is the EV charger drawing
+// right now (and it's trustworthy)" signal, derived the same way.
 //
-// Offline drivers (stale telemetry, watchdog tripped) are skipped so a
-// dangling 3.6 kW last-known reading can't sneak into load or grid
-// accounting after the driver has actually stopped reporting.
+// Watchdog-offline drivers are skipped so a dangling 3.6 kW last-known
+// reading can't sneak into load or grid accounting after the driver has
+// actually stopped reporting. A DeviceFault does not skip: that flag
+// means the charger cannot take a command, not that it stopped drawing.
 //
 // Sub-watt floor: when the Kalman residual decays toward zero (driver
 // reports a real 0 W), the smoothed value asymptotes to denormals like
@@ -493,7 +589,7 @@ func (s *Store) SumOnlineEVW() float64 {
 			continue
 		}
 		h, ok := s.health[r.Driver]
-		if !ok || !h.IsOnline() {
+		if !ok || !h.TelemetryLive() {
 			continue
 		}
 		sum += r.SmoothedW
@@ -504,9 +600,12 @@ func (s *Store) SumOnlineEVW() float64 {
 	return sum
 }
 
-// SumOnlineV2XW returns the summed SmoothedW across online bidirectional
-// V2X chargers. Positive values mean vehicle charging; negative values
-// mean the vehicle is discharging into the site/grid.
+// SumOnlineV2XW returns the summed SmoothedW across bidirectional V2X
+// chargers that are still reporting. Positive values mean vehicle
+// charging; negative values mean the vehicle is discharging into the
+// site/grid. DeviceFault is not a skip, for the same reason as
+// SumOnlineEVW: a charger that cannot take a command can still move
+// power.
 func (s *Store) SumOnlineV2XW() float64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -516,7 +615,7 @@ func (s *Store) SumOnlineV2XW() float64 {
 			continue
 		}
 		h, ok := s.health[r.Driver]
-		if !ok || !h.IsOnline() {
+		if !ok || !h.TelemetryLive() {
 			continue
 		}
 		sum += r.SmoothedW
@@ -650,7 +749,7 @@ func (s *Store) WatchdogScan(timeout time.Duration) []WatchdogTransition {
 		stale := h.LastSuccess == nil || now.Sub(*h.LastSuccess) > eff
 		wasOnline := h.Status != StatusOffline
 		if stale && wasOnline {
-			h.Status = StatusOffline
+			h.SetOffline()
 			out = append(out, WatchdogTransition{Name: name, Online: false})
 		} else if !stale && !wasOnline {
 			h.Status = StatusOk
@@ -685,8 +784,9 @@ func (s *Store) SetDriverDeviceFault(name string, faulted bool, reason string) {
 		h = &DriverHealth{Name: name}
 		s.health[name] = h
 	}
-	changed := h.DeviceFault != faulted
+	before := h.DeviceFault
 	h.SetDeviceFault(faulted, reason)
+	changed := h.DeviceFault != before
 	s.mu.Unlock()
 	// Log only the transition (the driver re-asserts the fault every poll) so
 	// the entry/exit surfaces in /api/logs as an operator alert without spam.
@@ -695,6 +795,33 @@ func (s *Store) SetDriverDeviceFault(name string, faulted bool, reason string) {
 			slog.Warn("driver device fault — excluding from dispatch + plan until it recovers", "driver", name, "reason", reason)
 		} else {
 			slog.Info("driver device fault cleared — back in control", "driver", name)
+		}
+	}
+}
+
+// SetDriverCommandFault records that core could not get its commands into
+// this device (or that it can again). Unlike SetDriverDeviceFault this does
+// NOT create a health record: only a driver that has been running can have
+// refused a command, and a removed driver must not be resurrected as a card
+// in the UI by a late verdict about it. Removing a driver therefore clears
+// this fault along with the rest of its health.
+func (s *Store) SetDriverCommandFault(name string, faulted bool, reason string) {
+	s.mu.Lock()
+	h, ok := s.health[name]
+	if !ok {
+		s.mu.Unlock()
+		return
+	}
+	before := h.DeviceFault
+	h.SetCommandFault(faulted, reason)
+	changed := h.DeviceFault != before
+	s.mu.Unlock()
+	if changed {
+		if faulted {
+			slog.Warn("driver refused control — excluding from dispatch + plan until it accepts a command again",
+				"driver", name, "reason", reason)
+		} else {
+			slog.Info("driver command fault cleared — back in control", "driver", name)
 		}
 	}
 }

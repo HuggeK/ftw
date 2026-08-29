@@ -57,6 +57,14 @@ func TestCatalogSourcefulZapIsReadOnly(t *testing.T) {
 			if !e.ReadOnly {
 				t.Fatal("Sourceful Zap must remain explicitly read-only until the local API has a semantic control endpoint")
 			}
+			want := map[string]bool{"meter": true, "pv": true, "battery": true}
+			got := map[string]bool{}
+			for _, c := range e.Capabilities {
+				got[c] = true
+			}
+			if len(got) != len(want) || !got["meter"] || !got["pv"] || !got["battery"] {
+				t.Fatalf("Sourceful Zap capabilities = %v, want meter, pv, battery (reads stay opt-in)", e.Capabilities)
+			}
 			return
 		}
 	}

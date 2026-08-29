@@ -73,31 +73,34 @@ drivers:
   # - name: ambibox
   #   lua: drivers/ambibox_v2x.lua
   #   capabilities:
+  #     # Lets FTW resolve the name itself over mDNS. Without it the name is
+  #     # left to the system resolver, which answers on some platforms only.
+  #     allow_unverified_local: true
   #     mqtt:
   #       host: sid-os.local
   #       port: 1883
 
-  # Sourceful Zap — official local-API integration. Zap can be the site meter
-  # and can aggregate every PV, battery and V2X DER attached to the gateway.
-  # The driver is telemetry-only: battery_telemetry_only admits battery data
-  # without making Zap a dispatch target. Zap firmware has semantic local
-  # command routes, but its REST path currently lacks expiring leases and a
-  # hardware-execution acknowledgement. FTW control therefore still uses the
-  # native inverter/charger driver; see docs/sourceful-zap.md.
+  # Sourceful Zap — P1/HAN site meter via the official local API.
+  # Default is the meter only. If Zap also lists an inverter or battery,
+  # add that device in FTW with its own driver when you can. Set read_pv
+  # / read_battery only when Zap is the only reader (closed Modbus, or
+  # an RS-485 bus Zap already owns). See docs/sourceful-zap.md.
   #
   # - name: sourceful-zap
   #   lua: drivers/zap.lua
   #   is_site_meter: true
-  #   battery_telemetry_only: true
   #   capabilities:
+  #     # Lets FTW resolve zap.local itself. Without it the name is left to
+  #     # the system resolver — which answers under Home Assistant, but not on
+  #     # a plain Compose or Pi install.
+  #     allow_unverified_local: true
   #     http:
-  #       allowed_hosts: ["zap.local"]  # use the LAN IP if mDNS is unavailable
+  #       allowed_hosts: ["zap.local"]  # .local is resolved by FTW over mDNS
   #   config:
   #     host: zap.local
-  #     # meter_serial: p1m-...          # optional; P1 is auto-selected
-  #     # disable_pv: true               # if a native driver already emits PV
-  #     # disable_battery: true          # if a native driver emits the battery
-  #     # disable_v2x: true              # if a native V2X driver is configured
+  #     # meter_serial: p1m-...          # optional; P1/HAN is auto-selected
+  #     # read_pv: true                  # opt-in; default is P1/HAN only
+  #     # read_battery: true             # opt-in; telemetry only
 
   # NIBE S-series heat pump — read-only telemetry over the on-prem Local
   # REST API (HTTPS + Basic auth). The pump presents a SELF-SIGNED cert, so
@@ -131,11 +134,13 @@ drivers:
 
 api:
   port: 8080
+  # lan_auth: false  # when true, protected LAN routes need Authorization: Bearer <house-password>
 
 # Home Assistant MQTT bridge (optional)
 homeassistant:
   enabled: false
   broker: 192.168.1.1
+  # allow_unverified_local: true  # let FTW resolve broker.local over mDNS itself
   port: 1883
   username: homeems
   password: homeems
@@ -161,7 +166,7 @@ caldav:
   password: ""
   calendar_path: /ftw/energy/
   poll_interval_s: 300
-  ev_default_target_soc_pct: 80
+  ev_default_target_soc: 0.80
   # ev_loadpoint_id: ""            # defaults to the first configured loadpoint
   # away_keywords: [away, vacation, holiday]
   # ev_keywords:   [ev, car, charge]
@@ -171,15 +176,54 @@ caldav:
   plan_path: /ftw/plan/
   # plan_publish_interval_s: 900   # how often the plan calendar is reconciled
 
+# Built-in OCPP Central System, speaking 1.6J and 2.0.1. EV chargers that speak
+# OCPP connect to FTW directly — there is no driver to write and nothing to add
+# under `drivers:`.
+# A charger appears as a device on its first BootNotification, keyed by the last
+# segment of the URL it dialled: ws://<ftw-host>:8887/garage-left
+#
+# Credentials are required when enabled, and FTW refuses to start without them:
+# the OCPP library builds its listen address from the port alone, so the socket
+# is reachable on every interface and basic auth is the only gate. Keep the port
+# closed at your router. See docs/ocpp.md.
+# Each version needs its own port: a charger picks its dialect in the WebSocket
+# handshake, so one listener cannot serve both. 2.1 is not supported — no
+# production-grade Go implementation of it exists yet.
+ocpp:
+  enabled: false
+  port: 8887                       # OCPP 1.6J
+  # port_v201: 8888                # OCPP 2.0.1; omit to disable
+  path: /
+  username: ftw
+  password: ""                     # required when enabled; use a long random string
+  heartbeat_interval_s: 60
+
 # Persistent state (SQLite)
 state:
   path: state.db
   # backup_dir: backups            # use an absolute mounted path for off-device backups
 
-# Home Link is opt-in. It opens only an outbound TLS connection and exposes
-# four read-only views after a local passkey is enrolled.
-home_link:
-  enabled: false
+# The FTW app. On by default: the box holds an outbound connection to a relay
+# that carries encrypted frames and holds no keys. The relay still sees the
+# source IP, timing and connection pattern. Set enabled to false to opt out.
+# An empty app_link object is also off. Pair a phone by scanning the box's code;
+# the pairing code is single-use and expires in ten minutes.
+app_link:
+  enabled: true
+
+# Anonymous fleet ping. Once a day, at a time that moves, the box tells the
+# FTW relay six things: its FTW version, its release channel, which driver
+# types it runs, roughly how much battery it has, its price zone and roughly
+# how old the install is. No id, no key, no serial, no site name, no counter
+# and no timestamp — nothing in the message says which box sent it. Two
+# limits: those six fields still describe a household, so a rare mix may be
+# the only one of its kind, and the relay sees the address during the request.
+# It saves only daily totals, so the result counts reports, not unique boxes.
+# Settings → FTW app → Fleet statistics shows the exact message this box would send. On by
+# default; `enabled: false` turns it off without a restart.
+fleet_ping:
+  enabled: true
+  # endpoint: https://relay.ftw.energy/fleet
 
 # Independently distributed Lua drivers. The signed stable catalog is refreshed
 # by default, but refresh never downloads, activates, or restarts a driver.
@@ -216,10 +260,12 @@ home_link:
 #   enabled: true
 #   engine: python
 #   mode: passive_arbitrage
+#   forecast_trust: balanced   # cautious | balanced | bold (first boot; live value is SQLite)
+#   battery_export: unknown    # unknown | not_allowed | allowed (unknown = no battery sale)
 #   horizon_hours: 48
 #   interval_min: 15
-#   soc_min_pct: 10
-#   soc_max_pct: 95
+#   soc_min: 0.10
+#   soc_max: 0.95
 #   optimizer_solver: HIGHS
 #   optimizer_formulation: auto
 #   optimizer_transport: process # process | auto | unix; official Compose sets unix

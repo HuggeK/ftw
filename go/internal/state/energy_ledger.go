@@ -374,11 +374,18 @@ func (s *Store) EnergyAssets() ([]EnergyAsset, error) {
 // may combine stored buckets but never subdivide them: hourly rollups therefore
 // remain honest hourly points even when BucketMS asks for five-minute detail.
 func (s *Store) LoadEnergyHistory(q EnergyHistoryQuery) ([]EnergyLedgerPoint, bool, error) {
+	return s.LoadEnergyHistoryContext(context.Background(), q)
+}
+
+// LoadEnergyHistoryContext is LoadEnergyHistory with caller cancellation. App
+// history uses it so a replaced phone query stops its SQLite scan rather than
+// finishing work whose result nobody will read.
+func (s *Store) LoadEnergyHistoryContext(ctx context.Context, q EnergyHistoryQuery) ([]EnergyLedgerPoint, bool, error) {
 	if q.SinceMS < 0 || q.UntilMS <= q.SinceMS || q.BucketMS < EnergyLedgerBucketMS || q.Limit < 1 {
 		return nil, false, errors.New("invalid energy history bounds")
 	}
 	assetID := q.AssetID
-	rows, err := s.db.Query(`WITH aggregated AS (
+	rows, err := s.db.QueryContext(ctx, `WITH aggregated AS (
 		SELECT
 			? AS schema_version,
 			CASE WHEN ? = '' THEN 'system' ELSE asset_id END AS result_asset_id,

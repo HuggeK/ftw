@@ -11,7 +11,7 @@
 #   make dev                  — start sims + main app (hot-reload workflow)
 #   make clean                — remove all build artifacts
 
-.PHONY: help test optimizer-install optimizer-test compose-migration-test container-boundary-test build build-arm64 build-amd64 build-windows-amd64 release \
+.PHONY: help test optimizer-install optimizer-test compose-migration-test container-boundary-test release-workflow-test build build-arm64 build-amd64 build-windows-amd64 release \
         run-sim dev fmt vet clean e2e ci ci-ui ci-hw-pi docs \
 		verify verify-all install-hooks driver-repository-validate driver-versions \
         drivers drivers-present driver-versions-across-pin
@@ -58,13 +58,24 @@ help:
 drivers:
 	bash scripts/sync-bundled-drivers.sh
 
-# Cheap enough to run before every test invocation, and it costs no network.
-# Fetching here instead would put a remote call in the inner loop.
+# Cheap enough to run before every test invocation: when the snapshot is on
+# disk this costs one ls and no network, which is every run after the first.
+#
+# When it is not on disk the answer is to fetch it, not to stop and explain
+# how. A fresh clone or worktree has an empty drivers/ -- they are gitignored
+# -- and telling four people in a row to run one specific command is a worse
+# use of their afternoon than running it for them. `go test` already downloads
+# its modules on a fresh checkout; this is the same bargain, once.
 drivers-present:
 	@ls drivers/*.lua >/dev/null 2>&1 || { \
-	  echo "drivers/ has no .lua files. Run 'make drivers' to fetch the" >&2; \
-	  echo "snapshot pinned in drivers/BUNDLED_SOURCE.json." >&2; \
-	  exit 1; }
+	  echo "drivers/ is empty; fetching the snapshot pinned in drivers/BUNDLED_SOURCE.json"; \
+	  $(MAKE) --no-print-directory drivers || { \
+	    echo "" >&2; \
+	    echo "Could not fetch the bundled drivers. They come from" >&2; \
+	    echo "srcfl/device-drivers over the network and are not in git, so this" >&2; \
+	    echo "needs curl, jq and a route out. Fix that and run 'make drivers'," >&2; \
+	    echo "or copy drivers/*.lua from a checkout that already has them." >&2; \
+	    exit 1; }; }
 
 # ---- Testing ----
 
@@ -78,20 +89,32 @@ test: optimizer/.venv/.installed drivers-present
 	cd go && FTW_TEST_OPTIMIZER_PYTHON=$(OPTIMIZER_PYTHON) go test ./internal/mpc \
 		-run 'TestExternalOptimizer(EndToEnd|PlansMultipleLoadpoints|PlansAndValidatesMultipleStorages)$$'
 
+# The interpreter is chosen in the script, not here: the optimizer needs
+# Python 3.11+ and PEP 660, and the python3 macOS ships is 3.9 with pip 21.2.
+# PYTHON still overrides the choice.
 optimizer-install:
-	$(PYTHON) -m venv optimizer/.venv
-	optimizer/.venv/bin/pip install -e 'optimizer[test]'
+	PYTHON="$(PYTHON)" bash scripts/optimizer-venv.sh
 	@touch optimizer/.venv/.installed
 
 optimizer-test: optimizer/.venv/.installed
 	optimizer/.venv/bin/pytest -q optimizer/tests
 
 compose-migration-test:
-	bash -n scripts/enable-modular-stack.sh scripts/migrate-legacy-compose.sh scripts/install-macos.sh scripts/deploy-home-link-web.sh scripts/sync-bundled-drivers.sh scripts/check-driver-versions.sh
+	bash -n scripts/enable-modular-stack.sh scripts/migrate-legacy-compose.sh scripts/install-macos.sh scripts/sync-bundled-drivers.sh scripts/check-driver-versions.sh scripts/check-debian-base.sh
 	bash scripts/test-modular-compose.sh
 
-container-boundary-test:
+container-boundary-test: release-workflow-test
 	bash scripts/test-container-boundaries.sh
+
+release-workflow-test:
+	bash -n scripts/check-ghcr-write-access.sh scripts/test-ghcr-write-access.sh
+	bash -n scripts/test-exact-image-promotion.sh
+	bash -n scripts/github-release-by-id.sh scripts/test-github-release-by-id.sh scripts/promote-paired-latest.sh
+	bash -n scripts/test-promote-paired-latest.sh
+	bash scripts/test-exact-image-promotion.sh
+	bash scripts/test-github-release-by-id.sh
+	bash scripts/test-ghcr-write-access.sh
+	bash scripts/test-promote-paired-latest.sh
 
 optimizer/.venv/.installed: optimizer/pyproject.toml
 	$(MAKE) optimizer-install
@@ -130,7 +153,7 @@ ci-hw-pi:
 # verify-all adds cross-compile checks for all release targets, catching
 # platform-specific syscall/import mistakes before push.
 
-verify: test compose-migration-test container-boundary-test
+verify: test compose-migration-test container-boundary-test release-workflow-test
 	cd go && go vet ./...
 	cd go && go build ./...
 	@echo "verify: vet + test + build clean"
@@ -156,6 +179,7 @@ build:
 	@ln -sf ftw bin/forty-two-watts
 	cd go && go build -ldflags="$(LDFLAGS)" -o ../bin/sim-ferroamp ./cmd/sim-ferroamp
 	cd go && go build -ldflags="$(LDFLAGS)" -o ../bin/sim-sungrow ./cmd/sim-sungrow
+	cd go && go build -ldflags="$(LDFLAGS)" -o ../bin/sim-pcs ./cmd/sim-pcs
 	@ls -la bin/
 
 build-arm64:
@@ -234,6 +258,7 @@ run-sim:
 	@trap 'kill 0' SIGINT; \
 	(cd go && go run ./cmd/sim-ferroamp) & \
 	(cd go && go run ./cmd/sim-sungrow) & \
+	(cd go && go run ./cmd/sim-pcs) & \
 	wait
 
 dev: optimizer/.venv/.installed config.local.yaml

@@ -346,6 +346,21 @@
       margin: 1rem 0;
     }
 
+    /* ---- Host addressing hint (mDNS name vs fixed IP) ---- */
+    .host-hint {
+      margin: 0 0 1rem;
+      padding: 10px 12px;
+      background: var(--ink-raised);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      font-size: 0.78rem;
+      color: var(--fg-dim);
+      line-height: 1.5;
+    }
+
+    .host-hint.mdns { border-color: color-mix(in srgb, var(--green-e) 45%, var(--line)); }
+    .host-hint.dhcp { border-color: color-mix(in srgb, var(--yellow) 55%, var(--line)); }
+
     /* ---- Driver picker ---- */
     .driver-desc {
       margin-top: 0.5rem;
@@ -588,8 +603,8 @@
     <div id="manual-ip-form" style="display:none">
       <div class="form-row">
         <div class="form-group">
-          <label for="manual-ip">IP address</label>
-          <input type="text" id="manual-ip" placeholder="192.168.1.10">
+          <label for="manual-ip">IP address or hostname</label>
+          <input type="text" id="manual-ip" placeholder="192.168.1.10 or inverter.local">
         </div>
         <div class="form-group">
           <label for="manual-port">Port</label>
@@ -619,6 +634,18 @@
 
     <div id="driver-description" class="driver-desc" style="display:none"></div>
 
+    <div id="driver-not-listed" class="driver-desc" style="display:none">
+      <p>This list is what's installed on this gateway. More drivers can be
+        installed from the signed driver repository after setup, in
+        <strong>Settings &rarr; Devices</strong>.</p>
+      <p style="margin-top:8px">No driver for your device anywhere? Ask for one in the
+        <a href="https://github.com/srcfl/device-drivers/issues" target="_blank" rel="noopener">driver
+        repository's issue tracker</a> &mdash; include the device make, model
+        and how it talks (Modbus, MQTT, HTTP&hellip;).</p>
+      <button class="btn-primary" style="margin-top:12px" onclick="skipUnlistedDevice()">Continue
+        without this device</button>
+    </div>
+
     <div class="wizard-actions">
       <button class="btn-secondary" onclick="goStep(3)">Back</button>
       <button class="btn-primary" id="driver-next-btn" onclick="goStep(5)" disabled>Continue</button>
@@ -637,7 +664,7 @@
 
     <div class="form-row">
       <div class="form-group">
-        <label for="drv-ip">IP address</label>
+        <label for="drv-ip">IP address or hostname</label>
         <input type="text" id="drv-ip" placeholder="192.168.1.10">
       </div>
       <div class="form-group">
@@ -645,6 +672,8 @@
         <input type="number" id="drv-port" value="502" min="1" max="65535">
       </div>
     </div>
+
+    <p class="host-hint" id="drv-host-hint" style="display:none"></p>
 
     <div class="form-group" id="drv-unitid-group">
       <label for="drv-unitid">Unit ID (Modbus)</label>
@@ -707,6 +736,13 @@
             <label for="ev-password">Password</label>
             <input type="password" id="ev-password">
           </div>
+        </div>
+        <div id="ev-fields-http-local" style="display:none">
+          <div class="form-group">
+            <label for="ev-http-host">IP address or hostname</label>
+            <input type="text" id="ev-http-host" placeholder="192.168.1.50">
+          </div>
+          <p class="hint">Tesla Wall Connector Gen 3 on the LAN. No account. The box reports power and plug state; current is set by the car (tesla_vehicle) or the Tesla app.</p>
         </div>
         <div id="ev-fields-modbus" style="display:none">
           <div class="form-group">
@@ -816,6 +852,7 @@
      dashboard component catalogue (ftw-energy-flow etc.) — dead weight on
      the first setup paint. -->
 <script type="module" src="/components/ftw-update-check.js"></script>
+<script src="/lan-auth.js?v=lan1"></script>
 <script src="/setup.js?v=zones1"></script>
 </body>
 </html>

@@ -9,7 +9,21 @@ import cvxpy as cp
 import numpy as np
 
 from . import SCHEMA_VERSION
-from .model import OPTIMAL_STATUSES, _export_price, _mode, _solver_options, _vector
+from .deadline import SolveDeadline
+from .model import (
+    OPTIMAL_STATUSES,
+    ReplayConsistencyError,
+    _arbitrage_spread_ore_kwh,
+    _canonicalize_storage_payload,
+    _export_price,
+    _mode,
+    _requires_direction_binary,
+    _solver_options,
+    _normalize_storage_specs,
+    _storage_relaxation_is_unsafe,
+    _validate_storage_replay,
+    _vector,
+)
 from .protocol import ProtocolError, finite_number, positive_number, require_dict, require_list
 
 
@@ -21,7 +35,13 @@ class ScenarioStorage:
     energy: cp.Variable
 
 
-def solve_storage_recourse(payload: dict[str, Any]) -> dict[str, Any]:
+def solve_storage_recourse(
+    payload: dict[str, Any],
+    deadline: SolveDeadline | None = None,
+    *,
+    _force_storage_direction: bool = False,
+    _started: float | None = None,
+) -> dict[str, Any]:
     """Solve a two-stage stochastic storage problem.
 
     Decisions in the configured non-anticipative prefix are shared across all
@@ -30,7 +50,11 @@ def solve_storage_recourse(payload: dict[str, Any]) -> dict[str, Any]:
     its shared first-stage action is intended for execution before replanning.
     """
 
-    started = time.perf_counter()
+    started = time.perf_counter() if _started is None else _started
+    payload = _canonicalize_storage_payload(payload)
+    if deadline is None:
+        deadline = SolveDeadline.from_payload(payload, started_at=started)
+    deadline.check("recourse model build")
     settings = require_dict(payload.get("settings", {}), "settings")
     if require_list(payload.get("flex_loads", []), "flex_loads"):
         raise ProtocolError("recourse shadow does not yet support flex_loads")
@@ -97,13 +121,11 @@ def solve_storage_recourse(payload: dict[str, Any]) -> dict[str, Any]:
     formulation = settings.get("formulation", "auto")
     if formulation not in {"auto", "milp", "relaxed"}:
         raise ProtocolError("settings.formulation must be auto, milp, or relaxed")
-    force_milp = formulation == "milp"
     constraints: list[cp.Constraint] = []
     discrete = False
-    storage_specs = [
-        require_dict(raw, f"storages[{i}]")
-        for i, raw in enumerate(require_list(payload.get("storages", []), "storages"))
-    ]
+    storage_specs, storage_above_maximum = _normalize_storage_specs(
+        require_list(payload.get("storages", []), "storages")
+    )
     asset_ids: set[str] = set()
     for i, spec in enumerate(storage_specs):
         asset_id = spec.get("id")
@@ -131,7 +153,13 @@ def solve_storage_recourse(payload: dict[str, Any]) -> dict[str, Any]:
     strict_sc_penalty: cp.Expression = cp.Constant(0.0)
     worst_service_slack = cp.Variable(nonneg=True, name="worst_service_slack")
     bonus_ore = max(0.0, finite_number(settings.get("pv_charge_bonus_ore_kwh", 0), "settings.pv_charge_bonus_ore_kwh"))
-    unsafe_cycle = bool(np.any(eff_import < 0)) or bonus_ore > 0
+    arbitrage_spread = _arbitrage_spread_ore_kwh(settings, mode)
+    unsafe_cycle = _storage_relaxation_is_unsafe(
+        eff_import,
+        eff_export,
+        bonus_ore,
+        storage_specs,
+    )
     unsafe_meter_split = bool(np.any(eff_import < eff_export - 1e-9))
 
     for si, scenario in enumerate(scenarios):
@@ -177,19 +205,24 @@ def solve_storage_recourse(payload: dict[str, Any]) -> dict[str, Any]:
                 upper_recovery[1:] <= upper_recovery[:-1],
             ]
             scenario_service += cp.sum(lower_recovery[1:] + upper_recovery[1:]) / (capacity * n)
-            if force_milp or (formulation == "auto" and unsafe_cycle):
+            initial_above_max = storage_above_maximum[i]
+            if (
+                _force_storage_direction
+                or initial_above_max
+                or _requires_direction_binary(formulation, unsafe_cycle)
+            ):
                 direction = cp.Variable(n, boolean=True, name=f"scenario_{si}_storage_{i}_charge_mode")
                 constraints += [charge <= max_charge * direction, discharge <= max_discharge * (1 - direction)]
                 discrete = True
             target = spec.get("target_energy_wh")
             if target is not None:
-                deadline = min(n - 1, max(0, int(spec.get("target_slot", n - 1))))
+                target_slot = min(n - 1, max(0, int(spec.get("target_slot", n - 1))))
                 shortfall = cp.Variable(nonneg=True, name=f"scenario_{si}_storage_{i}_shortfall")
-                constraints.append(energy[deadline + 1] + shortfall >= finite_number(target, f"storages[{i}].target_energy_wh"))
+                constraints.append(energy[target_slot + 1] + shortfall >= finite_number(target, f"storages[{i}].target_energy_wh"))
                 scenario_service += shortfall / capacity
 
             cycle_ore = max(0.0, finite_number(spec.get("cycle_cost_ore_kwh", 0), "storage.cycle_cost_ore_kwh"))
-            cycle_ore += max(0.0, finite_number(settings.get("min_arbitrage_spread_ore_kwh", 0), "settings.min_arbitrage_spread_ore_kwh"))
+            cycle_ore += arbitrage_spread
             scenario_cycle += cycle_ore * cp.sum(cp.multiply(dt_h, discharge)) / 1000.0
             terminal_price = finite_number(spec.get("terminal_price_ore_kwh", 0), "storage.terminal_price_ore_kwh")
             scenario_terminal += terminal_price * energy[-1] / 1000.0
@@ -209,7 +242,7 @@ def solve_storage_recourse(payload: dict[str, Any]) -> dict[str, Any]:
             grid_import <= np.where(import_limit > 0, import_limit, max_site_power),
             grid_export <= np.where(export_limit > 0, export_limit, max_site_power),
         ]
-        if force_milp or (formulation == "auto" and unsafe_meter_split):
+        if _requires_direction_binary(formulation, unsafe_meter_split):
             direction = cp.Variable(n, boolean=True, name=f"scenario_{si}_import_mode")
             constraints += [grid_import <= max_site_power * direction, grid_export <= max_site_power * (1 - direction)]
             discrete = True
@@ -290,13 +323,19 @@ def solve_storage_recourse(payload: dict[str, Any]) -> dict[str, Any]:
 
     def run_problem(problem: cp.Problem, solver_name: str) -> None:
         solver = cp.HIGHS if solver_name == "HIGHS" else cp.CLARABEL
-        problem.solve(solver=solver, warm_start=True, **_solver_options(settings, solver))
+        problem.solve(
+            solver=solver,
+            warm_start=True,
+            **_solver_options(settings, solver, deadline),
+        )
+        deadline.check(f"recourse {solver_name} solve")
 
     slack_problem = cp.Problem(cp.Minimize(worst_service_slack), constraints)
     solver_used = preferred_solver
     try:
         run_problem(slack_problem, solver_used)
     except cp.error.SolverError:
+        deadline.check("recourse service solver fallback")
         if discrete or solver_used == "CLARABEL":
             raise
         solver_used = "CLARABEL"
@@ -311,6 +350,7 @@ def solve_storage_recourse(payload: dict[str, Any]) -> dict[str, Any]:
     try:
         run_problem(cost_problem, solver_used)
     except cp.error.SolverError:
+        deadline.check("recourse economic solver fallback")
         if discrete or solver_used == "CLARABEL":
             raise
         solver_used = "CLARABEL"
@@ -370,6 +410,21 @@ def solve_storage_recourse(payload: dict[str, Any]) -> dict[str, Any]:
                 mip_gap = float(value)
                 break
     solve_ms = (time.perf_counter() - started) * 1000.0
+    try:
+        _validate_storage_replay(actions, slots, storage_specs)
+    except ReplayConsistencyError as exc:
+        if _force_storage_direction:
+            raise
+        deadline.check("recourse storage replay fallback")
+        response = solve_storage_recourse(
+            payload,
+            deadline,
+            _force_storage_direction=True,
+            _started=started,
+        )
+        response["solver"]["fallback"] = True
+        response["solver"]["fallback_reason"] = str(exc)
+        return response
     return {
         "schema_version": SCHEMA_VERSION,
         "request_id": str(payload["request_id"]),

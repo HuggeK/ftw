@@ -28,7 +28,7 @@ jobs:
       base_sha: ${{ steps.paths.outputs.base_sha }}
       head_sha: ${{ steps.paths.outputs.head_sha }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - id: paths
@@ -54,43 +54,17 @@ jobs:
             if [ -z "${BASE_SHA}" ] || [[ "${BASE_SHA}" =~ ^0+$ ]]; then
               BASE_SHA="$(git rev-parse HEAD^)"
             fi
-            while IFS= read -r file; do
-              [ -n "${file}" ] || continue
-              case "${file}" in
-                go/*|drivers/*|config*.yaml|Dockerfile|Dockerfile.updater|.dockerignore)
-                  core=true
-                  ;;
-                optimizer/*|Dockerfile.optimizer|go/internal/mpc/*|go/cmd/ftw/main.go)
-                  optimizer=true
-                  ;;
-                web/*|package.json|package-lock.json)
-                  web=true
-                  ;;
-                drivers/*.lua|drivers/BUNDLED_SOURCE.json|scripts/sync-bundled-drivers.sh)
-                  drivers=true
-                  ;;
-                Dockerfile|Dockerfile.optimizer|docker-compose*.yml|scripts/enable-modular-stack.sh|scripts/migrate-legacy-compose.sh|scripts/test-modular-compose.sh|scripts/test-container-boundaries.sh|scripts/install-macos.sh)
-                  compose=true
-                  ;;
-                Makefile|.github/workflows/test.yml)
-                  core=true
-                  optimizer=true
-                  web=true
-                  drivers=true
-                  compose=true
-                  ;;
+            mapfile -t changed_paths < <(git diff --name-only "${BASE_SHA}"..."${HEAD_SHA}")
+            printf '%s\n' "${changed_paths[@]}" | bash .github/scripts/classify-test-changes.sh > "${RUNNER_TEMP}/test-paths"
+            while IFS='=' read -r key value; do
+              case "${key}" in
+                core) core="${value}" ;;
+                optimizer) optimizer="${value}" ;;
+                web) web="${value}" ;;
+                drivers) drivers="${value}" ;;
+                compose) compose="${value}" ;;
               esac
-              case "${file}" in
-                optimizer/*|Dockerfile.optimizer|go/internal/mpc/*|go/cmd/ftw/main.go)
-                  optimizer=true
-                  ;;
-              esac
-              case "${file}" in
-                drivers/*.lua)
-                  drivers=true
-                  ;;
-              esac
-            done < <(git diff --name-only "${BASE_SHA}"..."${HEAD_SHA}")
+            done < "${RUNNER_TEMP}/test-paths"
           fi
 
           {
@@ -109,7 +83,7 @@ jobs:
     if: needs.changes.outputs.core == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
           go-version: '1.26'
@@ -135,8 +109,8 @@ jobs:
     if: needs.changes.outputs.optimizer == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
           cache: pip
@@ -163,7 +137,7 @@ jobs:
     if: needs.changes.outputs.web == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
           node-version: '22'
@@ -183,7 +157,7 @@ jobs:
     if: needs.changes.outputs.drivers == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
           go-version: '1.26'
@@ -192,14 +166,19 @@ jobs:
       - name: Discard the committed snapshot
         run: rm -f drivers/*.lua
 
-      - name: The presence guard notices
+      # This is the fresh-clone path itself: drivers-present is what `make
+      # test`, `make e2e` and `make release` depend on, and on an empty
+      # drivers/ it fetches the snapshot rather than stopping to say how.
+      - name: The presence guard materialises the snapshot
         run: |
-          if make drivers-present 2>/dev/null; then
-            echo "::error::drivers-present passed with no drivers on disk"
-            exit 1
-          fi
-          echo "guard fired as expected"
+          make drivers-present
+          want="$(jq -r '.drivers | length' drivers/BUNDLED_SOURCE.json)"
+          got="$(ls drivers/*.lua | wc -l | tr -d ' ')"
+          echo "guard fetched ${got} of ${want}"
+          [ "$want" = "$got" ] \
+            || { echo "::error::guard left ${got} of ${want} drivers"; exit 1; }
 
+      # Idempotent by design: asking again writes the same bytes.
       - name: Fetch from the pin
         run: make drivers
 
@@ -228,7 +207,7 @@ jobs:
     if: needs.changes.outputs.drivers == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: actions/setup-go@v7
@@ -278,7 +257,7 @@ jobs:
     env:
       DEVICE_SUPPORT_TOKEN: ${{ secrets.SOURCEFUL_CI_REPO_TOKEN }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
         if: env.DEVICE_SUPPORT_TOKEN != ''
         with:
@@ -308,7 +287,7 @@ jobs:
 
       - name: Check out canonical Device Support package source
         if: env.DEVICE_SUPPORT_TOKEN != ''
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: ${{ steps.baseline.outputs.repository }}
           ref: ${{ steps.baseline.outputs.commit }}
@@ -388,8 +367,96 @@ jobs:
     if: needs.changes.outputs.compose == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - run: make compose-migration-test container-boundary-test
+      - run: bash .github/scripts/test-change-classifier.sh
+
+  # contract/registry.yaml is one file that lives in this repository and in
+  # srcfl/ftw-webapp, and only a job with both checked out can tell whether it
+  # still is one file. The header has always claimed CI fails when the two
+  # drift; nothing compared them, and they drifted three ways — a code each
+  # side had that the other had never heard of, and a retryable flag that
+  # disagreed in the direction that decides what a phone offers a user.
+  #
+  # Not gated on changed paths. The whole failure was a check that ran only
+  # sometimes, and the app can change its copy without a file here moving.
+  contract:
+    name: the registry has not drifted from the app
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # A change that lands in both repositories at once cannot be compared
+      # against the other one's default branch: the counterpart is not there
+      # yet, and each side would wait for the other forever. A pull request
+      # that names where its pair lives is compared against that instead.
+      # Everything else — a stray edit, a rename, a copy someone forgot — still
+      # meets the default branch, which is the case this job exists for.
+      - name: Which copy of the app to compare against
+        id: pair
+        env:
+          # Read live rather than from github.event: that payload is a snapshot
+          # taken when the run was queued, so a pair declared after the last
+          # push would be invisible and the job would compare against the wrong
+          # branch while looking like it had worked.
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PULL_REQUEST_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          REF=main
+          if [ "${EVENT_NAME}" = pull_request ]; then
+            BODY=$(gh pr view "${PULL_REQUEST_NUMBER}" \
+                     --repo "${{ github.repository }}" --json body -q .body)
+            PAIR_REF=$(printf '%s\n' "$BODY" | sed -n 's|^Contract-pair: *srcfl/ftw-webapp@||p' | head -1 | tr -d '\r')
+            if [ -n "${PAIR_REF}" ]; then
+              REF="${PAIR_REF}"
+            fi
+          fi
+          echo "ref=${REF}" >> "$GITHUB_OUTPUT"
+          echo "comparing against srcfl/ftw-webapp@${REF}"
+
+      # One file, not the app's whole history.
+      - name: Check out the app
+        uses: actions/checkout@v7
+        with:
+          repository: srcfl/ftw-webapp
+          ref: ${{ steps.pair.outputs.ref }}
+          path: .app
+          token: ${{ secrets.FTW_CONTRACT_TOKEN || github.token }}
+          sparse-checkout: |
+            contract/registry.yaml
+            contract/push-catalogue.yaml
+          sparse-checkout-cone-mode: false
+
+      - name: Compare the two copies
+        run: |
+          set -euo pipefail
+          # The registry and the push catalogue are paired the same way: one
+          # file each, living in both repositories. The catalogue carries every
+          # sentence the box may put on a lock screen — the app's prose, which
+          # the box renders only because a push arrives when the app is not
+          # running to render it itself.
+          for file in contract/registry.yaml contract/push-catalogue.yaml; do
+            # A missing checkout is not agreement. Said out loud here because
+            # the obvious way to write this step — diff and hope — passes
+            # silently when the path is wrong, which is exactly how the last
+            # guard failed.
+            if [ ! -f ".app/$file" ]; then
+              echo "the app's copy is not at .app/$file."
+              echo "the checkout above failed or moved; this check will not guess."
+              exit 1
+            fi
+            if ! diff -u "$file" ".app/$file"; then
+              echo
+              echo "This file is one file in two repositories. Decide which side"
+              echo "is right by reading what each side's code does, then change"
+              echo "both copies in the same pair of pull requests — and rerun"
+              echo "go generate ./internal/... here."
+              exit 1
+            fi
+          done
+          echo "byte for byte the same files"
 
   e2e:
     name: full stack
@@ -397,7 +464,7 @@ jobs:
     if: needs.changes.outputs.core == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
           go-version: '1.26'
@@ -412,7 +479,8 @@ jobs:
   test:
     name: go test + vet
     if: always()
-    needs: [changes, core, optimizer, web, drivers, device-support-contract, compose, e2e]
+    needs:
+      [changes, core, optimizer, web, drivers, device-support-contract, compose, e2e, contract]
     runs-on: ubuntu-latest
     env:
       RESULTS: >-
@@ -420,7 +488,7 @@ jobs:
         ${{ needs.optimizer.result }} ${{ needs.web.result }}
         ${{ needs.drivers.result }} ${{ needs.device-support-contract.result }}
         ${{ needs.compose.result }}
-        ${{ needs.e2e.result }}
+        ${{ needs.e2e.result }} ${{ needs.contract.result }}
     steps:
       - name: Require every selected suite to pass
         run: |

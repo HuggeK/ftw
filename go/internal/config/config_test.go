@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -93,6 +94,37 @@ planner:
 	}
 }
 
+func TestPlannerForecastTrustAndExportValidate(t *testing.T) {
+	base := `
+site:
+  name: Test
+fuse:
+  max_amps: 16
+drivers:
+  - name: ferroamp
+    lua: drivers/ferroamp.lua
+    is_site_meter: true
+    capabilities:
+      mqtt:
+        host: 192.168.1.153
+planner:
+  mode: passive_arbitrage
+`
+	if _, err := Parse([]byte(base+"  forecast_trust: spicy\n"), "/tmp"); err == nil {
+		t.Fatal("expected error for junk forecast_trust")
+	}
+	if _, err := Parse([]byte(base+"  battery_export: maybe\n"), "/tmp"); err == nil {
+		t.Fatal("expected error for junk battery_export")
+	}
+	c, err := Parse([]byte(base+"  forecast_trust: cautious\n  battery_export: not_allowed\n"), "/tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Planner.ForecastTrust != "cautious" || c.Planner.BatteryExport != "not_allowed" {
+		t.Fatalf("got trust=%q export=%q", c.Planner.ForecastTrust, c.Planner.BatteryExport)
+	}
+}
+
 func TestLoadMinimalYAML(t *testing.T) {
 	c, err := Parse([]byte(minimalYAML), "/tmp")
 	if err != nil {
@@ -119,6 +151,50 @@ func TestLoadMinimalYAML(t *testing.T) {
 	}
 }
 
+func TestAllowUnverifiedLocalDefaultsDenyAndParsesExplicitOptIn(t *testing.T) {
+	cfg, err := Parse([]byte(minimalYAML), "/tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Drivers[0].Capabilities.AllowUnverifiedLocal {
+		t.Fatal("allow_unverified_local must default to false")
+	}
+
+	withOptIn := strings.Replace(minimalYAML,
+		"capabilities:\n      mqtt:",
+		"capabilities:\n      allow_unverified_local: true\n      mqtt:", 1)
+	optedIn, err := Parse([]byte(withOptIn), "/tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !optedIn.Drivers[0].Capabilities.AllowUnverifiedLocal {
+		t.Fatal("explicit allow_unverified_local=true was not retained")
+	}
+}
+
+func TestHomeAssistantAllowUnverifiedLocalDefaultsDeny(t *testing.T) {
+	base := minimalYAML + `
+homeassistant:
+  enabled: true
+  broker: broker.local
+`
+	cfg, err := Parse([]byte(base), "/tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.HomeAssistant.AllowUnverifiedLocal {
+		t.Fatal("homeassistant allow_unverified_local must default to false")
+	}
+
+	optedIn, err := Parse([]byte(base+"  allow_unverified_local: true\n"), "/tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !optedIn.HomeAssistant.AllowUnverifiedLocal {
+		t.Fatal("homeassistant explicit local opt-in was not retained")
+	}
+}
+
 func TestParseIgnoresRetiredRemoteAccessKeys(t *testing.T) {
 	legacy := minimalYAML + `
 remote_access:
@@ -130,26 +206,11 @@ fleet_statistics:
   enabled: true
   endpoint: https://relay.example.test/fleet/heartbeat
   interval_h: 24
+home_link:
+  enabled: true
 `
 	if _, err := Parse([]byte(legacy), "/tmp"); err != nil {
 		t.Fatalf("existing config with retired remote keys must keep loading: %v", err)
-	}
-}
-
-func TestHomeLinkIsExplicitAndDisabledByDefault(t *testing.T) {
-	cfg, err := Parse([]byte(minimalYAML), "/tmp")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.HomeLink != nil && cfg.HomeLink.Enabled {
-		t.Fatal("Home Link enabled without explicit config")
-	}
-	cfg, err = Parse([]byte(minimalYAML+"\nhome_link:\n  enabled: true\n"), "/tmp")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.HomeLink == nil || !cfg.HomeLink.Enabled {
-		t.Fatal("explicit Home Link enable was lost")
 	}
 }
 
@@ -227,7 +288,7 @@ v2x:
 	if c.V2X == nil {
 		t.Fatal("v2x policy not parsed")
 	}
-	if !c.V2X.Enabled || c.V2X.DriverName != "ferroamp" || c.V2X.MinReserveSoCPct != 35 {
+	if !c.V2X.Enabled || c.V2X.DriverName != "ferroamp" || c.V2X.MinReserveSoC != 0.35 {
 		t.Fatalf("unexpected v2x policy: %+v", c.V2X)
 	}
 }
@@ -574,6 +635,42 @@ batteries:
 	}
 }
 
+func TestPVArrayGeometryDistinguishesMissingFromZero(t *testing.T) {
+	yaml := minimalYAML + `
+weather:
+  provider: open_meteo
+  latitude: 59.3293
+  longitude: 18.0686
+  pv_arrays:
+    - name: partial
+      kwp: 10
+      tilt_deg: 35
+    - name: north flat
+      kwp: 5
+      tilt_deg: 0
+      azimuth_deg: 0
+`
+	c, err := Parse([]byte(yaml), "/tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Weather == nil || len(c.Weather.PVArrays) != 2 {
+		t.Fatalf("weather arrays missing: %+v", c.Weather)
+	}
+	partial := c.Weather.PVArrays[0]
+	if partial.AzimuthDeg != nil {
+		t.Fatalf("omitted azimuth should remain nil, got %v", *partial.AzimuthDeg)
+	}
+	if _, _, _, ok := partial.CompleteGeometry(); ok {
+		t.Fatal("partial geometry must not be treated as a north-facing array")
+	}
+	northFlat := c.Weather.PVArrays[1]
+	tilt, azimuth, ratedW, ok := northFlat.CompleteGeometry()
+	if !ok || tilt != 0 || azimuth != 0 || ratedW != 5000 {
+		t.Fatalf("explicit zero geometry should remain valid: tilt=%v azimuth=%v ratedW=%v ok=%v", tilt, azimuth, ratedW, ok)
+	}
+}
+
 func TestSiteMeterDriverReturnsName(t *testing.T) {
 	c, err := Parse([]byte(minimalYAML), ".")
 	if err != nil {
@@ -639,6 +736,164 @@ func TestSaveAtomicKeepsOutOfTreeDriverPathAbsolute(t *testing.T) {
 	}
 }
 
+// config.yaml holds MQTT passwords, API keys and OAuth refresh tokens. Rename
+// replaces the destination inode, so the temp file's mode is the mode the
+// operator ends up with — including when the config on disk was already
+// world-readable, or when an interrupted save left a world-readable temp
+// behind for the next save to reuse.
+func TestSaveAtomicWritesOwnerOnlyMode(t *testing.T) {
+	tests := []struct {
+		name string
+		prep func(t *testing.T, path string)
+	}{
+		{
+			name: "new config file",
+			prep: func(*testing.T, string) {},
+		},
+		{
+			name: "replacing a world-readable config",
+			prep: func(t *testing.T, path string) {
+				if err := os.WriteFile(path, []byte("site:\n  name: old\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "stale world-readable tmp from an interrupted save",
+			prep: func(t *testing.T, path string) {
+				if err := os.WriteFile(path+".tmp", []byte("half a config"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "c.yaml")
+			c, err := Parse([]byte(minimalYAML), dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tt.prep(t, path)
+			if err := SaveAtomic(path, c); err != nil {
+				t.Fatal(err)
+			}
+			if err := verifyConfigFileOwnerOnly(path); err != nil {
+				t.Errorf("saved config is not owner-only — the file holds MQTT passwords and OAuth refresh tokens: %v", err)
+			}
+			if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+				t.Errorf("tmp file survived the save: %v", err)
+			}
+		})
+	}
+}
+
+// A rename is only atomic for bytes that already reached the disk, and the
+// rename itself only survives power loss once the directory entry is synced.
+// Both syncs must happen, and they must straddle the rename in that order.
+func TestSaveAtomicSyncsFileBeforeRenameAndDirAfter(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.yaml")
+	c, err := Parse([]byte(minimalYAML), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved := func() bool {
+		_, err := os.Stat(path)
+		return err == nil
+	}
+	var order []string
+	var savedAtFileSync, savedAtDirSync bool
+	w := durableWriter{
+		syncFile: func(f *os.File) error {
+			order = append(order, "file")
+			savedAtFileSync = saved()
+			return f.Sync()
+		},
+		syncDir: func(d string) error {
+			order = append(order, "dir")
+			savedAtDirSync = saved()
+			if d != dir {
+				t.Errorf("syncDir got %q, want the config's directory %q", d, dir)
+			}
+			return syncDir(d)
+		},
+	}
+	if err := saveAtomic(w, path, c); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(order, ","); got != "file,dir" {
+		t.Fatalf("sync order = [%s], want [file,dir]", got)
+	}
+	if savedAtFileSync {
+		t.Error("the temp file was fsynced after the rename; a power cut could publish a truncated config")
+	}
+	if !savedAtDirSync {
+		t.Error("the directory was fsynced before the rename; the rename itself would not be durable")
+	}
+}
+
+// The caller's contract is "the config is now saved". A sync that fails must
+// not report success, or the settings UI tells the operator a change landed
+// that the next power cut can still take away.
+func TestSaveAtomicReportsSyncFailure(t *testing.T) {
+	syncFailed := errors.New("no space left on device")
+	const oldConfig = "site:\n  name: previous\n"
+	tests := []struct {
+		name        string
+		writer      durableWriter
+		keepsOldCfg bool
+	}{
+		{
+			name: "temp file sync fails",
+			writer: durableWriter{
+				syncFile: func(*os.File) error { return syncFailed },
+				syncDir:  syncDir,
+			},
+			// The rename never ran, so the config the gateway boots from is
+			// still the one that was there before.
+			keepsOldCfg: true,
+		},
+		{
+			name: "directory sync fails",
+			writer: durableWriter{
+				syncFile: (*os.File).Sync,
+				syncDir:  func(string) error { return syncFailed },
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "c.yaml")
+			c, err := Parse([]byte(minimalYAML), dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(oldConfig), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			err = saveAtomic(tt.writer, path, c)
+			if !errors.Is(err, syncFailed) {
+				t.Fatalf("saveAtomic error = %v, want it to report %v", err, syncFailed)
+			}
+			if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+				t.Errorf("tmp file survived a failed save: %v", err)
+			}
+			if tt.keepsOldCfg {
+				got, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(got) != oldConfig {
+					t.Errorf("config on disk = %q, want the previous config left untouched", got)
+				}
+			}
+		})
+	}
+}
+
 func pretty(f float64) string {
 	return fmt.Sprintf("%g", f)
 }
@@ -669,21 +924,31 @@ func TestStripLeadingDotDot(t *testing.T) {
 	}
 }
 
+func testAbsolutePath(p string) string {
+	got, err := filepath.Abs(filepath.FromSlash(p))
+	if err != nil {
+		panic(err)
+	}
+	return got
+}
+
 func TestResolveDriverPaths(t *testing.T) {
-	baseDir := "/etc/ftw"
+	baseDir := testAbsolutePath("/etc/ftw")
+	absin := testAbsolutePath("/etc/ftw/drivers/b.lua")
+	absout := testAbsolutePath("/opt/drivers/c.lua")
 	c := &Config{Drivers: []Driver{
 		{Name: "rel", Lua: "drivers/a.lua"},
-		{Name: "absin", Lua: "/etc/ftw/drivers/b.lua"},
-		{Name: "absout", Lua: "/opt/drivers/c.lua"},
+		{Name: "absin", Lua: absin},
+		{Name: "absout", Lua: absout},
 		{Name: "escape", Lua: "../../secrets/d.lua"},
 		{Name: "empty"},
 	}}
 	c.ResolveDriverPaths(baseDir)
 	want := map[string]string{
-		"rel":    "/etc/ftw/drivers/a.lua", // joined with baseDir
-		"absin":  "/etc/ftw/drivers/b.lua", // already absolute, untouched
-		"absout": "/opt/drivers/c.lua",     // absolute outside baseDir, untouched
-		"escape": "/etc/ftw/secrets/d.lua", // leading "../" stripped, then joined
+		"rel":    filepath.Join(baseDir, "drivers", "a.lua"), // joined with baseDir
+		"absin":  absin,                                      // already absolute, untouched
+		"absout": absout,                                     // absolute outside baseDir, untouched
+		"escape": filepath.Join(baseDir, "secrets", "d.lua"), // leading "../" stripped, then joined
 		"empty":  "",
 	}
 	for _, d := range c.Drivers {
@@ -694,11 +959,13 @@ func TestResolveDriverPaths(t *testing.T) {
 }
 
 func TestUnresolveDriverPathsRoundtrip(t *testing.T) {
-	baseDir := "/etc/ftw"
+	baseDir := testAbsolutePath("/etc/ftw")
+	absin := testAbsolutePath("/etc/ftw/drivers/b.lua")
+	absout := testAbsolutePath("/opt/drivers/c.lua")
 	original := []Driver{
 		{Name: "rel", Lua: "drivers/a.lua"},
-		{Name: "absin", Lua: "/etc/ftw/drivers/b.lua"}, // absolute but inside baseDir
-		{Name: "absout", Lua: "/opt/drivers/c.lua"},    // absolute outside baseDir — must stay absolute
+		{Name: "absin", Lua: absin},   // absolute but inside baseDir
+		{Name: "absout", Lua: absout}, // absolute outside baseDir — must stay absolute
 		{Name: "empty"},
 	}
 	c := &Config{Drivers: append([]Driver(nil), original...)}
@@ -713,14 +980,14 @@ func TestUnresolveDriverPathsRoundtrip(t *testing.T) {
 	for _, d := range c.Drivers {
 		got[d.Name] = d.Lua
 	}
-	if got["rel"] != "drivers/a.lua" {
-		t.Errorf("rel: got %q, want drivers/a.lua", got["rel"])
+	if got["rel"] != filepath.Join("drivers", "a.lua") {
+		t.Errorf("rel: got %q, want %s", got["rel"], filepath.Join("drivers", "a.lua"))
 	}
-	if got["absin"] != "drivers/b.lua" {
-		t.Errorf("absin: got %q, want drivers/b.lua", got["absin"])
+	if got["absin"] != filepath.Join("drivers", "b.lua") {
+		t.Errorf("absin: got %q, want %s", got["absin"], filepath.Join("drivers", "b.lua"))
 	}
-	if got["absout"] != "/opt/drivers/c.lua" {
-		t.Errorf("absout: got %q, want /opt/drivers/c.lua (must remain absolute)", got["absout"])
+	if got["absout"] != absout {
+		t.Errorf("absout: got %q, want %s (must remain absolute)", got["absout"], absout)
 	}
 	if got["empty"] != "" {
 		t.Errorf("empty: got %q, want empty string", got["empty"])
@@ -730,9 +997,9 @@ func TestUnresolveDriverPathsRoundtrip(t *testing.T) {
 	// Resolve — the UI save/load cycle relies on this being a fixed point.
 	c.ResolveDriverPaths(baseDir)
 	want := map[string]string{
-		"rel":    "/etc/ftw/drivers/a.lua",
-		"absin":  "/etc/ftw/drivers/b.lua",
-		"absout": "/opt/drivers/c.lua",
+		"rel":    filepath.Join(baseDir, "drivers", "a.lua"),
+		"absin":  absin,
+		"absout": absout,
 		"empty":  "",
 	}
 	for _, d := range c.Drivers {
@@ -762,6 +1029,52 @@ func TestSlewExplicitDisablePreserved(t *testing.T) {
 	}
 }
 
+func TestAppLinkDefaultsOnAndPreservesOptOut(t *testing.T) {
+	absent := &Config{}
+	applyDefaults(absent)
+	if absent.AppLink == nil || !absent.AppLink.Enabled {
+		t.Fatalf("omitted app_link must default on, got %+v", absent.AppLink)
+	}
+
+	disabled := &Config{AppLink: &AppLink{Enabled: false}}
+	applyDefaults(disabled)
+	if disabled.AppLink.Enabled {
+		t.Fatal("explicit app_link opt-out was overwritten")
+	}
+}
+
+func TestParseAppLinkPreservesExplicitNullOptOut(t *testing.T) {
+	tests := []struct {
+		name    string
+		suffix  string
+		enabled bool
+	}{
+		{name: "omitted", enabled: true},
+		{name: "bare null", suffix: "app_link:\n", enabled: false},
+		{name: "named null", suffix: "app_link: null\n", enabled: false},
+		{name: "null alias", suffix: "disabled: &disabled null\napp_link: *disabled\n", enabled: false},
+		{name: "null with ignored complex key", suffix: "legacy:\n  ? [old, key]\n  : ignored\napp_link: null\n", enabled: false},
+		{name: "merged null", suffix: "defaults: &defaults\n  app_link: null\n<<: *defaults\n", enabled: false},
+		{name: "merged sequence first null", suffix: "off: &off {app_link: null}\non: &on {app_link: {enabled: true}}\n<<: [*off, *on]\n", enabled: false},
+		{name: "merged sequence first true", suffix: "off: &off {app_link: null}\non: &on {app_link: {enabled: true}}\n<<: [*on, *off]\n", enabled: true},
+		{name: "direct true overrides merged null", suffix: "off: &off {app_link: null}\n<<: *off\napp_link: {enabled: true}\n", enabled: true},
+		{name: "empty mapping", suffix: "app_link: {}\n", enabled: false},
+		{name: "explicit false", suffix: "app_link:\n  enabled: false\n", enabled: false},
+		{name: "explicit true", suffix: "app_link:\n  enabled: true\n", enabled: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := Parse([]byte(minimalYAML+tt.suffix), t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.AppLink.On(); got != tt.enabled {
+				t.Fatalf("app link enabled = %v, want %v", got, tt.enabled)
+			}
+		})
+	}
+}
+
 func TestNotificationsDefaults(t *testing.T) {
 	c := &Config{Notifications: &Notifications{Enabled: false}}
 	applyDefaults(c)
@@ -776,14 +1089,54 @@ func TestNotificationsDefaults(t *testing.T) {
 	}
 }
 
-func TestNotificationsValidateRejectsEmptyTopic(t *testing.T) {
+// validFuse is a complete, safe fuse block so notification tests fail on the
+// notification rule under test, not on an unrelated fuse check that runs first.
+func validFuse() Fuse { return Fuse{MaxAmps: 16, Phases: 1, Voltage: 230} }
+
+// A real box stores the legacy default: provider "ntfy", server set to the
+// public host, and no topic (it was never entered). Web push is engine-owned,
+// so enabling notifications must succeed on such a box — the topic-less ntfy
+// is inactive, not a fatal config error. Holds whether the provider field is
+// the legacy "ntfy" or the newer "".
+func TestNotificationsEnableWithIncompleteNtfySucceeds(t *testing.T) {
+	for _, provider := range []string{"ntfy", ""} {
+		c := &Config{
+			Site:          Site{SmoothingAlpha: 0.3},
+			Fuse:          validFuse(),
+			Notifications: &Notifications{Enabled: true, Provider: provider, Ntfy: &NtfyConfig{Server: "https://ntfy.sh", Topic: ""}},
+		}
+		if err := c.Validate(); err != nil {
+			t.Errorf("provider %q: unexpected error enabling with topic-less ntfy: %v", provider, err)
+		}
+	}
+}
+
+// A box that genuinely configured ntfy — server and topic both set — stays
+// valid, and the runtime still selects the ntfy transport.
+func TestNotificationsEnableWithCompleteNtfyValid(t *testing.T) {
 	c := &Config{
 		Site:          Site{SmoothingAlpha: 0.3},
-		Fuse:          Fuse{MaxAmps: 16},
-		Notifications: &Notifications{Enabled: true, Provider: "ntfy", Ntfy: &NtfyConfig{Server: "https://ntfy.sh", Topic: ""}},
+		Fuse:          validFuse(),
+		Notifications: &Notifications{Enabled: true, Provider: "ntfy", Ntfy: &NtfyConfig{Server: "https://ntfy.sh", Topic: "my-topic"}},
 	}
-	if err := c.Validate(); err == nil {
-		t.Error("expected error for empty topic")
+	if err := c.Validate(); err != nil {
+		t.Errorf("unexpected error for complete ntfy: %v", err)
+	}
+}
+
+// A topic with no server to publish it to is a half-finished, hand-edited
+// ntfy — a real mistake worth catching rather than silently dropping.
+func TestNotificationsNtfyTopicWithoutServerErrors(t *testing.T) {
+	for _, provider := range []string{"ntfy", ""} {
+		c := &Config{
+			Site:          Site{SmoothingAlpha: 0.3},
+			Fuse:          validFuse(),
+			Notifications: &Notifications{Enabled: true, Provider: provider, Ntfy: &NtfyConfig{Server: "", Topic: "my-topic"}},
+		}
+		err := c.Validate()
+		if err == nil || !strings.Contains(err.Error(), "notifications.ntfy.server required") {
+			t.Errorf("provider %q: want ntfy.server-required error, got %v", provider, err)
+		}
 	}
 }
 

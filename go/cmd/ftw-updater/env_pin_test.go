@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/base64"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -68,6 +70,17 @@ func TestMergeEnvFileCreatesFromNothing(t *testing.T) {
 	}
 }
 
+func TestMergeEnvFileReplacesTheEffectiveLastAssignment(t *testing.T) {
+	existing := "FTW_IMAGE_TAG=older\n# the later value wins\nexport FTW_IMAGE_TAG=old\n"
+	got := mergeEnvFile(existing, map[string]string{mainTagEnv: "v2.0.0-beta.1"})
+	if strings.Count(got, mainTagEnv+"=") != 1 {
+		t.Fatalf("merged .env retained duplicate effective assignments:\n%s", got)
+	}
+	if !strings.Contains(got, "# the later value wins\nFTW_IMAGE_TAG=v2.0.0-beta.1") {
+		t.Fatalf("the effective last assignment was not replaced in place:\n%s", got)
+	}
+}
+
 func TestEnvPinScriptWritesAtomicallyInPlace(t *testing.T) {
 	script := envPinScript("/srv/ftw", "FTW_IMAGE_TAG=v1.2.3\n")
 	if !strings.Contains(script, "base64 -d") {
@@ -85,7 +98,7 @@ func TestEnvPinScriptWritesAtomicallyInPlace(t *testing.T) {
 		t.Errorf("failure should reach stderr\n%s", script)
 	}
 
-	start := strings.Index(script, "'") + 1
+	start := strings.Index(script, "printf %s '") + len("printf %s '")
 	end := strings.Index(script[start:], "'") + start
 	decoded, err := base64.StdEncoding.DecodeString(script[start:end])
 	if err != nil {
@@ -93,6 +106,51 @@ func TestEnvPinScriptWritesAtomicallyInPlace(t *testing.T) {
 	}
 	if string(decoded) != "FTW_IMAGE_TAG=v1.2.3\n" {
 		t.Fatalf("payload = %q", decoded)
+	}
+}
+
+func TestEnvPinScriptPreservesExistingOwnerAndMode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	if err := os.WriteFile(path, []byte("FTW_IMAGE_TAG=old\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sh", "-c", envPinScript(dir, "FTW_IMAGE_TAG=new\n")).CombinedOutput(); err != nil {
+		t.Fatalf("run env pin: %v\n%s", err, out)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Mode().Perm() != before.Mode().Perm() {
+		t.Fatalf("mode = %v, want %v", after.Mode().Perm(), before.Mode().Perm())
+	}
+	beforeStat, beforeOK := before.Sys().(*syscall.Stat_t)
+	afterStat, afterOK := after.Sys().(*syscall.Stat_t)
+	if !beforeOK || !afterOK || beforeStat.Uid != afterStat.Uid || beforeStat.Gid != afterStat.Gid {
+		t.Fatalf("owner changed: before=%v after=%v", before.Sys(), after.Sys())
+	}
+}
+
+func TestEnvPinScriptQuotesApostropheInProjectPath(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "Fred's FTW")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	content := "FTW_IMAGE_TAG=v2.0.0-beta.1\n"
+	if out, err := exec.Command("sh", "-c", envPinScript(dir, content)).CombinedOutput(); err != nil {
+		t.Fatalf("run env pin in apostrophe path: %v\n%s", err, out)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, ".env"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != content {
+		t.Fatalf("persisted .env = %q, want %q", got, content)
 	}
 }
 
@@ -151,7 +209,7 @@ func TestHelperPersistsTagsBeforeRecreating(t *testing.T) {
 	}
 	// Write the pin first, then recreate: the new sidecar should come up with
 	// the file already correct.
-	pinAt, upAt := strings.Index(run, "base64 -d"), strings.Index(run, "up -d --no-deps")
+	pinAt, upAt := strings.Index(run, "base64 -d"), strings.Index(run, "exec docker 'compose'")
 	if pinAt < 0 || upAt < 0 || pinAt > upAt {
 		t.Errorf("expected the .env write before the recreate\ngot: %s", run)
 	}
@@ -173,6 +231,183 @@ func TestHelperPersistsTagsBeforeRecreating(t *testing.T) {
 	}
 }
 
+func TestLegacyReleaseIdentitySurvivesLaterPlainComposeRecreate(t *testing.T) {
+	s, runner := newTestServer(t)
+	writeCompose(t, s.composeFile, `services:
+  ftw:
+    image: ghcr.io/srcfl/ftw:${FTW_IMAGE_TAG:-latest}
+    volumes:
+      - ./data:/app/data
+  ftw-updater:
+    image: ghcr.io/srcfl/ftw-updater:${FTW_UPDATER_IMAGE_TAG:-latest}
+`)
+	target := "v1.13.3-beta.1"
+	if err := s.replaceUpdater(context.Background(), target); err != nil {
+		t.Fatalf("replaceUpdater: %v", err)
+	}
+
+	// Run the same persistence fragment the detached helper runs, without its
+	// delay or its final sidecar recreate.
+	runArgs := runner.snapshot()[2]
+	script := runArgs[len(runArgs)-1]
+	script = strings.TrimPrefix(script, "sleep 3; ")
+	if end := strings.LastIndex(script, "; exec docker "); end >= 0 {
+		script = script[:end]
+	} else {
+		t.Fatalf("helper script has no final Compose recreate: %s", script)
+	}
+	cmd := exec.Command("sh", "-c", script)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("run helper persistence: %v\n%s", err, out)
+	}
+
+	dir := filepath.Dir(s.composeFile)
+	env, err := readEnvFile(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(env, mainTagEnv+"="+target) {
+		t.Fatalf("persisted .env lost exact Core tag:\n%s", env)
+	}
+	overrides := discoverOverrides(s.composeFile)
+	if len(overrides) != 1 || filepath.Base(overrides[0]) != releaseIdentityOverrideName {
+		t.Fatalf("plain Compose would not discover the release identity override: %v", overrides)
+	}
+	mapped, err := serviceEnvironmentUsesVariable(append([]string{s.composeFile}, overrides...), canonicalMainServiceName, mainTagEnv, mainTagEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !mapped {
+		t.Fatal("later plain Compose recreate would omit FTW_IMAGE_TAG from Core")
+	}
+}
+
+func TestLegacyListEnvironmentReleaseIdentitySurvivesLaterPlainComposeRecreate(t *testing.T) {
+	s, runner := newTestServer(t)
+	writeCompose(t, s.composeFile, `services:
+  ftw:
+    image: ghcr.io/srcfl/ftw:${FTW_IMAGE_TAG:-latest}
+    environment:
+      - OPERATOR_SETTING=preserved
+      - FTW_IMAGE_TAG=${FTW_IMAGE_TAG:-}
+  ftw-updater:
+    image: ghcr.io/srcfl/ftw-updater:${FTW_UPDATER_IMAGE_TAG:-latest}
+`)
+	target := "v1.13.3-beta.1"
+	if err := s.replaceUpdater(context.Background(), target); err != nil {
+		t.Fatalf("replaceUpdater: %v", err)
+	}
+
+	run := strings.Join(runner.snapshot()[2], " ")
+	if strings.Contains(run, releaseIdentityOverrideName) {
+		t.Fatalf("list-form mapping should not create a redundant override: %s", run)
+	}
+	if !strings.Contains(run, "base64 -d") {
+		t.Fatalf("list-form mapping did not persist the exact tag: %s", run)
+	}
+
+	mapped, err := serviceEnvironmentUsesVariable([]string{s.composeFile}, canonicalMainServiceName, mainTagEnv, mainTagEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !mapped {
+		t.Fatal("later plain Compose recreate would omit FTW_IMAGE_TAG from list-form environment")
+	}
+}
+
+func TestComposeEnvironmentListBareVariableFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	compose := filepath.Join(dir, "compose.yml")
+	if err := os.WriteFile(compose, []byte(`services:
+  ftw:
+    environment:
+      - FTW_IMAGE_TAG
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mapped, err := serviceEnvironmentUsesVariable([]string{compose}, canonicalMainServiceName, mainTagEnv, mainTagEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mapped {
+		t.Fatal("bare list entry does not prove that FTW_IMAGE_TAG is passed by value")
+	}
+}
+
+func TestComposeEnvironmentListUsesLastAssignment(t *testing.T) {
+	dir := t.TempDir()
+	compose := filepath.Join(dir, "compose.yml")
+	tests := []struct {
+		name  string
+		items string
+		want  bool
+	}{
+		{
+			name: "later composite overrides exact mapping",
+			items: `      - FTW_IMAGE_TAG=${FTW_IMAGE_TAG:-}
+      - FTW_IMAGE_TAG=${FTW_IMAGE_TAG:-}${ARCH}
+`,
+			want: false,
+		},
+		{
+			name: "later exact mapping overrides composite",
+			items: `      - FTW_IMAGE_TAG=${FTW_IMAGE_TAG:-}${ARCH}
+      - FTW_IMAGE_TAG=${FTW_IMAGE_TAG:-}
+`,
+			want: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			body := "services:\n  ftw:\n    environment:\n" + tc.items
+			if err := os.WriteFile(compose, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			got, err := serviceEnvironmentUsesVariable([]string{compose}, canonicalMainServiceName, mainTagEnv, mainTagEnv)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("serviceEnvironmentUsesVariable() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestComposeValueUsesOnlyOneExactVariableExpansion(t *testing.T) {
+	for _, value := range []string{
+		"$FTW_IMAGE_TAG",
+		"${FTW_IMAGE_TAG}",
+		"${FTW_IMAGE_TAG:-}",
+		"${FTW_IMAGE_TAG:-latest}",
+	} {
+		if !composeValueUsesVariable(value, mainTagEnv) {
+			t.Errorf("composeValueUsesVariable(%q) = false, want true", value)
+		}
+	}
+	for _, value := range []string{
+		"${FTW_IMAGE_TAG:-}${ARCH}",
+		"${FTW_IMAGE_TAG:-${DEFAULT_TAG}}",
+		"prefix-${FTW_IMAGE_TAG}",
+		"${FTW_IMAGE_TAG}-suffix",
+	} {
+		if composeValueUsesVariable(value, mainTagEnv) {
+			t.Errorf("composeValueUsesVariable(%q) = true, want false", value)
+		}
+	}
+}
+
+func TestHardCodedLegacyImageDoesNotPersistFalseReleaseIdentity(t *testing.T) {
+	s, _ := newTestServer(t)
+	writeCompose(t, s.composeFile, `services:
+  ftw:
+    image: ghcr.io/srcfl/ftw:latest
+`)
+	if _, err := s.releaseIdentityPinStep(filepath.Dir(s.composeFile), "v1.13.3-beta.1"); err == nil {
+		t.Fatal("hard-coded host image must not receive a different persisted runtime identity")
+	}
+}
+
 // An unreadable .env must not cost the site its update.
 func TestUnreadableEnvStillReplacesTheUpdater(t *testing.T) {
 	s, runner := newTestServer(t)
@@ -189,7 +424,7 @@ func TestUnreadableEnvStillReplacesTheUpdater(t *testing.T) {
 	if strings.Contains(run, "base64 -d") {
 		t.Errorf("must not overwrite an .env it could not read\ngot: %s", run)
 	}
-	if !strings.Contains(run, "up -d --no-deps ftw-updater") {
+	if !strings.Contains(run, "'up' '-d' '--no-deps' 'ftw-updater'") {
 		t.Errorf("the recreate itself must still happen\ngot: %s", run)
 	}
 }

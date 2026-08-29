@@ -9,9 +9,13 @@
 
   // Collected state
   var configuredDrivers = [];    // array of driver objects ready for config.drivers
-  var selectedDevice = null;     // { ip, port, protocol } from scan or manual entry
+  var selectedDevice = null;     // { ip, port, protocol, hostname } from scan or manual entry
   var selectedCatalog = null;    // CatalogEntry from /api/drivers/catalog
   var driverCatalog = [];        // full catalog cache
+
+  // Picker option for a device with no catalog entry. Deliberately not a
+  // number so it can never be mistaken for a catalog index.
+  var NOT_LISTED = '__not_listed__';
 
   // --- Step navigation ---
 
@@ -49,6 +53,13 @@
   // Back from step 7 goes to step 6 if we have drivers, step 2 if we skipped
   window.goStepBack7 = function () {
     goStep(configuredDrivers.length > 0 ? 6 : 2);
+  };
+
+  // Forward path for a device the catalog cannot serve: the devices
+  // summary when something is already configured, otherwise straight on
+  // to the integrations.
+  window.skipUnlistedDevice = function () {
+    goStep(configuredDrivers.length > 0 ? 6 : 7);
   };
 
   // --- Step 3: Scan ---
@@ -95,7 +106,7 @@
             '<td>' + identity + '</td>' +
             '<td><button class="btn-use">Use this device</button></td>';
           tr.querySelector('.btn-use').addEventListener('click', function () {
-            useScanDevice(d.ip, d.port, proto, match && match.driver);
+            useScanDevice(d, proto, match && match.driver);
           });
           tbody.appendChild(tr);
         });
@@ -112,16 +123,22 @@
     document.getElementById('manual-ip-toggle').style.display = 'none';
   };
 
-  function useScanDevice(ip, port, protocol, matchedFilename) {
-    selectedDevice = { ip: ip, port: port, protocol: protocol, matchedFilename: matchedFilename || '' };
+  function useScanDevice(dev, protocol, matchedFilename) {
+    selectedDevice = {
+      ip: dev.ip,
+      port: dev.port,
+      protocol: protocol,
+      hostname: dev.hostname || '',
+      matchedFilename: matchedFilename || ''
+    };
     goStep(4);
   }
 
   window.useManualDevice = function () {
-    var ip = document.getElementById('manual-ip').value.trim();
+    var host = document.getElementById('manual-ip').value.trim();
     var port = parseInt(document.getElementById('manual-port').value, 10) || 502;
-    if (!ip) return;
-    selectedDevice = { ip: ip, port: port, protocol: guessProtocol(port) };
+    if (!host) return;
+    selectedDevice = { ip: host, port: port, protocol: guessProtocol(port), hostname: '' };
     goStep(4);
   };
 
@@ -202,6 +219,14 @@
       sel.appendChild(opt);
     });
 
+    // The escape hatch. Without it, a device with no catalog entry
+    // dead-ends this step: Continue stays disabled and the only
+    // affordance left is Back.
+    var notListed = document.createElement('option');
+    notListed.value = NOT_LISTED;
+    notListed.textContent = 'My device is not listed…';
+    sel.appendChild(notListed);
+
     // A positive fingerprint preselects the matching catalog driver while
     // still sending the operator through the normal configuration form.
     if (selectedDevice && selectedDevice.matchedFilename) {
@@ -222,18 +247,34 @@
     var sel = document.getElementById('driver-select');
     var btn = document.getElementById('driver-next-btn');
     var descEl = document.getElementById('driver-description');
+    var notListedEl = document.getElementById('driver-not-listed');
 
     if (!sel.value) {
       selectedCatalog = null;
       btn.disabled = true;
       descEl.style.display = 'none';
+      notListedEl.style.display = 'none';
       return;
     }
+
+    if (sel.value === NOT_LISTED) {
+      // Nothing to configure, so Continue stays held; the panel offers
+      // its own forward path instead.
+      selectedCatalog = null;
+      btn.disabled = true;
+      descEl.style.display = 'none';
+      notListedEl.style.display = 'block';
+      return;
+    }
+    notListedEl.style.display = 'none';
 
     selectedCatalog = driverCatalog[parseInt(sel.value, 10)];
     btn.disabled = false;
 
     var lines = [];
+    if (selectedCatalog.filename === 'zap.lua' || selectedCatalog.id === 'sourceful-zap') {
+      lines.push('This driver is the P1/HAN site meter by default. Add inverters, batteries and chargers as their own devices in FTW when you can. If Zap is the only reader, turn on PV or battery ingest later under Settings → Devices.');
+    }
     if (selectedCatalog.description) lines.push(selectedCatalog.description);
 
     var version = selectedCatalog.installed_version || selectedCatalog.version;
@@ -286,9 +327,15 @@
     document.getElementById('drv-name').value = name;
 
     if (selectedDevice) {
-      document.getElementById('drv-ip').value = selectedDevice.ip;
+      // Prefer the device's self-broadcast mDNS (.local) name over the raw
+      // IP: the name follows the device across DHCP lease changes, the IP
+      // doesn't. Other reverse-DNS names stay display-only — resolving them
+      // at runtime depends on the router, so the IP is the safer default.
+      var host = isMDNSName(selectedDevice.hostname) ? selectedDevice.hostname : selectedDevice.ip;
+      document.getElementById('drv-ip').value = host;
       document.getElementById('drv-port').value = selectedDevice.port;
     }
+    updateHostHint();
 
     // Show/hide unit ID for modbus
     var isModbus = !selectedCatalog.protocols || selectedCatalog.protocols.length === 0 ||
@@ -335,11 +382,51 @@
     });
   }
 
+  // A self-broadcast mDNS name (RFC 6762 .local). Only these are safe to
+  // prefer over the IP — any other hostname needs the router's DNS to
+  // resolve, which FTW can't verify from here.
+  function isMDNSName(host) {
+    return /\.local\.?$/i.test(host || '');
+  }
+
+  function isIPv4Literal(host) {
+    return /^\d{1,3}(\.\d{1,3}){3}$/.test(host || '');
+  }
+
+  // Addressing hint under the host field: a .local name survives DHCP
+  // lease changes; a raw IP only stays valid if the operator reserves it
+  // for the device in the router's DHCP pool. Tracks user edits live.
+  function updateHostHint() {
+    var el = document.getElementById('drv-host-hint');
+    var input = document.getElementById('drv-ip');
+    if (!el || !input) return;
+    var host = input.value.trim();
+    el.style.display = 'none';
+    el.className = 'host-hint';
+    if (isMDNSName(host)) {
+      var discovered = '';
+      if (selectedDevice && selectedDevice.ip &&
+          host.toLowerCase() === (selectedDevice.hostname || '').toLowerCase()) {
+        discovered = ' (discovered at ' + selectedDevice.ip + ')';
+      }
+      el.textContent = 'Connecting by the device’s mDNS name' + discovered +
+        ' — it keeps working even if your router assigns the device a new IP address.';
+      el.className = 'host-hint mdns';
+      el.style.display = 'block';
+    } else if (isIPv4Literal(host)) {
+      el.textContent = 'No mDNS (.local) name in use — FTW will connect to this fixed IP address. ' +
+        'Reserve it for the device in your router’s DHCP settings so a new ' +
+        'DHCP lease can’t move the device and break the connection.';
+      el.className = 'host-hint dhcp';
+      el.style.display = 'block';
+    }
+  }
+
   window.saveDriver = function () {
     var name = document.getElementById('drv-name').value.trim();
     if (!name) { alert('Driver name is required.'); return; }
 
-    var ip = document.getElementById('drv-ip').value.trim();
+    var host = document.getElementById('drv-ip').value.trim();
     var port = parseInt(document.getElementById('drv-port').value, 10);
     var unitId = parseInt(document.getElementById('drv-unitid').value, 10) || 1;
     var isSiteMeter = document.getElementById('drv-site-meter').checked;
@@ -355,7 +442,7 @@
       ? (parseFloat(document.getElementById('drv-battery-kwh').value) || 0)
       : 0;
 
-    if (!ip) { alert('IP address is required.'); return; }
+    if (!host) { alert('IP address or hostname is required.'); return; }
 
     // Determine protocol from catalog entry
     var protocol = 'modbus';
@@ -381,11 +468,11 @@
     }
 
     if (protocol === 'modbus') {
-      driver.capabilities.modbus = { host: ip, port: port, unit_id: unitId };
+      driver.capabilities.modbus = { host: host, port: port, unit_id: unitId };
     } else if (protocol === 'mqtt') {
-      driver.capabilities.mqtt = { host: ip, port: port };
+      driver.capabilities.mqtt = { host: host, port: port };
     } else if (protocol === 'http') {
-      driver.capabilities.http = { allowed_hosts: [ip] };
+      driver.capabilities.http = { allowed_hosts: [host] };
       // connection_defaults.host is declared only by drivers that take a
       // user-configurable local endpoint — seed config.host from the IP the
       // user just entered. Cloud drivers (Easee etc.) declare http_hosts
@@ -398,7 +485,7 @@
       // Cloud drivers don't declare it and key off email/password.
       if (Object.prototype.hasOwnProperty.call(connDefaults, 'host')) {
         driver.config = driver.config || {};
-        driver.config.host = ip;
+        driver.config.host = host;
       }
     }
 
@@ -495,11 +582,15 @@
   // Known EV charger providers, keyed by the `provider` string the Go
   // config (EVCharger.Provider) accepts. `transport` selects which field
   // block (#ev-fields-http vs #ev-fields-modbus) the wizard reveals:
-  //   - easee: cloud HTTP, needs username/password + serial lookup.
-  //   - ctek:  local Modbus/TCP, needs host/port/unit, no auth.
+  //   - easee:    cloud HTTP, needs username/password + serial lookup.
+  //   - zaptec:   cloud HTTP, needs username/password + serial lookup.
+  //   - tesla-wc: local HTTP, needs host, no auth. Observation only.
+  //   - ctek:     local Modbus/TCP, needs host/port/unit, no auth.
   // Mirrors go/internal/config/config.go EVCharger.Validate.
   var EV_PROVIDERS = [
     { value: 'easee', label: 'Easee', transport: 'http' },
+    { value: 'zaptec', label: 'Zaptec', transport: 'http' },
+    { value: 'tesla-wc', label: 'Tesla Wall Connector', transport: 'http-local' },
     { value: 'ctek', label: 'CTEK', transport: 'modbus' }
   ];
 
@@ -536,10 +627,13 @@
     var transport = evProviderTransport(provider);
     document.getElementById('ev-fields').style.display = provider ? 'block' : 'none';
     document.getElementById('ev-fields-http').style.display = transport === 'http' ? 'block' : 'none';
+    var localHttp = document.getElementById('ev-fields-http-local');
+    if (localHttp) localHttp.style.display = transport === 'http-local' ? 'block' : 'none';
     document.getElementById('ev-fields-modbus').style.display = transport === 'modbus' ? 'block' : 'none';
-    // Charger-serial lookup is an HTTP/cloud-only affordance.
-    document.getElementById('ev-load-chargers').style.display = transport === 'http' ? '' : 'none';
-    if (transport !== 'http') {
+    // Probe is offered for cloud accounts and for a LAN Tesla Wall Connector.
+    var canProbe = transport === 'http' || transport === 'http-local';
+    document.getElementById('ev-load-chargers').style.display = canProbe ? '' : 'none';
+    if (!canProbe) {
       document.getElementById('ev-serial-group').style.display = 'none';
     }
   }
@@ -564,19 +658,35 @@
   // mirrors the settings screen so operators don't have to transcribe a
   // serial off the side of the charger. The serial field only appears
   // after a successful call returns at least one device.
+  function evLocalHTTPBase(host) {
+    host = (host || '').trim();
+    if (!host) return '';
+    if (host.indexOf('://') >= 0) return host.replace(/\/$/, '');
+    return 'http://' + host.replace(/\/$/, '');
+  }
+
   window.loadEVChargers = function () {
     var provider = document.getElementById('ev-provider').value || 'easee';
+    var transport = evProviderTransport(provider);
     var username = document.getElementById('ev-username').value.trim();
     var password = document.getElementById('ev-password').value;
     var btn = document.getElementById('ev-load-chargers');
     var statusEl = document.getElementById('ev-chargers-status');
     var group = document.getElementById('ev-serial-group');
     var sel = document.getElementById('ev-serial');
+    var body;
 
     statusEl.style.display = 'inline';
     statusEl.style.color = 'var(--fg-muted)';
-    if (!username) { statusEl.textContent = 'Enter username first'; return; }
-    if (!password) { statusEl.textContent = 'Enter password first'; return; }
+    if (transport === 'http-local') {
+      var localHost = document.getElementById('ev-http-host').value.trim();
+      if (!localHost) { statusEl.textContent = 'Enter the wall connector IP first'; return; }
+      body = { provider: provider, http: { base_url: evLocalHTTPBase(localHost) } };
+    } else {
+      if (!username) { statusEl.textContent = 'Enter username first'; return; }
+      if (!password) { statusEl.textContent = 'Enter password first'; return; }
+      body = { provider: provider, email: username, password: password };
+    }
 
     statusEl.textContent = 'Connecting…';
     btn.disabled = true;
@@ -584,7 +694,7 @@
     fetch('/api/ev/chargers', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ provider: provider, email: username, password: password })
+      body: JSON.stringify(body)
     })
       .then(function (r) {
         return r.json().then(function (j) { return { ok: r.ok, body: j }; });
@@ -656,6 +766,9 @@
       if (evProviderTransport(evProvider) === 'modbus') {
         var mbHost = document.getElementById('ev-mb-host').value.trim();
         if (mbHost) html += ' (' + esc(mbHost) + ')';
+      } else if (evProviderTransport(evProvider) === 'http-local') {
+        var httpHost = document.getElementById('ev-http-host').value.trim();
+        if (httpHost) html += ' (' + esc(httpHost) + ')';
       } else {
         var evSerial = document.getElementById('ev-serial').value;
         if (evSerial) html += ' (' + esc(evSerial) + ')';
@@ -767,8 +880,9 @@
 
     // EV Charger — shape the block to match the provider's transport
     // (see go/internal/config/config.go EVCharger). Cloud HTTP providers
-    // (easee) carry username/password/serial; local Modbus providers
-    // (ctek) carry a modbus{host,port,unit_id} block and reject auth.
+    // (easee, zaptec) carry username/password/serial; local HTTP
+    // (tesla-wc) carries http.base_url; local Modbus (ctek) carries a
+    // modbus{host,port,unit_id} block and rejects auth.
     var evProvider = document.getElementById('ev-provider').value;
     if (evProvider) {
       var ev = { provider: evProvider };
@@ -779,6 +893,11 @@
         ev.modbus = { host: mbHost };
         if (mbPort) ev.modbus.port = mbPort;
         if (!isNaN(mbUnit)) ev.modbus.unit_id = mbUnit;
+      } else if (evProviderTransport(evProvider) === 'http-local') {
+        var localBase = evLocalHTTPBase(document.getElementById('ev-http-host').value);
+        if (localBase) ev.http = { base_url: localBase };
+        var localSerial = document.getElementById('ev-serial').value.trim();
+        if (localSerial) ev.serial = localSerial;
       } else {
         ev.username = document.getElementById('ev-username').value.trim();
         ev.password = document.getElementById('ev-password').value;
@@ -886,6 +1005,8 @@
     if (n > TOTAL_STEPS) return TOTAL_STEPS;
     return n;
   }
+
+  document.getElementById('drv-ip').addEventListener('input', updateHostHint);
 
   renderDots();
   loadPriceZones();

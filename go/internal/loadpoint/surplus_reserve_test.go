@@ -74,6 +74,19 @@ func TestSurplusReserveW(t *testing.T) {
 	}
 }
 
+func TestSurplusChargingWCountsOnlyProtectedLoadpoints(t *testing.T) {
+	states := []State{
+		{ID: "surplus", SurplusOnly: true, PluggedIn: true, CurrentPowerW: 3000},
+		{ID: "regular", SurplusOnly: false, PluggedIn: true, CurrentPowerW: 4000},
+		{ID: "unplugged", SurplusOnly: true, PluggedIn: false, CurrentPowerW: 2500},
+		{ID: "manual", SurplusOnly: true, PluggedIn: true, ManualActive: true, CurrentPowerW: 2000},
+		{ID: "v2x", SurplusOnly: true, PluggedIn: true, CurrentPowerW: -1000},
+	}
+	if got := SurplusChargingW(states); got != 3000 {
+		t.Errorf("SurplusChargingW = %.0f, want 3000 from the protected EV only", got)
+	}
+}
+
 // Concrete regression: user's reported bug. EV at 2.5 kW on an Easee
 // with 11 kW max, plan says charge battery, 3 kW of PV exporting.
 // Pre-fix the reserve was 11 kW so ceiling = pvSurplus − (reserve −
@@ -163,11 +176,11 @@ func TestSurplusReserveWAllowsOnePhaseLadderClimb(t *testing.T) {
 func TestSurplusReserveWPluggedStoppedWithHeadroomReservesMin(t *testing.T) {
 	states := []State{{
 		ID: "garage", SurplusOnly: true, PluggedIn: true,
-		CurrentPowerW:         0, // not drawing
-		MinChargeW:            1380,
-		MaxChargeW:            11000,
-		VehicleSoCPct:         34, // below limit
-		VehicleChargeLimitPct: 60,
+		CurrentPowerW:      0, // not drawing
+		MinChargeW:         1380,
+		MaxChargeW:         11000,
+		VehicleSoC:         0.34, // below limit
+		VehicleChargeLimit: 0.6,
 	}}
 	got := SurplusReserveW(states, nil)
 	if got != 1380 {
@@ -181,11 +194,11 @@ func TestSurplusReserveWPluggedStoppedWithHeadroomReservesMin(t *testing.T) {
 func TestSurplusReserveWPluggedStoppedAtLimitNoReserve(t *testing.T) {
 	states := []State{{
 		ID: "garage", SurplusOnly: true, PluggedIn: true,
-		CurrentPowerW:         0,
-		MinChargeW:            1380,
-		MaxChargeW:            11000,
-		VehicleSoCPct:         60, // at limit
-		VehicleChargeLimitPct: 60,
+		CurrentPowerW:      0,
+		MinChargeW:         1380,
+		MaxChargeW:         11000,
+		VehicleSoC:         0.6, // at limit
+		VehicleChargeLimit: 0.6,
 	}}
 	if got := SurplusReserveW(states, nil); got != 0 {
 		t.Errorf("SurplusReserveW = %.0f, want 0 (EV at limit, no headroom)", got)
@@ -205,7 +218,7 @@ func TestSurplusReserveWPluggedStoppedSoCUnknownBootstraps(t *testing.T) {
 		CurrentPowerW: 0,
 		MinChargeW:    1380,
 		MaxChargeW:    11000,
-		// VehicleSoCPct + VehicleChargeLimitPct both 0 (unknown — dumb charger)
+		// VehicleSoC + VehicleChargeLimit both 0 (unknown — dumb charger)
 	}}
 	if got := SurplusReserveW(states, nil); got != 1380 {
 		t.Errorf("SurplusReserveW = %.0f, want 1380 (MinChargeW bootstrap for dumb charger)", got)

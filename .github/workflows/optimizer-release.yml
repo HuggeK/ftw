@@ -32,13 +32,13 @@ jobs:
       alias: ${{ steps.version.outputs.alias }}
       image_exists: ${{ steps.version.outputs.image_exists }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - id: version
         env:
@@ -139,8 +139,8 @@ jobs:
     needs: validate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
           cache: pip
@@ -170,17 +170,17 @@ jobs:
     if: needs.validate.outputs.image_exists != 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4.6.0
         with:
           registry: ghcr.io
-          username: ${{ vars.SOURCEFUL_GHCR_USER || github.actor }}
-          password: ${{ secrets.SOURCEFUL_GHCR_TOKEN || secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile.optimizer
@@ -212,7 +212,7 @@ jobs:
       }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - env:

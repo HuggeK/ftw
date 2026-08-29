@@ -67,6 +67,10 @@ Several people run agents against this repository at the same time. These
 rules exist because each one has already been broken once, and the cost
 landed on somebody else's finished work.
 
+- **Name the pull request in every CLI read.** Run `gh pr view` with an
+  explicit PR number or URL. Never omit the target or build it from a variable
+  that may be empty; without a target, `gh` tries the current branch, often
+  `master`.
 - **Read a pull request's reviews before judging it.** Never recommend
   closing, superseding or reworking an open PR without reading what the
   reviewers actually wrote. "A review exists" is not the same as knowing
@@ -83,6 +87,8 @@ landed on somebody else's finished work.
   badly while it waits.
 - **Respect `.github/CODEOWNERS`.** An owner reviews what lands in their
   area, whoever — or whatever — wrote it.
+- **Review web/UI changes in a browser.** A human must inspect the rendered
+  interface; AI review and reading the source code are not enough.
 
 Planning documents, design specs, task breakdowns and agent scratch notes
 stay out of the repository; [`.github/check-no-planning-docs.sh`](.github/check-no-planning-docs.sh) enforces
@@ -117,8 +123,41 @@ Only two release channels exist:
 - **stable** promotes the exact commit already published and validated as beta.
 
 There is no edge channel. Core and signed driver artifacts can release
-independently but follow the same beta-to-stable progression. See
-[docs/self-update.md](docs/self-update.md).
+independently but follow the same beta-to-stable progression.
+
+Normal path:
+
+1. Merge the Version Packages PR.
+2. Publish beta `vX.Y.Z-beta.N` from that exact commit.
+3. Validate that beta on real sites.
+4. Promote the same commit to stable `vX.Y.Z`.
+
+Do not create a new beta, tag, draft or candidate to recover a failed
+stable publish. Resume the existing draft by its numeric GitHub Release
+id, with workflow code from `master` and binaries from the immutable
+tag. GitHub 5xx is an external retry condition, not a reason to rebuild
+the candidate.
+
+See [docs/self-update.md](docs/self-update.md).
+
+A release is one workflow dispatch, not a manual list of registry commands.
+The `srcfl/*` images use the job-scoped `GITHUB_TOKEN`; each package must grant
+the `srcfl/ftw` repository GitHub Actions write access. The compatibility
+`frahlg/*` mirror uses the dedicated `LEGACY_GHCR_TOKEN`, with only
+`write:packages`. Never use a developer's local `gh` token, create a new token
+for each release, or fall back to `GITHUB_TOKEN` for the personal namespace.
+
+Registry credentials and package access are repository setup, not release
+steps. Before creating a beta tag or starting stable publication, the release
+workflows request a scoped `pull,push` bearer and start an empty GHCR blob
+upload in all four target packages. HTTP 202 proves write access without
+creating a blob, manifest, package version or tag. The workflow then tries to
+cancel the empty session. GHCR currently returns HTTP 405 for that optional
+cleanup, which is accepted; any other unexpected cleanup result fails the
+check. If the write check fails, stop, repair package access or rotate the one
+dedicated secret, then rerun the same immutable version. Do not mint another
+beta tag to work around an access failure.
+`CLAUDE.md` imports this file, so these rules apply to Claude and Codex alike.
 
 ## Useful source entry points
 

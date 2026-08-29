@@ -23,11 +23,11 @@ var sensitiveMutations = []sensitiveMutation{
 	{name: "restart", path: "/api/restart"},
 }
 
-func TestSecureMutationsBlocksBrowserCrossSiteSensitiveRoutes(t *testing.T) {
+func TestAuthenticateBlocksBrowserCrossSiteSensitiveRoutes(t *testing.T) {
 	for _, endpoint := range sensitiveMutations {
 		t.Run(endpoint.name, func(t *testing.T) {
 			called := false
-			h := SecureMutations(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			h := Authenticate(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				called = true
 				w.WriteHeader(http.StatusNoContent)
 			}), MutationPolicy{})
@@ -51,7 +51,7 @@ func TestSecureMutationsBlocksBrowserCrossSiteSensitiveRoutes(t *testing.T) {
 	}
 }
 
-func TestSecureMutationsTreatsEveryUnsafeHTTPMethodAsMutation(t *testing.T) {
+func TestAuthenticateTreatsEveryUnsafeHTTPMethodAsMutation(t *testing.T) {
 	for _, method := range []string{
 		http.MethodPost,
 		http.MethodPut,
@@ -67,7 +67,7 @@ func TestSecureMutationsTreatsEveryUnsafeHTTPMethodAsMutation(t *testing.T) {
 			req.Header.Set("Origin", "https://attacker.example")
 			req.Header.Set("Sec-Fetch-Site", "cross-site")
 			rr := httptest.NewRecorder()
-			SecureMutations(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			Authenticate(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				called = true
 				w.WriteHeader(http.StatusNoContent)
 			}), MutationPolicy{}).ServeHTTP(rr, req)
@@ -82,7 +82,7 @@ func TestSecureMutationsTreatsEveryUnsafeHTTPMethodAsMutation(t *testing.T) {
 	}
 }
 
-func TestSecureMutationsGuardsSemanticallyActiveReads(t *testing.T) {
+func TestAuthenticateGuardsProtectedReads(t *testing.T) {
 	guarded := []struct {
 		name   string
 		method string
@@ -95,6 +95,69 @@ func TestSecureMutationsGuardsSemanticallyActiveReads(t *testing.T) {
 		{name: "OAuth start", method: http.MethodGet, path: "/api/oauth/myuplink/start"},
 		{name: "OAuth start via HEAD", method: http.MethodHead, path: "/api/oauth/myuplink/start"},
 		{name: "OAuth callback via HEAD", method: http.MethodHead, path: "/api/oauth/myuplink/callback"},
+		{name: "backup list", method: http.MethodGet, path: "/api/backups"},
+		{name: "backup list via HEAD", method: http.MethodHead, path: "/api/backups"},
+		{name: "backup download", method: http.MethodGet, path: "/api/backups/ftw-full-backup-20260731T120000Z.ftwbak"},
+		{name: "backup download via HEAD", method: http.MethodHead, path: "/api/backups/ftw-full-backup-20260731T120000Z.ftwbak"},
+		{name: "CalDAV credentials", method: http.MethodGet, path: "/api/caldav/credentials"},
+		{name: "CalDAV credentials via HEAD", method: http.MethodHead, path: "/api/caldav/credentials"},
+		{name: "config", method: http.MethodGet, path: "/api/config"},
+		{name: "config via HEAD", method: http.MethodHead, path: "/api/config"},
+		{name: "support dump", method: http.MethodGet, path: "/api/support/dump"},
+		{name: "support dump via HEAD", method: http.MethodHead, path: "/api/support/dump"},
+		{name: "support report", method: http.MethodGet, path: "/api/support/report"},
+		{name: "support report via HEAD", method: http.MethodHead, path: "/api/support/report"},
+		{name: "logs", method: http.MethodGet, path: "/api/logs"},
+		{name: "logs via HEAD", method: http.MethodHead, path: "/api/logs"},
+		{name: "system info", method: http.MethodGet, path: "/api/system/info"},
+		{name: "system info via HEAD", method: http.MethodHead, path: "/api/system/info"},
+		{name: "storage inventory", method: http.MethodGet, path: "/api/storage/inventory"},
+		{name: "storage inventory via HEAD", method: http.MethodHead, path: "/api/storage/inventory"},
+		{name: "research dump", method: http.MethodGet, path: "/api/research/load/dump"},
+		{name: "research dump via HEAD", method: http.MethodHead, path: "/api/research/load/dump"},
+		{name: "app-link devices", method: http.MethodGet, path: "/api/app-link/devices"},
+		{name: "app-link devices via HEAD", method: http.MethodHead, path: "/api/app-link/devices"},
+		{name: "device identities", method: http.MethodGet, path: "/api/devices"},
+		{name: "device identities via HEAD", method: http.MethodHead, path: "/api/devices"},
+		{name: "driver catalog", method: http.MethodGet, path: "/api/drivers/catalog"},
+		{name: "driver catalog via HEAD", method: http.MethodHead, path: "/api/drivers/catalog"},
+		{name: "driver detail", method: http.MethodGet, path: "/api/drivers/sonnen"},
+		{name: "driver detail via HEAD", method: http.MethodHead, path: "/api/drivers/sonnen"},
+		{name: "driver source", method: http.MethodGet, path: "/api/drivers/sonnen/source"},
+		{name: "driver source via HEAD", method: http.MethodHead, path: "/api/drivers/sonnen/source"},
+		{name: "driver logs", method: http.MethodGet, path: "/api/drivers/sonnen/logs"},
+		{name: "driver logs via HEAD", method: http.MethodHead, path: "/api/drivers/sonnen/logs"},
+		{name: "device repository status", method: http.MethodGet, path: "/api/device_repository/status"},
+		{name: "device repository status via HEAD", method: http.MethodHead, path: "/api/device_repository/status"},
+		{name: "component status", method: http.MethodGet, path: "/api/components"},
+		{name: "component status via HEAD", method: http.MethodHead, path: "/api/components"},
+		{name: "component history", method: http.MethodGet, path: "/api/components/history"},
+		{name: "component history via HEAD", method: http.MethodHead, path: "/api/components/history"},
+		{name: "Home Assistant status", method: http.MethodGet, path: "/api/ha/status"},
+		{name: "Home Assistant status via HEAD", method: http.MethodHead, path: "/api/ha/status"},
+		{name: "CalDAV status", method: http.MethodGet, path: "/api/caldav/status"},
+		{name: "CalDAV status via HEAD", method: http.MethodHead, path: "/api/caldav/status"},
+		{name: "notification status", method: http.MethodGet, path: "/api/notifications/status"},
+		{name: "notification status via HEAD", method: http.MethodHead, path: "/api/notifications/status"},
+		{name: "notification history", method: http.MethodGet, path: "/api/notifications/history"},
+		{name: "notification history via HEAD", method: http.MethodHead, path: "/api/notifications/history"},
+		{name: "version snapshots", method: http.MethodGet, path: "/api/version/snapshots"},
+		{name: "version snapshots via HEAD", method: http.MethodHead, path: "/api/version/snapshots"},
+		{name: "driver list", method: http.MethodGet, path: "/api/drivers"},
+		{name: "driver list via HEAD", method: http.MethodHead, path: "/api/drivers"},
+		{name: "driver draft", method: http.MethodGet, path: "/api/drivers/sonnen/draft"},
+		{name: "EV status", method: http.MethodGet, path: "/api/ev/status"},
+		{name: "EV status via HEAD", method: http.MethodHead, path: "/api/ev/status"},
+		{name: "series", method: http.MethodGet, path: "/api/series"},
+		{name: "series catalog", method: http.MethodGet, path: "/api/series/catalog"},
+		{name: "planner diagnose", method: http.MethodGet, path: "/api/mpc/diagnose"},
+		{name: "planner diagnose history", method: http.MethodGet, path: "/api/mpc/diagnose/history"},
+		{name: "planner diagnose at", method: http.MethodGet, path: "/api/mpc/diagnose/at"},
+		{name: "fleet ping", method: http.MethodGet, path: "/api/fleet-ping"},
+		{name: "notification rules", method: http.MethodGet, path: "/api/notifications/rules"},
+		{name: "device repository catalog", method: http.MethodGet, path: "/api/device_repository/catalog"},
+		{name: "device repository versions", method: http.MethodGet, path: "/api/device_repository/drivers/sonnen/versions"},
+		{name: "app-link status", method: http.MethodGet, path: "/api/app-link/status"},
 	}
 
 	for _, tc := range guarded {
@@ -104,7 +167,7 @@ func TestSecureMutationsGuardsSemanticallyActiveReads(t *testing.T) {
 			req.Header.Set("Origin", "https://attacker.example")
 			req.Header.Set("Sec-Fetch-Site", "cross-site")
 			rr := httptest.NewRecorder()
-			SecureMutations(statusHandler(http.StatusNoContent), MutationPolicy{}).ServeHTTP(rr, req)
+			Authenticate(statusHandler(http.StatusNoContent), MutationPolicy{}).ServeHTTP(rr, req)
 			if rr.Code != http.StatusForbidden {
 				t.Fatalf("status = %d, want 403 (body=%s)", rr.Code, rr.Body.String())
 			}
@@ -116,15 +179,18 @@ func TestSecureMutationsGuardsSemanticallyActiveReads(t *testing.T) {
 			req.Header.Set("Origin", "http://ftw.local:8080")
 			req.Header.Set("Sec-Fetch-Site", "same-origin")
 			rr := httptest.NewRecorder()
-			SecureMutations(statusHandler(http.StatusNoContent), MutationPolicy{RequireTokenForRemote: true}).ServeHTTP(rr, req)
+			Authenticate(statusHandler(http.StatusNoContent), MutationPolicy{RequireTokenForRemote: true}).ServeHTTP(rr, req)
 			if rr.Code != http.StatusNoContent {
 				t.Fatalf("status = %d, want 204 (body=%s)", rr.Code, rr.Body.String())
+			}
+			if got := rr.Header().Get("Cache-Control"); got != "no-store" {
+				t.Fatalf("Cache-Control = %q, want no-store", got)
 			}
 		})
 	}
 }
 
-func TestSecureMutationsLeavesOrdinaryReadsAndOAuthCallbackCompatible(t *testing.T) {
+func TestAuthenticateLeavesOrdinaryReadsAndOAuthCallbackCompatible(t *testing.T) {
 	for _, tc := range []struct {
 		method string
 		path   string
@@ -134,6 +200,13 @@ func TestSecureMutationsLeavesOrdinaryReadsAndOAuthCallbackCompatible(t *testing
 		{method: http.MethodOptions, path: "/api/status"},
 		{method: http.MethodGet, path: "/api/version/check"},
 		{method: http.MethodGet, path: "/api/oauth/myuplink/callback?code=code&state=state"},
+		{method: http.MethodGet, path: "/api/energy/history"},
+		{method: http.MethodGet, path: "/api/prices"},
+		{method: http.MethodGet, path: "/api/mpc/plan"},
+		// Dashboard poll — must stay open so lan_auth does not pop a login
+		// on every 2s status tick.
+		{method: http.MethodGet, path: "/api/loadpoints"},
+		{method: http.MethodGet, path: "/api/history"},
 	} {
 		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
 			req := httptest.NewRequest(tc.method, "http://ftw.local:8080"+tc.path, nil)
@@ -141,7 +214,7 @@ func TestSecureMutationsLeavesOrdinaryReadsAndOAuthCallbackCompatible(t *testing
 			req.Header.Set("Origin", "https://identity.example")
 			req.Header.Set("Sec-Fetch-Site", "cross-site")
 			rr := httptest.NewRecorder()
-			SecureMutations(statusHandler(http.StatusNoContent), MutationPolicy{}).ServeHTTP(rr, req)
+			Authenticate(statusHandler(http.StatusNoContent), MutationPolicy{}).ServeHTTP(rr, req)
 			if rr.Code != http.StatusNoContent {
 				t.Fatalf("status = %d, want 204 (body=%s)", rr.Code, rr.Body.String())
 			}
@@ -149,33 +222,77 @@ func TestSecureMutationsLeavesOrdinaryReadsAndOAuthCallbackCompatible(t *testing
 	}
 }
 
-func TestSecureMutationsRequiresRemoteTokenForSemanticallyActiveRead(t *testing.T) {
+func TestAuthenticateRequiresRemoteTokenForProtectedReads(t *testing.T) {
 	policy := MutationPolicy{RequireTokenForRemote: true, Token: testMutationToken}
-	request := func(auth string) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodGet, "https://ftw.example.com/api/scan", nil)
-		req.RemoteAddr = "192.168.1.10:43210"
-		req.Header.Set("Origin", "https://ftw.example.com")
-		req.Header.Set("Sec-Fetch-Site", "same-origin")
-		if auth != "" {
-			req.Header.Set("Authorization", auth)
-		}
-		rr := httptest.NewRecorder()
-		SecureMutations(statusHandler(http.StatusNoContent), policy).ServeHTTP(rr, req)
-		return rr
-	}
+	for _, path := range []string{
+		"/api/scan",
+		"/api/backups",
+		"/api/backups/ftw-full-backup-20260731T120000Z.ftwbak",
+		"/api/caldav/credentials",
+		"/api/config",
+		"/api/support/dump",
+		"/api/support/report",
+		"/api/logs",
+		"/api/system/info",
+		"/api/storage/inventory",
+		"/api/research/load/dump",
+		"/api/app-link/devices",
+		"/api/devices",
+		"/api/drivers/catalog",
+		"/api/drivers/sonnen",
+		"/api/drivers/sonnen/source",
+		"/api/drivers/sonnen/logs",
+		"/api/device_repository/status",
+		"/api/components",
+		"/api/components/history",
+		"/api/ha/status",
+		"/api/caldav/status",
+		"/api/notifications/status",
+		"/api/notifications/history",
+		"/api/notifications/rules",
+		"/api/version/snapshots",
+		"/api/drivers",
+		"/api/drivers/sonnen/draft",
+		"/api/ev/status",
+		"/api/series",
+		"/api/series/catalog",
+		"/api/mpc/diagnose",
+		"/api/mpc/diagnose/history",
+		"/api/fleet-ping",
+		"/api/device_repository/catalog",
+		"/api/device_repository/drivers/sonnen/versions",
+		"/api/app-link/status",
+	} {
+		t.Run(path, func(t *testing.T) {
+			request := func(auth string) *httptest.ResponseRecorder {
+				req := httptest.NewRequest(http.MethodGet, "https://ftw.example.com"+path, nil)
+				req.RemoteAddr = "192.168.1.10:43210"
+				req.Header.Set("Origin", "https://ftw.example.com")
+				req.Header.Set("Sec-Fetch-Site", "same-origin")
+				if auth != "" {
+					req.Header.Set("Authorization", auth)
+				}
+				rr := httptest.NewRecorder()
+				Authenticate(statusHandler(http.StatusNoContent), policy).ServeHTTP(rr, req)
+				return rr
+			}
 
-	if rr := request(""); rr.Code != http.StatusUnauthorized {
-		t.Fatalf("missing token status = %d, want 401", rr.Code)
-	}
-	if rr := request("Bearer " + testMutationToken); rr.Code != http.StatusNoContent {
-		t.Fatalf("valid token status = %d, want 204 (body=%s)", rr.Code, rr.Body.String())
+			if rr := request(""); rr.Code != http.StatusUnauthorized {
+				t.Fatalf("missing token status = %d, want 401", rr.Code)
+			} else if got := rr.Header().Get("Cache-Control"); got != "no-store" {
+				t.Fatalf("missing token Cache-Control = %q, want no-store", got)
+			}
+			if rr := request("Bearer " + testMutationToken); rr.Code != http.StatusNoContent {
+				t.Fatalf("valid token status = %d, want 204 (body=%s)", rr.Code, rr.Body.String())
+			}
+		})
 	}
 }
 
-func TestSecureMutationsAllowsSameOriginAndLocalCLIFlows(t *testing.T) {
+func TestAuthenticateAllowsSameOriginAndLocalCLIFlows(t *testing.T) {
 	for _, endpoint := range sensitiveMutations {
 		t.Run(endpoint.name+" same-origin browser", func(t *testing.T) {
-			h := SecureMutations(statusHandler(http.StatusNoContent), MutationPolicy{RequireTokenForRemote: true})
+			h := Authenticate(statusHandler(http.StatusNoContent), MutationPolicy{RequireTokenForRemote: true})
 			req := mutationRequest(endpoint, "http://ftw.local:8080")
 			req.Header.Set("Origin", "http://ftw.local:8080")
 			req.Header.Set("Sec-Fetch-Site", "same-origin")
@@ -187,7 +304,7 @@ func TestSecureMutationsAllowsSameOriginAndLocalCLIFlows(t *testing.T) {
 		})
 
 		t.Run(endpoint.name+" private-address CLI", func(t *testing.T) {
-			h := SecureMutations(statusHandler(http.StatusNoContent), MutationPolicy{RequireTokenForRemote: true})
+			h := Authenticate(statusHandler(http.StatusNoContent), MutationPolicy{RequireTokenForRemote: true})
 			req := mutationRequest(endpoint, "http://192.168.1.42:8080")
 			rr := httptest.NewRecorder()
 			h.ServeHTTP(rr, req)
@@ -198,7 +315,7 @@ func TestSecureMutationsAllowsSameOriginAndLocalCLIFlows(t *testing.T) {
 	}
 }
 
-func TestSecureMutationsRequiresBearerTokenForRemoteHost(t *testing.T) {
+func TestAuthenticateRequiresBearerTokenForRemoteHost(t *testing.T) {
 	policy := MutationPolicy{RequireTokenForRemote: true, Token: testMutationToken}
 	request := func(auth string) *httptest.ResponseRecorder {
 		req := mutationRequest(sensitiveMutations[0], "https://ftw.example.com")
@@ -208,7 +325,7 @@ func TestSecureMutationsRequiresBearerTokenForRemoteHost(t *testing.T) {
 			req.Header.Set("Authorization", auth)
 		}
 		rr := httptest.NewRecorder()
-		SecureMutations(statusHandler(http.StatusNoContent), policy).ServeHTTP(rr, req)
+		Authenticate(statusHandler(http.StatusNoContent), policy).ServeHTTP(rr, req)
 		return rr
 	}
 
@@ -226,23 +343,35 @@ func TestSecureMutationsRequiresBearerTokenForRemoteHost(t *testing.T) {
 	req := mutationRequest(sensitiveMutations[0], "https://ftw.example.com")
 	req.Header.Set("Origin", "https://ftw.example.com")
 	rr := httptest.NewRecorder()
-	SecureMutations(statusHandler(http.StatusNoContent), locked).ServeHTTP(rr, req)
+	Authenticate(statusHandler(http.StatusNoContent), locked).ServeHTTP(rr, req)
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("unconfigured remote policy status = %d, want 403", rr.Code)
 	}
 }
 
-func TestSecureMutationsRemoteClientCannotSpoofLocalHost(t *testing.T) {
+func TestAuthenticateNoDotHostIsNotLocal(t *testing.T) {
+	req := mutationRequest(sensitiveMutations[4], "http://intranet:8080")
+	req.RemoteAddr = "192.168.1.10:43210"
+	req.Header.Set("Origin", "http://intranet:8080")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	rr := httptest.NewRecorder()
+	Authenticate(statusHandler(http.StatusNoContent), MutationPolicy{RequireTokenForRemote: true}).ServeHTTP(rr, req)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("no-dot host status = %d, want 403 (body=%s)", rr.Code, rr.Body.String())
+	}
+}
+
+func TestAuthenticateRemoteClientCannotSpoofLocalHost(t *testing.T) {
 	req := mutationRequest(sensitiveMutations[4], "http://192.168.1.42:8080")
 	req.RemoteAddr = "203.0.113.10:43210"
 	rr := httptest.NewRecorder()
-	SecureMutations(statusHandler(http.StatusNoContent), MutationPolicy{RequireTokenForRemote: true}).ServeHTTP(rr, req)
+	Authenticate(statusHandler(http.StatusNoContent), MutationPolicy{RequireTokenForRemote: true}).ServeHTTP(rr, req)
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403 (body=%s)", rr.Code, rr.Body.String())
 	}
 }
 
-func TestSecureMutationsRequiresJSONContentTypeForBodies(t *testing.T) {
+func TestAuthenticateRequiresJSONContentTypeForBodies(t *testing.T) {
 	for _, endpoint := range sensitiveMutations {
 		if endpoint.body == "" {
 			continue
@@ -250,7 +379,7 @@ func TestSecureMutationsRequiresJSONContentTypeForBodies(t *testing.T) {
 		t.Run(endpoint.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "http://ftw.local:8080"+endpoint.path, strings.NewReader(endpoint.body))
 			rr := httptest.NewRecorder()
-			SecureMutations(statusHandler(http.StatusNoContent), MutationPolicy{}).ServeHTTP(rr, req)
+			Authenticate(statusHandler(http.StatusNoContent), MutationPolicy{}).ServeHTTP(rr, req)
 			if rr.Code != http.StatusUnsupportedMediaType {
 				t.Fatalf("missing Content-Type status = %d, want 415", rr.Code)
 			}
@@ -258,7 +387,7 @@ func TestSecureMutationsRequiresJSONContentTypeForBodies(t *testing.T) {
 			req = mutationRequest(endpoint, "http://ftw.local:8080")
 			req.Header.Set("Content-Type", "application/json; charset=utf-8")
 			rr = httptest.NewRecorder()
-			SecureMutations(statusHandler(http.StatusNoContent), MutationPolicy{}).ServeHTTP(rr, req)
+			Authenticate(statusHandler(http.StatusNoContent), MutationPolicy{}).ServeHTTP(rr, req)
 			if rr.Code != http.StatusNoContent {
 				t.Fatalf("JSON Content-Type status = %d, want 204", rr.Code)
 			}
@@ -266,18 +395,18 @@ func TestSecureMutationsRequiresJSONContentTypeForBodies(t *testing.T) {
 	}
 }
 
-func TestSecureMutationsRejectsOriginMismatchEvenWhenFetchSiteClaimsSameOrigin(t *testing.T) {
+func TestAuthenticateRejectsOriginMismatchEvenWhenFetchSiteClaimsSameOrigin(t *testing.T) {
 	req := mutationRequest(sensitiveMutations[1], "http://192.168.1.42:8080")
 	req.Header.Set("Origin", "http://192.168.1.99:8080")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	rr := httptest.NewRecorder()
-	SecureMutations(statusHandler(http.StatusNoContent), MutationPolicy{}).ServeHTTP(rr, req)
+	Authenticate(statusHandler(http.StatusNoContent), MutationPolicy{}).ServeHTTP(rr, req)
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403", rr.Code)
 	}
 }
 
-func TestSecureMutationsRejectsInvalidHostAndFetchMetadata(t *testing.T) {
+func TestAuthenticateRejectsInvalidHostAndFetchMetadata(t *testing.T) {
 	tests := []struct {
 		name       string
 		host       string
@@ -301,7 +430,7 @@ func TestSecureMutationsRejectsInvalidHostAndFetchMetadata(t *testing.T) {
 				req.Header.Set("Sec-Fetch-Site", tc.fetchSite)
 			}
 			rr := httptest.NewRecorder()
-			SecureMutations(statusHandler(http.StatusNoContent), MutationPolicy{}).ServeHTTP(rr, req)
+			Authenticate(statusHandler(http.StatusNoContent), MutationPolicy{}).ServeHTTP(rr, req)
 			if rr.Code != tc.wantStatus {
 				t.Fatalf("status = %d, want %d", rr.Code, tc.wantStatus)
 			}
@@ -330,6 +459,28 @@ func TestServerHandlerAppliesMutationSecurity(t *testing.T) {
 	}
 }
 
+func TestServerHandlerSetsSecurityHeaders(t *testing.T) {
+	srv := New(&Deps{})
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	assertSecurityHeaders(t, rr)
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf("Access-Control-Allow-Origin = %q, want empty", got)
+	}
+}
+
+func TestWithSecurityHeadersAppliesOnEveryStatus(t *testing.T) {
+	h := WithSecurityHeaders(statusHandler(http.StatusNotFound))
+	req := httptest.NewRequest(http.MethodGet, "/missing", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rr.Code)
+	}
+	assertSecurityHeaders(t, rr)
+}
+
 func TestJSONResponsesDoNotAdvertiseWildcardCORS(t *testing.T) {
 	rr := httptest.NewRecorder()
 	writeJSON(rr, http.StatusOK, map[string]string{"status": "ok"})
@@ -355,4 +506,19 @@ func mutationRequest(endpoint sensitiveMutation, baseURL string) *http.Request {
 
 func statusHandler(status int) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(status) })
+}
+
+func assertSecurityHeaders(t *testing.T, rr *httptest.ResponseRecorder) {
+	t.Helper()
+	want := map[string]string{
+		"Content-Security-Policy": "frame-ancestors 'none'",
+		"X-Frame-Options":         "DENY",
+		"X-Content-Type-Options":  "nosniff",
+		"Referrer-Policy":         "no-referrer",
+	}
+	for name, value := range want {
+		if got := rr.Header().Get(name); got != value {
+			t.Errorf("%s = %q, want %q", name, got, value)
+		}
+	}
 }

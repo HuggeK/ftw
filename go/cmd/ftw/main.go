@@ -25,11 +25,21 @@ import (
 	"syscall"
 	"time"
 
+	// Embed the zoneinfo database as a fallback. The image's system tree still
+	// wins whenever it is present; this exists so time.Local can never silently
+	// degrade to UTC and mis-time price and plan windows if a base image ships
+	// without tzdata. The failure it guards against is invisible — production
+	// code reads time.Local, and the tzdata tests skip rather than fail — so the
+	// ~450 KB is worth it.
+	_ "time/tzdata"
+
 	"github.com/srcfl/ftw/go/internal/api"
+	"github.com/srcfl/ftw/go/internal/appuplink"
 	"github.com/srcfl/ftw/go/internal/arp"
 	"github.com/srcfl/ftw/go/internal/battery"
 	"github.com/srcfl/ftw/go/internal/caldavserver"
 	"github.com/srcfl/ftw/go/internal/calendar"
+	"github.com/srcfl/ftw/go/internal/components"
 	"github.com/srcfl/ftw/go/internal/config"
 	"github.com/srcfl/ftw/go/internal/configreload"
 	"github.com/srcfl/ftw/go/internal/control"
@@ -49,6 +59,7 @@ import (
 	mqttcli "github.com/srcfl/ftw/go/internal/mqtt"
 	"github.com/srcfl/ftw/go/internal/notifications"
 	"github.com/srcfl/ftw/go/internal/nova"
+	"github.com/srcfl/ftw/go/internal/ocpp"
 	"github.com/srcfl/ftw/go/internal/priceforecast"
 	"github.com/srcfl/ftw/go/internal/prices"
 	"github.com/srcfl/ftw/go/internal/proxy"
@@ -63,10 +74,96 @@ import (
 // local runs.
 var Version = "dev"
 
+// CandidateTag gets injected into release container builds. It binds the
+// binary to the one beta identity that produced the image manifest.
+var CandidateTag = ""
+
+// runtimeVersionFromImageTag lets one content-addressed image serve first as
+// a beta candidate and then as stable without changing its bytes. Release
+// images bake the stable product version into the binary. docker-compose
+// supplies the immutable deployed tag. The process accepts only the stable
+// identity and the exact beta identity bound into the binary at build time.
+func runtimeVersionFromImageTag(baked, candidate, imageTag string) (string, bool) {
+	imageTag = strings.TrimSpace(imageTag)
+	if imageTag == "" {
+		return baked, false
+	}
+	base, stable := releaseVersionBase(baked)
+	if !stable || base != baked {
+		return baked, false
+	}
+	if imageTag == baked {
+		return baked, true
+	}
+	candidateBase, beta := releaseVersionBase(candidate)
+	if !beta || candidateBase != baked || candidate == candidateBase || imageTag != candidate {
+		return baked, false
+	}
+	return candidate, true
+}
+
+func releaseVersionBase(tag string) (string, bool) {
+	if !strings.HasPrefix(tag, "v") {
+		return "", false
+	}
+	base := tag
+	if i := strings.Index(base, "-beta."); i >= 0 {
+		if i+len("-beta.") == len(base) || !decimalDigits(base[i+len("-beta."):]) {
+			return "", false
+		}
+		base = base[:i]
+	} else if strings.Contains(base, "-") {
+		return "", false
+	}
+	parts := strings.Split(strings.TrimPrefix(base, "v"), ".")
+	if len(parts) != 3 {
+		return "", false
+	}
+	for _, part := range parts {
+		if part == "" || !decimalDigits(part) {
+			return "", false
+		}
+	}
+	return base, true
+}
+
+func decimalDigits(s string) bool {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return s != ""
+}
+
+// controlSlotDirectiveFromMPC keeps the import-cycle bridge explicit. The
+// decision ID is report metadata; control does not use it for dispatch math.
+func controlSlotDirectiveFromMPC(d mpc.SlotDirective) control.SlotDirective {
+	return control.SlotDirective{
+		DecisionID:          d.DecisionID,
+		SlotStart:           d.SlotStart,
+		SlotEnd:             d.SlotEnd,
+		BatteryEnergyWh:     d.BatteryEnergyWh,
+		SoCTarget:           d.SoCTarget,
+		Strategy:            string(d.Strategy),
+		PVLimitW:            d.PVLimitW,
+		PlannedGridW:        d.GridW,
+		HasPlannedGridW:     true,
+		LivePVSurplusSoCCap: d.LivePVSurplusSoCCap,
+		LoadpointEnergyWh:   d.LoadpointEnergyWh,
+	}
+}
+
+// siteIdentityLoad is the machine's own identity, not a user's.
+//
+// Bound is set when nova.key has been adopted into a hardware-protected
+// binding. It outlived Home Link, which is what first needed it: the binding
+// is what stops a box from quietly minting a replacement key and losing its
+// Nova claim when the sidecar state is incomplete.
 type siteIdentityLoad struct {
-	Nova     *nova.Identity
-	HomeLink gatewayidentity.Identity
-	Binding  gatewayidentity.SoftwareBinding
+	Nova    *nova.Identity
+	Bound   gatewayidentity.Identity
+	Binding gatewayidentity.SoftwareBinding
 }
 
 func loadSiteIdentity(keyPath string) (siteIdentityLoad, error) {
@@ -88,7 +185,7 @@ func loadSiteIdentityWith(
 	switch {
 	case err == nil:
 		if identity == nil {
-			return siteIdentityLoad{}, errors.New("bound home link identity is nil")
+			return siteIdentityLoad{}, errors.New("bound gateway identity is nil")
 		}
 		existing, loadErr := loadNovaExisting(keyPath)
 		if loadErr != nil {
@@ -99,14 +196,14 @@ func loadSiteIdentityWith(
 		}
 		publicKey := identity.PublicKey()
 		if existing.PublicKeyHex() != hex.EncodeToString(publicKey) {
-			return siteIdentityLoad{}, errors.New("nova and home link identities use different keys")
+			return siteIdentityLoad{}, errors.New("nova and bound gateway identities use different keys")
 		}
 		publicHash := sha256.Sum256(publicKey)
 		if binding.PublicKeySHA256 != hex.EncodeToString(publicHash[:]) {
-			return siteIdentityLoad{}, errors.New("home link binding key hash changed")
+			return siteIdentityLoad{}, errors.New("gateway binding key hash changed")
 		}
 		return siteIdentityLoad{
-			Nova: existing, HomeLink: identity, Binding: binding,
+			Nova: existing, Bound: identity, Binding: binding,
 		}, nil
 	case errors.Is(err, gatewayidentity.ErrBindingNotAdopted),
 		errors.Is(err, gatewayidentity.ErrUnsupportedBinding),
@@ -134,33 +231,38 @@ func loadSiteIdentityWith(
 	}
 }
 
-func runHomeLinkAdopt(args []string) {
-	if err := adoptHomeLinkIdentity(args, os.Stdout); err != nil {
-		slog.Error("home link identity adoption failed", "err", err)
+func runGatewayIdentityAdopt(args []string) {
+	if err := adoptGatewayIdentity(args, os.Stdout); err != nil {
+		slog.Error("gateway identity adoption failed", "err", err)
 		os.Exit(2)
 	}
 }
 
-func adoptHomeLinkIdentity(args []string, out io.Writer) error {
-	return adoptHomeLinkIdentityWith(
+func adoptGatewayIdentity(args []string, out io.Writer) error {
+	return adoptGatewayIdentityWith(
 		args,
 		out,
 		gatewayidentity.PreviewSoftwareBinding,
 		gatewayidentity.ApplySoftwareBinding,
 		gatewayidentity.LoadBoundSoftwareIdentity,
-		gatewayidentity.RouteHandle,
 	)
 }
 
-func adoptHomeLinkIdentityWith(
+// adoptGatewayIdentityWith binds an existing nova.key to this machine.
+//
+// The sidecar files it writes are still called nova.key.home-link.{state,json}
+// and the confirmation is still domain-separated as home-link adoption. Those
+// names are on disk on shipped boxes, so renaming them would orphan every
+// gateway already adopted. The subcommand is not: it was only ever named after
+// the first feature that needed a bound identity.
+func adoptGatewayIdentityWith(
 	args []string,
 	out io.Writer,
 	preview func(context.Context, string) (gatewayidentity.SoftwareBindingPreview, error),
 	apply func(context.Context, string, string) (gatewayidentity.SoftwareBinding, error),
 	load func(string) (gatewayidentity.Identity, gatewayidentity.SoftwareBinding, error),
-	routeHandle func([]byte) (string, error),
 ) error {
-	flags := flag.NewFlagSet("home-link-adopt", flag.ContinueOnError)
+	flags := flag.NewFlagSet("gateway-identity-adopt", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	keyPath := flags.String("key", "", "Path to the existing canonical nova.key")
 	confirmation := flags.String("confirm", "", "Exact confirmation from a fresh preview")
@@ -168,7 +270,7 @@ func adoptHomeLinkIdentityWith(
 		return err
 	}
 	if flags.NArg() != 0 || strings.TrimSpace(*keyPath) == "" {
-		return errors.New("home-link-adopt requires --key=<existing nova.key>")
+		return errors.New("gateway-identity-adopt requires --key=<existing nova.key>")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -196,14 +298,10 @@ func adoptHomeLinkIdentityWith(
 		return err
 	}
 	if loaded != binding {
-		return errors.New("adopted home link identity changed while reopening")
+		return errors.New("adopted gateway identity changed while reopening")
 	}
 	if identity == nil {
-		return errors.New("adopted home link identity is nil")
-	}
-	handle, err := routeHandle(identity.PublicKey())
-	if err != nil {
-		return err
+		return errors.New("adopted gateway identity is nil")
 	}
 	name, err := gatewayidentity.ThreeWordName(binding.GatewayID)
 	if err != nil {
@@ -211,20 +309,25 @@ func adoptHomeLinkIdentityWith(
 	}
 	_, err = fmt.Fprintf(
 		out,
-		"gateway_id=%s\nthree_word_name=%s\nkey_fingerprint_sha256=%s\nroute_handle=%s\n",
-		binding.GatewayID, name, binding.PublicKeySHA256, handle,
+		"gateway_id=%s\nthree_word_name=%s\nkey_fingerprint_sha256=%s\n",
+		binding.GatewayID, name, binding.PublicKeySHA256,
 	)
 	return err
 }
 
 func main() {
+	imageTag := os.Getenv("FTW_IMAGE_TAG")
+	builtVersion := Version
+	resolvedVersion, imageTagApplied := runtimeVersionFromImageTag(builtVersion, CandidateTag, imageTag)
+	Version = resolvedVersion
+
 	// Subcommand dispatch — a bare first non-flag argument selects one
 	// of the bootstrap CLIs, e.g. `ftw nova-claim --url=…`.
 	// Everything else is the long-running service.
 	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
 		switch os.Args[1] {
-		case "home-link-adopt":
-			runHomeLinkAdopt(os.Args[2:])
+		case "gateway-identity-adopt":
+			runGatewayIdentityAdopt(os.Args[2:])
 			return
 		case "nova-claim":
 			// Shift os.Args so the subcommand's flag.FlagSet sees its own flags.
@@ -270,6 +373,9 @@ func main() {
 	stdoutHandler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
 	logger := slog.New(telemetry.NewLogHandler(stdoutHandler, logRing))
 	slog.SetDefault(logger)
+	if imageTag != "" && !imageTagApplied {
+		slog.Warn("ignoring FTW_IMAGE_TAG that does not match a built release identity", "built_version", builtVersion, "built_candidate", CandidateTag, "image_tag", imageTag)
+	}
 	slog.Info("FTW starting", "version", Version, "config", *configPath)
 
 	// Route "drivers/<name>.lua" path resolution through the drivers dir
@@ -292,6 +398,11 @@ func main() {
 		os.Exit(1)
 	}
 	slog.Info("config loaded", "site", cfg.Site.Name, "drivers", len(cfg.Drivers))
+	// Repaired-but-wrong config: ERROR so it reaches the log ring and the
+	// support report, without stopping a boot the repair made safe.
+	for _, w := range cfg.LoadWarnings {
+		slog.Error(w)
+	}
 
 	// ---- Open persistent state (SQLite) ----
 	statePath := "state.db"
@@ -330,10 +441,16 @@ func main() {
 	// observed 2026-07-16 as an auto-rollback in the middle of a VACUUM.
 	// Until the real mux is wired, /api/health answers 200 "starting" and
 	// everything else 503.
+	// Closures start unbound (lan_auth off) so the boot-phase health
+	// listener does not lock the box before state.db is open.
+	lanAuth := &lanAuthLookups{}
+	bootPolicy := apiMutationPolicy()
+	bootPolicy.LANAuthEnabled = lanAuth.Enabled
+	bootPolicy.VerifyLANSecret = lanAuth.Verify
 	apiHandler := newSwappableHandler(bootPhaseHandler())
 	httpSrv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.API.Port),
-		Handler:           api.SecureMutations(apiHandler, apiMutationPolicy()),
+		Handler:           api.WithSecurityHeaders(api.Authenticate(apiHandler, bootPolicy)),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	go func() {
@@ -420,6 +537,29 @@ func main() {
 	if v, ok := st.LoadConfig("mode"); ok {
 		if m := control.Mode(v); control.IsValidMode(m) {
 			ctrl.Mode = m
+		}
+	}
+	storedTrust, _ := st.LoadConfig(config.StateKeyForecastTrust)
+	storedExport, _ := st.LoadConfig(config.StateKeyBatteryExport)
+	yamlTrust, yamlExport := "", ""
+	if cfg.Planner != nil {
+		yamlTrust = cfg.Planner.ForecastTrust
+		yamlExport = cfg.Planner.BatteryExport
+	}
+	trust, export, missingPrefs := config.ResolvePlannerPrefs(storedTrust, storedExport, string(ctrl.Mode), yamlTrust, yamlExport)
+	plannerPrefs := config.NewPlannerPrefs(trust, export)
+	if missingPrefs {
+		if err := st.SaveConfig(config.StateKeyForecastTrust, string(trust)); err != nil {
+			slog.Warn("failed to persist forecast_trust", "err", err)
+		}
+		if err := st.SaveConfig(config.StateKeyBatteryExport, string(export)); err != nil {
+			slog.Warn("failed to persist battery_export", "err", err)
+		}
+	}
+	if ctrl.Mode == control.ModePlannerArbitrage && export != config.BatteryExportAllowed {
+		ctrl.Mode = control.ModePlannerPassiveArbitrage
+		if err := st.SaveConfig("mode", string(ctrl.Mode)); err != nil {
+			slog.Warn("failed to persist mode after export migration", "err", err)
 		}
 	}
 	if v, ok := st.LoadConfig("grid_target_w"); ok {
@@ -513,10 +653,10 @@ func main() {
 		}
 	}
 	reg.MQTTFactory = func(name string, c *config.MQTTConfig) (drivers.MQTTCap, error) {
-		return mqttcli.Dial(c.Host, c.Port, c.Username, c.Password, "ftw-"+name)
+		return mqttcli.DialWithOptions(c.Host, c.Port, c.Username, c.Password, "ftw-"+name, c.AllowUnverifiedLocal)
 	}
 	reg.ModbusFactory = func(name string, c *config.ModbusConfig) (drivers.ModbusCap, error) {
-		return modbuscli.Dial(c.Host, c.Port, c.UnitID)
+		return modbuscli.DialWithOptions(c.Host, c.Port, c.UnitID, c.AllowUnverifiedLocal)
 	}
 	reg.SerialFactory = func(name string, c *config.SerialConfig) (drivers.SerialCap, error) {
 		return drivers.OpenSerial(c)
@@ -537,6 +677,18 @@ func main() {
 		}
 	}
 	defer reg.ShutdownAll()
+	batteryIdentity := func(name string) (string, bool) {
+		return runningDeviceID(reg, name)
+	}
+	ctrl.BatteryHoldTargetValid = func(name, deviceID string) bool {
+		currentID, ok := batteryIdentity(name)
+		if !ok || currentID != deviceID {
+			return false
+		}
+		health := tel.DriverHealth(name)
+		reading := tel.Get(name, telemetry.DerBattery)
+		return health != nil && health.IsOnline() && reading != nil && reading.SoC != nil
+	}
 
 	// ---- Identity bootstrap ----
 	// Drivers report make/serial inside driver_init via host.set_make / set_sn,
@@ -556,6 +708,13 @@ func main() {
 
 	// ---- Shared mutexes for API/control/models ----
 	ctrlMu := &sync.Mutex{}
+	// The revision of controllable state. The app sends the revision a
+	// command expected to act against and the box refuses the command when
+	// they differ, so this has to move whenever the mode, the targets or the
+	// ceilings do. It is derived from the state rather than incremented at
+	// each mutation site, because control is written from four places and a
+	// counter every one of them had to remember would be wrong within a month.
+	controlRev := &control.Revision{}
 	capMu := &sync.RWMutex{}
 	cfgMu := &sync.RWMutex{}
 	modelsMu := &sync.Mutex{}
@@ -710,224 +869,267 @@ func main() {
 	// hot-reload the calendar client (#498). Assigned later (calendar.New).
 	var calSvc *calendar.Service
 
+	// Forward-declared so the reload callback can keep the OCPP quarantine
+	// in step with hot-reloaded loadpoints — adopting a pending charger is
+	// naming it in a charger entry, and must take effect on the same save.
+	// Assigned where the OCPP server starts (optional; nil-guarded).
+	var ocppSrv *ocpp.Server
+
 	// ---- Config hot-reload watcher ----
-	watcher, err := configreload.New(*configPath, cfgMu, cfg, ctrlMu, ctrl,
-		func(newCfg, oldCfg *config.Config) {
-			// Restore EV charger password from state.db (not in YAML).
-			if newCfg.EVCharger != nil {
-				if pw, ok := st.LoadConfig("ev_charger_password"); ok {
-					newCfg.EVCharger.Password = pw
-				}
+	// Named because two callers share it: the fsnotify watcher created
+	// below and POST /api/config (Deps.ConfigApplier), so a config saved
+	// through the API is applied exactly like an edit of the file (#760).
+	applyConfigChange := func(newCfg, oldCfg *config.Config) {
+		// Restore EV charger password from state.db (not in YAML).
+		if newCfg.EVCharger != nil {
+			if pw, ok := st.LoadConfig("ev_charger_password"); ok {
+				newCfg.EVCharger.Password = pw
 			}
-			// Restore CalDAV password from state.db (not in YAML). Any CalDAV
-			// change is restart-gated because the native server and client must
-			// switch credentials, paths, and listeners atomically.
-			if newCfg.CalDAV != nil {
-				if pw, ok := st.LoadConfig("caldav_password"); ok {
-					newCfg.CalDAV.Password = pw
-				}
+		}
+		// Restore CalDAV password from state.db (not in YAML). Any CalDAV
+		// change is restart-gated because the native server and client must
+		// switch credentials, paths, and listeners atomically.
+		if newCfg.CalDAV != nil {
+			if pw, ok := st.LoadConfig("caldav_password"); ok {
+				newCfg.CalDAV.Password = pw
 			}
-			// Driver paths are already resolved by config.Load; no extra
-			// work needed here. Re-apply the battery SoC-window → driver
-			// config mapping so a hot-edited soc_max reaches the driver too.
-			reg.Reload(ctx,
-				config.WithBatterySoCBounds(newCfg.Drivers, newCfg.Batteries),
-				newCfg.Site.TroubleshootingMode)
-			// Refresh capacities — mutate the existing map in place so
-			// Deps.Capacities (a map header captured at init) sees the
-			// update. Rebinding the local variable would orphan the
-			// reference the api server still holds.
-			capMu.Lock()
-			for k := range capacities {
-				delete(capacities, k)
-			}
-			for k := range telemetryCapacities {
-				delete(telemetryCapacities, k)
-			}
-			// Re-scan the catalog so a hot-edited Lua driver's
-			// capability change is picked up by the EV-classification
-			// filter on the very next reload tick.
-			reloadCatalog, err := drivers.LoadCatalogMulti(*userDriversDirFlag, resolveDriverDir())
-			if err != nil || len(reloadCatalog) == 0 {
-				slog.Warn("driver catalog reload failed; retaining last known catalog",
-					"err", err, "entries", len(reloadCatalog))
-				reloadCatalog = driverCatalog
-			} else {
-				driverCatalog = reloadCatalog
-			}
-			for k, v := range driverCapacitiesFrom(newCfg.Drivers, newCfg.Loadpoints, reloadCatalog, true) {
-				capacities[k] = v
-			}
-			for k, v := range driverCapacitiesFrom(newCfg.Drivers, newCfg.Loadpoints, reloadCatalog, false) {
-				telemetryCapacities[k] = v
-			}
-			observeOnly = config.ObserveOnlyDriverSet(newCfg)
-			capMu.Unlock()
-			warnIfEVHasBatteryCapacity(newCfg.Drivers, newCfg.Loadpoints, reloadCatalog)
+		}
+		// Driver paths are already resolved by config.Load; no extra
+		// work needed here. Re-apply the battery SoC-window → driver
+		// config mapping so a hot-edited soc_max reaches the driver too.
+		reg.Reload(ctx,
+			config.WithBatterySoCBounds(newCfg.Drivers, newCfg.Batteries),
+			newCfg.Site.TroubleshootingMode)
+		// Refresh capacities — mutate the existing map in place so
+		// Deps.Capacities (a map header captured at init) sees the
+		// update. Rebinding the local variable would orphan the
+		// reference the api server still holds.
+		capMu.Lock()
+		for k := range capacities {
+			delete(capacities, k)
+		}
+		for k := range telemetryCapacities {
+			delete(telemetryCapacities, k)
+		}
+		// Re-scan the catalog so a hot-edited Lua driver's
+		// capability change is picked up by the EV-classification
+		// filter on the very next reload tick.
+		reloadCatalog, err := drivers.LoadCatalogMulti(*userDriversDirFlag, resolveDriverDir())
+		if err != nil || len(reloadCatalog) == 0 {
+			slog.Warn("driver catalog reload failed; retaining last known catalog",
+				"err", err, "entries", len(reloadCatalog))
+			reloadCatalog = driverCatalog
+		} else {
+			driverCatalog = reloadCatalog
+		}
+		for k, v := range driverCapacitiesFrom(newCfg.Drivers, newCfg.Loadpoints, reloadCatalog, true) {
+			capacities[k] = v
+		}
+		for k, v := range driverCapacitiesFrom(newCfg.Drivers, newCfg.Loadpoints, reloadCatalog, false) {
+			telemetryCapacities[k] = v
+		}
+		observeOnly = config.ObserveOnlyDriverSet(newCfg)
+		capMu.Unlock()
+		warnIfEVHasBatteryCapacity(newCfg.Drivers, newCfg.Loadpoints, reloadCatalog)
 
-			// Swap inverter-group tags (#143) and per-driver power
-			// limits (#145) together. Taken under ctrlMu because
-			// ComputeDispatch reads State.InverterGroups + .DriverLimits;
-			// a bare replace would race with the control loop's 5 s tick.
-			ctrlMu.Lock()
-			ctrl.InverterGroups = inverterGroupsFrom(newCfg.Drivers)
-			ctrl.SupportsPVCurtail = supportsPVCurtailFrom(newCfg.Drivers)
-			ctrl.DriverLimits = driverLimitsFrom(newCfg.Drivers, newCfg.Batteries)
-			// Fuse params + safety margin: previously startup-only.
-			// Hot-reload them so operators can tune the per-phase margin
-			// from the UI without restarting (e.g. raising it after the
-			// inverter's own protection trips, lowering it to recover
-			// last few hundred W of arbitrage headroom).
-			ctrl.SiteFuseAmps = newCfg.Fuse.MaxAmps
-			ctrl.SiteFuseVoltage = newCfg.Fuse.Voltage
-			ctrl.SiteFusePhases = newCfg.Fuse.Phases
-			// Mirror the startup-path default semantics — nil → 0.5,
-			// explicit 0 → disabled. See EffectiveSafetyMarginA.
-			ctrl.SiteFuseSafetyA = newCfg.Fuse.EffectiveSafetyMarginA()
-			ctrl.MaxExportW = newCfg.Site.MaxExportW
-			ctrlMu.Unlock()
+		// Swap inverter-group tags (#143) and per-driver power
+		// limits (#145) together. Taken under ctrlMu because
+		// ComputeDispatch reads State.InverterGroups + .DriverLimits;
+		// a bare replace would race with the control loop's 5 s tick.
+		ctrlMu.Lock()
+		ctrl.InverterGroups = inverterGroupsFrom(newCfg.Drivers)
+		ctrl.SupportsPVCurtail = supportsPVCurtailFrom(newCfg.Drivers)
+		ctrl.SolarFeedDrivers = solarFeedDriversFrom(newCfg.Drivers)
+		ctrl.DriverLimits = driverLimitsFrom(newCfg.Drivers, newCfg.Batteries)
+		// Fuse params + safety margin: previously startup-only.
+		// Hot-reload them so operators can tune the per-phase margin
+		// from the UI without restarting (e.g. raising it after the
+		// inverter's own protection trips, lowering it to recover
+		// last few hundred W of arbitrage headroom).
+		ctrl.SiteFuseAmps = newCfg.Fuse.MaxAmps
+		ctrl.SiteFuseVoltage = newCfg.Fuse.Voltage
+		ctrl.SiteFusePhases = newCfg.Fuse.Phases
+		// Mirror the startup-path default semantics — nil → 0.5,
+		// explicit 0 → disabled. See EffectiveSafetyMarginA.
+		ctrl.SiteFuseSafetyA = newCfg.Fuse.EffectiveSafetyMarginA()
+		ctrl.MaxExportW = newCfg.Site.MaxExportW
+		// Lowering the fuse can strand a peak limit that was legal when it
+		// was set. SetPeakLimit refuses to create that state; only a reload
+		// can arrive at it from the other side, and it is silent — the
+		// threshold simply stops being the first thing to bind. Say so
+		// while the operator is still looking at the config they just saved.
+		// Peak shaving only: in every other mode the threshold is unread,
+		// so warning about it would be noise.
+		peakCeilingW, peakDead := ctrl.PeakLimitIsDead()
+		peakLimitW, peakMode := ctrl.PeakLimitW, ctrl.Mode == control.ModePeakShaving
+		ctrlMu.Unlock()
+		if peakDead && peakMode {
+			slog.Warn("peak limit is now above the site's import ceiling and cannot bind",
+				"peak_limit_w", peakLimitW, "import_ceiling_w", peakCeilingW)
+		}
 
-			// Keep the loadpoint controller's per-phase EV fuse clamp in
-			// sync with hot-reloaded fuse params — previously startup-only,
-			// so an operator tuning max_amps / margin from the UI updated
-			// the control-package battery lever (above) but left the EV
-			// clamp on the stale startup value until restart. SetSiteFuse
-			// takes its own lock; call it outside ctrlMu.
-			if lpController != nil {
-				lpController.SetSiteFuse(loadpoint.SiteFuse{
-					MaxAmps:  newCfg.Fuse.MaxAmps,
-					Voltage:  newCfg.Fuse.Voltage,
-					PhaseCnt: newCfg.Fuse.Phases,
-				})
-			}
+		// Keep the loadpoint controller's per-phase EV fuse clamp in
+		// sync with hot-reloaded fuse params — previously startup-only,
+		// so an operator tuning max_amps / margin from the UI updated
+		// the control-package battery lever (above) but left the EV
+		// clamp on the stale startup value until restart. SetSiteFuse
+		// takes its own lock; call it outside ctrlMu.
+		if lpController != nil {
+			lpController.SetSiteFuse(loadpoint.SiteFuse{
+				MaxAmps:  newCfg.Fuse.MaxAmps,
+				Voltage:  newCfg.Fuse.Voltage,
+				PhaseCnt: newCfg.Fuse.Phases,
+			})
+		}
 
-			// Site-meter swap propagation. The configreload watcher
-			// already updated ctrl.SiteMeterDriver under ctrlMu before
-			// this applier ran, so the dispatch loop reads from the
-			// right driver from the next tick. Two more sites cached
-			// the meter at construction and need the same hot-update
-			// treatment:
-			//   - mpc.Service.SiteMeter — used by reactive replan to
-			//     compute actual site load (grid − pv − bat).
-			//   - loadmodel.Service.SiteMeter — drives twin learning;
-			//     leaving it stale teaches the load model from a meter
-			//     that may not even be emitting any more.
-			if newCfg.SiteMeterDriver() != oldCfg.SiteMeterDriver() {
-				if mpcSvc != nil {
-					mpcSvc.SetSiteMeter(newCfg.SiteMeterDriver())
-				}
-				if loadSvc != nil {
-					loadSvc.SetSiteMeter(newCfg.SiteMeterDriver())
-				}
-				slog.Info("site-meter hot-reloaded into mpc + loadmodel",
-					"driver", newCfg.SiteMeterDriver())
-			}
-
-			// Push the new pool totals into the planner so its next
-			// replan uses the right CapacityWh / MaxChargeW /
-			// MaxDischargeW. Without this the MPC keeps the snapshot
-			// it took at buildMPC time; SoC % and terminal credit go
-			// stale after an EV loadpoint is added/removed. Codex P1
-			// on PR #121.
+		// Site-meter swap propagation. The configreload watcher
+		// already updated ctrl.SiteMeterDriver under ctrlMu before
+		// this applier ran, so the dispatch loop reads from the
+		// right driver from the next tick. Two more sites cached
+		// the meter at construction and need the same hot-update
+		// treatment:
+		//   - mpc.Service.SiteMeter — used by reactive replan to
+		//     compute actual site load (grid − pv − bat).
+		//   - loadmodel.Service.SiteMeter — drives twin learning;
+		//     leaving it stale teaches the load model from a meter
+		//     that may not even be emitting any more.
+		if newCfg.SiteMeterDriver() != oldCfg.SiteMeterDriver() {
 			if mpcSvc != nil {
-				fleet := mpcBatteryFleetFromConfig(newCfg, capacities)
-				totalCap, maxChg, maxDis := aggregateBatteryFleetLimits(newCfg, fleet)
-				mpcSvc.UpdateBatteryFleet(fleet, totalCap, maxChg, maxDis)
-				slog.Info("mpc: capacity updated via hot-reload",
-					"capacity_wh", totalCap, "max_charge_w", maxChg, "max_discharge_w", maxDis)
+				mpcSvc.SetSiteMeter(newCfg.SiteMeterDriver())
 			}
-
-			// Hot-reload EV loadpoints so operators can add / remove /
-			// retune them without restarting. Manager preserves
-			// observed state across reloads (plug status, session
-			// anchor, current SoC estimate) — see loadpoint.Manager.Load.
-			lpMgr.Load(buildLoadpointConfigs(newCfg.Loadpoints))
-			hydrateLoadpointSurplusOnly()
-
-			// Notifications: rebuild the provider from fresh config
-			// (handles the cold-start case where the initial config
-			// had no notifications: block and notifProvider was nil),
-			// wire it onto the service, then reset the rule-engine
-			// per-outage latch. All calls are nil-safe.
-			newProv := notifications.NewProvider(newCfg.Notifications)
-			notifProvider = newProv
-			var newPub notifications.Publisher
-			if newProv != nil {
-				newPub = newProv
+			if loadSvc != nil {
+				loadSvc.SetSiteMeter(newCfg.SiteMeterDriver())
 			}
-			notifSvc.SetPublisher(newPub)
-			notifSvc.Reload(newCfg.Notifications)
+			slog.Info("site-meter hot-reloaded into mpc + loadmodel",
+				"driver", newCfg.SiteMeterDriver())
+		}
 
-			// Home Assistant: hot-reload broker / credentials / publish
-			// interval / driver list. Bridge.Reload tears down the paho
-			// client and re-publishes discovery so an operator changing
-			// the broker IP from Settings sees HA reconnect within a
-			// second — no process restart required.
-			//
-			// Three transitions to handle:
-			//   running → running:  Bridge.Reload swaps connection.
-			//   running → disabled: Stop the existing bridge.
-			//   disabled → enabled: Start a fresh bridge (handles both
-			//                       the "previously toggled off" case and
-			//                       the "Start failed at boot, operator
-			//                       fixed the broker" recovery path).
-			haEnabled := newCfg.HomeAssistant != nil && newCfg.HomeAssistant.Enabled
-			switch {
-			case haBridge != nil && haEnabled:
-				if err := haBridge.Reload(newCfg.HomeAssistant, reg.Names()); err != nil {
-					slog.Warn("HA bridge reload failed", "err", err)
-				} else {
-					slog.Info("HA bridge reloaded", "broker", newCfg.HomeAssistant.Broker)
-				}
-			case haBridge != nil && !haEnabled:
-				haBridge.Stop()
-				haBridge = nil
-				deps.HA = nil
-				slog.Info("HA bridge stopped (disabled in config)")
-			case haBridge == nil && haEnabled:
-				if bridge, err := ha.Start(newCfg.HomeAssistant, tel, ctrl, ctrlMu, reg.Names(), haCallbacks(ctx, ctrl, ctrlMu, st, mpcSvc), mpcPlanSource(mpcSvc), haEnergySource(st)); err != nil {
-					slog.Warn("HA bridge start failed", "err", err)
-				} else {
-					haBridge = bridge
-					deps.HA = bridge
-					slog.Info("HA bridge started", "broker", newCfg.HomeAssistant.Broker)
+		// Push the new pool totals into the planner so its next
+		// replan uses the right CapacityWh / MaxChargeW /
+		// MaxDischargeW. Without this the MPC keeps the snapshot
+		// it took at buildMPC time; SoC % and terminal credit go
+		// stale after an EV loadpoint is added/removed. Codex P1
+		// on PR #121.
+		if mpcSvc != nil {
+			fleet := mpcBatteryFleetFromConfig(newCfg, capacities)
+			totalCap, maxChg, maxDis := aggregateBatteryFleetLimits(newCfg, fleet)
+			mpcSvc.UpdateBatteryFleet(fleet, totalCap, maxChg, maxDis)
+			slog.Info("mpc: capacity updated via hot-reload",
+				"capacity_wh", totalCap, "max_charge_w", maxChg, "max_discharge_w", maxDis)
+		}
+
+		// Hot-reload EV loadpoints so operators can add / remove /
+		// retune them without restarting. Manager preserves
+		// observed state across reloads (plug status, session
+		// anchor, current SoC estimate) — see loadpoint.Manager.Load.
+		lpMgr.Load(buildLoadpointConfigs(newCfg.Loadpoints))
+		hydrateLoadpointSurplusOnly()
+
+		// The OCPP quarantine follows the loadpoints just reloaded:
+		// a pending charger a new entry names is adopted on this save,
+		// and one whose entry was removed goes back to pending.
+		if ocppSrv != nil {
+			approved := make([]string, 0, len(newCfg.Loadpoints))
+			for _, lp := range newCfg.Loadpoints {
+				if lp.DriverName != "" {
+					approved = append(approved, lp.DriverName)
 				}
 			}
+			ocppSrv.Handler().SetApprovedIDs(approved)
+		}
 
-			// Weather diff → push live into the PV twin + forecast
-			// fetcher without a process restart. Users adjust rated PV
-			// + lat/lon from Settings and expect the change to take
-			// effect right away.
-			if newCfg.Weather != nil {
-				oldLat, oldLon, oldRated := 0.0, 0.0, 0.0
-				if oldCfg.Weather != nil {
-					oldLat = oldCfg.Weather.Latitude
-					oldLon = oldCfg.Weather.Longitude
-					oldRated = oldCfg.Weather.PVRatedW
+		// Notifications: rebuild the provider from fresh config
+		// (handles the cold-start case where the initial config
+		// had no notifications: block and notifProvider was nil),
+		// wire it onto the service, then reset the rule-engine
+		// per-outage latch. All calls are nil-safe.
+		newProv := notifications.NewProvider(newCfg.Notifications)
+		notifProvider = newProv
+		var newPub notifications.Publisher
+		if newProv != nil {
+			newPub = newProv
+		}
+		notifSvc.SetPublisher(newPub)
+		notifSvc.Reload(newCfg.Notifications)
+
+		// Home Assistant: hot-reload broker / credentials / publish
+		// interval / driver list. Bridge.Reload tears down the paho
+		// client and re-publishes discovery so an operator changing
+		// the broker IP from Settings sees HA reconnect within a
+		// second — no process restart required.
+		//
+		// Three transitions to handle:
+		//   running → running:  Bridge.Reload swaps connection.
+		//   running → disabled: Stop the existing bridge.
+		//   disabled → enabled: Start a fresh bridge (handles both
+		//                       the "previously toggled off" case and
+		//                       the "Start failed at boot, operator
+		//                       fixed the broker" recovery path).
+		haEnabled := newCfg.HomeAssistant != nil && newCfg.HomeAssistant.Enabled
+		switch {
+		case haBridge != nil && haEnabled:
+			if err := haBridge.Reload(newCfg.HomeAssistant, reg.Names()); err != nil {
+				slog.Warn("HA bridge reload failed", "err", err)
+			} else {
+				slog.Info("HA bridge reloaded", "broker", newCfg.HomeAssistant.Broker)
+			}
+		case haBridge != nil && !haEnabled:
+			haBridge.Stop()
+			haBridge = nil
+			deps.HA = nil
+			slog.Info("HA bridge stopped (disabled in config)")
+		case haBridge == nil && haEnabled:
+			if bridge, err := ha.Start(newCfg.HomeAssistant, tel, ctrl, ctrlMu, reg.Names(), haCallbacks(ctx, ctrl, ctrlMu, st, mpcSvc, plannerPrefs), mpcPlanSource(mpcSvc), haEnergySource(st)); err != nil {
+				slog.Warn("HA bridge start failed", "err", err)
+			} else {
+				haBridge = bridge
+				deps.HA = bridge
+				slog.Info("HA bridge started", "broker", newCfg.HomeAssistant.Broker)
+			}
+		}
+
+		// Weather diff → push live into the PV twin + forecast
+		// fetcher without a process restart. Users adjust rated PV
+		// + lat/lon from Settings and expect the change to take
+		// effect right away.
+		if newCfg.Weather != nil {
+			oldLat, oldLon, oldRated := 0.0, 0.0, 0.0
+			if oldCfg.Weather != nil {
+				oldLat = oldCfg.Weather.Latitude
+				oldLon = oldCfg.Weather.Longitude
+				oldRated = oldCfg.Weather.PVRatedW
+			}
+			newRated := newCfg.Weather.PVRatedW
+			if newRated > 0 && newRated != oldRated {
+				if pvSvc != nil {
+					pvSvc.SetRated(newRated)
 				}
-				newRated := newCfg.Weather.PVRatedW
-				if newRated > 0 && newRated != oldRated {
-					if pvSvc != nil {
-						pvSvc.SetRated(newRated)
-					}
+				if forecastSvc != nil {
+					forecastSvc.RatedPVW = newRated
+				}
+				if mpcSvc != nil {
 					if forecastSvc != nil {
-						forecastSvc.RatedPVW = newRated
+						mpcSvc.PVNameplateW = forecast.NameplateW(forecastSvc.RatedPVW, forecastSvc.Arrays)
+					} else {
+						mpcSvc.PVNameplateW = newRated
 					}
-				}
-				newLat := newCfg.Weather.Latitude
-				newLon := newCfg.Weather.Longitude
-				if newLat != oldLat || newLon != oldLon {
-					if pvSvc != nil {
-						pvSvc.ClearSky = func(t time.Time) float64 { return forecast.ClearSkyW(newLat, newLon, t) }
-					}
-					if forecastSvc != nil {
-						forecastSvc.Lat = newLat
-						forecastSvc.Lon = newLon
-					}
-					slog.Info("weather location updated", "lat", newLat, "lon", newLon)
 				}
 			}
-		})
+			newLat := newCfg.Weather.Latitude
+			newLon := newCfg.Weather.Longitude
+			if newLat != oldLat || newLon != oldLon {
+				if pvSvc != nil {
+					pvSvc.ClearSky = func(t time.Time) float64 { return forecast.ClearSkyWm2(newLat, newLon, t) }
+				}
+				if forecastSvc != nil {
+					forecastSvc.Lat = newLat
+					forecastSvc.Lon = newLon
+				}
+				slog.Info("weather location updated", "lat", newLat, "lon", newLon)
+			}
+		}
+	}
+	watcher, err := configreload.New(*configPath, cfgMu, cfg, ctrlMu, ctrl, applyConfigChange)
 	if err != nil {
 		slog.Warn("could not start config watcher", "err", err)
 	} else {
@@ -996,7 +1198,7 @@ func main() {
 	// pvSvc is pre-declared above so the reload Applier can update it.
 	if cfg.Weather != nil && cfg.Weather.Provider != "" && cfg.Weather.Provider != "none" {
 		lat, lon := cfg.Weather.Latitude, cfg.Weather.Longitude
-		clearSkyFn := func(t time.Time) float64 { return forecast.ClearSkyW(lat, lon, t) }
+		clearSkyFn := func(t time.Time) float64 { return forecast.ClearSkyWm2(lat, lon, t) }
 		cloudFn := func(t time.Time) (float64, bool) {
 			// Look up nearest forecast row covering `t`.
 			nowMs := t.UnixMilli()
@@ -1102,6 +1304,100 @@ func main() {
 		slog.Info("caldav started", "listen", cfg.CalDAV.ListenAddr(), "url", cfg.CalDAV.URL, "calendar", cfg.CalDAV.CalendarPath)
 	}
 
+	// ---- Start OCPP 1.6J Central System (optional) ----
+	// Chargers dial us, so there is nothing to add to cfg.Drivers and no Lua
+	// driver involved. A charge point whose identity (the last segment of the
+	// URL it dialed) is named by a loadpoint becomes a device in tel on its
+	// first message and dispatch picks it up like any other EV reading. Any
+	// other identity is quarantined as pending — visible in the UI, absent
+	// from telemetry — so a device that merely knows the shared password
+	// cannot inject EV load into dispatch.
+	if cfg.OCPP != nil && cfg.OCPP.Enabled {
+		approved := make([]string, 0, len(cfg.Loadpoints))
+		for _, lp := range cfg.Loadpoints {
+			if lp.DriverName != "" {
+				approved = append(approved, lp.DriverName)
+			}
+		}
+		srv, err := ocpp.Start(ctx, &ocpp.Config{
+			Enabled:            cfg.OCPP.Enabled,
+			Port:               cfg.OCPP.Port,
+			PortV201:           cfg.OCPP.PortV201,
+			Path:               cfg.OCPP.Path,
+			Username:           cfg.OCPP.Username,
+			Password:           cfg.OCPP.Password,
+			HeartbeatIntervalS: cfg.OCPP.HeartbeatIntervalS,
+			ApprovedIDs:        approved,
+		}, tel)
+		if err != nil {
+			// A charger that cannot reach us is a missing device, not a
+			// broken site, so keep the rest of the process running.
+			slog.Error("ocpp: central system failed to start", "err", err)
+		} else {
+			ocppSrv = srv
+			defer ocppSrv.Stop()
+			// Vehicle profiles: when a charging transaction identifies the
+			// car (RFID idTag on 1.6, MacAddress/eMAID idToken on 2.0.1),
+			// apply the matching vehicles: profile to the loadpoint bound
+			// to that charger — capacity for SoC/planner sizing, plus the
+			// profile's charging policy. An identity matching no profile
+			// changes nothing (the visitor default); it still shows in the
+			// Chargers panel so the operator can paste it into a profile.
+			ocppSrv.Handler().SetVehicleIdentified(func(chargerID, vehicleID, source string) {
+				cfgMu.RLock()
+				lpID := ""
+				for _, lp := range cfg.Loadpoints {
+					if lp.DriverName == chargerID {
+						lpID = lp.ID
+						break
+					}
+				}
+				var vehicle *config.Vehicle
+				if lpID != "" {
+					if v := cfg.VehicleByIdentifier(vehicleID); v != nil {
+						vc := *v
+						vehicle = &vc
+					}
+				}
+				cfgMu.RUnlock()
+				if lpID == "" {
+					return
+				}
+				if vehicle == nil {
+					slog.Info("ocpp: session identity matches no vehicle profile — loadpoint keeps its own settings",
+						"charger", chargerID, "identity", vehicleID, "source", source)
+					return
+				}
+				name := vehicle.Name
+				if name == "" {
+					name = vehicle.ID
+				}
+				lpMgr.ApplyVehicleProfile(lpID, name, vehicle.CapacityWh)
+				lpMgr.SetSurplusOnly(lpID, vehicle.SurplusOnly)
+				if vehicle.TargetSoC > 0 {
+					lpMgr.SetTarget(lpID, vehicle.TargetSoC, time.Time{})
+				}
+				slog.Info("ocpp: vehicle profile applied",
+					"charger", chargerID, "lp", lpID, "vehicle", vehicle.ID,
+					"source", source, "capacity_wh", vehicle.CapacityWh,
+					"surplus_only", vehicle.SurplusOnly,
+					"target_soc", vehicle.TargetSoC)
+			})
+			slog.Info("ocpp: central system started",
+				"port", ocppSrv.Port(),
+				"port_v201", cfg.OCPP.PortV201,
+				"path", ocppSrv.Path(),
+				"note", "listener is reachable on every interface; basic auth gates the socket, and chargers no loadpoint names stay pending outside telemetry")
+		}
+	}
+	// Snapshot hook for GET /api/ocpp/chargers. Left nil when the server is
+	// disabled or failed to start, which the endpoint reports as an empty
+	// list rather than an error.
+	var ocppChargersFn func() map[string]ocpp.ChargerView
+	if ocppSrv != nil {
+		ocppChargersFn = ocppSrv.Handler().Snapshot
+	}
+
 	// ---- Start MPC planner (optional) ----
 	mpcSvc = buildMPC(cfg, st, tel, capacities)
 	if mpcSvc != nil {
@@ -1109,6 +1405,12 @@ func main() {
 		// the fuse from the start (instead of producing plans that
 		// dispatch later has to scale via the joint allocator).
 		mpcSvc.FuseMaxW = cfg.Fuse.MaxPowerW()
+		mpcSvc.LoadMaxW = cfg.Fuse.MaxPowerW()
+		if forecastSvc != nil {
+			mpcSvc.PVNameplateW = forecast.NameplateW(forecastSvc.RatedPVW, forecastSvc.Arrays)
+		} else if ratedPVW > 0 {
+			mpcSvc.PVNameplateW = ratedPVW
+		}
 		// Cap planned export below the fuse when the operator set a site
 		// export ceiling, so the DP never schedules a discharge that would
 		// over-export and trip an inverter (the Ferroamp 0x8030 fault).
@@ -1127,7 +1429,7 @@ func main() {
 		}
 		// Downside-PV safety planning (forecast − k·σ) — replaces the old SoC
 		// safety floor. Unset config → default 1.0; explicit 0 → raw forecast.
-		mpcSvc.PVForecastSafetyK = cfg.Planner.PVSafetyK()
+		mpcSvc.PVForecastSafetyK = cfg.Planner.EffectiveSafetyK(trust)
 		if cfg.Planner != nil {
 			mpcSvc.MinArbitrageSpreadOreKwh = cfg.Planner.MinArbitrageSpreadOreKwh
 		}
@@ -1160,14 +1462,14 @@ func main() {
 				// departure. It overrides planning inputs without mutating the
 				// operator's recurring loadpoint schedule; once the lease stops,
 				// the normal schedule is still exactly as it was.
-				effectiveTargetPct := st.TargetSoCPct
+				effectiveTarget := st.TargetSoC
 				effectiveTargetTime := st.TargetTime
 				boostActive := false
 				if lpController != nil {
 					if lease, status := lpController.BatteryBoost(st.ID, time.Now()); status.Active {
 						boostActive = true
-						if lease.EVTargetSoCPct > 0 {
-							effectiveTargetPct = lease.EVTargetSoCPct
+						if lease.EVTargetSoC > 0 {
+							effectiveTarget = lease.EVTargetSoC
 						}
 						if !lease.DepartureAt.IsZero() {
 							effectiveTargetTime = lease.DepartureAt
@@ -1182,7 +1484,7 @@ func main() {
 				// against a target the operator never asked for. With
 				// no schedule, EV is left to the loadpoint controller's
 				// reactive surplus-only behaviour.
-				if effectiveTargetPct <= 0 || effectiveTargetTime.IsZero() ||
+				if effectiveTarget <= 0 || effectiveTargetTime.IsZero() ||
 					!effectiveTargetTime.After(time.Now()) {
 					continue
 				}
@@ -1206,14 +1508,14 @@ func main() {
 				// loadpoint decoration agrees with us on which vehicle
 				// is "the one". Falls back to inferred SoC when nothing
 				// usable online matches.
-				initSoC := st.CurrentSoCPct
+				initSoC := st.CurrentSoC
 				socSource := "inferred"
 				var vehicleChargeLimit float64 // 0 = unknown
 				delivering := st.CurrentPowerW > loadpoint.DeliveringW
 				if pick := telemetry.PickBestVehicleForLoadpoint(tel, delivering, time.Now()); pick.Driver != "" {
-					initSoC = pick.SoCPct
+					initSoC = pick.SoC
 					socSource = "vehicle:" + pick.Driver
-					vehicleChargeLimit = pick.ChargeLimitPct
+					vehicleChargeLimit = pick.ChargeLimit
 				}
 				// Map target time → slot index using the DP's
 				// actual slot length (hour-of-prices vs. 15-min
@@ -1236,9 +1538,9 @@ func main() {
 				// so planning past it is wasted DP grid space. When
 				// the limit is unknown, fall back to the deadline
 				// target itself; never plan beyond what was requested.
-				maxPct := effectiveTargetPct
-				if vehicleChargeLimit > 0 && vehicleChargeLimit < maxPct {
-					maxPct = vehicleChargeLimit
+				maxSoC := effectiveTarget
+				if vehicleChargeLimit > 0 && vehicleChargeLimit < maxSoC {
+					maxSoC = vehicleChargeLimit
 				}
 				// Effective deadline target: when the operator asked
 				// for 100% but the vehicle (Tesla via TeslaBLEProxy
@@ -1249,19 +1551,19 @@ func main() {
 				// and MPC keeps committing grid charging chasing an
 				// unreachable goal. Cap target_pct to whatever the
 				// car will physically accept.
-				targetPct := effectiveTargetPct
-				if vehicleChargeLimit > 0 && vehicleChargeLimit < targetPct {
-					targetPct = vehicleChargeLimit
+				targetSoC := effectiveTarget
+				if vehicleChargeLimit > 0 && vehicleChargeLimit < targetSoC {
+					targetSoC = vehicleChargeLimit
 					slog.Info("mpc: target capped to vehicle charge limit",
-						"lp", st.ID, "operator_target_pct", effectiveTargetPct,
-						"vehicle_limit_pct", vehicleChargeLimit)
+						"lp", st.ID, "operator_target", effectiveTarget,
+						"vehicle_limit", vehicleChargeLimit)
 				}
-				// Guard against degenerate grids: if current SoC > maxPct
+				// Guard against degenerate grids: if current SoC > maxSoC
 				// (already over target), grow the ceiling to current so
 				// the DP can at least represent it (no charging will be
 				// scheduled). The deadline penalty handles the rest.
-				if initSoC > maxPct {
-					maxPct = initSoC
+				if initSoC > maxSoC {
+					maxSoC = initSoC
 				}
 				// Defer grid-funded EV planning when the deadline lies
 				// past the last published price slot AND is more than ~3 h
@@ -1294,9 +1596,9 @@ func main() {
 					}
 				}
 				slog.Debug("mpc: loadpoint spec",
-					"id", st.ID, "soc_pct", initSoC, "soc_source", socSource,
-					"target_pct", effectiveTargetPct, "target_slot", targetSlot,
-					"max_pct", maxPct, "vehicle_limit_pct", vehicleChargeLimit,
+					"id", st.ID, "soc", initSoC, "soc_source", socSource,
+					"target", effectiveTarget, "target_slot", targetSlot,
+					"max_soc", maxSoC, "vehicle_limit", vehicleChargeLimit,
 					"defer_grid_plan", deferGridPlan)
 				if deferGridPlan {
 					slog.Info("mpc: LP grid-funded planning deferred — target past published prices",
@@ -1343,11 +1645,11 @@ func main() {
 					ID:               st.ID,
 					CapacityWh:       capWh,
 					Levels:           11,
-					MinPct:           0,
-					MaxPct:           maxPct,
-					InitialSoCPct:    initSoC,
+					SoCMin:           0,
+					SoCMax:           maxSoC,
+					InitialSoC:       initSoC,
 					PluggedIn:        true,
-					TargetSoCPct:     targetPct,
+					TargetSoC:        targetSoC,
 					TargetSlotIdx:    targetSlot,
 					MaxChargeW:       st.MaxChargeW,
 					AllowedStepsW:    st.AllowedStepsW,
@@ -1388,18 +1690,7 @@ func main() {
 			if !ok {
 				return control.SlotDirective{}, false
 			}
-			return control.SlotDirective{
-				SlotStart:              d.SlotStart,
-				SlotEnd:                d.SlotEnd,
-				BatteryEnergyWh:        d.BatteryEnergyWh,
-				SoCTargetPct:           d.SoCTargetPct,
-				Strategy:               string(d.Strategy),
-				PVLimitW:               d.PVLimitW,
-				PlannedGridW:           d.GridW,
-				HasPlannedGridW:        true,
-				LivePVSurplusSoCCapPct: d.LivePVSurplusSoCCapPct,
-				LoadpointEnergyWh:      d.LoadpointEnergyWh,
-			}, true
+			return controlSlotDirectiveFromMPC(d), true
 		}
 		// Default to the energy-allocation path. The plan is a
 		// scheduler (decides WHEN each strategy applies); the EMS is
@@ -1457,6 +1748,13 @@ func main() {
 		}()
 	}
 
+	// One tracker for every dispatch path: storage, PV curtail and EV all
+	// report refused commands here, and it walks a driver that cannot
+	// actuate to its declared default. Built before the loadpoint
+	// controller because that controller needs it. See
+	// driver_failure_default.go.
+	actuation := newDriverActuationTracker(tel)
+
 	// ---- EV loadpoint controller ----
 	// loadpoint.Controller owns per-tick EV dispatch, including the
 	// energy-allocation contract, snapping and phase transitions.
@@ -1504,7 +1802,35 @@ func main() {
 				RequestActive: reqActive,
 			}, true
 		}
-		lpController = loadpoint.NewController(lpMgr, planAdapter, telAdapter, reg.Send)
+		// An OCPP charge point is not in the driver registry — it connected to
+		// us rather than being dialled — so route by name: if an online charger
+		// answers to it, command it over OCPP, otherwise fall through to the
+		// Lua driver registry. Loadpoints stay unaware of the difference.
+		send := reg.Send
+		if ocppSrv != nil {
+			send = func(ctx context.Context, name string, payload []byte) error {
+				if ocppSrv.Handler().IsOnline(name) {
+					return ocppSrv.Command(ctx, name, payload)
+				}
+				return reg.Send(ctx, name, payload)
+			}
+		}
+		lpController = loadpoint.NewController(lpMgr, planAdapter, telAdapter, send)
+		// A charger that answers every poll and refuses every setpoint is
+		// the storage bug of #800 on the EV wire: it holds its last
+		// current and the plan keeps counting the load. Only the periodic
+		// ev_set_current is reported — see loadpoint.DispatchOutcomeFunc
+		// for the sends that are deliberately not.
+		lpController.SetOutcomeSender(reg.SendWithOutcome)
+		lpController.SetCycleSender(reg.SendEVContinuation)
+		lpController.SetDispatchOutcome(actuation.recordCommandOutcome)
+		lpController.SetDriverOnline(func(name string) bool {
+			if ocppSrv != nil && ocppSrv.Handler().IsOnline(name) {
+				return true
+			}
+			health := tel.DriverHealth(name)
+			return health != nil && health.IsOnline()
+		})
 		// Wire the site fuse so the per-phase EV clamp and the
 		// phase-split derivation can use the actual site voltage and
 		// breaker rating instead of hard-coding 230 V × 16 A.
@@ -1591,7 +1917,7 @@ func main() {
 					return loadpoint.BatteryBoostStoppedBatteryUnavailable
 				}
 				usable++
-				floor := lease.MinBatterySoCPct / 100
+				floor := lease.MinBatterySoC
 				if staticFloor[name] > floor {
 					floor = staticFloor[name]
 				}
@@ -1893,16 +2219,16 @@ func main() {
 			// surplus-only mode, battery charging power is NOT
 			// available for the EV. The original formula assumed
 			// "if I told the battery to stop, that surplus would
-			// free up for the EV" — but the MPC, even with the
-			// grid-charge ban now in place, may still legitimately
-			// charge the battery from PV surplus. If we hand that
-			// power back to the EV, the controller commands the EV
-			// on, the battery loses its share, the planner re-budgets
-			// the EV down → flap. The truthful surplus for an EV
-			// under surplus-only is what's left AFTER the battery
-			// has taken its share: -gridW + max(0, -batW) (battery
-			// counts only if it's discharging, contributing to
-			// site supply).
+			// free up for the EV" — but the MPC may still
+			// legitimately charge the battery from PV surplus
+			// (and, in active arbitrage, from the grid). If we
+			// hand that power back to the EV, the controller
+			// commands the EV on, the battery loses its share,
+			// the planner re-budgets the EV down → flap. The
+			// truthful surplus for an EV under surplus-only is
+			// what's left AFTER the battery has taken its share:
+			// -gridW + max(0, -batW) (battery counts only if
+			// it's discharging, contributing to site supply).
 			// A bat-SoC-armed loadpoint is just as much a "PV-priority"
 			// claimant as a configured surplus_only LP — both want PV
 			// routed to the EV ahead of the home battery. Counting
@@ -2040,32 +2366,96 @@ func main() {
 	case identityErr != nil:
 		// Binding and platform checks fail closed. Never create a replacement
 		// key when state is incomplete or this host cannot protect it.
-		slog.Warn("home link identity disabled", "err", identityErr, "path", identityKeyPath)
-	case identityState.HomeLink != nil:
-		handle, handleErr := gatewayidentity.RouteHandle(identityState.HomeLink.PublicKey())
-		if handleErr != nil {
-			slog.Warn("home link identity disabled", "err", handleErr, "path", identityKeyPath)
-		} else {
-			slog.Info("home link identity ready",
-				"gateway_id", identityState.Binding.GatewayID,
-				"route_handle", handle,
-			)
-		}
+		slog.Warn("site identity disabled", "err", identityErr, "path", identityKeyPath)
+	case identityState.Bound != nil:
+		slog.Info("site identity ready (hardware-bound)",
+			"gateway_id", identityState.Binding.GatewayID,
+		)
 	case identityState.Nova != nil:
 		slog.Info("site identity ready", "pubkey_prefix", identityState.Nova.PublicKeyHex()[:16])
 	}
-	homeLinkAdmin, homeLinkEnabled, homeLinkErr := startHomeLink(
-		ctx, cfg, identityState, st, tel, mpcSvc, ctrl, ctrlMu,
-	)
-	if homeLinkErr != nil {
-		slog.Warn("Home Link unavailable")
+
+	// The web-push provider, built before the uplink because the dead man's
+	// rows carry its VAPID signature. Engine-owned, keyed by stored
+	// subscriptions rather than by config, so a household using ntfy loses
+	// nothing when the app enables it. Its VAPID key is the box's own,
+	// generated on first run beside state.db exactly as nova.key is, and it
+	// signs VAPID tokens and nothing else. Wired into the notifications
+	// engine and the API further down, once those exist.
+	var webPush *notifications.WebPush
+	if st != nil {
+		vapidPath := filepath.Join(filepath.Dir(statePath), "webpush.key")
+		if vapidKey, err := nova.LoadOrCreateIdentity(vapidPath); err != nil {
+			slog.Warn("web push disabled — VAPID key unavailable", "err", err, "path", vapidPath)
+		} else if wp, err := notifications.NewWebPush(vapidKey, pushSubscriptionSource{st: st}); err != nil {
+			slog.Warn("web push disabled", "err", err)
+		} else {
+			webPush = wp
+		}
 	}
 
+	// The FTW app's uplink. It speaks the app's own protocol end to end and
+	// reaches the box through a relay that holds no keys.
+	appLinkWatchdog := time.Duration(cfg.Site.WatchdogTimeoutS) * time.Second
+	if appLinkWatchdog <= 0 {
+		appLinkWatchdog = 60 * time.Second
+	}
+	boxID := ""
+	if identityState.Nova != nil {
+		boxID = identityState.Nova.PublicKeyHex()[:16]
+	}
+	// The app's window onto this box's own HTTP API. Handed to the uplink
+	// now and filled in below, once the API server exists.
+	appAPI := &lateAPI{}
+	appEnroll, appUplink, appLinkEnabled, appLinkErr := startAppLink(
+		ctx, cfg, identityKeyPath, boxID, Version,
+		st, tel, mpcSvc, lpMgr, lpController, priceSvc, ctrl, ctrlMu, plannerPrefs,
+		controlRev, appLinkWatchdog, appAPI, webPush,
+	)
+	switch {
+	case appLinkErr != nil:
+		slog.Warn("app link unavailable", "err", appLinkErr)
+	case appLinkEnabled:
+		slog.Info("app link connected", "relay", appuplink.Endpoint,
+			"paired_devices", appEnroll.AuthorisedCount())
+	default:
+		slog.Info("app link disabled — set app_link.enabled to turn it on")
+	}
+
+	// The anonymous fleet ping: how many boxes, which versions, which drivers.
+	// Its separate relay HTTP door keeps daily totals; the encrypted app path
+	// stays opaque and stores no routed traffic.
+	// The bundled drivers dir is deliberately not passed: which drivers this
+	// build ships with is compiled in, not discovered on disk. See
+	// fleetCatalogue for what that buys.
+	fleetPinger, fleetPingErr := startFleetPing(
+		ctx, cfg, cfgMu, st, Version, config.ManagedDriversDirOverride,
+	)
+	if fleetPingErr != nil {
+		slog.Warn("fleet ping unavailable", "err", fleetPingErr)
+	}
+
+	mutationPolicy := apiMutationPolicy()
+	mutationPolicy.LANAuthEnabled = func() bool {
+		cfgMu.RLock()
+		defer cfgMu.RUnlock()
+		return cfg.API.LANAuth
+	}
+	mutationPolicy.VerifyLANSecret = func(secret string) bool {
+		return api.VerifyStoredLANSecret(st, secret)
+	}
+	lanAuth.Bind(mutationPolicy.LANAuthEnabled, mutationPolicy.VerifyLANSecret)
+
 	deps = &api.Deps{
-		Tel: tel, LogRing: logRing, Ctrl: ctrl, CtrlMu: ctrlMu,
+		MutationPolicy: mutationPolicy,
+		Tel:            tel, LogRing: logRing, Ctrl: ctrl, CtrlMu: ctrlMu,
 		State: st,
 		CapMu: capMu, Capacities: capacities, TelemetryCapacities: telemetryCapacities,
-		CfgMu: cfgMu, Cfg: cfg, ConfigPath: *configPath,
+		BatteryIdentity: batteryIdentity,
+		AppEnroll:       appEnrollForAPI(appEnroll, appUplink, st, appLinkEnabled),
+		FleetPing:       fleetPinger,
+		CfgMu:           cfgMu, Cfg: cfg, ConfigPath: *configPath,
+		ConfigApplier:       applyConfigChange,
 		DriverDir:           resolveDriverDir(),
 		UserDriverDir:       *userDriversDirFlag,
 		DriverMQTTFactory:   reg.MQTTFactory,
@@ -2090,10 +2480,12 @@ func main() {
 		Prices:           priceSvc,
 		Forecast:         forecastSvc,
 		MPC:              mpcSvc,
+		PlannerPrefs:     plannerPrefs,
 		PVModel:          pvSvc,
 		LoadModel:        loadSvc,
 		Loadpoints:       lpMgr,
 		LoadpointCtrl:    lpController,
+		OCPPChargers:     ocppChargersFn,
 		CalDAV:           calSvc,
 		HA:               haBridge,
 		Registry:         reg,
@@ -2102,8 +2494,6 @@ func main() {
 		Notifications:    notifSvc,
 		SelfUpdate:       selfUpdater,
 		OptimizerUpdate:  optimizerUpdater,
-		HomeLink:         homeLinkAdmin,
-		HomeLinkEnabled:  homeLinkEnabled,
 		Restart: func(reqCtx context.Context) error {
 			// Prefer the docker-compose sidecar path when wired up: the
 			// updater container does docker compose up -d --force-recreate,
@@ -2128,9 +2518,13 @@ func main() {
 			})
 			return nil
 		},
+		Bundle:  components.BundleFromEnv(),
 		Version: Version,
 	}
 	srv := api.New(deps)
+	// From here an app session reaches the same handler the LAN does, with
+	// the same trust boundary, carrying the enrolled device's identity.
+	appAPI.bind(srv)
 	// Dev-mode proxy: when FTW_PROXY_UPSTREAM is set (e.g.
 	// http://192.168.1.139:8080), /api/* is forwarded to that instance so
 	// the local UI renders live data without owning the control loop.
@@ -2234,12 +2628,27 @@ func main() {
 			slog.Warn("notification_log: record failed", "err", err)
 		}
 	})
+	// Web push runs beside whatever provider the config names. The provider
+	// itself was built before the uplink (the dead man's rows carry its
+	// signature); here it joins the engine and the API.
+	if webPush != nil {
+		notifSvc.AddPublisher(webPush)
+		deps.WebPush = webPush
+	}
+	if appUplink != nil {
+		deps.PushResync = appUplink.ResyncDeadman
+	}
+	// The loadpoint manager publishes its session latches (completion,
+	// interruption) on the same bus the engine listens to.
+	if lpMgr != nil {
+		lpMgr.SetBus(bus)
+	}
 	// Late-bind onto the Deps literal that was built earlier with a nil
 	// notifSvc (the deps struct is assembled before this block runs).
 	// Same pattern haBridge uses a few lines below.
 	deps.Notifications = notifSvc
 	if cfg.Notifications != nil && cfg.Notifications.Enabled {
-		name := "ntfy"
+		name := "webpush"
 		if notifProvider != nil {
 			name = notifProvider.Name()
 		}
@@ -2248,7 +2657,7 @@ func main() {
 
 	// ---- HA MQTT bridge (optional) ----
 	if cfg.HomeAssistant != nil && cfg.HomeAssistant.Enabled {
-		bridge, err := ha.Start(cfg.HomeAssistant, tel, ctrl, ctrlMu, reg.Names(), haCallbacks(ctx, ctrl, ctrlMu, st, mpcSvc), mpcPlanSource(mpcSvc), haEnergySource(st))
+		bridge, err := ha.Start(cfg.HomeAssistant, tel, ctrl, ctrlMu, reg.Names(), haCallbacks(ctx, ctrl, ctrlMu, st, mpcSvc, plannerPrefs), mpcPlanSource(mpcSvc), haEnergySource(st))
 		if err != nil {
 			slog.Warn("HA MQTT bridge failed to start", "err", err)
 		} else {
@@ -2319,6 +2728,12 @@ func main() {
 	// the configreload watcher updates those fields directly, so a
 	// startup snapshot here would go stale on the first hot-reload.
 	dtS := float64(cfg.Site.ControlIntervalS)
+	// Every dispatch command carries its own deadline — see
+	// driverCommandTimeout for the stall it bounds.
+	driverCmdTimeout := driverCommandTimeout(controlInterval)
+	if lpController != nil {
+		lpController.SetCommandTimeout(driverCmdTimeout)
+	}
 
 	// Graceful shutdown
 	sigc := make(chan os.Signal, 1)
@@ -2354,6 +2769,7 @@ func main() {
 	const evStopHigh = 100.0 // W — "was actually drawing"
 	const evStopLow = 50.0   // W — "now essentially zero"
 	var staleDefaults staleSiteDefaultTracker
+	solarFeed := newSolarFeedSender()
 	for {
 		select {
 		case <-sigc:
@@ -2430,13 +2846,22 @@ func main() {
 				if !tr.Online {
 					slog.Warn("driver telemetry stale — marking offline + reverting to autonomous",
 						"name", tr.Name, "timeout", watchdogTimeout)
-					sendDriverDefault(ctx, reg, tr.Name, "watchdog", observeOnlySnap)
+					sendDriverDefault(ctx, srv, tr.Name, "watchdog", observeOnlySnap)
 					watchdogDefaulted[tr.Name] = struct{}{}
 					bus.Publish(events.DriverLost{Driver: tr.Name, At: time.Now()})
 				} else {
 					slog.Info("driver telemetry recovered — back online", "name", tr.Name)
 					bus.Publish(events.DriverRecovered{Driver: tr.Name, At: time.Now()})
 				}
+			}
+			// Same law for a driver that is answering but cannot actuate,
+			// whether it says so itself or core found out by having its
+			// commands refused. Joins watchdogDefaulted so the freshness
+			// gate below doesn't send it a second default this tick. See
+			// driver_failure_default.go.
+			for _, name := range actuation.update(tickNow, observeOnlySnap) {
+				sendDriverDefault(ctx, srv, name, driverCannotActuateReason, observeOnlySnap)
+				watchdogDefaulted[name] = struct{}{}
 			}
 			// Fire a HealthTick so subscribers that track user-level
 			// thresholds (e.g. notifications) can evaluate their own
@@ -2476,7 +2901,7 @@ func main() {
 				if _, alreadyDefaulted := watchdogDefaulted[name]; alreadyDefaulted {
 					continue
 				}
-				sendDriverDefault(ctx, reg, name, freshness.Reason, observeOnlySnap)
+				sendDriverDefault(ctx, srv, name, freshness.Reason, observeOnlySnap)
 			}
 
 			// Loadpoint observation and schedule rolling stay live while the
@@ -2508,10 +2933,14 @@ func main() {
 				if pick.Driver == "" || pick.Stale {
 					continue
 				}
-				lpMgr.AnchorVehicleSoC(st.ID, pick.SoCPct)
+				lpMgr.AnchorVehicleSoC(st.ID, pick.SoC)
 			}
 
 			if !freshness.Allowed() {
+				// Clear before persisting: persistTelemetryTick snapshots
+				// ctrl, so the stored tick has to show the hold already
+				// released rather than one the blocked tick never executed.
+				clearBatteryManualHoldForDispatchBlock(ctrl, ctrlMu)
 				sampleCount, err := persistTelemetryTick(st, tel, ctrl, nowMs, watchdogTimeout)
 				if err != nil {
 					slog.Warn("tick persistence failed", "samples", sampleCount, "err", err)
@@ -2573,6 +3002,10 @@ func main() {
 				}
 			}
 			evReserveW := loadpoint.SurplusReserveW(lpStatesSnapshot, wakeKickActiveIDs)
+			// Keep the protected EVs' actual draw separate from aggregate EV
+			// power. A regular loadpoint must stay coverable when another LP is
+			// surplus-only.
+			evSurplusOnlyChargingW := loadpoint.SurplusChargingW(lpStatesSnapshot)
 			// Parallel curtail-side reserve — more permissive than the
 			// dispatch reserve above; counts plugged-but-stopped EVs
 			// with SoC headroom so PV isn't cut when a vehicle could
@@ -2582,6 +3015,7 @@ func main() {
 
 			ctrlMu.Lock()
 			ctrl.EVSurplusOnlyReserveW = evReserveW
+			ctrl.EVSurplusOnlyChargingW = evSurplusOnlyChargingW
 			ctrl.EVCurtailHeadroomW = evCurtailHeadroomW
 			ctrl.BatteryBoostEVChargingW = boostEVW
 			ctrl.BatteryBoostReserveSoC = boostReserveSoC
@@ -2637,9 +3071,7 @@ func main() {
 					continue
 				}
 				payload, _ := json.Marshal(map[string]any{"action": "battery", "power_w": t.TargetW})
-				if err := reg.Send(ctx, t.Driver, payload); err != nil {
-					slog.Warn("driver send", "name", t.Driver, "err", err)
-				}
+				actuation.dispatchCommand(ctx, reg, "driver send", t.Driver, payload, driverCmdTimeout, tickNow)
 			}
 
 			// ---- PV curtailment dispatch ----
@@ -2653,21 +3085,28 @@ func main() {
 			ctrlMu.Lock()
 			curtailTargets := control.ComputePVCurtail(ctrl, tel)
 			ctrlMu.Unlock()
-			for _, c := range curtailTargets {
-				var payload []byte
-				if c.LimitW > 0 {
-					payload, _ = json.Marshal(map[string]any{
-						"action":  "curtail",
-						"power_w": c.LimitW,
-					})
-				} else {
-					payload, _ = json.Marshal(map[string]any{
-						"action": "curtail_disable",
-					})
+			// The cap is a dispatch command and its outcome is counted; the
+			// release is not. See pv_curtail_dispatch.go.
+			dispatchPVCurtail(ctx, reg, actuation, curtailTargets, driverCmdTimeout, tickNow)
+
+			// ---- Solar-surplus feed dispatch ----
+			// Per-tick hint to drivers whose operator armed a `solar_pv`
+			// write path (NIBE Solar PV surplus feed, #537): the live
+			// solar-attributable export, site-signed. Sent every tick —
+			// repetition is what feeds the driver's dead-man switch; the
+			// driver deadbands and rate-limits the actual device writes.
+			// Runs only on freshness-allowed ticks (the stale path above
+			// `continue`s), and a stale entry already walks every driver
+			// to its default mode, which clears the device-side feed.
+			ctrlMu.Lock()
+			feedTargets := control.ComputeSolarFeed(ctrl, tel)
+			ctrlMu.Unlock()
+			for _, f := range feedTargets {
+				if observeOnlySnap[f.Driver] {
+					continue
 				}
-				if err := reg.Send(ctx, c.Driver, payload); err != nil {
-					slog.Warn("pv curtail send", "name", c.Driver, "err", err)
-				}
+				payload, _ := json.Marshal(map[string]any{"action": "solar_pv", "power_w": f.PowerW})
+				solarFeed.send(ctx, reg, f.Driver, payload, driverCmdTimeout)
 			}
 
 			// LP dispatch ran at the top of this tick — see the
@@ -2953,15 +3392,37 @@ func registerAllDevices(st *state.Store, reg *drivers.Registry) {
 	}
 }
 
+func runningDeviceID(reg *drivers.Registry, name string) (string, bool) {
+	if reg == nil || name == "" {
+		return "", false
+	}
+	env := reg.Env(name)
+	if env == nil {
+		return "", false
+	}
+	makeName, serial, mac, endpoint := env.FullIdentity()
+	id := state.ResolveDeviceID(makeName, serial, mac, endpoint)
+	return id, id != ""
+}
+
+func clearBatteryManualHoldForDispatchBlock(ctrl *control.State, ctrlMu *sync.Mutex) {
+	if ctrl == nil || ctrlMu == nil {
+		return
+	}
+	ctrlMu.Lock()
+	ctrl.ClearBatteryManualHold()
+	ctrlMu.Unlock()
+}
+
 const driverDefaultTimeout = 2 * time.Second
 
-func sendDriverDefault(ctx context.Context, reg *drivers.Registry, name, reason string, observeOnly map[string]bool) {
+func sendDriverDefault(ctx context.Context, srv *api.Server, name, reason string, observeOnly map[string]bool) {
 	if observeOnly[name] {
 		return
 	}
 	cmdCtx, cancel := context.WithTimeout(ctx, driverDefaultTimeout)
 	defer cancel()
-	if err := reg.SendDefault(cmdCtx, name); err != nil {
+	if err := srv.SendDriverDefault(cmdCtx, name); err != nil {
 		slog.Warn("driver default command failed",
 			"name", name, "reason", reason, "timeout", driverDefaultTimeout, "err", err)
 	}
@@ -3036,11 +3497,14 @@ func driverCapacitiesFrom(drvList []config.Driver, loadpoints []config.Loadpoint
 
 // driverLimitsFrom builds the driver-name → per-battery PowerLimits map
 // used by control.State for per-battery charge/discharge caps (#145).
-// Reads the drivers section first, then falls back to the batteries
-// section for the same key — operators commonly set per-battery limits
+// Reads the drivers section first, then applies any batteries-section
+// override for the same key — operators commonly set per-battery limits
 // only under `batteries:` (the MPC reads them from there), and without
-// this fallback the dispatcher silently uses the 5 kW MaxCommandW
+// this path the dispatcher silently uses the 5 kW MaxCommandW
 // default while the planner schedules against the configured 9 kW.
+// Battery limit pointers preserve omitted versus explicit zero. As in the
+// MPC builder below, exact both-zero battery overrides are a config error and
+// retain defaults rather than disabling the battery in both directions.
 // Drivers without limits in either place are omitted from the map.
 func driverLimitsFrom(drivers []config.Driver, batteries map[string]config.Battery) map[string]control.PowerLimits {
 	out := map[string]control.PowerLimits{}
@@ -3049,20 +3513,29 @@ func driverLimitsFrom(drivers []config.Driver, batteries map[string]config.Batte
 			continue
 		}
 		chg, dis := d.MaxChargeW, d.MaxDischargeW
+		chgSet, disSet := chg > 0, dis > 0
 		if b, ok := batteries[d.Name]; ok {
-			if chg == 0 && b.MaxChargeW != nil && *b.MaxChargeW > 0 {
-				chg = *b.MaxChargeW
-			}
-			if dis == 0 && b.MaxDischargeW != nil && *b.MaxDischargeW > 0 {
-				dis = *b.MaxDischargeW
+			bothZero := b.MaxChargeW != nil && *b.MaxChargeW == 0 &&
+				b.MaxDischargeW != nil && *b.MaxDischargeW == 0
+			if !bothZero {
+				if b.MaxChargeW != nil && *b.MaxChargeW >= 0 {
+					chg = *b.MaxChargeW
+					chgSet = true
+				}
+				if b.MaxDischargeW != nil && *b.MaxDischargeW >= 0 {
+					dis = *b.MaxDischargeW
+					disSet = true
+				}
 			}
 		}
-		if chg == 0 && dis == 0 {
+		if chg == 0 && dis == 0 && !chgSet && !disSet {
 			continue
 		}
 		out[d.Name] = control.PowerLimits{
-			MaxChargeW:    chg,
-			MaxDischargeW: dis,
+			MaxChargeW:       chg,
+			MaxDischargeW:    dis,
+			MaxChargeWSet:    chgSet,
+			MaxDischargeWSet: disSet,
 		}
 	}
 	return out
@@ -3244,7 +3717,7 @@ func planSlotsFromMPC(mpcSvc *mpc.Service) []calendar.PlanSlot {
 			End:        start.Add(time.Duration(ln) * time.Minute),
 			BatteryW:   a.BatteryW,
 			GridW:      a.GridW,
-			SoCPct:     a.SoCPct,
+			SoC:        a.SoC,
 			Confidence: a.Confidence,
 		})
 	}
@@ -3274,7 +3747,7 @@ func buildLoadpointConfigs(src []config.Loadpoint) []loadpoint.Config {
 			MaxChargeW:        lp.MaxChargeW,
 			AllowedStepsW:     lp.AllowedStepsW,
 			VehicleCapacityWh: lp.VehicleCapacityWh,
-			PluginSoCPct:      lp.PluginSoCPct,
+			PluginSoC:         lp.PluginSoC,
 			PhaseMode:         lp.PhaseMode,
 			PhaseSplitW:       lp.PhaseSplitW,
 			MinPhaseHoldS:     lp.MinPhaseHoldS,
@@ -3375,17 +3848,22 @@ func aggregateBatteryFleetLimits(cfg *config.Config, fleet []mpc.BatteryFleetMem
 
 // buildMPC constructs a planner from config. Returns nil if disabled,
 // if prices aren't configured, or if there are no batteries with capacity.
+// The skip reason is the same vocabulary /api/mpc/diagnose exposes.
 func buildMPC(cfg *config.Config, st *state.Store, tel *telemetry.Store, capacities map[string]float64) *mpc.Service {
-	if cfg.Planner == nil || !cfg.Planner.Enabled {
-		return nil
-	}
-	if cfg.Price == nil || cfg.Price.Provider == "" || cfg.Price.Provider == "none" {
-		slog.Warn("mpc requires price provider — skipping")
-		return nil
+	plannerOn := cfg.Planner != nil && cfg.Planner.Enabled
+	priceProvider := ""
+	if cfg.Price != nil {
+		priceProvider = cfg.Price.Provider
 	}
 	fleet := mpcBatteryFleetFromConfig(cfg, capacities)
 	totalCap, maxChg, maxDis := aggregateBatteryFleetLimits(cfg, fleet)
-	if totalCap <= 0 {
+	switch mpc.UnavailableReason(plannerOn, priceProvider, totalCap) {
+	case mpc.ReasonPlannerDisabled:
+		return nil
+	case mpc.ReasonNoPriceProvider:
+		slog.Warn("mpc requires price provider — skipping")
+		return nil
+	case mpc.ReasonNoBatteryCapacity:
 		slog.Warn("mpc: no battery capacity — skipping")
 		return nil
 	}
@@ -3398,13 +3876,13 @@ func buildMPC(cfg *config.Config, st *state.Store, tel *telemetry.Store, capacit
 	if mode == "" {
 		mode = mpc.ModeSelfConsumption
 	}
-	socMin := pl.SoCMinPct
+	socMin := pl.SoCMin
 	if socMin <= 0 {
-		socMin = 10
+		socMin = 0.10
 	}
-	socMax := pl.SoCMaxPct
-	if socMax <= 0 || socMax > 100 {
-		socMax = 95
+	socMax := pl.SoCMax
+	if socMax <= 0 || socMax > 1 {
+		socMax = 0.95
 	}
 	if pl.SoCSafetyFloorPct != 0 || pl.SafetyFloorPenaltyOreKwhHour != 0 {
 		slog.Warn("config: soc_safety_floor_pct / safety_floor_penalty_ore_kwh_hour are deprecated and ignored — forecast-risk reserve is now handled by pv_forecast_safety_k (downside-PV planning)")
@@ -3425,10 +3903,10 @@ func buildMPC(cfg *config.Config, st *state.Store, tel *telemetry.Store, capacit
 		Mode:                mode,
 		SoCLevels:           41,
 		CapacityWh:          totalCap,
-		SoCMinPct:           socMin,
-		SoCMaxPct:           socMax,
+		SoCMin:              socMin,
+		SoCMax:              socMax,
 		PVChargeBonusOreKwh: pvBonus,
-		InitialSoCPct:       50,
+		InitialSoC:          0.50,
 		// ActionLevels = 81 → 225 W discretization step on a ±9 kW
 		// action range. Coarser values (21=900 W, 41=450 W) lose
 		// borderline-PV slots: on a 273 W net surplus the 450 W min
@@ -3798,7 +4276,7 @@ func restoreLatestMPCDiagnostic(st *state.Store, svc *mpc.Service, now time.Time
 // path can share the exact same wiring — drift between them would mean
 // HA commands behave one way after boot and a different way after a
 // hot-reload, which is the kind of silent skew that's hardest to debug.
-func haCallbacks(ctx context.Context, ctrl *control.State, ctrlMu *sync.Mutex, st *state.Store, mpcSvc *mpc.Service) ha.CommandCallbacks {
+func haCallbacks(ctx context.Context, ctrl *control.State, ctrlMu *sync.Mutex, st *state.Store, mpcSvc *mpc.Service, prefs *config.PlannerPrefs) ha.CommandCallbacks {
 	return ha.CommandCallbacks{
 		SetMode: func(m string) error {
 			mode := control.Mode(m)
@@ -3821,6 +4299,9 @@ func haCallbacks(ctx context.Context, ctrl *control.State, ctrlMu *sync.Mutex, s
 			if err := st.SaveConfig("mode", m); err != nil {
 				return err
 			}
+			if prefs != nil {
+				prefs.ApplyExportFromMode(m, st.SaveConfig)
+			}
 			if mm, ok := control.PlannerMPCMode(mode); ok && mpcSvc != nil {
 				mpcSvc.SetMode(ctx, mm)
 			}
@@ -3832,11 +4313,16 @@ func haCallbacks(ctx context.Context, ctrl *control.State, ctrlMu *sync.Mutex, s
 			ctrl.SetGridTarget(w)
 			return st.SaveConfig("grid_target_w", strconv.FormatFloat(w, 'f', 1, 64))
 		},
+		// Same validation as POST /api/peak_limit — an HA number can be
+		// dragged past the site's fuse just as easily as an API caller can
+		// post past it, and the two setters must not diverge (#mode-drift
+		// again, one field down). The returned error reaches the bridge,
+		// which logs it; HA's own state topic republishes the value FTW
+		// actually holds, so the operator sees the number snap back.
 		SetPeakLimit: func(w float64) error {
 			ctrlMu.Lock()
 			defer ctrlMu.Unlock()
-			ctrl.PeakLimitW = w
-			return nil
+			return ctrl.SetPeakLimit(w)
 		},
 		SetEVCharging: func(w float64, active bool) error {
 			ctrlMu.Lock()
@@ -3876,7 +4362,7 @@ func (b mpcPlanBridge) LatestActions() []ha.PlanAction {
 			SlotLenMin:  a.SlotLenMin,
 			BatteryW:    a.BatteryW,
 			GridW:       a.GridW,
-			SoCPct:      a.SoCPct,
+			SoCPct:      a.SoC * 100,
 			PriceOre:    a.PriceOre,
 			SpotOre:     a.SpotOre,
 			CostOre:     a.CostOre,

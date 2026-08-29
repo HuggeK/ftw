@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	net_url "net/url"
 	"sync"
 	"time"
 
 	"github.com/srcfl/ftw/go/internal/telemetry"
+	"github.com/srcfl/ftw/go/internal/units"
 )
 
 // ErrNoCapability is returned by host functions the driver wasn't granted.
@@ -85,6 +87,10 @@ type HostEnv struct {
 	// backward compat with existing drivers that didn't declare a list.
 	// Populated from driver config `capabilities.http.allowed_hosts`.
 	HTTPAllowedHosts []string
+	// AllowUnverifiedLocal permits all this driver's mDNS-resolved .local
+	// transports. The name allowlist is not server identity; core keeps this
+	// false unless the operator explicitly opts in.
+	AllowUnverifiedLocal bool
 	// HTTPTLSPinSHA256, when non-empty, pins the HTTPS leaf certificate to
 	// this SHA-256 fingerprint (hex; colons/whitespace ignored, case-
 	// insensitive — same value as `openssl x509 -fingerprint -sha256`).
@@ -266,6 +272,33 @@ func (h *HostEnv) endWriteScope() (int, []string) {
 	h.writeEvidence = nil
 	h.mu.Unlock()
 	return writes, evidence
+}
+
+// allowAuthPost reports whether this POST is the sign-in the signed package
+// declared, and so may proceed outside the write phases.
+//
+// A read-only driver that reads a vendor cloud cannot read anything until it
+// has exchanged a token, and it exchanges one from init or poll -- the phases
+// allowWrite refuses, for good reason, since nothing there can carry a command
+// lease. Authenticating is a precondition for reading rather than a write to
+// the device, so it is admitted here instead, confined to the single path the
+// signed manifest names and only for a driver published read-only. It does not
+// consume the write budget: a token refresh is driven by expiry, not by a
+// caller, and spending the budget on it would leave the driver unable to read
+// once its token aged out.
+func (h *HostEnv) allowAuthPost(rawURL string) bool {
+	if h.RuntimePolicy == nil || !h.RuntimePolicy.ReadOnly {
+		return false
+	}
+	declared := h.RuntimePolicy.AuthPostPath
+	if declared == "" || !h.RuntimePolicy.allows("http.post") {
+		return false
+	}
+	parsed, err := net_url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	return parsed.Path == declared
 }
 
 func (h *HostEnv) allowWrite(permission string) error {
@@ -464,6 +497,12 @@ func (h *HostEnv) WithHTTPAllowedHosts(hosts []string) *HostEnv {
 	return h
 }
 
+// WithAllowUnverifiedLocal permits this driver's raw .local transports.
+func (h *HostEnv) WithAllowUnverifiedLocal() *HostEnv {
+	h.AllowUnverifiedLocal = true
+	return h
+}
+
 // WithHTTPTLSPin pins the HTTPS leaf certificate this driver's http_*
 // calls will accept, by SHA-256 fingerprint. Empty string = no pin
 // (standard system-root verification). See HostEnv.HTTPTLSPinSHA256.
@@ -606,6 +645,13 @@ func (h *HostEnv) emitTelemetry(rawJSON []byte) error {
 			soc = env.VehicleSoCFract
 		}
 	}
+	// Driver door: Tesla battery_level and similar vendor percents arrive
+	// as 0–100 on DerVehicle. Battery and V2X already emit 0–1 and are
+	// rejected if they do not. Convert only vehicles, before ValidateReading.
+	if t == telemetry.DerVehicle && soc != nil {
+		f := units.FractionFromLegacyPercent(*soc)
+		soc = &f
+	}
 	if err := telemetry.ValidateReading(t, rawW, soc); err != nil {
 		return fmt.Errorf("emit_telemetry: %w", err)
 	}
@@ -646,10 +692,13 @@ func (h *HostEnv) emitTelemetry(rawJSON []byte) error {
 // Driver authors call this for anything beyond the standard pv/battery/meter
 // shape — temperatures, voltages, frequencies, MPPT currents, etc. unit is an
 // optional display unit (e.g. "°C", "Hz") used by the UI to group + label.
+// Vendor kW/kWh are folded to W/Wh here so a pinned Lua driver that still
+// speaks kilo-units cannot store the wrong scale.
 func (h *HostEnv) emitMetric(name string, value float64, unit, register, title string) error {
 	if math.IsNaN(value) || math.IsInf(value, 0) {
 		return fmt.Errorf("emit_metric: %s is non-finite: %v", name, value)
 	}
+	value, unit = units.CanonicalPowerEnergy(value, unit)
 	if h.bufferPollMetric(pollMetric{name: name, value: value, unit: unit, register: register, title: title}) {
 		return nil
 	}

@@ -10,6 +10,31 @@ import (
 	"github.com/srcfl/ftw/go/internal/telemetry"
 )
 
+func seedReactivePrices(t *testing.T, st *state.Store) {
+	t.Helper()
+	start := time.Now().UTC().Truncate(15 * time.Minute)
+	prices := make([]state.PricePoint, 4)
+	for i := range prices {
+		prices[i] = state.PricePoint{
+			Zone: "SE3", SlotTsMs: start.Add(time.Duration(i) * 15 * time.Minute).UnixMilli(),
+			SlotLenMin: 15, SpotOreKwh: 50, TotalOreKwh: 100,
+			Source: "test", FetchedAtMs: start.UnixMilli(),
+		}
+	}
+	if err := st.SavePrices(prices); err != nil {
+		t.Fatalf("save prices: %v", err)
+	}
+}
+
+func reactiveTestParams() Params {
+	return Params{
+		Mode: ModeSelfConsumption, SoCLevels: 11, ActionLevels: 5,
+		CapacityWh: 10000, InitialSoC: 0.5, SoCMin: 0.1, SoCMax: 0.95,
+		MaxChargeW: 3000, MaxDischargeW: 3000,
+		ChargeEfficiency: 0.95, DischargeEfficiency: 0.95,
+	}
+}
+
 // buildTestService spins up a minimal Service with one cached plan
 // covering the current time, so checkDivergence has something to
 // compare against.
@@ -19,6 +44,7 @@ func buildTestService(t *testing.T, planPV, planLoad float64) (*Service, *teleme
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
+	seedReactivePrices(t, st)
 	tel := telemetry.NewStore()
 	tel.DriverHealthMut("site").RecordSuccess()
 	tel.DriverHealthMut("inverter").RecordSuccess()
@@ -32,6 +58,9 @@ func buildTestService(t *testing.T, planPV, planLoad float64) (*Service, *teleme
 		MinReplanGap:     time.Millisecond,
 		PVDivergenceWh:   500,
 		LoadDivergenceWh: 400,
+		Horizon:          time.Hour,
+		Defaults:         reactiveTestParams(),
+		BaseLoad:         500,
 	}
 	now := time.Now()
 	s.last = &Plan{
@@ -175,13 +204,16 @@ func buildDefaultTestService(t *testing.T, planPV, planLoad float64) (*Service, 
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
+	seedReactivePrices(t, st)
 	tel := telemetry.NewStore()
 	tel.DriverHealthMut("site").RecordSuccess()
 	tel.DriverHealthMut("inverter").RecordSuccess()
 
 	// Mirror New()'s defaults so this test exercises the production
 	// reactive-trigger numbers.
-	s := New(st, tel, "SE3", Params{})
+	s := New(st, tel, "SE3", reactiveTestParams())
+	s.Horizon = time.Hour
+	s.BaseLoad = 500
 	s.SiteMeter = "site"
 	s.ReactiveInterval = 10 * time.Millisecond
 	now := time.Now()
@@ -255,8 +287,11 @@ func twinDriftService(t *testing.T) *Service {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
+	seedReactivePrices(t, st)
 	tel := telemetry.NewStore()
-	s := New(st, tel, "SE3", Params{})
+	s := New(st, tel, "SE3", reactiveTestParams())
+	s.Horizon = time.Hour
+	s.BaseLoad = 500
 	s.ReactiveInterval = 10 * time.Millisecond
 	// Make sure cooldown doesn't suppress the first trigger.
 	s.lastReplanAt = time.Now().Add(-time.Hour)
@@ -282,9 +317,8 @@ func TestTwinDriftReplanFiresOnLargePVShift(t *testing.T) {
 	// A live PV predictor that now returns 1500 W per slot — RMSE = 500 W,
 	// well past the 250 W threshold.
 	s.PV = func(time.Time, float64) float64 { return 1500 }
-	// Stub a minimal plan so replan() (called on trigger) doesn't panic —
-	// it'll bail with "no prices available yet" but lastReason has been
-	// set on the service before that call, which is what we assert.
+	// Stub a minimal active plan. The seeded prices let the triggered replan
+	// commit its reason with the replacement plan.
 	s.last = &Plan{GeneratedAtMs: now.UnixMilli()}
 
 	s.checkTwinDrift(context.Background())
@@ -341,6 +375,45 @@ func TestTwinDriftReplanIgnoresTinyShift(t *testing.T) {
 	s.checkTwinDrift(context.Background())
 	if s.lastReason != "scheduled" {
 		t.Fatalf("100 W RMSE must not trigger replan, got %q", s.lastReason)
+	}
+}
+
+func TestTwinDriftKeepsWeatherRowCoveringFirstSlot(t *testing.T) {
+	s := twinDriftService(t)
+	slotStart := time.Now().UTC().Truncate(time.Hour).Add(45 * time.Minute)
+	coveringCloud := 10.0
+	nextCloud := 90.0
+	if err := s.Store.SaveForecasts([]state.ForecastPoint{
+		{
+			SlotTsMs:   slotStart.Add(-45 * time.Minute).UnixMilli(),
+			SlotLenMin: 60, CloudCoverPct: &coveringCloud,
+			Source: "weather-test", FetchedAtMs: time.Now().UnixMilli(),
+		},
+		{
+			SlotTsMs:   slotStart.Add(15 * time.Minute).UnixMilli(),
+			SlotLenMin: 60, CloudCoverPct: &nextCloud,
+			Source: "weather-test", FetchedAtMs: time.Now().UnixMilli(),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s.plannedPredictions = &plannedPredictions{
+		pv:        []float64{coveringCloud * 100},
+		load:      []float64{0},
+		slotStart: []time.Time{slotStart},
+		builtAt:   time.Now(),
+	}
+	s.PV = func(_ time.Time, cloud float64) float64 { return cloud * 100 }
+	s.Load = nil
+	s.TwinDriftPVW = 100
+	s.TwinDriftLoadW = 0
+	s.last = &Plan{GeneratedAtMs: time.Now().UnixMilli()}
+	s.lastReason = "scheduled"
+
+	s.checkTwinDrift(context.Background())
+	if s.lastReason != "scheduled" {
+		t.Fatalf("covering weather row must not cause false twin drift, got %q", s.lastReason)
 	}
 }
 

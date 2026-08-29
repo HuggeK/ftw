@@ -176,7 +176,7 @@ func caps(items map[string]float64) map[string]float64 { return items }
 
 func ptrF64(v float64) *float64 { return &v }
 
-func TestIdleModeReturnsNothing(t *testing.T) {
+func TestIdleModeCommandsZero(t *testing.T) {
 	store := seedStore(2000, []struct {
 		name          string
 		currentW, soc float64
@@ -186,8 +186,11 @@ func TestIdleModeReturnsNothing(t *testing.T) {
 	st := NewState(0, 50, "ferroamp")
 	st.Mode = ModeIdle
 	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
-	if len(targets) != 0 {
-		t.Errorf("idle should dispatch nothing, got %d", len(targets))
+	if len(targets) != 1 {
+		t.Fatalf("idle should command every battery, got %d targets: %v", len(targets), targets)
+	}
+	if math.Abs(targets[0].TargetW) > 0.01 {
+		t.Errorf("idle target = %.2f W, want 0 W", targets[0].TargetW)
 	}
 }
 
@@ -259,6 +262,38 @@ func TestDeviceFaultExcludesBatteryAndReallocates(t *testing.T) {
 	}
 	if !sawSungrow || sungrow >= 0 {
 		t.Errorf("the healthy sungrow should discharge to cover the load alone (negative target), got saw=%v %.0f W", sawSungrow, sungrow)
+	}
+}
+
+// Same exclusion, reached from the other side: the driver reports itself
+// healthy but has rejected the commands core sent it. Before, it kept
+// Status=ok and stayed in the dispatch set, so the plan went on counting on
+// power it never delivered and the shortfall became grid import.
+func TestCommandFaultExcludesBatteryAndReallocates(t *testing.T) {
+	store := seedStore(3000, []struct { // site importing 3 kW
+		name          string
+		currentW, soc float64
+	}{
+		{"ferroamp", 0, 0.5},
+		{"sungrow", 0, 0.5},
+	})
+	store.SetDriverCommandFault("ferroamp", true, "modbus write refused")
+
+	st := NewState(0, 50, "ferroamp")
+	st.Mode = ModeSelfConsumption
+	var sungrow float64
+	sawSungrow := false
+	for _, tg := range ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200, "sungrow": 9600}), 11040) {
+		if tg.Driver == "ferroamp" {
+			t.Errorf("a battery that refuses commands must NOT get a dispatch target, got %.0f W", tg.TargetW)
+		}
+		if tg.Driver == "sungrow" {
+			sungrow = tg.TargetW
+			sawSungrow = true
+		}
+	}
+	if !sawSungrow || sungrow >= 0 {
+		t.Errorf("sungrow should cover the load alone (negative target), got saw=%v %.0f W", sawSungrow, sungrow)
 	}
 }
 
@@ -611,6 +646,49 @@ func TestWeightedDistribution(t *testing.T) {
 	}
 }
 
+func TestWeightedDistributionReallocatesBlockedDirection(t *testing.T) {
+	tests := []struct {
+		name       string
+		correction float64
+		bats       []batteryInfo
+		wantB      float64
+	}{
+		{
+			name:       "charge",
+			correction: 1000,
+			bats: []batteryInfo{
+				{driver: "blocked", capacityWh: 10000, soc: 0.5, online: true, chargeBlocked: true},
+				{driver: "capable", capacityWh: 10000, soc: 0.5, online: true},
+			},
+			wantB: 1000,
+		},
+		{
+			name:       "discharge",
+			correction: -1000,
+			bats: []batteryInfo{
+				{driver: "blocked", capacityWh: 10000, soc: 0.5, online: true, dischargeBlocked: true},
+				{driver: "capable", capacityWh: 10000, soc: 0.5, online: true},
+			},
+			wantB: -1000,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			targets := distributeWeighted(tt.bats, tt.correction, map[string]float64{
+				"blocked": 1,
+				"capable": 1,
+			})
+			got := targetsByDriver(targets)
+			if got["blocked"].TargetW != 0 || !got["blocked"].Clamped {
+				t.Errorf("blocked target = %+v, want 0 W clamped", got["blocked"])
+			}
+			if got["capable"].TargetW != tt.wantB {
+				t.Errorf("capable TargetW = %.1f W, want %.1f W", got["capable"].TargetW, tt.wantB)
+			}
+		})
+	}
+}
+
 // ---- Clamps ----
 
 func TestClampWithSoCBlocksDischargeWhenEmpty(t *testing.T) {
@@ -654,6 +732,96 @@ func TestClampWithSoCUsesPerBatteryLimits(t *testing.T) {
 	if v, was := clampWithSoC(-9000, b); v != -8000 || !was {
 		t.Errorf("-9000 vs 8 kW discharge cap: got %f clamped=%v, want -8000 true", v, was)
 	}
+}
+
+func TestClampWithSoCPreservesExplicitZeroDirectionLimits(t *testing.T) {
+	b := batteryInfo{
+		soc:              0.5,
+		maxChargeWSet:    true,
+		maxDischargeW:    8000,
+		maxDischargeWSet: true,
+	}
+	if v, was := clampWithSoC(1000, b); v != 0 || !was {
+		t.Errorf("explicit zero charge limit: got %f clamped=%v, want 0 true", v, was)
+	}
+	if v, was := clampWithSoC(-1000, b); v != -1000 || was {
+		t.Errorf("enabled discharge direction changed: got %f clamped=%v, want -1000 false", v, was)
+	}
+
+	b = batteryInfo{
+		soc:              0.5,
+		maxChargeW:       8000,
+		maxChargeWSet:    true,
+		maxDischargeWSet: true,
+	}
+	if v, was := clampWithSoC(-1000, b); v != 0 || !was {
+		t.Errorf("explicit zero discharge limit: got %f clamped=%v, want 0 true", v, was)
+	}
+	if v, was := clampWithSoC(1000, b); v != 1000 || was {
+		t.Errorf("enabled charge direction changed: got %f clamped=%v, want 1000 false", v, was)
+	}
+}
+
+func TestPowerLimitsPositiveValuesRemainEffectiveWithoutSetFlags(t *testing.T) {
+	limits := map[string]PowerLimits{
+		"battery": {MaxChargeW: 7000, MaxDischargeW: 6000},
+	}
+	targets := clampTargetsToPowerLimits([]DispatchTarget{
+		{Driver: "battery", TargetW: 9000},
+		{Driver: "battery", TargetW: -9000},
+	}, limits)
+	if targets[0].TargetW != 7000 || !targets[0].Clamped {
+		t.Errorf("legacy positive charge limit: got %+v, want +7000 clamped", targets[0])
+	}
+	if targets[1].TargetW != -6000 || !targets[1].Clamped {
+		t.Errorf("legacy positive discharge limit: got %+v, want -6000 clamped", targets[1])
+	}
+}
+
+func TestComputeDispatchPreservesExplicitZeroDirectionLimits(t *testing.T) {
+	t.Run("charge", func(t *testing.T) {
+		store := seedStore(-6000, []struct {
+			name          string
+			currentW, soc float64
+		}{{"battery", 0, 0.5}})
+		st := NewState(0, 0, "ferroamp")
+		st.Mode = ModeCharge
+		st.DriverLimits = map[string]PowerLimits{
+			"battery": {
+				MaxChargeWSet:    true,
+				MaxDischargeW:    6000,
+				MaxDischargeWSet: true,
+			},
+		}
+
+		targets := ComputeDispatch(store, st, caps(map[string]float64{"battery": 10000}), 50000)
+		if len(targets) != 1 || targets[0].TargetW != 0 {
+			t.Fatalf("explicit zero charge limit produced targets %+v, want one 0 W target", targets)
+		}
+	})
+
+	t.Run("discharge", func(t *testing.T) {
+		store := seedStore(12000, []struct {
+			name          string
+			currentW, soc float64
+		}{{"battery", 0, 0.5}})
+		st := NewState(0, 0, "ferroamp")
+		st.Mode = ModeSelfConsumption
+		st.SlewRateW = 100000
+		st.MinDispatchIntervalS = 0
+		st.DriverLimits = map[string]PowerLimits{
+			"battery": {
+				MaxChargeW:       6000,
+				MaxChargeWSet:    true,
+				MaxDischargeWSet: true,
+			},
+		}
+
+		targets := ComputeDispatch(store, st, caps(map[string]float64{"battery": 10000}), 50000)
+		if len(targets) != 1 || targets[0].TargetW != 0 {
+			t.Fatalf("explicit zero discharge limit produced targets %+v, want one 0 W target", targets)
+		}
+	})
 }
 
 // ---- Fuse guard ----
@@ -890,8 +1058,9 @@ func TestPeakShavingActsWhenOverLimit(t *testing.T) {
 	}
 }
 
-func TestEVChargingSignalExcludedFromGrid(t *testing.T) {
-	// Grid = +3000 includes 2500W EV charging. Effective = +500W → within tolerance.
+func TestPlannerSelfBatteryCoversEVOffExcludesEVFromGrid(t *testing.T) {
+	// Planner modes keep the opt-in policy. Grid = +3000 includes 2500 W
+	// of EV charging, so the PI sees only 500 W when BatteryCoversEV is off.
 	store := seedStore(3000, []struct {
 		name          string
 		currentW, soc float64
@@ -899,16 +1068,47 @@ func TestEVChargingSignalExcludedFromGrid(t *testing.T) {
 		{"ferroamp", 0, 0.5},
 	})
 	st := NewState(0, 50, "ferroamp")
-	st.Mode = ModeSelfConsumption
+	st.Mode = ModePlannerSelf
 	st.EVChargingW = 2500
+	st.BatteryCoversEV = false
 	st.SlewRateW = 100000
 	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
-	// Effective grid 500 → beyond 50 band, but small correction expected
+	// Effective grid 500 W is outside the 50 W band, but the correction
+	// must stay far below one that covers the full site import.
 	if len(targets) > 0 {
-		// Allow small dispatch, but verify not trying to cover all 3000W
 		if math.Abs(targets[0].TargetW) > 2000 {
-			t.Errorf("EV-corrected dispatch should be modest, got %f", targets[0].TargetW)
+			t.Errorf("planner dispatch should exclude EV draw, got %f", targets[0].TargetW)
 		}
+	}
+}
+
+func TestPlannerDoesNotDischargeIntoAFaultedChargersDraw(t *testing.T) {
+	// Site importing 9.9 kW because the car is drawing 11.4 kW against
+	// 1.5 kW of solar-minus-house. The charger is emitting that 11.4 kW
+	// but DeviceFault so it cannot take a command. BatteryCoversEV is
+	// off. Before the TelemetryLive split, IsOnline() hid the car and
+	// the planner discharged the battery into it as if it were house
+	// load.
+	store := seedStore(9900, []struct {
+		name          string
+		currentW, soc float64
+	}{
+		{"ferroamp", 0, 0.5},
+	})
+	store.Update("easee", telemetry.DerEV, 11400, nil, nil)
+	store.DriverHealthMut("easee").RecordSuccess()
+	store.SetDriverDeviceFault("easee", true, "setpoint refused")
+
+	st := NewState(0, 50, "ferroamp")
+	st.Mode = ModePlannerSelf
+	st.BatteryCoversEV = false
+	st.SlewRateW = 100000
+	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
+	if st.EVChargingW < 11000 {
+		t.Fatalf("EVChargingW = %f; a faulted charger still drawing was ignored", st.EVChargingW)
+	}
+	if len(targets) > 0 && targets[0].TargetW < -2000 {
+		t.Errorf("battery discharged %.0f W into a car that cover-EV is off for", targets[0].TargetW)
 	}
 }
 
@@ -1036,13 +1236,55 @@ func TestSelfConsumptionDoesNotChargeBatteryFromV2XDischargeByDefault(t *testing
 	}
 }
 
-// TestBatteryCoversEV_OffExcludesEVFromGrid mirrors the existing
-// exclusion behaviour. Grid meter reads +3000 W, 2500 W is EV, so
-// the effective grid the controller sees should be 500 W — well
-// within the dead-band — and the battery should not try to cover
-// the whole 3000 W. Regression guard that the new flag's default
-// preserves current behaviour.
-func TestBatteryCoversEV_OffExcludesEVFromGrid(t *testing.T) {
+// Björn's case: the battery charges from PV while a larger EV load makes the
+// raw site meter import. Self (manual) must react to the 5.56 kW site import,
+// not subtract the 8.11 kW EV and ask the battery to charge harder.
+func TestSelfConsumptionIncludesEVWithBatteryCoversEVOff(t *testing.T) {
+	store := seedStore(5560, []struct {
+		name          string
+		currentW, soc float64
+	}{
+		{"ferroamp", 4260, 0.5},
+	})
+	st := NewState(0, 50, "ferroamp")
+	st.Mode = ModeSelfConsumption
+	st.EVChargingW = 8110
+	st.BatteryCoversEV = false
+	st.SlewRateW = 100000
+	st.MinDispatchIntervalS = 0
+	const nonBatterySiteW = 1300.0
+	var firstTarget, lastTarget float64
+	for i := 0; i < 12; i++ {
+		targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
+		if len(targets) == 0 {
+			if math.Abs(nonBatterySiteW+lastTarget) > st.GridToleranceW {
+				t.Fatalf("cycle %d: dispatch stopped outside tolerance at target %f W", i, lastTarget)
+			}
+			break
+		}
+		if len(targets) != 1 {
+			t.Fatalf("cycle %d: expected 1 target, got %d", i, len(targets))
+		}
+		lastTarget = targets[0].TargetW
+		if i == 0 {
+			firstTarget = lastTarget
+		}
+		store.Update("ferroamp", telemetry.DerBattery, lastTarget, ptrF64(0.5), nil)
+		store.Update("ferroamp", telemetry.DerMeter, nonBatterySiteW+lastTarget, nil, nil)
+		store.DriverHealthMut("ferroamp").RecordSuccess()
+	}
+	if firstTarget >= 1500 {
+		t.Errorf("Self (manual) did not react to raw site import: first target=%f W, want <1500 W", firstTarget)
+	}
+	if math.Abs(lastTarget-(-nonBatterySiteW)) > 50 {
+		t.Errorf("Self (manual) converged to %f W, want about -1300 W from the raw meter", lastTarget)
+	}
+}
+
+func TestSelfConsumptionSurplusOnlyEVStillBlocksBatteryDischarge(t *testing.T) {
+	// The EV is larger than the available PV surplus: raw site import is
+	// 3 kW while the house-side signal exports 6 kW. Surplus-only wins over
+	// the global cover toggle, so the home battery must not feed the EV.
 	store := seedStore(3000, []struct {
 		name          string
 		currentW, soc float64
@@ -1051,12 +1293,76 @@ func TestBatteryCoversEV_OffExcludesEVFromGrid(t *testing.T) {
 	})
 	st := NewState(0, 50, "ferroamp")
 	st.Mode = ModeSelfConsumption
-	st.EVChargingW = 2500
-	st.BatteryCoversEV = false // explicit — this is the default
+	st.EVChargingW = 9000
+	st.EVSurplusOnlyReserveW = 11000
+	st.EVSurplusOnlyChargingW = 9000
+	st.BatteryCoversEV = true
 	st.SlewRateW = 100000
 	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
-	if len(targets) > 0 && math.Abs(targets[0].TargetW) > 2000 {
-		t.Errorf("with flag off, battery must not try to cover 2500W EV draw; got target=%f", targets[0].TargetW)
+	if len(targets) != 1 {
+		t.Fatalf("expected 1 target, got %d", len(targets))
+	}
+	if math.Abs(targets[0].TargetW) > 1 {
+		t.Errorf("surplus-only EV moved the home battery: target=%f W, want idle", targets[0].TargetW)
+	}
+}
+
+func TestSelfConsumptionSurplusOnlyEVStillCoversHouseLoad(t *testing.T) {
+	// Raw import is 4 kW: 3 kW EV and 1 kW house. The battery may cover
+	// the house, but surplus-only must stop it before it feeds the EV.
+	store := seedStore(4000, []struct {
+		name          string
+		currentW, soc float64
+	}{
+		{"ferroamp", 0, 0.5},
+	})
+	st := NewState(0, 50, "ferroamp")
+	st.Mode = ModeSelfConsumption
+	st.EVChargingW = 3000
+	st.EVSurplusOnlyReserveW = 5000
+	st.EVSurplusOnlyChargingW = 3000
+	st.BatteryCoversEV = true
+	st.SlewRateW = 100000
+	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
+	if len(targets) != 1 {
+		t.Fatalf("expected 1 target, got %d", len(targets))
+	}
+	if math.Abs(targets[0].TargetW-(-1000)) > 1 {
+		t.Errorf("surplus-only house coverage target=%f W, want -1000 W", targets[0].TargetW)
+	}
+}
+
+func TestSelfConsumptionSurplusOnlyEVDoesNotBlockCoveringRegularEV(t *testing.T) {
+	// Raw import is 8 kW: 3 kW surplus-only EV, 4 kW regular EV and
+	// 1 kW house. Protect only the surplus-only EV; the battery may cover
+	// the regular EV and house load.
+	store := seedStore(8000, []struct {
+		name          string
+		currentW, soc float64
+	}{
+		{"ferroamp", 0, 0.5},
+	})
+	st := NewState(0, 50, "ferroamp")
+	st.Mode = ModeSelfConsumption
+	st.EVChargingW = 7000
+	st.EVSurplusOnlyReserveW = 5000
+	st.EVSurplusOnlyChargingW = 3000
+	st.BatteryCoversEV = true
+	st.SlewRateW = 100000
+	st.MinDispatchIntervalS = 0
+	var lastTarget float64
+	for i := 0; i < 12; i++ {
+		targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
+		if len(targets) != 1 {
+			t.Fatalf("cycle %d: expected 1 target, got %d", i, len(targets))
+		}
+		lastTarget = targets[0].TargetW
+		store.Update("ferroamp", telemetry.DerBattery, lastTarget, ptrF64(0.5), nil)
+		store.Update("ferroamp", telemetry.DerMeter, 8000+lastTarget, nil, nil)
+		store.DriverHealthMut("ferroamp").RecordSuccess()
+	}
+	if math.Abs(lastTarget-(-5000)) > 50 {
+		t.Errorf("mixed-EV target converged to %f W, want -5000 W for house plus regular EV", lastTarget)
 	}
 }
 
@@ -1083,6 +1389,7 @@ func TestSurplusOnlyEVDoesNotAutoEnableBatteryCoversEV(t *testing.T) {
 	st.UseEnergyDispatch = true
 	st.EVChargingW = 9000
 	st.EVSurplusOnlyReserveW = 11000
+	st.EVSurplusOnlyChargingW = 9000
 	st.BatteryCoversEV = false
 	st.SlewRateW = 100000
 	st.MinDispatchIntervalS = 0
@@ -1690,7 +1997,7 @@ func TestEnergyDispatchFallsBackToLegacyWhenDirectiveUnavailable(t *testing.T) {
 	st.SlotDirective = func(time.Time) (SlotDirective, bool) { return SlotDirective{}, false }
 	// Legacy fallback hook: return ok=false too, should route to the
 	// "plan stale" self-consumption-with-grid-target=0 branch.
-	st.PlanTarget = func(time.Time) (string, float64, bool) { return "", 0, false }
+	st.PlanTarget = func(time.Time) (string, float64, string, bool) { return "", 0, "", false }
 
 	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
 	if !st.PlanStale {
@@ -2676,8 +2983,8 @@ func TestPlannerArbitrageCoverLoadChasesGridZeroNotPlannedImport(t *testing.T) {
 	// Production wiring: PlanTarget exists alongside SlotDirective.
 	// actionToSlot returns ("self_consumption", a.GridW, true) for
 	// arbitrage discharge — i.e. would set grid_target to planned import.
-	st.PlanTarget = func(time.Time) (string, float64, bool) {
-		return "self_consumption", 1700, true
+	st.PlanTarget = func(time.Time) (string, float64, string, bool) {
+		return "self_consumption", 1700, "", true
 	}
 
 	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
@@ -3135,7 +3442,7 @@ func TestPlannerSelfStalePlanDischargesToCoverLoad(t *testing.T) {
 	st.SlewRateW = 10000
 	st.MinDispatchIntervalS = 0
 	st.SlotDirective = func(time.Time) (SlotDirective, bool) { return SlotDirective{}, false }
-	st.PlanTarget = func(time.Time) (string, float64, bool) { return "", 0, false }
+	st.PlanTarget = func(time.Time) (string, float64, string, bool) { return "", 0, "", false }
 
 	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
 	if len(targets) != 1 {
@@ -3168,7 +3475,7 @@ func TestPlannerSelfStalePlanBlocksPVCharging(t *testing.T) {
 	st.SlewRateW = 10000
 	st.MinDispatchIntervalS = 0
 	st.SlotDirective = func(time.Time) (SlotDirective, bool) { return SlotDirective{}, false }
-	st.PlanTarget = func(time.Time) (string, float64, bool) { return "", 0, false }
+	st.PlanTarget = func(time.Time) (string, float64, string, bool) { return "", 0, "", false }
 
 	targets := ComputeDispatch(store, st, caps(map[string]float64{
 		"ferroamp": 15200,
@@ -3809,6 +4116,7 @@ func TestPlannerSelfIdleGateLeavesSurplusOnlyEVReserve(t *testing.T) {
 	st.UseEnergyDispatch = true
 	st.EVChargingW = 1000
 	st.EVSurplusOnlyReserveW = 3000
+	st.EVSurplusOnlyChargingW = 1000
 	st.SlewRateW = 10000
 	st.MinDispatchIntervalS = 0
 	st.SlotDirective = func(time.Time) (SlotDirective, bool) { return dir, true }
@@ -4275,13 +4583,42 @@ func TestPlanSignFloorReadsLegacyPlanTarget(t *testing.T) {
 	// mapping.
 	st := NewState(0, 0, "ferroamp")
 	st.Mode = ModePlannerArbitrage
-	st.PlanTarget = func(time.Time) (string, float64, bool) {
-		return "self_consumption", -4000, true
+	st.PlanTarget = func(time.Time) (string, float64, string, bool) {
+		return "self_consumption", -4000, "", true
 	}
 	in := []DispatchTarget{{Driver: "pixii", TargetW: 1700}} // charge against discharge plan
 	out := applyPlanSignFloor(in, st)
 	if out[0].TargetW != 0 {
 		t.Errorf("legacy-path discharge intent: TargetW = %f, want 0", out[0].TargetW)
+	}
+}
+
+func TestLegacyPlanSignGuardUsesOnlyMatchingDirectiveIdentity(t *testing.T) {
+	const decisionID = "00000000-0000-4000-8000-000000000304"
+	st := NewState(0, 0, "ferroamp")
+	st.Mode = ModePlannerArbitrage
+	st.SlotDirective = func(time.Time) (SlotDirective, bool) { return SlotDirective{}, false }
+	st.PlanTarget = func(time.Time) (string, float64, string, bool) { return "", 0, "", false }
+	st.controlPlanSnapshot = controlPlanSnapshot{
+		active:      true,
+		source:      controlPlanLegacyTarget,
+		directiveOK: true,
+		directive: SlotDirective{
+			DecisionID:      decisionID,
+			BatteryEnergyWh: -600,
+		},
+		legacyOK:   true,
+		legacyMode: string(ModeSelfConsumption),
+		legacyID:   decisionID,
+	}
+
+	if got := planSignIntent(st); got != -1 {
+		t.Fatalf("matching legacy/directive plan sign = %d, want discharge (-1)", got)
+	}
+
+	st.controlPlanSnapshot.directive.DecisionID = "00000000-0000-4000-8000-000000000305"
+	if got := planSignIntent(st); got != 0 {
+		t.Fatalf("mixed-plan directive sign = %d, want neutral legacy intent (0)", got)
 	}
 }
 
@@ -4321,8 +4658,8 @@ func TestComputeDispatchAppliesSignFloorOnDischargeSlot(t *testing.T) {
 	// here to return grid_target=0 to model the bug behaviour where the
 	// negative grid target failed to plumb through (whatever the cause).
 	// The plan INTENT (discharge) still comes from SlotDirective.
-	st.PlanTarget = func(time.Time) (string, float64, bool) {
-		return "self_consumption", 0, true // bug: should have been negative
+	st.PlanTarget = func(time.Time) (string, float64, string, bool) {
+		return "self_consumption", 0, "", true // bug: should have been negative
 	}
 	st.SlotDirective = func(time.Time) (SlotDirective, bool) {
 		return SlotDirective{
@@ -4630,6 +4967,108 @@ func TestBatteryManualHoldBypassesHoldoff(t *testing.T) {
 	}
 }
 
+func TestBatteryManualHoldScopedPinsTargetAndStopsSiblingBeforeSlew(t *testing.T) {
+	store := seedStore(5000, []struct {
+		name          string
+		currentW, soc float64
+	}{
+		{"bat_a", 3000, 0.5},
+		{"bat_b", 2000, 0.5},
+	})
+	st := NewState(0, 50, "ferroamp")
+	st.SlewEnabled = true
+	st.SlewRateW = 500
+	st.BatteryHoldTargetValid = func(driver, deviceID string) bool {
+		return driver == "bat_a" && deviceID == "maker:serial-a"
+	}
+	st.SetBatteryManualHold(BatteryManualHold{
+		Driver: "bat_a", DeviceID: "maker:serial-a", PowerW: 3000,
+		ExpiresAt: time.Now().Add(time.Minute),
+	})
+	targets := ComputeDispatch(store, st, caps(map[string]float64{"bat_a": 10000, "bat_b": 10000}), 100000)
+	byDriver := map[string]float64{}
+	for _, target := range targets {
+		byDriver[target.Driver] = target.TargetW
+	}
+	if math.Abs(byDriver["bat_a"]-3000) > 1 || math.Abs(byDriver["bat_b"]) > 1 {
+		t.Fatalf("scoped targets = %+v, want bat_a=3000 bat_b=0", byDriver)
+	}
+}
+
+func TestBatteryManualHoldScopedClearsWhenTargetIsNoLongerSafe(t *testing.T) {
+	store := seedStore(0, []struct {
+		name          string
+		currentW, soc float64
+	}{{"bat_a", 0, 0.5}})
+	st := NewState(0, 50, "ferroamp")
+	valid := false
+	st.BatteryHoldTargetValid = func(string, string) bool { return valid }
+	st.SetBatteryManualHold(BatteryManualHold{
+		Driver: "bat_a", DeviceID: "maker:serial-a", PowerW: 3000,
+		ExpiresAt: time.Now().Add(time.Minute),
+	})
+	ComputeDispatch(store, st, caps(map[string]float64{"bat_a": 10000}), 100000)
+	if _, active := st.GetBatteryManualHold(time.Now()); active {
+		t.Fatal("unsafe target left scoped hold active")
+	}
+	valid = true
+	ComputeDispatch(store, st, caps(map[string]float64{"bat_a": 10000}), 100000)
+	if _, active := st.GetBatteryManualHold(time.Now()); active {
+		t.Fatal("cleared scoped hold resumed after target recovered")
+	}
+}
+
+func TestBatteryManualHoldScopedClearsWhenHardwareIdentityChanges(t *testing.T) {
+	store := seedStore(0, []struct {
+		name          string
+		currentW, soc float64
+	}{{"bat_a", 0, 0.5}})
+	st := NewState(0, 50, "ferroamp")
+	currentDeviceID := "maker:serial-b"
+	st.BatteryHoldTargetValid = func(driver, deviceID string) bool {
+		return driver == "bat_a" && deviceID == currentDeviceID
+	}
+	st.SetBatteryManualHold(BatteryManualHold{
+		Driver: "bat_a", DeviceID: "maker:serial-a", PowerW: 3000,
+		ExpiresAt: time.Now().Add(time.Minute),
+	})
+
+	ComputeDispatch(store, st, caps(map[string]float64{"bat_a": 10000}), 100000)
+
+	if _, active := st.GetBatteryManualHold(time.Now()); active {
+		t.Fatal("driver name moved the scoped hold to different hardware")
+	}
+}
+
+func TestBatteryManualHoldScopedStillUsesCoreClamps(t *testing.T) {
+	store := seedStore(0, []struct {
+		name          string
+		currentW, soc float64
+	}{{"bat_a", 0, 0.2}})
+	st := NewState(0, 50, "ferroamp")
+	st.SlewEnabled = false
+	st.DriverLimits = map[string]PowerLimits{"bat_a": {MaxChargeW: 1000, MaxDischargeW: 1000}}
+	st.BatteryHoldTargetValid = func(string, string) bool { return true }
+	st.SetBatteryManualHold(BatteryManualHold{
+		Driver: "bat_a", DeviceID: "maker:serial-a", PowerW: 3000,
+		ExpiresAt: time.Now().Add(time.Minute),
+	})
+	targets := ComputeDispatch(store, st, caps(map[string]float64{"bat_a": 10000}), 100000)
+	if len(targets) != 1 || math.Abs(targets[0].TargetW-1000) > 1 {
+		t.Fatalf("cap targets = %+v, want bat_a=1000", targets)
+	}
+
+	st.BatteryBoostReserveSoC = 0.3
+	st.SetBatteryManualHold(BatteryManualHold{
+		Driver: "bat_a", DeviceID: "maker:serial-a", PowerW: -1000,
+		ExpiresAt: time.Now().Add(time.Minute),
+	})
+	targets = ComputeDispatch(store, st, caps(map[string]float64{"bat_a": 10000}), 100000)
+	if len(targets) != 1 || math.Abs(targets[0].TargetW) > 1 {
+		t.Fatalf("reserve targets = %+v, want bat_a=0", targets)
+	}
+}
+
 // ---- Meter clamp on the legacy PI dispatch arm ----
 //
 // The reactive PI path commits a charge/discharge magnitude based on
@@ -4882,7 +5321,7 @@ func TestMeterClampRespectsNonZeroGridTarget(t *testing.T) {
 // ---- PV surplus absorber underlay ----
 //
 // Opt-in policy reversal of TestEnergyDispatchDoesNotAbsorbPVSurprise: when
-// the operator sets a SoC cap (PVSurplusAbsorbSoCCapPct > 0), the dispatch
+// the operator sets a SoC cap (PVSurplusAbsorbSoCCap > 0), the dispatch
 // catches the gap between the planner's 15-min slot allocation and the
 // live PV/load drift — additional export beyond plan flows into the
 // battery instead of out the meter at low spot price. Only kicks in
@@ -4912,7 +5351,7 @@ func TestPVSurplusAbsorberAbsorbsExtraExportWhenEnabled(t *testing.T) {
 	store.DriverHealthMut("pv-1").RecordSuccess()
 
 	st := newStateWithEnergyDispatch(dir, "ferroamp")
-	st.PVSurplusAbsorbSoCCapPct = 88 // enable
+	st.PVSurplusAbsorbSoCCap = 0.88 // enable
 	st.PVSurplusAbsorbThresholdW = 100
 
 	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
@@ -4941,13 +5380,13 @@ func TestPVSurplusAbsorberAbsorbsExtraExportWhenEnabled(t *testing.T) {
 func TestPVSurplusAbsorberDisplacesLaterGridCharge(t *testing.T) {
 	now := time.Now()
 	dir := SlotDirective{
-		SlotStart:              now,
-		SlotEnd:                now.Add(15 * time.Minute),
-		BatteryEnergyWh:        200, // plan only asked for ~800 W now
-		Strategy:               "arbitrage",
-		PlannedGridW:           -1000, // preserve 1 kW of planned PV export
-		HasPlannedGridW:        true,
-		LivePVSurplusSoCCapPct: 80, // energy-derived replacement ceiling
+		SlotStart:           now,
+		SlotEnd:             now.Add(15 * time.Minute),
+		BatteryEnergyWh:     200, // plan only asked for ~800 W now
+		Strategy:            "arbitrage",
+		PlannedGridW:        -1000, // preserve 1 kW of planned PV export
+		HasPlannedGridW:     true,
+		LivePVSurplusSoCCap: 0.8, // energy-derived replacement ceiling
 	}
 	store := seedStore(-4000, []struct {
 		name          string
@@ -4959,7 +5398,7 @@ func TestPVSurplusAbsorberDisplacesLaterGridCharge(t *testing.T) {
 	store.DriverHealthMut("pv-1").RecordSuccess()
 
 	st := newStateWithEnergyDispatch(dir, "ferroamp")
-	// No PVSurplusAbsorbSoCCapPct operator override: the plan directive
+	// No PVSurplusAbsorbSoCCap operator override: the plan directive
 	// alone must enable this economically justified slot.
 	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
 	if len(targets) != 1 {
@@ -4970,7 +5409,7 @@ func TestPVSurplusAbsorberDisplacesLaterGridCharge(t *testing.T) {
 	}
 }
 
-// Defaults preserve back-compat: PVSurplusAbsorbSoCCapPct = 0 means
+// Defaults preserve back-compat: PVSurplusAbsorbSoCCap = 0 means
 // disabled; original "don't absorb surprise" behavior holds.
 func TestPVSurplusAbsorberDisabledByDefault(t *testing.T) {
 	now := time.Now()
@@ -4990,7 +5429,7 @@ func TestPVSurplusAbsorberDisabledByDefault(t *testing.T) {
 	store.DriverHealthMut("pv-1").RecordSuccess()
 
 	st := newStateWithEnergyDispatch(dir, "ferroamp")
-	// No PVSurplusAbsorbSoCCapPct set → defaults to 0 → feature off.
+	// No PVSurplusAbsorbSoCCap set → defaults to 0 → feature off.
 
 	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
 	got := targets[0].TargetW
@@ -5022,7 +5461,7 @@ func TestPVSurplusAbsorberHoldsAtCap(t *testing.T) {
 	store.DriverHealthMut("pv-1").RecordSuccess()
 
 	st := newStateWithEnergyDispatch(dir, "ferroamp")
-	st.PVSurplusAbsorbSoCCapPct = 88
+	st.PVSurplusAbsorbSoCCap = 0.88
 
 	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
 	got := targets[0].TargetW
@@ -5154,6 +5593,7 @@ func TestEnergyDispatchAbsorbsSurplusBeyondEVReserveActualDraw(t *testing.T) {
 	st := newStateWithEnergyDispatch(dir, "ferroamp")
 	st.EVChargingW = 2500
 	st.EVSurplusOnlyReserveW = 2500 + 2000 // = SurplusReserveW for one LP at 2.5 kW
+	st.EVSurplusOnlyChargingW = 2500
 
 	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
 	if len(targets) != 1 {
@@ -5166,6 +5606,36 @@ func TestEnergyDispatchAbsorbsSurplusBeyondEVReserveActualDraw(t *testing.T) {
 	}
 	if got > 3900 {
 		t.Errorf("TargetW = %.0f W — battery overshoot, must leave EVRampHeadroomW (2 kW) of headroom for EV ramp-up (want ≈ 3500 W)", got)
+	}
+}
+
+func TestEnergyDispatchHonoursPlannedGridChargeWithIdleSurplusOnlyEV(t *testing.T) {
+	now := time.Now()
+	dir := SlotDirective{
+		SlotStart:       now,
+		SlotEnd:         now.Add(15 * time.Minute),
+		BatteryEnergyWh: 1250, // ~5 kW over 15 min
+		Strategy:        "arbitrage",
+		HasPlannedGridW: true,
+		PlannedGridW:    5500,
+	}
+	store := seedStore(500, []struct {
+		name          string
+		currentW, soc float64
+	}{
+		{"ferroamp", 0, 0.5},
+	})
+	st := newStateWithEnergyDispatch(dir, "ferroamp")
+	st.EVSurplusOnlyReserveW = 2000
+	st.EVSurplusOnlyChargingW = 0
+
+	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
+	if len(targets) != 1 {
+		t.Fatalf("want 1 target, got %d", len(targets))
+	}
+	got := targets[0].TargetW
+	if got < 4000 {
+		t.Errorf("TargetW = %.0f W — idle surplus-only EV must not zero a planned night grid-charge (want ~5000)", got)
 	}
 }
 
@@ -5223,6 +5693,7 @@ func TestEnergyDispatchPreFixReserveStarvesBattery(t *testing.T) {
 	st := newStateWithEnergyDispatch(dir, "ferroamp")
 	st.EVChargingW = 2500
 	st.EVSurplusOnlyReserveW = 11000 // simulate the old "reserve = MaxChargeW" formula
+	st.EVSurplusOnlyChargingW = 2500
 
 	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
 	got := targets[0].TargetW
@@ -5251,7 +5722,7 @@ func TestPVSurplusAbsorberDoesNotReverseDischarge(t *testing.T) {
 	store.DriverHealthMut("pv-1").RecordSuccess()
 
 	st := newStateWithEnergyDispatch(dir, "ferroamp")
-	st.PVSurplusAbsorbSoCCapPct = 88
+	st.PVSurplusAbsorbSoCCap = 0.88
 
 	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
 	got := targets[0].TargetW
@@ -5368,6 +5839,131 @@ func makeSlotMetricsState(siteMeter string, dirFn SlotDirectiveFunc) *State {
 	st.MinDispatchIntervalS = 0
 	st.SlotDirective = dirFn
 	return st
+}
+
+func TestControlSlotIdentityTracksSameSlotReplan(t *testing.T) {
+	now := time.Date(2026, 8, 16, 12, 5, 0, 0, time.UTC)
+	current := SlotDirective{
+		DecisionID:      "00000000-0000-4000-8000-000000000301",
+		SlotStart:       now.Add(-5 * time.Minute),
+		SlotEnd:         now.Add(10 * time.Minute),
+		BatteryEnergyWh: 250,
+		Strategy:        "arbitrage",
+	}
+	available := true
+	calls := 0
+	store := seedStore(0, []struct {
+		name          string
+		currentW, soc float64
+	}{{"ferroamp", 0, 0.5}})
+	st := makeSlotMetricsState("ferroamp", func(time.Time) (SlotDirective, bool) {
+		calls++
+		return current, available
+	})
+	st.clock = func() time.Time { return now }
+
+	_ = ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
+	if got := st.SlotEnergy().DecisionID; got != current.DecisionID {
+		t.Fatalf("first control tick decision ID = %q, want %q", got, current.DecisionID)
+	}
+	if calls != 1 {
+		t.Fatalf("first control tick read %d plan generations, want 1", calls)
+	}
+
+	current.DecisionID = "00000000-0000-4000-8000-000000000302"
+	_ = ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
+	if got := st.SlotEnergy().DecisionID; got != current.DecisionID {
+		t.Fatalf("same-slot replan decision ID = %q, want %q", got, current.DecisionID)
+	}
+	if calls != 2 {
+		t.Fatalf("second control tick read %d total plan generations, want 2", calls)
+	}
+
+	available = false
+	_ = ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
+	if got := st.SlotEnergy().DecisionID; got != "" {
+		t.Fatalf("tick without a plan slot retained decision ID %q", got)
+	}
+	if calls != 3 {
+		t.Fatalf("stale-plan tick read %d total plan generations, want 3", calls)
+	}
+}
+
+func TestControlSlotIdentityTracksLegacyPlan(t *testing.T) {
+	now := time.Date(2026, 8, 16, 12, 5, 0, 0, time.UTC)
+	decisionID := "00000000-0000-4000-8000-000000000303"
+	available := true
+	calls := 0
+	store := seedStore(0, []struct {
+		name          string
+		currentW, soc float64
+	}{{"ferroamp", 0, 0.5}})
+	st := NewState(0, 0, "ferroamp")
+	st.Mode = ModePlannerArbitrage
+	st.SlewRateW = 100000
+	st.clock = func() time.Time { return now }
+	st.PlanTarget = func(time.Time) (string, float64, string, bool) {
+		calls++
+		return "self_consumption", 0, decisionID, available
+	}
+
+	_ = ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
+	if got := st.SlotEnergy().DecisionID; got != decisionID {
+		t.Fatalf("legacy control tick decision ID = %q, want %q", got, decisionID)
+	}
+	if calls != 1 {
+		t.Fatalf("legacy control tick read %d plan generations, want 1", calls)
+	}
+
+	available = false
+	_ = ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
+	if got := st.SlotEnergy().DecisionID; got != "" {
+		t.Fatalf("legacy tick without a plan slot retained decision ID %q", got)
+	}
+	if calls != 2 {
+		t.Fatalf("stale legacy tick read %d total plan generations, want 2", calls)
+	}
+}
+
+func TestLegacyPlanCallbacksUseOneTickTime(t *testing.T) {
+	boundary := time.Date(2026, 8, 16, 12, 15, 0, 0, time.UTC)
+	clockCalls := 0
+	var directiveAt, targetAt time.Time
+	const decisionID = "00000000-0000-4000-8000-000000000306"
+
+	store := seedStore(0, []struct {
+		name          string
+		currentW, soc float64
+	}{{"ferroamp", 0, 0.5}})
+	st := NewState(0, 0, "ferroamp")
+	st.Mode = ModePlannerArbitrage
+	st.SlewRateW = 100000
+	st.MinDispatchIntervalS = 0
+	st.clock = func() time.Time {
+		clockCalls++
+		if clockCalls == 1 {
+			return boundary.Add(-time.Nanosecond)
+		}
+		return boundary
+	}
+	st.SlotDirective = func(at time.Time) (SlotDirective, bool) {
+		directiveAt = at
+		return SlotDirective{
+			DecisionID:      decisionID,
+			SlotStart:       boundary.Add(-15 * time.Minute),
+			SlotEnd:         boundary,
+			BatteryEnergyWh: -600,
+		}, true
+	}
+	st.PlanTarget = func(at time.Time) (string, float64, string, bool) {
+		targetAt = at
+		return string(ModeSelfConsumption), 0, decisionID, true
+	}
+
+	_ = ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
+	if !directiveAt.Equal(targetAt) {
+		t.Fatalf("one control tick read directive at %s and legacy target at %s", directiveAt, targetAt)
+	}
 }
 
 //  1. The accumulator integrates current battery total × dt across
@@ -5766,13 +6362,13 @@ func TestPlannerArbitrageIdleSlotDoesNotAbsorbLiveSurplus(t *testing.T) {
 func TestPlannerPassiveArbitrageIdleSlotPreservesPlannedExportWithAbsorber(t *testing.T) {
 	now := time.Now()
 	dir := SlotDirective{
-		SlotStart:              now,
-		SlotEnd:                now.Add(15 * time.Minute),
-		BatteryEnergyWh:        0,
-		Strategy:               "passive_arbitrage",
-		PlannedGridW:           -2000,
-		HasPlannedGridW:        true,
-		LivePVSurplusSoCCapPct: 80,
+		SlotStart:           now,
+		SlotEnd:             now.Add(15 * time.Minute),
+		BatteryEnergyWh:     0,
+		Strategy:            "passive_arbitrage",
+		PlannedGridW:        -2000,
+		HasPlannedGridW:     true,
+		LivePVSurplusSoCCap: 0.8,
 	}
 	// Meter exports only 100 W because the battery is already absorbing
 	// 1900 W. Without battery charge the site would export the planned 2 kW.
@@ -5804,13 +6400,13 @@ func TestPlannerPassiveArbitrageIdleSlotPreservesPlannedExportWithAbsorber(t *te
 func TestPlannerArbitrageIdleSlotAbsorbsSurplusThatDisplacesGridCharge(t *testing.T) {
 	now := time.Now()
 	dir := SlotDirective{
-		SlotStart:              now,
-		SlotEnd:                now.Add(15 * time.Minute),
-		BatteryEnergyWh:        0,
-		Strategy:               "arbitrage",
-		PlannedGridW:           2000, // plan forecast a load deficit
-		HasPlannedGridW:        true,
-		LivePVSurplusSoCCapPct: 80,
+		SlotStart:           now,
+		SlotEnd:             now.Add(15 * time.Minute),
+		BatteryEnergyWh:     0,
+		Strategy:            "arbitrage",
+		PlannedGridW:        2000, // plan forecast a load deficit
+		HasPlannedGridW:     true,
+		LivePVSurplusSoCCap: 0.8,
 	}
 	store := seedStore(-2000, []struct {
 		name          string

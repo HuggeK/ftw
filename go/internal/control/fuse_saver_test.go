@@ -2,6 +2,7 @@ package control
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -134,6 +135,42 @@ func TestFuseSaverRespectsMaxDischarge(t *testing.T) {
 	}
 }
 
+func TestFuseSaverRespectsExplicitZeroDischargeLimit(t *testing.T) {
+	store, state, caps := setupFuseSaver(20000, 0, 0.6, 10000)
+	state.DriverLimits["bat"] = PowerLimits{
+		MaxChargeW:       10000,
+		MaxDischargeWSet: true,
+	}
+	targets := []DispatchTarget{{Driver: "bat", TargetW: 0}}
+	out := forceFuseDischarge(targets, store, state, caps, 11040)
+	if out[0].TargetW != 0 || out[0].Clamped {
+		t.Errorf("explicit zero discharge limit must close fuse-saver headroom: got %+v", out[0])
+	}
+}
+
+func TestDeadbandFuseSaverRespectsExplicitZeroDischargeLimit(t *testing.T) {
+	store, state, caps := setupFuseSaver(14000, 0, 0.6, 10000)
+	state.DriverLimits["bat"] = PowerLimits{
+		MaxChargeW:       10000,
+		MaxDischargeWSet: true,
+	}
+	state.SetGridTarget(14000)
+	state.MinDispatchIntervalS = 0
+
+	if out := ComputeDispatch(store, state, caps, 11040); out != nil {
+		t.Fatalf("deadband fuse saver crossed explicit zero discharge limit: %+v", out)
+	}
+}
+
+func TestFuseSaverLegacyZeroWithoutSetFlagStillUsesDefault(t *testing.T) {
+	store, state, caps := setupFuseSaver(20000, 0, 0.6, 0)
+	targets := []DispatchTarget{{Driver: "bat", TargetW: 0}}
+	out := forceFuseDischarge(targets, store, state, caps, 11040)
+	if out[0].TargetW != -MaxCommandW || !out[0].Clamped {
+		t.Errorf("legacy zero without validity flag: got %+v, want -%d W clamped", out[0], MaxCommandW)
+	}
+}
+
 // Within fuse → no-op. The fuse-saver doesn't touch dispatch when
 // predicted gridW is already safe.
 func TestFuseSaverNoOpWhenWithinFuse(t *testing.T) {
@@ -224,10 +261,18 @@ func TestFuseSaverBypassesSlew(t *testing.T) {
 // ---- Per-phase clamp ----
 
 // setupPerPhase wires a meter that emits l1_a/l2_a/l3_a in
-// DerReading.Data and a single battery. Aggregate gridW stays
-// deliberately under the fuse to prove the per-phase clamp fires
-// independently of the aggregate guard.
+// DerReading.Data and a single battery on a 3Φ 230 V site. Aggregate
+// gridW stays deliberately under the fuse to prove the per-phase clamp
+// fires independently of the aggregate guard.
 func setupPerPhase(aggGridW float64, l1A, l2A, l3A float64, batSoC float64, maxDischargeW float64) (*telemetry.Store, *State, map[string]float64) {
+	return setupPerPhaseSite(3, 230, aggGridW, l1A, l2A, l3A, batSoC, maxDischargeW)
+}
+
+// setupPerPhaseSite is setupPerPhase with the site's fuse description
+// spelled out. Phase count and per-phase voltage drive the conversion
+// from a worst-phase overage into aggregate battery watts, so a test
+// that cares about that conversion states them.
+func setupPerPhaseSite(phases int, voltage float64, aggGridW float64, l1A, l2A, l3A float64, batSoC float64, maxDischargeW float64) (*telemetry.Store, *State, map[string]float64) {
 	s := telemetry.NewStore()
 	data, _ := json.Marshal(map[string]any{
 		"l1_a": l1A,
@@ -241,7 +286,8 @@ func setupPerPhase(aggGridW float64, l1A, l2A, l3A float64, batSoC float64, maxD
 	s.DriverHealthMut("bat").RecordSuccess()
 	st := NewState(0, 50, "meter")
 	st.SiteFuseAmps = 16
-	st.SiteFuseVoltage = 230
+	st.SiteFuseVoltage = voltage
+	st.SiteFusePhases = phases
 	st.DriverLimits = map[string]PowerLimits{
 		"bat": {MaxChargeW: 10000, MaxDischargeW: maxDischargeW},
 	}
@@ -280,7 +326,7 @@ func TestPerPhaseClampScalesChargingOnImbalance(t *testing.T) {
 // path now does.
 func TestPerPhaseClampFiresFuseSaverFromIdle(t *testing.T) {
 	store, state, caps := setupPerPhase(9000, 18, 12, 8, 0.6, 10000)
-	out := fuseSaverFromZero(store, state, caps, 11040)
+	out := fuseSaverFromLivePower(store, state, caps, 11040)
 	if out == nil {
 		t.Fatalf("per-phase overload from idle must trigger fuse-saver")
 	}
@@ -298,7 +344,7 @@ func TestPerPhaseClampFiresFuseSaverFromIdle(t *testing.T) {
 // All phases under the fuse → per-phase clamp doesn't fire.
 func TestPerPhaseClampNoOpWhenAllPhasesSafe(t *testing.T) {
 	store, state, caps := setupPerPhase(8000, 14, 12, 10, 0.6, 10000)
-	out := fuseSaverFromZero(store, state, caps, 11040)
+	out := fuseSaverFromLivePower(store, state, caps, 11040)
 	if out != nil {
 		t.Errorf("all phases under fuse: expected nil, got %v", out)
 	}
@@ -309,7 +355,7 @@ func TestPerPhaseClampNoOpWhenAllPhasesSafe(t *testing.T) {
 func TestPerPhaseClampDisabledWhenSiteFuseAmpsZero(t *testing.T) {
 	store, state, caps := setupPerPhase(9000, 18, 12, 8, 0.6, 10000)
 	state.SiteFuseAmps = 0 // disable per-phase clamp
-	out := fuseSaverFromZero(store, state, caps, 11040)
+	out := fuseSaverFromLivePower(store, state, caps, 11040)
 	if out != nil {
 		t.Errorf("per-phase clamp disabled but still fired: %v", out)
 	}
@@ -321,7 +367,7 @@ func TestPerPhaseClampDominatesAggregateWhenLarger(t *testing.T) {
 	// Aggregate over by 500 W (predicted = 11540 vs 11040). But L1 is
 	// at 22 A → over by 6 A × 230 = 1380 W per-phase × 3 = 4140 W.
 	store, state, caps := setupPerPhase(11540, 22, 14, 8, 0.6, 10000)
-	out := fuseSaverFromZero(store, state, caps, 11040)
+	out := fuseSaverFromLivePower(store, state, caps, 11040)
 	if out == nil {
 		t.Fatalf("expected discharge, got nil")
 	}
@@ -398,11 +444,11 @@ func TestFuseGuardPredictsAgainstControlledBatteriesOnly(t *testing.T) {
 // export-side per-phase trip would push the over-current phase
 // further over the breaker. Regression for PR #219 review S1.
 func TestForceFuseDischargeIgnoresExportSidePerPhase(t *testing.T) {
-	// Heavy export with one phase over fuse. fuseSaverFromZero (which
+	// Heavy export with one phase over fuse. fuseSaverFromLivePower (which
 	// calls forceFuseDischarge) MUST return nil — the export-side
 	// overage is not its problem.
 	store, state, caps := setupPerPhase(-9000, 12, 18, 8, 0.6, 10000)
-	out := fuseSaverFromZero(store, state, caps, 11040)
+	out := fuseSaverFromLivePower(store, state, caps, 11040)
 	if out != nil {
 		t.Errorf("forceFuseDischarge fired on export-side per-phase overage; "+
 			"would worsen the over-current phase. got %v", out)
@@ -452,6 +498,143 @@ func TestPerPhaseClampSafetyMarginZeroIsBackCompat(t *testing.T) {
 	if math.Abs(guarded[0].TargetW-expected) > 1 {
 		t.Errorf("safety_margin_a=0 must match pre-PR behaviour: got %.0f W, want %.0f W",
 			guarded[0].TargetW, expected)
+	}
+}
+
+// ---- Per-phase relief is scaled by the site's phase count ----
+//
+// A worst-phase overage is watts on one phase; the dispatcher commands
+// aggregate battery watts. The conversion between them is the site's
+// phase count, and on a 1Φ site the aggregate meter and the single
+// phase are the same wire — relief there is 1 × the overage, not 3 ×.
+//
+// A 1Φ site at 24 A on a 16 A fuse (0.5 A margin ⇒ 15.5 A threshold,
+// 230 V): fuse budget 3680 W, aggregate ceiling 3565 W, meter at
+// 5520 W. Worst-phase overage = (24 − 15.5) × 230 = 1955 W, which on
+// this site is also exactly the aggregate overage — the two numbers
+// must agree when there is only one phase.
+
+// Import side, battery idle: the forced discharge equals the overage
+// once, and leaves the meter on the import side of zero.
+func TestPerPhaseReliefMatchesSinglePhaseSiteOnImport(t *testing.T) {
+	store, state, caps := setupPerPhaseSite(1, 230, 5520, 24, 0, 0, 0.6, 10000)
+	state.SiteFuseSafetyA = 0.5
+	fuseMaxW := 16 * 230.0 * 1
+
+	out := fuseSaverFromLivePower(store, state, caps, fuseMaxW)
+	if out == nil {
+		t.Fatalf("1Φ site at 24 A on a 16 A fuse: expected a forced discharge")
+	}
+	expected := -1955.0
+	if math.Abs(out[0].TargetW-expected) > 1 {
+		t.Fatalf("forced discharge = %.0f W, want %.0f W (overage × 1 phase, "+
+			"not × 3)", out[0].TargetW, expected)
+	}
+	// The site has one phase, so the post-dispatch meter is that
+	// phase. Demanding 3 × 1955 W would have driven 5520 W of import
+	// to 345 W of export: relief the site never needed, pushing the
+	// same breaker up the other way.
+	if postGridW := 5520 + out[0].TargetW; postGridW < 0 {
+		t.Errorf("post-dispatch grid = %.0f W: relief overshot through zero "+
+			"into export", postGridW)
+	}
+}
+
+// Export side — the direction forceFuseDischarge deliberately skips
+// (more discharge would worsen it) and applyFuseGuard owns. The same
+// phase-count law applies: shrink the discharge by the overage once.
+func TestPerPhaseReliefMatchesSinglePhaseSiteOnExport(t *testing.T) {
+	// Meter magnitudes mirror the import case: 5520 W out, 24 A on the
+	// one phase. Pixii-style signed per-phase amps, so L1 reads −24.
+	store, state, _ := setupPerPhaseSite(1, 230, -5520, -24, 0, 0, 0.6, 10000)
+	state.SiteFuseSafetyA = 0.5
+	fuseMaxW := 16 * 230.0 * 1
+
+	// The battery is already discharging what the meter shows, and the
+	// target holds it there — so the aggregate export overage is the
+	// per-phase one. On a site with one phase the two must agree.
+	setBatteryLiveW(store, "bat", -5000, 0.6)
+
+	targets := []DispatchTarget{{Driver: "bat", TargetW: -5000}}
+	guarded := applyFuseGuard(targets, store, state, fuseMaxW)
+	if !guarded[0].Clamped {
+		t.Fatalf("export-side per-phase overage must clamp the discharge target")
+	}
+	// Discharge 5000 − overage 1955 − buffer (half the 115 W margin)
+	// = 2987.5 W. Demanding 1955 × 3 leaves nothing: the discharge is
+	// zeroed and the site swings to 520 W of import.
+	expected := -2987.5
+	if math.Abs(guarded[0].TargetW-expected) > 1 {
+		t.Errorf("discharge after 1Φ export clamp = %.1f W, want %.1f W",
+			guarded[0].TargetW, expected)
+	}
+}
+
+// setBatteryLiveW drives a battery's smoothed reading to w. The store
+// Kalman-filters every sample, so one update lands about three quarters
+// of the way there; repeat until the filter has converged.
+func setBatteryLiveW(s *telemetry.Store, driver string, w, soc float64) {
+	setBatteryLiveReading(s, driver, w, soc, nil)
+}
+
+func setBatteryLiveReading(s *telemetry.Store, driver string, w, soc float64, data json.RawMessage) {
+	for i := 0; i < 12; i++ {
+		s.Update(driver, telemetry.DerBattery, w, &soc, data)
+	}
+	s.DriverHealthMut(driver).RecordSuccess()
+}
+
+// A 1Φ site has no L2 and no L3. Current reported on a phase the site
+// does not have is not a breaker this guard defends — reading it fires
+// the clamp on a site that is nowhere near its fuse.
+func TestPerPhaseClampReadsConfiguredPhasesOnly(t *testing.T) {
+	store, state, caps := setupPerPhaseSite(1, 230, 2300, 10, 24, 24, 0.6, 10000)
+	out := fuseSaverFromLivePower(store, state, caps, 16*230.0*1)
+	if out != nil {
+		t.Errorf("1Φ site with L1 at 10 A is under its fuse; l2_a/l3_a must "+
+			"not fire the clamp. got %v", out)
+	}
+}
+
+// Per-phase watts come from the configured voltage, the same source
+// fuseSafetyMarginW uses. A 240 V site converts its amps at 240 V.
+func TestPerPhaseClampUsesConfiguredVoltage(t *testing.T) {
+	store, state, _ := setupPerPhaseSite(3, 240, 7000, 18, 12, 8, 0.6, 10000)
+	targets := []DispatchTarget{{Driver: "bat", TargetW: 4000}}
+	guarded := applyFuseGuard(targets, store, state, 16*240.0*3)
+	if !guarded[0].Clamped {
+		t.Fatalf("L1 at 18 A on a 16 A fuse must clamp")
+	}
+	// (18 − 16) × 240 = 480 W per phase × 3 = 1440 W of relief.
+	// Charge 4000 → 2560. At the old hardcoded 230 V it would be 2620.
+	expected := 2560.0
+	if math.Abs(guarded[0].TargetW-expected) > 1 {
+		t.Errorf("charge after per-phase clamp on a 240 V site = %.0f W, "+
+			"want %.0f W", guarded[0].TargetW, expected)
+	}
+}
+
+// Amps alone do not describe a fuse. Without a phase count and a
+// voltage there is no conversion to watts, so the per-phase clamp
+// stays off rather than inventing 230 V / 3Φ — the same law
+// fuseSafetyMarginW follows. Production config always fills both
+// (defaults 230 V / 3Φ, validation rejects <= 0).
+func TestPerPhaseClampOffWhenFuseDescriptionIncomplete(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		phases  int
+		voltage float64
+	}{
+		{"no phase count", 0, 230},
+		{"no voltage", 3, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, state, caps := setupPerPhaseSite(
+				tc.phases, tc.voltage, 9000, 18, 12, 8, 0.6, 10000)
+			if out := fuseSaverFromLivePower(store, state, caps, 11040); out != nil {
+				t.Errorf("incomplete fuse description must not clamp per phase, got %v", out)
+			}
+		})
 	}
 }
 
@@ -618,10 +801,9 @@ func TestPeakCeilingForcesDischargeBelowFuse(t *testing.T) {
 	}
 }
 
-// Joint EV/battery allocator caps EV draw against the peak ceiling
-// across modes — the operator's tariff is honoured even with
-// BatteryCoversEV=false (the EV throttles, the battery isn't pulled
-// in to cover steady-state).
+// Joint EV/battery allocator caps EV draw against the peak ceiling in a
+// planner mode where BatteryCoversEV=false (the EV throttles, the battery
+// is not pulled in to cover steady state).
 func TestPeakCeilingClampsEVViaJointAllocator(t *testing.T) {
 	// House load 1 kW, EV pinned at 7 kW = 8 kW import. Peak 5 kW.
 	// Fuse 11 kW (won't fire). Battery idle (no charge or discharge).
@@ -640,7 +822,7 @@ func TestPeakCeilingClampsEVViaJointAllocator(t *testing.T) {
 
 	// Run a full dispatch cycle so the joint allocator's geometry
 	// fires (it lives inside ComputeDispatch, not as a free function).
-	st.Mode = ModeSelfConsumption
+	st.Mode = ModePlannerSelf
 	_ = ComputeDispatch(store, st, caps, 11040)
 
 	// Joint allocator should have set FuseEVMaxW so that
@@ -677,5 +859,869 @@ func TestPeakCeilingAboveFuseFusewins(t *testing.T) {
 	if math.Abs(out[0].TargetW-expected) > 1 {
 		t.Errorf("target = %.0f, want %.0f (fuse should bind when peak is looser)",
 			out[0].TargetW, expected)
+	}
+}
+
+// ---- The reactive deadband is not a safe state ----
+//
+// ComputeDispatch's legacy/reactive arm short-circuits when the grid
+// error is inside GridToleranceW: nothing to correct, leave the
+// batteries where they are. That exit used to return before
+// applyFuseGuard, applyPlanSignFloor, applyBatteryBoostReserve and
+// forceFuseDischarge — so on a site sitting inside the deadband no
+// protection ran at all. The idle and holdoff exits already ran the
+// fuse-saver for exactly this reason; this one was missed.
+//
+// The deadband asks one question: is aggregate grid close to aggregate
+// target? Two protections answer to numbers that question never reads.
+
+// An operator tariff ceiling below the plan's grid target. The plan
+// asks for 8 kW of import, the meter delivers 8 kW, the error is zero
+// — and every one of those watts above 5 kW is billed at the peak
+// tariff the operator set the ceiling to avoid.
+func TestDeadbandExitDefendsPeakImportCeiling(t *testing.T) {
+	store, state, caps := setupFuseSaver(8000, 0, 0.6, 10000)
+	state.SetGridTarget(8000) // plan target — meter is exactly on it
+	state.PeakImportCeilingW = 5000
+	state.MinDispatchIntervalS = 0
+
+	out := ComputeDispatch(store, state, caps, 11040)
+	if len(out) == 0 {
+		t.Fatalf("grid 8000 W against a 5000 W peak ceiling: expected the " +
+			"fuse-saver to bridge, got no targets (3 kW peak overrun stands)")
+	}
+	// Predicted from zero = 8000. Effective import ceiling = 5000
+	// (peak binds below the 11040 W fuse). Overage = 3000.
+	expected := -3000.0
+	if math.Abs(out[0].TargetW-expected) > 1 {
+		t.Errorf("target = %.0f W, want %.0f W", out[0].TargetW, expected)
+	}
+	if !out[0].Clamped {
+		t.Errorf("Clamped flag must mark fuse-saver activation")
+	}
+}
+
+// An unbalanced site inside the aggregate deadband with one phase over
+// the breaker: a single-phase EVSE on L1 against three-phase PV export.
+// The aggregate says "nothing to do"; L1 is at 18 A on a 16 A fuse.
+func TestDeadbandExitDefendsPerPhaseBreaker(t *testing.T) {
+	store, state, caps := setupPerPhase(0, 18, 4, 4, 0.6, 10000)
+	state.SetGridTarget(0) // aggregate is exactly on target
+	state.MinDispatchIntervalS = 0
+
+	out := ComputeDispatch(store, state, caps, 11040)
+	if len(out) == 0 {
+		t.Fatalf("L1 at 18 A on a 16 A fuse inside the aggregate deadband: " +
+			"expected a forced discharge, got no targets")
+	}
+	// Per-phase overage = (18 − 16) × 230 = 460 W on the worst phase,
+	// × 3 under the balanced-3Φ assumption = 1380 W from idle.
+	expected := -1380.0
+	if math.Abs(out[0].TargetW-expected) > 1 {
+		t.Errorf("forced discharge = %.0f W, want %.0f W", out[0].TargetW, expected)
+	}
+	if !out[0].Clamped {
+		t.Errorf("Clamped flag must mark per-phase fuse-saver activation")
+	}
+}
+
+// An early-exit fuse response must start from the battery's live power, not
+// from idle. Replacing an existing discharge with a smaller discharge would
+// increase import on every phase and make the overloaded phase worse.
+func TestDeadbandExitPerPhaseReliefPreservesLiveDischarge(t *testing.T) {
+	const (
+		liveBatteryW = -5000.0
+		liveWorstA   = 18.0
+		fuseA        = 16.0
+		phases       = 3.0
+		voltage      = 230.0
+	)
+	store, state, caps := setupPerPhase(0, liveWorstA, 4, 4, 0.6, 10000)
+	setBatteryLiveW(store, "bat", liveBatteryW, 0.6)
+	state.SetGridTarget(0)
+	state.MinDispatchIntervalS = 0
+
+	live := store.Get("bat", telemetry.DerBattery).SmoothedW
+	out := ComputeDispatch(store, state, caps, 11040)
+	if len(out) != 1 {
+		t.Fatalf("L1 at %.0f A with battery already discharging: got %+v, want one relief target", liveWorstA, out)
+	}
+	if out[0].TargetW > live {
+		t.Fatalf("fuse relief reduced live discharge from %.0f W to %.0f W", live, out[0].TargetW)
+	}
+
+	// Under the dispatcher's balanced-3-phase conversion, the target delta
+	// changes each phase by deltaW / (phases * voltage). The response must
+	// not worsen the live worst phase and must relieve it to the fuse limit.
+	postWorstA := liveWorstA + (out[0].TargetW-live)/(phases*voltage)
+	if postWorstA > liveWorstA+0.01 {
+		t.Fatalf("worst phase rose from %.2f A to %.2f A", liveWorstA, postWorstA)
+	}
+	if math.Abs(postWorstA-fuseA) > 0.01 {
+		t.Errorf("worst phase after relief = %.2f A, want %.2f A", postWorstA, fuseA)
+	}
+	if !out[0].Clamped {
+		t.Errorf("Clamped flag must mark per-phase fuse-saver activation")
+	}
+}
+
+func TestDeadbandExitPerPhaseReliefStartsFromLiveCharge(t *testing.T) {
+	const (
+		liveBatteryW = 5000.0
+		liveWorstA   = 18.0
+		fuseA        = 16.0
+		phases       = 3.0
+		voltage      = 230.0
+	)
+	store, state, caps := setupPerPhase(0, liveWorstA, 4, 4, 0.6, 10000)
+	setBatteryLiveW(store, "bat", liveBatteryW, 0.6)
+	state.SetGridTarget(0)
+	state.MinDispatchIntervalS = 0
+
+	live := store.Get("bat", telemetry.DerBattery).SmoothedW
+	out := ComputeDispatch(store, state, caps, 11040)
+	if len(out) != 1 {
+		t.Fatalf("L1 at %.0f A with battery charging: got %+v, want one relief target", liveWorstA, out)
+	}
+	expected := live - (liveWorstA-fuseA)*voltage*phases
+	if math.Abs(out[0].TargetW-expected) > 1 {
+		t.Fatalf("fuse relief target = %.0f W, want %.0f W from live charge %.0f W", out[0].TargetW, expected, live)
+	}
+	if out[0].TargetW <= 0 {
+		t.Fatalf("relief of %.0f W needlessly reversed a %.0f W live charge", live-out[0].TargetW, live)
+	}
+	postWorstA := liveWorstA + (out[0].TargetW-live)/(phases*voltage)
+	if math.Abs(postWorstA-fuseA) > 0.01 {
+		t.Errorf("worst phase after relief = %.2f A, want %.2f A", postWorstA, fuseA)
+	}
+	if !out[0].Clamped {
+		t.Errorf("Clamped flag must mark per-phase fuse-saver activation")
+	}
+}
+
+func TestDeadbandExitCanCancelChargeBeforeUsingDischargeHeadroom(t *testing.T) {
+	const (
+		gridW        = 23000.0
+		liveBatteryW = 5000.0
+		fuseMaxW     = 11040.0
+	)
+	store, state, caps := setupFuseSaver(gridW, 0, 0.6, 10000)
+	setBatteryLiveW(store, "bat", liveBatteryW, 0.6)
+	state.SetGridTarget(gridW)
+	state.MinDispatchIntervalS = 0
+
+	live := store.Get("bat", telemetry.DerBattery).SmoothedW
+	out := ComputeDispatch(store, state, caps, fuseMaxW)
+	if len(out) != 1 {
+		t.Fatalf("grid %.0f W with battery charging: got %+v, want one relief target", gridW, out)
+	}
+	expected := live - (gridW - fuseMaxW)
+	if math.Abs(out[0].TargetW-expected) > 1 {
+		t.Fatalf("target = %.0f W, want %.0f W after cancelling charge and using discharge headroom", out[0].TargetW, expected)
+	}
+	if out[0].TargetW < -state.DriverLimits["bat"].MaxDischargeW {
+		t.Fatalf("target %.0f W exceeds max discharge %.0f W", out[0].TargetW, state.DriverLimits["bat"].MaxDischargeW)
+	}
+	postGridW := gridW - live + out[0].TargetW
+	if math.Abs(postGridW-fuseMaxW) > 1 {
+		t.Errorf("post-dispatch grid = %.0f W, want fuse ceiling %.0f W", postGridW, fuseMaxW)
+	}
+	if !out[0].Clamped {
+		t.Errorf("Clamped flag must mark fuse-saver activation")
+	}
+}
+
+func TestDeadbandExitClampsLiveChargeBeforeFuseRelief(t *testing.T) {
+	const (
+		gridW        = 19040.0
+		liveBatteryW = 10000.0
+		maxChargeW   = 3000.0
+		fuseMaxW     = 11040.0
+	)
+	store, state, caps := setupFuseSaver(gridW, 0, 0.6, 10000)
+	setBatteryLiveW(store, "bat", liveBatteryW, 0.6)
+	state.DriverLimits["bat"] = PowerLimits{MaxChargeW: maxChargeW, MaxDischargeW: 10000}
+	state.SetGridTarget(gridW)
+	state.MinDispatchIntervalS = 0
+
+	live := store.Get("bat", telemetry.DerBattery).SmoothedW
+	out := ComputeDispatch(store, state, caps, fuseMaxW)
+	if len(out) != 1 {
+		t.Fatalf("grid %.0f W with out-of-range live charge: got %+v, want one safe target", gridW, out)
+	}
+	if math.Abs(out[0].TargetW-2000) > 1 {
+		t.Fatalf("target = %.0f W, want 2000 W after cap and fuse relief", out[0].TargetW)
+	}
+	if out[0].TargetW > maxChargeW {
+		t.Fatalf("target %.0f W exceeds max charge %.0f W", out[0].TargetW, maxChargeW)
+	}
+	postGridW := gridW - live + out[0].TargetW
+	if math.Abs(postGridW-fuseMaxW) > 1 {
+		t.Errorf("post-dispatch grid = %.0f W, want fuse ceiling %.0f W", postGridW, fuseMaxW)
+	}
+	if !out[0].Clamped {
+		t.Errorf("Clamped flag must mark cap and fuse relief")
+	}
+}
+
+func TestDeadbandExitSelectsOnlyNeededOutOfCapChargeClamp(t *testing.T) {
+	const (
+		fuseMaxW   = 11040.0
+		gridW      = fuseMaxW + 1000
+		liveCharge = 10000.0
+		maxCharge  = 3000.0
+	)
+	store := telemetry.NewStore()
+	store.Update("meter", telemetry.DerMeter, gridW, nil, nil)
+	store.DriverHealthMut("meter").RecordSuccess()
+	setBatteryLiveW(store, "a", liveCharge, 0.6)
+	setBatteryLiveW(store, "b", liveCharge, 0.6)
+	state := NewState(0, 50, "meter")
+	state.DriverLimits = map[string]PowerLimits{
+		"a": {MaxChargeW: maxCharge, MaxDischargeW: 10000},
+		"b": {MaxChargeW: maxCharge, MaxDischargeW: 10000},
+	}
+	state.SetGridTarget(gridW)
+	state.MinDispatchIntervalS = 0
+	caps := map[string]float64{"b": 10000, "a": 10000}
+
+	// Map iteration is deliberately unstable. Repeat the exact two-battery
+	// case to prove that only one command-safe cap is selected each time.
+	for i := 0; i < 100; i++ {
+		out := ComputeDispatch(store, state, caps, fuseMaxW)
+		if len(out) != 1 {
+			t.Fatalf("run %d: got %+v, want one capped battery", i, out)
+		}
+		if out[0].Driver != "a" || math.Abs(out[0].TargetW-maxCharge) > 1 || !out[0].Clamped {
+			t.Fatalf("run %d: got %+v, want deterministic a at safe cap %.0f W", i, out, maxCharge)
+		}
+		if out[0].TargetW > state.DriverLimits[out[0].Driver].MaxChargeW {
+			t.Fatalf("run %d: target %.0f W exceeds max charge %.0f W", i, out[0].TargetW, maxCharge)
+		}
+		postGridW := gridW - liveCharge + out[0].TargetW
+		if postGridW > fuseMaxW+1 || postGridW < -1 {
+			t.Fatalf("run %d: post-dispatch grid %.0f W, want import within [0, %.0f] W", i, postGridW, fuseMaxW)
+		}
+	}
+}
+
+func TestDeadbandExitSkipsCapStepThatWouldBreakExportCeiling(t *testing.T) {
+	const (
+		fuseMaxW      = 11040.0
+		gridW         = fuseMaxW + 1000
+		liveChargeW   = 20000.0
+		maxChargeW    = 3000.0
+		maxExportW    = 1000.0
+		capReliefW    = liveChargeW - maxChargeW
+		maxSafeRelief = gridW + maxExportW
+	)
+	if capReliefW <= maxSafeRelief {
+		t.Fatalf("test setup needs cap relief %.0f W above export budget %.0f W", capReliefW, maxSafeRelief)
+	}
+
+	store := telemetry.NewStore()
+	store.Update("meter", telemetry.DerMeter, gridW, nil, nil)
+	store.DriverHealthMut("meter").RecordSuccess()
+	setBatteryLiveW(store, "oversized", liveChargeW, 0.6)
+	setBatteryLiveW(store, "safe", 0, 0.6)
+	state := NewState(0, 50, "meter")
+	state.MaxExportW = maxExportW
+	state.DriverLimits = map[string]PowerLimits{
+		"oversized": {MaxChargeW: maxChargeW, MaxDischargeW: 10000},
+		"safe":      {MaxChargeW: 10000, MaxDischargeW: 10000},
+	}
+	state.SetGridTarget(gridW)
+	state.MinDispatchIntervalS = 0
+	caps := map[string]float64{"oversized": 20000, "safe": 10000}
+
+	out := ComputeDispatch(store, state, caps, fuseMaxW)
+	if len(out) != 1 || out[0].Driver != "safe" {
+		t.Fatalf("got %+v, want relief only from the in-range battery", out)
+	}
+	if math.Abs(out[0].TargetW-(-1000)) > 1 {
+		t.Fatalf("safe target = %.0f W, want -1000 W", out[0].TargetW)
+	}
+	if postGridW := gridW + out[0].TargetW; math.Abs(postGridW-fuseMaxW) > 1 {
+		t.Fatalf("post-dispatch grid = %.0f W, want %.0f W", postGridW, fuseMaxW)
+	}
+}
+
+func TestDeadbandExitReturnsNoTargetWhenOnlyCapStepBreaksExportCeiling(t *testing.T) {
+	const (
+		fuseMaxW    = 11040.0
+		gridW       = fuseMaxW + 1000
+		liveChargeW = 20000.0
+		maxChargeW  = 3000.0
+	)
+	store, state, caps := setupFuseSaver(gridW, 0, 0.6, 20000)
+	setBatteryLiveW(store, "bat", liveChargeW, 0.6)
+	state.MaxExportW = 1000
+	state.DriverLimits["bat"] = PowerLimits{MaxChargeW: maxChargeW, MaxDischargeW: 10000}
+	state.SetGridTarget(gridW)
+	state.MinDispatchIntervalS = 0
+
+	if out := ComputeDispatch(store, state, caps, fuseMaxW); out != nil {
+		t.Fatalf("unsafe discrete cap step must fail closed, got %+v", out)
+	}
+}
+
+func TestDeadbandExitCapsPerPhaseReliefAtExportCeiling(t *testing.T) {
+	const (
+		gridW      = 1000.0
+		maxExportW = 1000.0
+		fuseMaxW   = 11040.0
+	)
+	store, state, caps := setupPerPhase(gridW, 20, 4, 4, 0.6, 10000)
+	state.MaxExportW = maxExportW
+	state.SetGridTarget(gridW)
+	state.MinDispatchIntervalS = 0
+
+	out := ComputeDispatch(store, state, caps, fuseMaxW)
+	if len(out) != 1 {
+		t.Fatalf("got %+v, want one bounded phase-relief target", out)
+	}
+	if math.Abs(out[0].TargetW-(-2000)) > 1 {
+		t.Fatalf("target = %.0f W, want -2000 W at the export ceiling", out[0].TargetW)
+	}
+	if postGridW := gridW + out[0].TargetW; math.Abs(postGridW-(-maxExportW)) > 1 {
+		t.Fatalf("post-dispatch grid = %.0f W, want export ceiling %.0f W", postGridW, -maxExportW)
+	}
+}
+
+func TestDeadbandExitFindsCapCombinationWithinExportBudget(t *testing.T) {
+	const (
+		gridW       = 9500.0
+		importLimit = 500.0
+		exportLimit = 500.0
+		fuseMaxW    = 11040.0
+		maxChargeW  = 1000.0
+	)
+	store := telemetry.NewStore()
+	store.Update("meter", telemetry.DerMeter, gridW, nil, nil)
+	store.DriverHealthMut("meter").RecordSuccess()
+	setBatteryLiveW(store, "a", 5000, 0.02) // 4 kW discrete cap relief.
+	setBatteryLiveW(store, "b", 7000, 0.02) // 6 kW discrete cap relief.
+	setBatteryLiveW(store, "c", 8000, 0.02) // 7 kW discrete cap relief.
+	state := NewState(0, 50, "meter")
+	state.PeakImportCeilingW = importLimit
+	state.MaxExportW = exportLimit
+	state.DriverLimits = map[string]PowerLimits{
+		"a": {MaxChargeW: maxChargeW, MaxDischargeW: 10000},
+		"b": {MaxChargeW: maxChargeW, MaxDischargeW: 10000},
+		"c": {MaxChargeW: maxChargeW, MaxDischargeW: 10000},
+	}
+	caps := map[string]float64{"a": 10000, "b": 10000, "c": 10000}
+
+	out := fuseSaverFromLivePower(store, state, caps, fuseMaxW)
+	if len(out) != 2 || out[0].Driver != "a" || out[1].Driver != "b" {
+		t.Fatalf("got %+v, want the 4+6 kW covering subset", out)
+	}
+	for _, target := range out {
+		if math.Abs(target.TargetW-maxChargeW) > 1 || !target.Clamped {
+			t.Fatalf("unsafe cap target: %+v", target)
+		}
+	}
+	if postGridW := gridW - 10000; math.Abs(postGridW-(-exportLimit)) > 1 {
+		t.Fatalf("post-dispatch grid = %.0f W, want export ceiling %.0f W", postGridW, -exportLimit)
+	}
+}
+
+func TestDeadbandExitChoosesCapWithEnoughContinuousHeadroom(t *testing.T) {
+	const (
+		gridW       = 5000.0
+		reliefW     = 10000.0
+		exportLimit = 5000.0
+		fuseMaxW    = 11040.0
+	)
+	phaseData, _ := json.Marshal(map[string]any{
+		"l1_a": 16 + reliefW/(3*230),
+		"l2_a": 4.0,
+		"l3_a": 4.0,
+	})
+	store := telemetry.NewStore()
+	store.Update("meter", telemetry.DerMeter, gridW, nil, phaseData)
+	store.DriverHealthMut("meter").RecordSuccess()
+	setBatteryLiveW(store, "large-step", 9500, 0.02)
+	setBatteryLiveW(store, "useful-room", 5000, 0.6)
+
+	state := NewState(0, 50, "meter")
+	state.SiteFuseAmps = 16
+	state.SiteFuseVoltage = 230
+	state.SiteFusePhases = 3
+	state.MaxExportW = exportLimit
+	state.DriverLimits = map[string]PowerLimits{
+		"large-step":  {MaxChargeW: 500, MaxDischargeW: 10000},
+		"useful-room": {MaxChargeW: 1000, MaxDischargeW: 10000},
+	}
+	caps := map[string]float64{"large-step": 10000, "useful-room": 10000}
+
+	out := fuseSaverFromLivePower(store, state, caps, fuseMaxW)
+	if len(out) != 1 || out[0].Driver != "useful-room" {
+		t.Fatalf("got %+v, want the smaller cap with enough continuous headroom", out)
+	}
+	if math.Abs(out[0].TargetW-(-5000)) > 1 {
+		t.Fatalf("target = %.0f W, want -5000 W at the export ceiling", out[0].TargetW)
+	}
+	if postGridW := gridW - 5000 + out[0].TargetW; math.Abs(postGridW-(-exportLimit)) > 1 {
+		t.Fatalf("post-dispatch grid = %.0f W, want export ceiling %.0f W", postGridW, -exportLimit)
+	}
+}
+
+func TestDeadbandExitCombinesCapsInLargeFleet(t *testing.T) {
+	const (
+		fuseMaxW = 11040.0
+		gridW    = fuseMaxW + 3000
+	)
+	store := telemetry.NewStore()
+	store.Update("meter", telemetry.DerMeter, gridW, nil, nil)
+	store.DriverHealthMut("meter").RecordSuccess()
+	state := NewState(0, 50, "meter")
+	state.DriverLimits = make(map[string]PowerLimits)
+	caps := make(map[string]float64)
+	for i := 0; i < 13; i++ {
+		name := fmt.Sprintf("bat-%02d", i)
+		setBatteryLiveW(store, name, 2000, 0.02)
+		state.DriverLimits[name] = PowerLimits{MaxChargeW: 1000, MaxDischargeW: 10000}
+		caps[name] = 10000
+	}
+
+	out := fuseSaverFromLivePower(store, state, caps, fuseMaxW)
+	if len(out) != 2 || out[0].Driver != "bat-00" || out[1].Driver != "bat-01" {
+		t.Fatalf("got %+v, want the first two deterministic cap candidates", out)
+	}
+	for _, target := range out {
+		if math.Abs(target.TargetW-500) > 1 || !target.Clamped {
+			t.Fatalf("target = %+v, want +500 W after cap and shared relief", target)
+		}
+	}
+	if postGridW := gridW - 4000 + 1000; math.Abs(postGridW-fuseMaxW) > 1 {
+		t.Fatalf("post-dispatch grid = %.0f W, want fuse ceiling %.0f W", postGridW, fuseMaxW)
+	}
+}
+
+func TestDeadbandExitEmitsCapClampWhenItAloneClearsFuseOverload(t *testing.T) {
+	const (
+		gridW        = 17040.0
+		liveBatteryW = 10000.0
+		maxChargeW   = 3000.0
+		fuseMaxW     = 11040.0
+	)
+	store, state, caps := setupFuseSaver(gridW, 0, 0.6, 10000)
+	setBatteryLiveW(store, "bat", liveBatteryW, 0.6)
+	state.DriverLimits["bat"] = PowerLimits{MaxChargeW: maxChargeW, MaxDischargeW: 10000}
+	state.SetGridTarget(gridW)
+	state.MinDispatchIntervalS = 0
+
+	live := store.Get("bat", telemetry.DerBattery).SmoothedW
+	out := ComputeDispatch(store, state, caps, fuseMaxW)
+	if len(out) != 1 {
+		t.Fatalf("cap clamp that clears fuse overload returned %+v, want one target", out)
+	}
+	if math.Abs(out[0].TargetW-maxChargeW) > 1 {
+		t.Fatalf("target = %.0f W, want max charge %.0f W", out[0].TargetW, maxChargeW)
+	}
+	if postGridW := gridW - live + out[0].TargetW; postGridW > fuseMaxW+1 {
+		t.Errorf("post-dispatch grid = %.0f W, want at or below %.0f W", postGridW, fuseMaxW)
+	}
+	if !out[0].Clamped {
+		t.Errorf("Clamped flag must mark the emitted cap clamp")
+	}
+}
+
+func TestDeadbandExitDoesNotTakeControlForSafeOutOfCapLiveReading(t *testing.T) {
+	const (
+		gridW        = 5000.0
+		liveBatteryW = 10000.0
+		maxChargeW   = 3000.0
+		fuseMaxW     = 11040.0
+	)
+	store, state, caps := setupFuseSaver(gridW, 0, 0.6, 10000)
+	setBatteryLiveW(store, "bat", liveBatteryW, 0.6)
+	state.DriverLimits["bat"] = PowerLimits{MaxChargeW: maxChargeW, MaxDischargeW: 10000}
+	state.SetGridTarget(gridW)
+	state.MinDispatchIntervalS = 0
+
+	if out := ComputeDispatch(store, state, caps, fuseMaxW); out != nil {
+		t.Fatalf("safe deadband took control of out-of-cap live reading: got %+v", out)
+	}
+	if state.LastDispatch != nil {
+		t.Errorf("safe deadband recorded a dispatch")
+	}
+}
+
+func TestDeadbandExitChargeCapCountsTowardPerPhaseRelief(t *testing.T) {
+	const (
+		liveBatteryW = 10000.0
+		maxChargeW   = 3000.0
+		liveWorstA   = 18.0
+		fuseA        = 16.0
+	)
+	store, state, caps := setupPerPhase(0, liveWorstA, 4, 4, 0.6, 10000)
+	setBatteryLiveW(store, "bat", liveBatteryW, 0.6)
+	state.DriverLimits["bat"] = PowerLimits{MaxChargeW: maxChargeW, MaxDischargeW: 10000}
+	state.SetGridTarget(0)
+	state.MinDispatchIntervalS = 0
+
+	out := ComputeDispatch(store, state, caps, 11040)
+	if len(out) != 1 {
+		t.Fatalf("got %+v, want one capped target", out)
+	}
+	if math.Abs(out[0].TargetW-maxChargeW) > 1 {
+		t.Fatalf("target = %.0f W, want cap %.0f W without duplicate phase relief", out[0].TargetW, maxChargeW)
+	}
+	postWorstA := liveWorstA + (out[0].TargetW-liveBatteryW)/(3*230)
+	if postWorstA > fuseA+0.01 {
+		t.Errorf("worst phase after cap = %.2f A, want at or below %.2f A", postWorstA, fuseA)
+	}
+}
+
+func TestDeadbandExitUsesOnlyRemainingPerPhaseReliefAfterChargeCap(t *testing.T) {
+	const (
+		liveBatteryW = 5000.0
+		maxChargeW   = 4500.0
+		liveWorstA   = 18.0
+		fuseA        = 16.0
+		phaseReliefW = (liveWorstA - fuseA) * 230 * 3
+	)
+	store, state, caps := setupPerPhase(0, liveWorstA, 4, 4, 0.6, 10000)
+	setBatteryLiveW(store, "bat", liveBatteryW, 0.6)
+	state.DriverLimits["bat"] = PowerLimits{MaxChargeW: maxChargeW, MaxDischargeW: 10000}
+	state.SetGridTarget(0)
+	state.MinDispatchIntervalS = 0
+
+	out := ComputeDispatch(store, state, caps, 11040)
+	if len(out) != 1 {
+		t.Fatalf("got %+v, want one capped relief target", out)
+	}
+	want := maxChargeW - (phaseReliefW - (liveBatteryW - maxChargeW))
+	if math.Abs(out[0].TargetW-want) > 1 {
+		t.Fatalf("target = %.0f W, want %.0f W after counting the cap delta once", out[0].TargetW, want)
+	}
+	postWorstA := liveWorstA + (out[0].TargetW-liveBatteryW)/(3*230)
+	if math.Abs(postWorstA-fuseA) > 0.01 {
+		t.Errorf("worst phase after relief = %.2f A, want %.2f A", postWorstA, fuseA)
+	}
+}
+
+func TestDeadbandExitChargeBlockCountsTowardPerPhaseRelief(t *testing.T) {
+	const (
+		liveBatteryW = 5000.0
+		liveWorstA   = 18.0
+	)
+	store, state, caps := setupPerPhase(0, liveWorstA, 4, 4, 0.6, 10000)
+	setBatteryLiveReading(store, "bat", liveBatteryW, 0.6,
+		json.RawMessage(`{"discharge_capable":true,"charge_capable":false}`))
+
+	out := fuseSaverFromLivePower(store, state, caps, 11040)
+	if len(out) != 1 {
+		t.Fatalf("got %+v, want one charge-stop target", out)
+	}
+	if math.Abs(out[0].TargetW) > 1 {
+		t.Fatalf("charge block target = %.0f W, want 0 W without duplicate phase relief", out[0].TargetW)
+	}
+}
+
+func TestDeadbandExitEmptyBatteryOnlyCancelsLiveCharge(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		overageW   float64
+		wantTarget float64
+		wantGridW  float64
+	}{
+		{name: "partial cancellation", overageW: 3000, wantTarget: 2000, wantGridW: 11040},
+		{name: "residual overload", overageW: 7000, wantTarget: 0, wantGridW: 13040},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const (
+				liveBatteryW = 5000.0
+				fuseMaxW     = 11040.0
+			)
+			gridW := fuseMaxW + tc.overageW
+			store, state, caps := setupFuseSaver(gridW, 0, 0.02, 10000)
+			setBatteryLiveW(store, "bat", liveBatteryW, 0.02)
+			state.SetGridTarget(gridW)
+			state.MinDispatchIntervalS = 0
+
+			live := store.Get("bat", telemetry.DerBattery).SmoothedW
+			out := ComputeDispatch(store, state, caps, fuseMaxW)
+			if len(out) != 1 {
+				t.Fatalf("empty battery live charge: got %+v, want one cancellation target", out)
+			}
+			if math.Abs(out[0].TargetW-tc.wantTarget) > 1 {
+				t.Fatalf("target = %.0f W, want %.0f W", out[0].TargetW, tc.wantTarget)
+			}
+			if out[0].TargetW < 0 {
+				t.Fatalf("empty battery was asked to discharge at %.0f W", out[0].TargetW)
+			}
+			postGridW := gridW - live + out[0].TargetW
+			if math.Abs(postGridW-tc.wantGridW) > 1 {
+				t.Errorf("post-dispatch grid = %.0f W, want %.0f W", postGridW, tc.wantGridW)
+			}
+		})
+	}
+}
+
+func TestDeadbandExitBlockedDischargeOnlyCancelsLiveCharge(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		liveW        float64
+		overageW     float64
+		wantTarget   float64
+		wantDispatch bool
+	}{
+		{name: "partial cancellation", liveW: 5000, overageW: 3000, wantTarget: 2000, wantDispatch: true},
+		{name: "residual overload", liveW: 5000, overageW: 7000, wantTarget: 0, wantDispatch: true},
+		{name: "live discharge is not weakened", liveW: -1000, overageW: 1000, wantDispatch: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const fuseMaxW = 11040.0
+			gridW := fuseMaxW + tc.overageW
+			store, state, caps := setupFuseSaver(gridW, 0, 0.6, 10000)
+			setBatteryLiveReading(store, "bat", tc.liveW, 0.6,
+				json.RawMessage(`{"discharge_capable":false,"charge_capable":true}`))
+			state.SetGridTarget(gridW)
+			state.MinDispatchIntervalS = 0
+
+			out := ComputeDispatch(store, state, caps, fuseMaxW)
+			if !tc.wantDispatch {
+				if out != nil {
+					t.Fatalf("blocked live discharge got a weaker fuse command: %+v", out)
+				}
+				if state.LastDispatch != nil {
+					t.Errorf("blocked live discharge recorded a dispatch")
+				}
+				return
+			}
+			if len(out) != 1 {
+				t.Fatalf("blocked-discharge battery: got %+v, want one safe target", out)
+			}
+			if math.Abs(out[0].TargetW-tc.wantTarget) > 1 {
+				t.Fatalf("target = %.0f W, want %.0f W", out[0].TargetW, tc.wantTarget)
+			}
+			if out[0].TargetW < 0 {
+				t.Fatalf("blocked-discharge battery was asked for %.0f W", out[0].TargetW)
+			}
+		})
+	}
+}
+
+func TestDeadbandExitDoesNotWeakenOutOfRangeLiveDischarge(t *testing.T) {
+	const (
+		gridW         = 12000.0
+		liveBatteryW  = -10000.0
+		maxDischargeW = 3000.0
+		fuseMaxW      = 11040.0
+	)
+	store, state, caps := setupFuseSaver(gridW, 0, 0.6, maxDischargeW)
+	setBatteryLiveW(store, "bat", liveBatteryW, 0.6)
+	state.SetGridTarget(gridW)
+	state.MinDispatchIntervalS = 0
+
+	if out := ComputeDispatch(store, state, caps, fuseMaxW); out != nil {
+		t.Fatalf("out-of-range live discharge got a weaker fuse command: %+v", out)
+	}
+	if state.LastDispatch != nil {
+		t.Errorf("out-of-range live discharge recorded a dispatch")
+	}
+	live := store.Get("bat", telemetry.DerBattery).SmoothedW
+	postClampGridW := gridW - live - maxDischargeW
+	if math.Abs(postClampGridW-19000) > 1 {
+		t.Fatalf("test setup no longer proves that clamping to -%.0f W would raise grid to 19000 W; got %.0f W", maxDischargeW, postClampGridW)
+	}
+}
+
+func TestDeadbandExitPerPhaseDoesNotWeakenOutOfRangeLiveDischarge(t *testing.T) {
+	const (
+		liveBatteryW  = -10000.0
+		maxDischargeW = 3000.0
+		liveWorstA    = 18.0
+	)
+	store, state, caps := setupPerPhase(0, liveWorstA, 4, 4, 0.6, maxDischargeW)
+	setBatteryLiveW(store, "bat", liveBatteryW, 0.6)
+	state.SetGridTarget(0)
+	state.MinDispatchIntervalS = 0
+
+	if out := ComputeDispatch(store, state, caps, 11040); out != nil {
+		t.Fatalf("per-phase fuse path weakened live discharge: %+v", out)
+	}
+	worstIfClampedA := liveWorstA + (-maxDischargeW-liveBatteryW)/(3*230)
+	if worstIfClampedA < 28 {
+		t.Fatalf("test setup no longer proves the unsafe phase increase: %.2f A", worstIfClampedA)
+	}
+}
+
+func TestDeadbandExitRoutesReliefAroundUnsafeLiveDischarge(t *testing.T) {
+	const (
+		gridW        = 14000.0
+		fuseMaxW     = 11040.0
+		blockedLiveW = -1000.0
+	)
+	store := telemetry.NewStore()
+	store.Update("meter", telemetry.DerMeter, gridW, nil, nil)
+	store.DriverHealthMut("meter").RecordSuccess()
+	setBatteryLiveReading(store, "blocked", blockedLiveW, 0.6,
+		json.RawMessage(`{"discharge_capable":false,"charge_capable":true}`))
+	setBatteryLiveW(store, "capable", 0, 0.6)
+	state := NewState(0, 50, "meter")
+	state.DriverLimits = map[string]PowerLimits{
+		"blocked": {MaxChargeW: 5000, MaxDischargeW: 5000},
+		"capable": {MaxChargeW: 5000, MaxDischargeW: 5000},
+	}
+	state.SetGridTarget(gridW)
+	state.MinDispatchIntervalS = 0
+	caps := map[string]float64{"blocked": 10000, "capable": 10000}
+
+	out := ComputeDispatch(store, state, caps, fuseMaxW)
+	if len(out) != 1 {
+		t.Fatalf("got %+v, want only the capable sibling", out)
+	}
+	if out[0].Driver != "capable" {
+		t.Fatalf("unsafe live-discharge driver was commanded: %+v", out)
+	}
+	if math.Abs(out[0].TargetW-(-2960)) > 1 {
+		t.Fatalf("capable sibling target = %.0f W, want -2960 W", out[0].TargetW)
+	}
+	capableLive := store.Get("capable", telemetry.DerBattery).SmoothedW
+	if postGridW := gridW - capableLive + out[0].TargetW; math.Abs(postGridW-fuseMaxW) > 1 {
+		t.Errorf("post-dispatch grid = %.0f W, want %.0f W", postGridW, fuseMaxW)
+	}
+}
+
+func TestEarlyFuseSnapshotFailsClosedOnTelemetryOrLimitDrift(t *testing.T) {
+	t.Run("battery sample", func(t *testing.T) {
+		store, state, caps := setupFuseSaver(12000, -5000, 0.6, 10000)
+		meter := store.Get("meter", telemetry.DerMeter)
+		_, safe, versions := fleetAtLivePower(store, caps, state.DriverLimits)
+		if !fuseSnapshotStillCurrent(store, state, meter.UpdatedAt, versions, safe) {
+			t.Fatalf("unchanged snapshot was rejected")
+		}
+		setBatteryLiveW(store, "bat", 0, 0.6)
+		if fuseSnapshotStillCurrent(store, state, meter.UpdatedAt, versions, safe) {
+			t.Fatalf("battery drift was accepted")
+		}
+	})
+
+	t.Run("meter sample", func(t *testing.T) {
+		store, state, caps := setupFuseSaver(12000, 0, 0.6, 10000)
+		meter := store.Get("meter", telemetry.DerMeter)
+		_, safe, versions := fleetAtLivePower(store, caps, state.DriverLimits)
+		store.Update("meter", telemetry.DerMeter, 13000, nil, nil)
+		if fuseSnapshotStillCurrent(store, state, meter.UpdatedAt, versions, safe) {
+			t.Fatalf("meter drift was accepted")
+		}
+	})
+
+	t.Run("capability sample", func(t *testing.T) {
+		store, state, caps := setupFuseSaver(14040, 0, 0.6, 10000)
+		setBatteryLiveReading(store, "bat", 5000, 0.6,
+			json.RawMessage(`{"discharge_capable":true,"charge_capable":true}`))
+		meter := store.Get("meter", telemetry.DerMeter)
+		_, safe, versions := fleetAtLivePower(store, caps, state.DriverLimits)
+		setBatteryLiveReading(store, "bat", 5000, 0.6,
+			json.RawMessage(`{"discharge_capable":true,"charge_capable":false}`))
+		if fuseSnapshotStillCurrent(store, state, meter.UpdatedAt, versions, safe) {
+			t.Fatalf("capability drift was accepted")
+		}
+	})
+
+	t.Run("command limit", func(t *testing.T) {
+		store, state, caps := setupFuseSaver(14040, 0, 0.6, 10000)
+		setBatteryLiveW(store, "bat", 5000, 0.6)
+		meter := store.Get("meter", telemetry.DerMeter)
+		_, safe, versions := fleetAtLivePower(store, caps, state.DriverLimits)
+		state.DriverLimits["bat"] = PowerLimits{MaxChargeW: 1000, MaxDischargeW: 10000}
+		if fuseSnapshotStillCurrent(store, state, meter.UpdatedAt, versions, safe) {
+			t.Fatalf("target outside a changed command limit was accepted")
+		}
+	})
+}
+
+func TestFuseSaverMixedFleetHonorsPerBatteryLowerBounds(t *testing.T) {
+	store := telemetry.NewStore()
+	store.Update("meter", telemetry.DerMeter, 20000, nil, nil)
+	store.DriverHealthMut("meter").RecordSuccess()
+	setBatteryLiveReading(store, "blocked", 3000, 0.6,
+		json.RawMessage(`{"discharge_capable":false,"charge_capable":true}`))
+	setBatteryLiveW(store, "capable", -1000, 0.6)
+	state := NewState(0, 50, "meter")
+	state.DriverLimits = map[string]PowerLimits{
+		"blocked": {MaxChargeW: 5000, MaxDischargeW: 5000},
+		"capable": {MaxChargeW: 5000, MaxDischargeW: 5000},
+	}
+	targets := []DispatchTarget{
+		{Driver: "blocked", TargetW: 3000},
+		{Driver: "capable", TargetW: -1000},
+	}
+	out := forceFuseDischarge(targets, store, state,
+		map[string]float64{"blocked": 10000, "capable": 10000}, 11040)
+	if len(out) != 2 {
+		t.Fatalf("got %d targets, want 2", len(out))
+	}
+	if out[0].TargetW < -0.001 {
+		t.Fatalf("blocked battery crossed below zero: %.0f W", out[0].TargetW)
+	}
+	if out[1].TargetW < -5000.001 {
+		t.Fatalf("capable battery crossed discharge cap: %.0f W", out[1].TargetW)
+	}
+	if math.Abs(out[0].TargetW-0) > 1 || math.Abs(out[1].TargetW-(-5000)) > 1 {
+		t.Errorf("targets = [%.0f, %.0f] W, want [0, -5000] W", out[0].TargetW, out[1].TargetW)
+	}
+}
+
+func TestDeadbandExitWithLiveBatteryPowerStaysQuietWhenNothingBinds(t *testing.T) {
+	for _, liveBatteryW := range []float64{-3000, 3000} {
+		t.Run(fmt.Sprintf("live_%+.0f_w", liveBatteryW), func(t *testing.T) {
+			store, state, caps := setupFuseSaver(2000, 0, 0.6, 10000)
+			setBatteryLiveW(store, "bat", liveBatteryW, 0.6)
+			state.SetGridTarget(2000)
+			state.MinDispatchIntervalS = 0
+
+			if out := ComputeDispatch(store, state, caps, 11040); out != nil {
+				t.Fatalf("safe deadband with live battery %.0f W: got %+v, want no dispatch", liveBatteryW, out)
+			}
+			if state.LastDispatch != nil {
+				t.Errorf("safe deadband with live battery %.0f W recorded a dispatch", liveBatteryW)
+			}
+		})
+	}
+}
+
+// The deadband still means "do nothing" when nothing binds. Running
+// the fuse-saver on this exit must not turn a quiet tick into a
+// dispatch: no targets, and no LastDispatch stamp that would start the
+// holdoff clock against a cycle that commanded nothing.
+func TestDeadbandExitStaysQuietWhenNothingBinds(t *testing.T) {
+	store, state, caps := setupFuseSaver(2000, 0, 0.6, 10000)
+	state.SetGridTarget(2000)
+	state.MinDispatchIntervalS = 0
+
+	out := ComputeDispatch(store, state, caps, 11040)
+	if len(out) != 0 {
+		t.Fatalf("grid on target, fuse and phases clear: expected no targets, got %+v", out)
+	}
+	if state.LastDispatch != nil {
+		t.Errorf("a no-op deadband tick must not record a dispatch")
+	}
+}
+
+// The fuse-saver fires from the deadband exit even while the holdoff
+// would otherwise suppress a re-dispatch on the following tick: firing
+// records the dispatch, so the next tick is the holdoff's to decide —
+// and the holdoff exit runs the same fuse-saver anyway.
+func TestDeadbandExitRecordsDispatchWhenFuseSaverFires(t *testing.T) {
+	store, state, caps := setupFuseSaver(8000, 0, 0.6, 10000)
+	state.SetGridTarget(8000)
+	state.PeakImportCeilingW = 5000
+	state.MinDispatchIntervalS = 5
+
+	out := ComputeDispatch(store, state, caps, 11040)
+	if len(out) == 0 {
+		t.Fatalf("expected fuse-saver discharge")
+	}
+	if state.LastDispatch == nil {
+		t.Errorf("a firing fuse-saver must record the dispatch")
+	}
+	if len(state.LastTargets) != len(out) {
+		t.Errorf("LastTargets = %+v, want the issued targets %+v", state.LastTargets, out)
 	}
 }

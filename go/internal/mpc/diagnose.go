@@ -3,6 +3,8 @@ package mpc
 import (
 	"encoding/json"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // DiagnosticSlot joins the per-slot inputs the DP saw with the action
@@ -22,10 +24,21 @@ type DiagnosticSlot struct {
 	PVW        float64 `json:"pv_w"`       // site-signed (≤ 0 when producing)
 	LoadW      float64 `json:"load_w"`
 
+	// Source and local availability time for the rows consulted to build this
+	// slot. Synthetic price rows use their creation time. WeatherRow is not full
+	// PV provenance: learned models, defaults, residual correction, blending,
+	// and a Go-DP downside adjustment may also shape PVW. These times are not
+	// provider issue times or model revisions. InputProvenanceSchema on the
+	// parent distinguishes a current row with missing data from a legacy row.
+	PriceInputSource        string `json:"price_input_source,omitempty"`
+	PriceInputAvailableAtMs int64  `json:"price_input_available_at_ms,omitempty"`
+	WeatherRowSource        string `json:"weather_row_source,omitempty"`
+	WeatherRowAvailableAtMs int64  `json:"weather_row_available_at_ms,omitempty"`
+
 	// Outputs
 	BatteryW float64 `json:"battery_w"`
 	GridW    float64 `json:"grid_w"`
-	SoCPct   float64 `json:"soc_pct"`  // SoC at END of slot
+	SoC   float64 `json:"soc"`  // SoC at END of slot
 	CostOre  float64 `json:"cost_ore"` // raw (un-blended) slot cost
 	Reason   string  `json:"reason"`
 	EMSMode  string  `json:"ems_mode"`
@@ -41,9 +54,9 @@ type DiagnosticSlot struct {
 	// exporting — reality was `LOAD 1.6 + EV 4.0 = 5.6 kW covered`,
 	// grid ≈ 0. See issue #174.
 	LoadpointW          float64            `json:"loadpoint_w,omitempty"`
-	LoadpointSoCPct     float64            `json:"loadpoint_soc_pct,omitempty"`
+	LoadpointSoC     float64            `json:"loadpoint_soc,omitempty"`
 	LoadpointPowerW     map[string]float64 `json:"loadpoint_power_w,omitempty"`
-	LoadpointSoCPctByID map[string]float64 `json:"loadpoint_soc_pct_by_id,omitempty"`
+	LoadpointSoCByID map[string]float64 `json:"loadpoint_soc_by_id,omitempty"`
 	StoragePowerW       map[string]float64 `json:"storage_power_w,omitempty"`
 	StorageEnergyWh     map[string]float64 `json:"storage_energy_wh,omitempty"`
 }
@@ -53,9 +66,9 @@ type DiagnosticSlot struct {
 // without pulling the whole internal struct.
 type DiagnosticParams struct {
 	Mode                Mode     `json:"mode"`
-	InitialSoCPct       float64  `json:"initial_soc_pct"`
-	SoCMinPct           float64  `json:"soc_min_pct"`
-	SoCMaxPct           float64  `json:"soc_max_pct"`
+	InitialSoC       float64  `json:"initial_soc"`
+	SoCMin           float64  `json:"soc_min"`
+	SoCMax           float64  `json:"soc_max"`
 	PVChargeBonusOreKwh float64  `json:"pv_charge_bonus_ore_kwh,omitempty"`
 	SoCLevels           int      `json:"soc_levels"`
 	ActionLevels        int      `json:"action_levels"`
@@ -77,21 +90,23 @@ type DiagnosticParams struct {
 // Diagnostic is the full post-mortem of the most recent Optimize call.
 // Returned by Service.Diagnose for the /api/mpc/diagnose endpoint.
 type Diagnostic struct {
-	ComputedAtMs       int64             `json:"computed_at_ms"`
-	Zone               string            `json:"zone"`
-	Horizon            int               `json:"horizon_slots"`
-	TotalCostOre       float64           `json:"total_cost_ore"`
-	Solver             *SolverInfo       `json:"solver,omitempty"`
-	DPShadow           *ShadowPlan       `json:"dp_shadow,omitempty"`
-	DPEvaluationShadow *ShadowPlan       `json:"dp_evaluation_shadow,omitempty"`
-	RecourseShadow     *ShadowPlan       `json:"recourse_shadow,omitempty"`
-	ShadowEvaluation   *ShadowEvaluation `json:"shadow_evaluation,omitempty"`
-	OptimizerInput     json.RawMessage   `json:"optimizer_input,omitempty"`
-	Params             DiagnosticParams  `json:"params"`
-	Slots              []DiagnosticSlot  `json:"slots"`
-	LoadpointID        string            `json:"loadpoint_id,omitempty"`
-	LastReplanAtMs     int64             `json:"last_replan_at_ms"`
-	LastReason         string            `json:"last_reason"`
+	DecisionID            string            `json:"decision_id,omitempty"`
+	ComputedAtMs          int64             `json:"computed_at_ms"`
+	InputProvenanceSchema int               `json:"input_provenance_schema,omitempty"`
+	Zone                  string            `json:"zone"`
+	Horizon               int               `json:"horizon_slots"`
+	TotalCostOre          float64           `json:"total_cost_ore"`
+	Solver                *SolverInfo       `json:"solver,omitempty"`
+	DPShadow              *ShadowPlan       `json:"dp_shadow,omitempty"`
+	DPEvaluationShadow    *ShadowPlan       `json:"dp_evaluation_shadow,omitempty"`
+	RecourseShadow        *ShadowPlan       `json:"recourse_shadow,omitempty"`
+	ShadowEvaluation      *ShadowEvaluation `json:"shadow_evaluation,omitempty"`
+	OptimizerInput        json.RawMessage   `json:"optimizer_input,omitempty"`
+	Params                DiagnosticParams  `json:"params"`
+	Slots                 []DiagnosticSlot  `json:"slots"`
+	LoadpointID           string            `json:"loadpoint_id,omitempty"`
+	LastReplanAtMs        int64             `json:"last_replan_at_ms"`
+	LastReason            string            `json:"last_reason"`
 }
 
 // Diagnose returns the inputs + outputs of the most recent Optimize
@@ -132,32 +147,40 @@ func buildDiagnostic(plan *Plan, slots []Slot, p Params, zone string,
 		n = len(plan.Actions)
 	}
 	out := make([]DiagnosticSlot, n)
+	inputProvenanceSchema := 0
 	for i := 0; i < n; i++ {
 		slot := slots[i]
+		if slot.InputProvenanceSchema > inputProvenanceSchema {
+			inputProvenanceSchema = slot.InputProvenanceSchema
+		}
 		action := plan.Actions[i]
 		out[i] = DiagnosticSlot{
-			Idx:                 i,
-			SlotStartMs:         slot.StartMs,
-			SlotEndMs:           slot.StartMs + int64(slot.LenMin)*60*1000,
-			LenMin:              slot.LenMin,
-			PriceOre:            slot.PriceOre,
-			SpotOre:             slot.SpotOre,
-			Confidence:          slot.Confidence,
-			PVW:                 slot.PVW,
-			LoadW:               slot.LoadW,
-			BatteryW:            action.BatteryW,
-			GridW:               action.GridW,
-			SoCPct:              action.SoCPct,
-			CostOre:             action.CostOre,
-			Reason:              action.Reason,
-			EMSMode:             action.EMSMode,
-			PVLimitW:            action.PVLimitW,
-			LoadpointW:          action.LoadpointW,
-			LoadpointSoCPct:     action.LoadpointSoCPct,
-			LoadpointPowerW:     action.LoadpointPowerW,
-			LoadpointSoCPctByID: action.LoadpointSoCPctByID,
-			StoragePowerW:       action.StoragePowerW,
-			StorageEnergyWh:     action.StorageEnergyWh,
+			Idx:                     i,
+			SlotStartMs:             slot.StartMs,
+			SlotEndMs:               slot.StartMs + int64(slot.LenMin)*60*1000,
+			LenMin:                  slot.LenMin,
+			PriceOre:                slot.PriceOre,
+			SpotOre:                 slot.SpotOre,
+			Confidence:              slot.Confidence,
+			PVW:                     slot.PVW,
+			LoadW:                   slot.LoadW,
+			PriceInputSource:        slot.PriceInputSource,
+			PriceInputAvailableAtMs: slot.PriceInputAvailableAtMs,
+			WeatherRowSource:        slot.WeatherRowSource,
+			WeatherRowAvailableAtMs: slot.WeatherRowAvailableAtMs,
+			BatteryW:                action.BatteryW,
+			GridW:                   action.GridW,
+			SoC:                  action.SoC,
+			CostOre:                 action.CostOre,
+			Reason:                  action.Reason,
+			EMSMode:                 action.EMSMode,
+			PVLimitW:                action.PVLimitW,
+			LoadpointW:              action.LoadpointW,
+			LoadpointSoC:         action.LoadpointSoC,
+			LoadpointPowerW:         action.LoadpointPowerW,
+			LoadpointSoCByID:     action.LoadpointSoCByID,
+			StoragePowerW:           action.StoragePowerW,
+			StorageEnergyWh:         action.StorageEnergyWh,
 		}
 	}
 	loadpointID := ""
@@ -165,21 +188,23 @@ func buildDiagnostic(plan *Plan, slots []Slot, p Params, zone string,
 		loadpointID = p.Loadpoint.ID
 	}
 	return &Diagnostic{
-		ComputedAtMs:       plan.GeneratedAtMs,
-		Zone:               zone,
-		Horizon:            plan.HorizonSlots,
-		TotalCostOre:       plan.TotalCostOre,
-		Solver:             plan.Solver,
-		DPShadow:           plan.DPShadow,
-		DPEvaluationShadow: plan.DPEvaluationShadow,
-		RecourseShadow:     plan.RecourseShadow,
-		ShadowEvaluation:   plan.ShadowEvaluation,
-		OptimizerInput:     append(json.RawMessage(nil), plan.OptimizerInput...),
+		DecisionID:            plan.DecisionID,
+		ComputedAtMs:          plan.GeneratedAtMs,
+		InputProvenanceSchema: inputProvenanceSchema,
+		Zone:                  zone,
+		Horizon:               plan.HorizonSlots,
+		TotalCostOre:          plan.TotalCostOre,
+		Solver:                plan.Solver,
+		DPShadow:              plan.DPShadow,
+		DPEvaluationShadow:    plan.DPEvaluationShadow,
+		RecourseShadow:        plan.RecourseShadow,
+		ShadowEvaluation:      plan.ShadowEvaluation,
+		OptimizerInput:        append(json.RawMessage(nil), plan.OptimizerInput...),
 		Params: DiagnosticParams{
 			Mode:                       p.Mode,
-			InitialSoCPct:              p.InitialSoCPct,
-			SoCMinPct:                  p.SoCMinPct,
-			SoCMaxPct:                  p.SoCMaxPct,
+			InitialSoC:              p.InitialSoC,
+			SoCMin:                  p.SoCMin,
+			SoCMax:                  p.SoCMax,
 			PVChargeBonusOreKwh:        p.PVChargeBonusOreKwh,
 			SoCLevels:                  p.SoCLevels,
 			ActionLevels:               p.ActionLevels,
@@ -276,6 +301,16 @@ func (s *Service) RestoreDiagnostic(d *Diagnostic, now time.Time, reason string)
 }
 
 func planFromDiagnostic(d *Diagnostic) (*Plan, []Slot, Params, time.Time, bool) {
+	if d == nil || d.InputProvenanceSchema < 0 || d.InputProvenanceSchema > inputProvenanceSchemaVersion {
+		return nil, nil, Params{}, time.Time{}, false
+	}
+	identified := d.DecisionID != ""
+	if identified {
+		parsed, err := uuid.Parse(d.DecisionID)
+		if err != nil || parsed == uuid.Nil || parsed.Variant() != uuid.RFC4122 || d.DecisionID != parsed.String() {
+			return nil, nil, Params{}, time.Time{}, false
+		}
+	}
 	generatedAtMs := d.ComputedAtMs
 	if generatedAtMs <= 0 {
 		generatedAtMs = d.LastReplanAtMs
@@ -289,9 +324,9 @@ func planFromDiagnostic(d *Diagnostic) (*Plan, []Slot, Params, time.Time, bool) 
 	}
 	params := Params{
 		Mode:                d.Params.Mode,
-		InitialSoCPct:       d.Params.InitialSoCPct,
-		SoCMinPct:           d.Params.SoCMinPct,
-		SoCMaxPct:           d.Params.SoCMaxPct,
+		InitialSoC:       d.Params.InitialSoC,
+		SoCMin:           d.Params.SoCMin,
+		SoCMax:           d.Params.SoCMax,
 		PVChargeBonusOreKwh: d.Params.PVChargeBonusOreKwh,
 		SoCLevels:           d.Params.SoCLevels,
 		ActionLevels:        d.Params.ActionLevels,
@@ -312,25 +347,36 @@ func planFromDiagnostic(d *Diagnostic) (*Plan, []Slot, Params, time.Time, bool) 
 	actions := make([]Action, 0, len(d.Slots))
 	for _, ds := range d.Slots {
 		if ds.SlotStartMs <= 0 {
+			if identified {
+				return nil, nil, Params{}, time.Time{}, false
+			}
 			continue
 		}
 		lenMin := ds.LenMin
-		if lenMin <= 0 && ds.SlotEndMs > ds.SlotStartMs {
+		if !identified && lenMin <= 0 && ds.SlotEndMs > ds.SlotStartMs {
 			lenMin = int((ds.SlotEndMs - ds.SlotStartMs) / 60000)
 		}
 		if lenMin <= 0 {
+			if identified {
+				return nil, nil, Params{}, time.Time{}, false
+			}
 			continue
 		}
 		slots = append(slots, Slot{
-			StartMs:    ds.SlotStartMs,
-			LenMin:     lenMin,
-			PriceOre:   ds.PriceOre,
-			SpotOre:    ds.SpotOre,
-			PVW:        ds.PVW,
-			LoadW:      ds.LoadW,
-			Confidence: ds.Confidence,
+			StartMs:                 ds.SlotStartMs,
+			LenMin:                  lenMin,
+			PriceOre:                ds.PriceOre,
+			SpotOre:                 ds.SpotOre,
+			PVW:                     ds.PVW,
+			LoadW:                   ds.LoadW,
+			Confidence:              ds.Confidence,
+			InputProvenanceSchema:   d.InputProvenanceSchema,
+			PriceInputSource:        ds.PriceInputSource,
+			PriceInputAvailableAtMs: ds.PriceInputAvailableAtMs,
+			WeatherRowSource:        ds.WeatherRowSource,
+			WeatherRowAvailableAtMs: ds.WeatherRowAvailableAtMs,
 		})
-		actions = append(actions, Action{
+		action := Action{
 			SlotStartMs:         ds.SlotStartMs,
 			SlotLenMin:          lenMin,
 			PriceOre:            ds.PriceOre,
@@ -339,33 +385,46 @@ func planFromDiagnostic(d *Diagnostic) (*Plan, []Slot, Params, time.Time, bool) 
 			LoadW:               ds.LoadW,
 			BatteryW:            ds.BatteryW,
 			GridW:               ds.GridW,
-			SoCPct:              ds.SoCPct,
+			SoC:              ds.SoC,
 			CostOre:             ds.CostOre,
 			Confidence:          ds.Confidence,
 			Reason:              ds.Reason,
 			EMSMode:             ds.EMSMode,
 			PVLimitW:            ds.PVLimitW,
 			LoadpointW:          ds.LoadpointW,
-			LoadpointSoCPct:     ds.LoadpointSoCPct,
+			LoadpointSoC:     ds.LoadpointSoC,
 			LoadpointPowerW:     ds.LoadpointPowerW,
-			LoadpointSoCPctByID: ds.LoadpointSoCPctByID,
+			LoadpointSoCByID: ds.LoadpointSoCByID,
 			StoragePowerW:       ds.StoragePowerW,
 			StorageEnergyWh:     ds.StorageEnergyWh,
-		})
+		}
+		if identified && ds.SlotEndMs > 0 {
+			slotEndMs, err := checkedSlotEndMs(action.SlotStartMs, action.SlotLenMin)
+			if err != nil || ds.SlotEndMs != slotEndMs {
+				return nil, nil, Params{}, time.Time{}, false
+			}
+		}
+		actions = append(actions, action)
 	}
 	if len(actions) == 0 {
 		return nil, nil, Params{}, time.Time{}, false
+	}
+	if identified {
+		if err := validatePlanSlotAlignment(slots, actions); err != nil {
+			return nil, nil, Params{}, time.Time{}, false
+		}
 	}
 	horizon := d.Horizon
 	if horizon <= 0 {
 		horizon = len(actions)
 	}
 	plan := &Plan{
+		DecisionID:         d.DecisionID,
 		GeneratedAtMs:      generatedAtMs,
 		Mode:               params.Mode,
 		HorizonSlots:       horizon,
 		CapacityWh:         params.CapacityWh,
-		InitialSoCPct:      params.InitialSoCPct,
+		InitialSoC:      params.InitialSoC,
 		TotalCostOre:       d.TotalCostOre,
 		Actions:            actions,
 		Solver:             d.Solver,

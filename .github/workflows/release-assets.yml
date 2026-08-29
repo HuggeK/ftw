@@ -1,26 +1,26 @@
 name: release-assets
 
-# Build + publish the artefacts that accompany a tagged release:
+# Publish the artefacts that accompany a tagged release:
 #   - cross-platform main binaries (linux amd64/arm64, windows amd64)
-#   - docker images for the paired core + updater control plane pushed to GHCR
+#   - validated beta manifests promoted unchanged for Core + updater
 #   - a versioned os_list.json alias for Raspberry Pi Imager
 #   - Discord release announcement
 #
 # Triggered by `release.yml` via `gh workflow run release-assets.yml
-# --ref vX.Y.Z` immediately after the tag + GitHub Release are created.
-# Also listens directly on `push: tags: ['v*']` so a hand-pushed tag
-# (e.g. via `git push origin vX.Y.Z` from a maintainer's laptop) does
-# the same thing — but in the normal Changesets flow that won't fire
-# because the bot-pushed tag from release.yml doesn't cascade workflow
-# runs.
+# --ref vX.Y.Z` immediately after the tag + draft GitHub Release are created.
+# Stable publication is explicit: a hand-pushed tag does not select a beta or
+# publish assets. Run release.yml so the chosen validated beta is bound first.
 #
 # Splitting these jobs out of release.yml means:
 #   - regular changeset-PR merges to master don't queue + skip a half
 #     dozen asset jobs every time.
 #   - asset builds run on the tag ref directly — no need for the meta
 #     job to thread `outputs.version` from a different workflow run.
-#   - failures here don't block the next release; a re-run is a clean
-#     `gh workflow run release-assets.yml --ref vX.Y.Z`.
+#   - failures here don't block the next release. To use a workflow fix that
+#     landed after the tag, rerun the first promotion with
+#     `--ref master -f tag=vX.Y.Z -f source_beta=vX.Y.Z-beta.N -f release_id=123`.
+#     After the receipt exists, rerun with
+#     `--ref master -f tag=vX.Y.Z -f release_id=123`.
 
 on:
   workflow_dispatch:
@@ -29,9 +29,14 @@ on:
         description: "Release tag (vX.Y.Z) — defaults to the tag this workflow is dispatched against"
         required: false
         type: string
-  push:
-    tags:
-      - "v*"
+      source_beta:
+        description: "Validated beta tag to promote without rebuilding"
+        required: false
+        type: string
+      release_id:
+        description: "Numeric id of the draft GitHub Release prepared by release.yml"
+        required: true
+        type: string
 
 permissions:
   contents: write   # upload release assets + read tag refs
@@ -40,30 +45,74 @@ permissions:
 # Multiple tags shouldn't trample each other. ref-scoped concurrency
 # group means dispatching v0.102.4 won't cancel an in-flight v0.102.3.
 concurrency:
-  group: release-assets-${{ github.ref }}
+  # Every stable run moves :latest, so serialize across all stable tags.
+  group: release-assets-stable-latest
   cancel-in-progress: false
 
 jobs:
+  registry:
+    name: verify package write access
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release checks
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Require the compatibility package credential
+        env:
+          LEGACY_GHCR_TOKEN: ${{ secrets.LEGACY_GHCR_TOKEN }}
+        run: |
+          if [ -z "${LEGACY_GHCR_TOKEN}" ]; then
+            echo "LEGACY_GHCR_TOKEN is missing; rotate the package-only credential before releasing." >&2
+            exit 1
+          fi
+
+      - name: Verify canonical package writes
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/check-ghcr-write-access.sh srcfl/ftw srcfl/ftw-updater
+
+      - name: Verify compatibility package writes
+        env:
+          GHCR_USERNAME: frahlg
+          GHCR_TOKEN: ${{ secrets.LEGACY_GHCR_TOKEN }}
+        run: bash scripts/check-ghcr-write-access.sh frahlg/forty-two-watts frahlg/forty-two-watts-updater
+
   meta:
     name: derive tag + version
     runs-on: ubuntu-latest
+    needs: registry
     # Beta tags have their own lightweight channel workflow and must never
     # retag :latest or publish stable Discord announcements.
     if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.ref_name, '-') }}
     outputs:
       tag:     ${{ steps.meta.outputs.tag }}
       version: ${{ steps.meta.outputs.version }}
+      source_beta: ${{ steps.meta.outputs.source_beta }}
+      release_id: ${{ steps.meta.outputs.release_id }}
     steps:
+      - name: Checkout release refs
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
       - name: Derive tag/version from ref
         id: meta
         env:
+          # The per-run GITHUB_TOKEN cannot resolve this repository's draft
+          # releases by tag. CI_TOKEN is repo-scoped with Contents write and
+          # is already the release workflow's durable GitHub credential.
+          GH_TOKEN: ${{ secrets.CI_TOKEN }}
           INPUT_TAG: ${{ github.event.inputs.tag }}
+          INPUT_BETA: ${{ github.event.inputs.source_beta }}
+          INPUT_RELEASE_ID: ${{ github.event.inputs.release_id }}
         run: |
           set -euo pipefail
           # Priority order:
           #   1. explicit workflow_dispatch `tag` input (operator override).
-          #   2. github.ref when it's a tag ref (set by `--ref` on dispatch
-          #      OR by `push: tags`).
+          #   2. github.ref when `--ref` dispatches against a tag.
           if [ -n "${INPUT_TAG}" ]; then
             TAG="${INPUT_TAG}"
           elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
@@ -77,9 +126,123 @@ jobs:
             exit 1
           fi
           VERSION="${TAG#v}"
+          STABLE_COMMIT="$(git rev-list -n 1 "${TAG}")"
+          if [ -z "${STABLE_COMMIT}" ]; then
+            echo "Cannot resolve stable tag ${TAG}." >&2
+            exit 1
+          fi
+          if [ "${STABLE_COMMIT}" != "${GITHUB_SHA}" ]; then
+            # A failed tag-ref run can be resumed with fixed workflow code
+            # from master. Every build, validation and publish job below
+            # checks out needs.meta.outputs.tag, so workflow code may advance
+            # while all shipped bytes remain bound to the immutable tag.
+            if [ -z "${INPUT_TAG}" ] || [ "${GITHUB_REF}" != "refs/heads/master" ]; then
+              echo "Stable tag ${TAG} peels to ${STABLE_COMMIT}, not workflow commit ${GITHUB_SHA}." >&2
+              exit 1
+            fi
+            echo "Resuming ${TAG} with workflow code from master; release inputs remain at ${STABLE_COMMIT}."
+          fi
+
+          if [[ ! "${INPUT_RELEASE_ID}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "release_id must name the exact draft prepared by release.yml." >&2
+            exit 1
+          fi
+          RELEASE_ID="${INPUT_RELEASE_ID}"
+          # Draft lookup by tag uses a pending-tag GraphQL query that Actions
+          # tokens cannot use across runs. The numeric REST id is stable and
+          # binds every upload, check and final publish to the same draft.
+          RELEASE_JSON="$(scripts/github-release-by-id.sh show "${RELEASE_ID}")"
+          jq -e --arg tag "${TAG}" '
+            .tag_name == $tag
+            and .draft == true
+            and .prerelease == false
+            and .published_at == null
+          ' <<<"${RELEASE_JSON}" >/dev/null
+
+          # The public collection remains the fail-closed source for the
+          # numeric downgrade guard; that check neither needs nor expects the
+          # current draft to appear in the list.
+          RELEASE_PAGES="$(gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/releases?per_page=100")"
+          printf '%s' "${RELEASE_PAGES}" | \
+            python3 scripts/check-stable-release.py order "${TAG}"
+
+          mkdir -p promotion
+          PROMOTION_RECORD="promotion/ftw-promotion-receipt.json"
+          if scripts/github-release-by-id.sh download \
+            "${RELEASE_ID}" promotion ftw-promotion-receipt.json >/dev/null 2>&1; then
+            jq -e \
+              --arg tag "${TAG}" \
+              --arg commit "${STABLE_COMMIT}" \
+              --arg version "${VERSION}" '
+                .schema == 1
+                and .stable_tag == $tag
+                and .commit == $commit
+                and .stable_version == $version
+                and (.source_beta | type == "string" and length > 0)
+                and (.images.core.digest | test("^sha256:[0-9a-f]{64}$"))
+                and (.images.updater.digest | test("^sha256:[0-9a-f]{64}$"))
+              ' "${PROMOTION_RECORD}" >/dev/null
+            BETA_TAG="$(jq -r '.source_beta' "${PROMOTION_RECORD}")"
+            if [ -n "${INPUT_BETA}" ] && [ "${INPUT_BETA}" != "${BETA_TAG}" ]; then
+              echo "Stable ${TAG} is already bound to ${BETA_TAG}, not requested ${INPUT_BETA}." >&2
+              exit 1
+            fi
+          else
+            if [ -z "${INPUT_BETA}" ]; then
+              echo "Stable ${TAG} has no promotion receipt; source_beta is required for its first promotion." >&2
+              exit 1
+            fi
+            BETA_TAG="${INPUT_BETA}"
+          fi
+
+          if [[ ! "${BETA_TAG}" =~ ^${TAG}-beta\.[0-9]+$ ]]; then
+            echo "Source ${BETA_TAG} is not a beta for ${TAG}." >&2
+            exit 1
+          fi
+          BETA_COMMIT="$(git rev-list -n 1 "${BETA_TAG}")"
+          if [ "${BETA_COMMIT}" != "${STABLE_COMMIT}" ]; then
+            echo "${BETA_TAG} points to ${BETA_COMMIT}, not stable commit ${STABLE_COMMIT}." >&2
+            exit 1
+          fi
+
+          if [ ! -f "${PROMOTION_RECORD}" ]; then
+            mkdir -p beta-receipt
+            gh release download "${BETA_TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --pattern ftw-image-digests.json \
+              --dir beta-receipt
+            BETA_RECORD="beta-receipt/ftw-image-digests.json"
+            jq -e \
+              --arg tag "${BETA_TAG}" \
+              --arg commit "${STABLE_COMMIT}" \
+              --arg version "${VERSION}" '
+                .schema == 1
+                and .tag == $tag
+                and .commit == $commit
+                and .stable_version == $version
+                and (.images.core.digest | test("^sha256:[0-9a-f]{64}$"))
+                and (.images.updater.digest | test("^sha256:[0-9a-f]{64}$"))
+              ' "${BETA_RECORD}" >/dev/null
+            CORE_DIGEST="$(jq -r '.images.core.digest' "${BETA_RECORD}")"
+            UPDATER_DIGEST="$(jq -r '.images.updater.digest' "${BETA_RECORD}")"
+            jq -n \
+              --arg stable_tag "${TAG}" \
+              --arg commit "${STABLE_COMMIT}" \
+              --arg version "${VERSION}" \
+              --arg source_beta "${BETA_TAG}" \
+              --arg core "${CORE_DIGEST}" \
+              --arg updater "${UPDATER_DIGEST}" \
+              '{schema: 1, stable_tag: $stable_tag, commit: $commit, stable_version: $version, source_beta: $source_beta, images: {core: {digest: $core}, updater: {digest: $updater}}}' \
+              > "${PROMOTION_RECORD}"
+            scripts/github-release-by-id.sh upload \
+              "${RELEASE_ID}" "${PROMOTION_RECORD}"
+          fi
           echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
-          echo "Building assets for ${TAG} (version ${VERSION})"
+          echo "source_beta=${BETA_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "release_id=${RELEASE_ID}" >> "${GITHUB_OUTPUT}"
+          echo "Publishing assets for ${TAG} from exact candidate ${BETA_TAG}"
 
   binaries:
     name: build + upload release binaries
@@ -107,10 +270,16 @@ jobs:
             archive: zip
     steps:
       - name: Checkout tag
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           # Check out the tag so -X main.Version matches what users install.
           ref: ${{ needs.meta.outputs.tag }}
+
+      - name: Checkout release workflow helpers
+        uses: actions/checkout@v7
+        with:
+          path: .release-workflow
+          persist-credentials: false
 
       - name: Setup Go
         uses: actions/setup-go@v7
@@ -180,13 +349,13 @@ jobs:
 
       - name: Upload to release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.meta.outputs.tag }}
+          GH_TOKEN: ${{ secrets.CI_TOKEN }}
+          RELEASE_ID: ${{ needs.meta.outputs.release_id }}
           ASSET: release/ftw-${{ matrix.goos }}-${{ matrix.goarch }}.${{ matrix.archive }}
           LEGACY_ASSET: release/forty-two-watts-${{ matrix.goos }}-${{ matrix.goarch }}.${{ matrix.archive }}
         # --clobber lets a workflow re-run replace a prior upload without
         # failing — useful when this workflow is re-dispatched manually.
-        run: gh release upload "${TAG}" "${ASSET}" "${ASSET}.sha256" "${LEGACY_ASSET}" "${LEGACY_ASSET}.sha256" --clobber
+        run: .release-workflow/scripts/github-release-by-id.sh upload "${RELEASE_ID}" --clobber "${ASSET}" "${ASSET}.sha256" "${LEGACY_ASSET}" "${LEGACY_ASSET}.sha256"
 
   imager-metadata:
     name: attach Raspberry Pi Imager metadata
@@ -195,10 +364,16 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout release workflow helpers
+        uses: actions/checkout@v7
+        with:
+          path: .release-workflow
+          persist-credentials: false
+
       - name: Mirror permanent installer metadata onto the version release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.meta.outputs.tag }}
+          GH_TOKEN: ${{ secrets.CI_TOKEN }}
+          RELEASE_ID: ${{ needs.meta.outputs.release_id }}
         run: |
           set -euo pipefail
           mkdir -p installer
@@ -212,120 +387,433 @@ jobs:
             and (.[0].url | contains("/releases/download/rpi-installer/"))
             and (.[0].extract_sha256 | test("^[0-9a-f]{64}$"))
           ' installer/os_list.json >/dev/null
-          gh release upload "${TAG}" installer/os_list.json \
-            --repo "${GITHUB_REPOSITORY}" --clobber
+          # Imager 2.x needs a device chooser (imager.devices) and device tags
+          # on the entry itself, or the wizard dead-ends before reaching FTW.
+          # A stable release stays draft until this required metadata passes.
+          jq -e '
+            (.imager.devices | length) > 0
+            and (.os_list[0].devices | length) > 0
+          ' installer/os_list.json >/dev/null
+          .release-workflow/scripts/github-release-by-id.sh upload \
+            "${RELEASE_ID}" --clobber installer/os_list.json
+
+  assets-ready:
+    name: verify complete draft assets
+    runs-on: ubuntu-latest
+    needs: [meta, binaries, imager-metadata]
+    permissions:
+      # Draft releases are visible only to tokens with push access.
+      contents: write
+    steps:
+      - name: Checkout stable tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Checkout release workflow helpers
+        uses: actions/checkout@v7
+        with:
+          path: .release-workflow
+          persist-credentials: false
+
+      - name: Verify receipt, binaries, checksums and Imager metadata
+        env:
+          GH_TOKEN: ${{ secrets.CI_TOKEN }}
+          TAG: ${{ needs.meta.outputs.tag }}
+          RELEASE_ID: ${{ needs.meta.outputs.release_id }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          SOURCE_BETA: ${{ needs.meta.outputs.source_beta }}
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          tag_commit="$(git rev-list -n 1 "${TAG}")"
+          if [ "${tag_commit}" != "${commit}" ]; then
+            echo "Stable tag ${TAG} peels to ${tag_commit}, not checked out commit ${commit}." >&2
+            exit 1
+          fi
+
+          release_json="$(.release-workflow/scripts/github-release-by-id.sh show "${RELEASE_ID}")"
+          printf '%s' "${release_json}" | jq '{
+            tagName: .tag_name,
+            isDraft: .draft,
+            isPrerelease: .prerelease,
+            publishedAt: .published_at,
+            assets: .assets
+          }' | \
+            python3 scripts/check-stable-release.py assets "${TAG}"
+
+          verify_dir="${RUNNER_TEMP}/stable-release-verification"
+          mkdir -p "${verify_dir}"
+          .release-workflow/scripts/github-release-by-id.sh download "${RELEASE_ID}" "${verify_dir}"
+          for checksum in "${verify_dir}"/*.sha256; do
+            checksum_name="$(basename "${checksum}")"
+            asset_name="${checksum_name%.sha256}"
+            read -r recorded_digest recorded_name extra < "${checksum}"
+            if [[ ! "${recorded_digest}" =~ ^[0-9a-f]{64}$ ]] || \
+               [ "${recorded_name}" != "${asset_name}" ] || \
+               [ -n "${extra:-}" ] || \
+               [ "$(wc -l < "${checksum}")" -ne 1 ]; then
+              echo "${checksum_name} must contain exactly one checksum for ${asset_name}." >&2
+              exit 1
+            fi
+            (cd "${verify_dir}" && sha256sum -c "${checksum_name}")
+          done
+
+          receipt="${verify_dir}/ftw-promotion-receipt.json"
+          jq -e \
+            --arg tag "${TAG}" \
+            --arg commit "${commit}" \
+            --arg version "${VERSION}" \
+            --arg source_beta "${SOURCE_BETA}" '
+              .schema == 1
+              and .stable_tag == $tag
+              and .commit == $commit
+              and .stable_version == $version
+              and .source_beta == $source_beta
+              and (.images.core.digest | test("^sha256:[0-9a-f]{64}$"))
+              and (.images.updater.digest | test("^sha256:[0-9a-f]{64}$"))
+            ' "${receipt}" >/dev/null
+
+          jq -e '
+            (.os_list | length) == 1
+            and .os_list[0].name == "FTW"
+            and (.os_list[0].url | contains("/releases/download/rpi-installer/"))
+            and (.os_list[0].extract_sha256 | test("^[0-9a-f]{64}$"))
+            and ((.imager.devices // []) | length) > 0
+            and ((.os_list[0].devices // []) | length) > 0
+          ' "${verify_dir}/os_list.json" >/dev/null
 
   docker:
-    name: docker build + push (${{ matrix.target }})
+    name: promote paired exact beta manifests
     runs-on: ubuntu-latest
-    needs: meta
+    needs: [meta, assets-ready]
+    outputs:
+      core_digest: ${{ steps.source.outputs.core_digest }}
+      updater_digest: ${{ steps.source.outputs.updater_digest }}
     # Core and updater are a paired control plane. The optimizer has its own
     # release workflow and version because compatibility is negotiated by
     # protocol rather than by matching core tags.
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: main
-            dockerfile: ./Dockerfile
-            image_suffix: ""
-            title: FTW
-            description: Unified Home Energy Management System
-          - target: updater
-            dockerfile: ./Dockerfile.updater
-            image_suffix: "-updater"
-            title: FTW updater
-            description: Sidecar that executes docker compose pull + up for in-app updates
     steps:
       - name: Checkout tag
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.meta.outputs.tag }}
 
-      # drivers/ is gitignored and fetched from the pin; the image copies it.
-      - name: Fetch the bundled drivers
-        run: make drivers
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - name: Checkout release workflow helpers
+        uses: actions/checkout@v7
+        with:
+          path: .release-workflow
+          persist-credentials: false
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
-      - name: Login to canonical GHCR namespace
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ vars.SOURCEFUL_GHCR_USER || github.actor }}
-          password: ${{ secrets.SOURCEFUL_GHCR_TOKEN || secrets.GITHUB_TOKEN }}
-
-      - name: Compute image metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/srcfl/ftw${{ matrix.image_suffix }}
-          tags: |
-            type=raw,value=${{ needs.meta.outputs.tag }}
-            type=raw,value=${{ needs.meta.outputs.version }}
-            type=raw,value=latest
-            type=sha,format=short
-          labels: |
-            org.opencontainers.image.title=${{ matrix.title }}
-            org.opencontainers.image.description=${{ matrix.description }}
-            org.opencontainers.image.source=https://github.com/srcfl/ftw
-            org.opencontainers.image.version=${{ needs.meta.outputs.version }}
-            org.opencontainers.image.licenses=Apache-2.0
-
-      - name: Build and push
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ${{ matrix.dockerfile }}
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            VERSION=${{ needs.meta.outputs.tag }}
-            BUILD_SHA=${{ github.sha }}
-          # Use the GHA cache backend so subsequent builds reuse layers.
-          # Per-target scope keeps main + updater from evicting each other.
-          cache-from: type=gha,scope=${{ matrix.target }}
-          cache-to:   type=gha,mode=max,scope=${{ matrix.target }}
-
-      # Docker stores one credential per registry host, so two consecutive
-      # ghcr.io logins cannot be active at once. Build and publish once to the
-      # canonical namespace, then copy that exact multi-platform manifest to
-      # the temporary compatibility namespace under its own credentials.
-      - name: Login to compatibility GHCR namespace
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: frahlg
-          password: ${{ secrets.LEGACY_GHCR_TOKEN || secrets.GITHUB_TOKEN }}
-
-      - name: Mirror exact manifests to compatibility namespace
+      # Check both members of the pair before the first tag moves. A matrix can
+      # publish one component before the other leg discovers a bad digest,
+      # missing platform or label mismatch.
+      - name: Validate both exact candidate manifests
+        id: source
         env:
-          CANONICAL_TAGS: ${{ steps.meta.outputs.tags }}
-          SOURCE_DIGEST: ${{ steps.build.outputs.digest }}
+          SOURCE_TAG: ${{ needs.meta.outputs.source_beta }}
+          STABLE_TAG: ${{ needs.meta.outputs.tag }}
+          RELEASE_ID: ${{ needs.meta.outputs.release_id }}
+          STABLE_VERSION: ${{ needs.meta.outputs.version }}
+          GH_TOKEN: ${{ secrets.CI_TOKEN }}
         run: |
           set -euo pipefail
-          test -n "${SOURCE_DIGEST}"
-          for source in ${CANONICAL_TAGS}; do
-            legacy="${source/ghcr.io\/srcfl\/ftw/ghcr.io\/frahlg\/forty-two-watts}"
-            docker buildx imagetools create --prefer-index=false --tag "${legacy}" "${source}"
-            legacy_digest="$(scripts/inspect-image-digest.sh "${legacy}")"
-            test "${SOURCE_DIGEST}" = "${legacy_digest}"
+          digest_dir="${RUNNER_TEMP}/paired-stable-digests"
+          mkdir -p "${digest_dir}"
+          .release-workflow/scripts/github-release-by-id.sh download \
+            "${RELEASE_ID}" "${digest_dir}" ftw-promotion-receipt.json
+          digest_record="${digest_dir}/ftw-promotion-receipt.json"
+          commit="$(git rev-parse HEAD)"
+          jq -e \
+            --arg stable_tag "${STABLE_TAG}" \
+            --arg source_beta "${SOURCE_TAG}" \
+            --arg commit "${commit}" \
+            --arg version "${STABLE_VERSION}" '
+              .schema == 1
+              and .stable_tag == $stable_tag
+              and .source_beta == $source_beta
+              and .commit == $commit
+              and .stable_version == $version
+              and (.images.core.digest | test("^sha256:[0-9a-f]{64}$"))
+              and (.images.updater.digest | test("^sha256:[0-9a-f]{64}$"))
+            ' "${digest_record}" >/dev/null
+
+          for item in \
+            "core|ghcr.io/srcfl/ftw" \
+            "updater|ghcr.io/srcfl/ftw-updater"; do
+            key="${item%%|*}"
+            repository="${item#*|}"
+            source="${repository}:${SOURCE_TAG}"
+            source_digest="$(jq -r --arg key "${key}" '.images[$key].digest' "${digest_record}")"
+            current_digest="$(scripts/inspect-image-digest.sh "${source}")"
+            if [ "${current_digest}" != "${source_digest}" ]; then
+              echo "${source} moved after beta publication: recorded ${source_digest}, current ${current_digest}." >&2
+              exit 1
+            fi
+
+            metadata="${RUNNER_TEMP}/${key}-candidate.json"
+            docker buildx imagetools inspect "${source}@${source_digest}" \
+              --format '{{json .Image}}' > "${metadata}"
+            python3 - "${metadata}" "${commit}" "${STABLE_VERSION}" "${source}" <<'PY'
+          import json
+          import sys
+
+          path, expected_revision, expected_version, image_ref = sys.argv[1:]
+          with open(path, encoding="utf-8") as source_file:
+              images = json.load(source_file)
+          for platform in ("linux/amd64", "linux/arm64"):
+              image = images.get(platform)
+              if image is None:
+                  raise SystemExit(f"{image_ref} is missing required platform {platform}")
+              labels = image.get("config", {}).get("Labels", {})
+              revision = labels.get("org.opencontainers.image.revision")
+              version = labels.get("org.opencontainers.image.version")
+              if revision != expected_revision or version != expected_version:
+                  raise SystemExit(
+                      f"{image_ref} metadata mismatch for {platform}: "
+                      f"revision={revision!r} version={version!r}"
+                  )
+          PY
+            echo "${key}_digest=${source_digest}" >> "${GITHUB_OUTPUT}"
           done
+
+      - name: Preflight all exact stable aliases
+        env:
+          STABLE_TAG: ${{ needs.meta.outputs.tag }}
+          STABLE_VERSION: ${{ needs.meta.outputs.version }}
+          CORE_DIGEST: ${{ steps.source.outputs.core_digest }}
+          UPDATER_DIGEST: ${{ steps.source.outputs.updater_digest }}
+        run: |
+          set -euo pipefail
+          short_sha="$(git rev-parse --short=7 HEAD)"
+
+          manifest_status() {
+            local repository="$1"
+            local reference="$2"
+            local token
+            token="$(curl -fsSL --get \
+              --data-urlencode service=ghcr.io \
+              --data-urlencode "scope=repository:${repository}:pull" \
+              https://ghcr.io/token | jq -er '.token')"
+            curl -sS -o /dev/null -w '%{http_code}' -I \
+              -H "Authorization: Bearer ${token}" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+              "https://ghcr.io/v2/${repository}/manifests/${reference}"
+          }
+
+          # Every exact alias must be absent or already point to this receipt.
+          # An error or conflicting digest stops the draft before any write.
+          for item in \
+            "updater|${UPDATER_DIGEST}|srcfl/ftw-updater|ghcr.io/srcfl/ftw-updater" \
+            "updater|${UPDATER_DIGEST}|frahlg/forty-two-watts-updater|ghcr.io/frahlg/forty-two-watts-updater" \
+            "core|${CORE_DIGEST}|srcfl/ftw|ghcr.io/srcfl/ftw" \
+            "core|${CORE_DIGEST}|frahlg/forty-two-watts|ghcr.io/frahlg/forty-two-watts"; do
+            component="${item%%|*}"
+            remainder="${item#*|}"
+            expected="${remainder%%|*}"
+            remainder="${remainder#*|}"
+            repository="${remainder%%|*}"
+            image="${remainder#*|}"
+            test -n "${expected}"
+            for tag in "${STABLE_TAG}" "${STABLE_VERSION}" "sha-${short_sha}"; do
+              status="$(manifest_status "${repository}" "${tag}")"
+              case "${status}" in
+                404)
+                  echo "${image}:${tag} is absent and may be created for ${component}."
+                  ;;
+                200)
+                  actual="$(scripts/inspect-image-digest.sh "${image}:${tag}")"
+                  if [ "${actual}" != "${expected}" ]; then
+                    echo "${image}:${tag} already points to ${actual}, not ${expected}." >&2
+                    exit 1
+                  fi
+                  ;;
+                *)
+                  echo "Could not prove ${image}:${tag} absent or exact (HTTP ${status})." >&2
+                  exit 1
+                  ;;
+              esac
+            done
+          done
+
+      - name: Publish and verify exact stable aliases updater before Core
+        env:
+          SOURCE_TAG: ${{ needs.meta.outputs.source_beta }}
+          STABLE_TAG: ${{ needs.meta.outputs.tag }}
+          STABLE_VERSION: ${{ needs.meta.outputs.version }}
+          CORE_DIGEST: ${{ steps.source.outputs.core_digest }}
+          UPDATER_DIGEST: ${{ steps.source.outputs.updater_digest }}
+          CANONICAL_GHCR_USER: ${{ github.actor }}
+          CANONICAL_GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMPATIBILITY_GHCR_USER: frahlg
+          COMPATIBILITY_GHCR_TOKEN: ${{ secrets.LEGACY_GHCR_TOKEN }}
+        run: |
+          set -euo pipefail
+          short_sha="$(git rev-parse --short=7 HEAD)"
+
+          login_registry() {
+            local user="$1"
+            local token="$2"
+            printf '%s' "${token}" | docker login ghcr.io \
+              --username "${user}" --password-stdin >/dev/null
+          }
+
+          publish_canonical() {
+            local repository="$1"
+            local source_digest="$2"
+            local source="${repository}:${SOURCE_TAG}"
+            for tag in "${STABLE_TAG}" "${STABLE_VERSION}" "sha-${short_sha}"; do
+              target="${repository}:${tag}"
+              docker buildx imagetools create --prefer-index=false \
+                --tag "${target}" "${source}@${source_digest}"
+              test "$(scripts/inspect-image-digest.sh "${target}")" = "${source_digest}"
+            done
+          }
+
+          mirror_compatibility() {
+            local canonical="$1"
+            local compatibility="$2"
+            local source_digest="$3"
+            for tag in "${STABLE_TAG}" "${STABLE_VERSION}" "sha-${short_sha}"; do
+              source="${canonical}:${tag}"
+              legacy="${compatibility}:${tag}"
+              docker buildx imagetools create --prefer-index=false \
+                --tag "${legacy}" "${source}@${source_digest}"
+              test "$(scripts/inspect-image-digest.sh "${legacy}")" = "${source_digest}"
+            done
+          }
+
+          # A newer updater can handle the older Core during an interrupted
+          # draft. Publish both updater namespaces before either Core target.
+          login_registry "${CANONICAL_GHCR_USER}" "${CANONICAL_GHCR_TOKEN}"
+          publish_canonical ghcr.io/srcfl/ftw-updater "${UPDATER_DIGEST}"
+          login_registry "${COMPATIBILITY_GHCR_USER}" "${COMPATIBILITY_GHCR_TOKEN}"
+          mirror_compatibility ghcr.io/srcfl/ftw-updater \
+            ghcr.io/frahlg/forty-two-watts-updater "${UPDATER_DIGEST}"
+
+          login_registry "${CANONICAL_GHCR_USER}" "${CANONICAL_GHCR_TOKEN}"
+          publish_canonical ghcr.io/srcfl/ftw "${CORE_DIGEST}"
+          login_registry "${COMPATIBILITY_GHCR_USER}" "${COMPATIBILITY_GHCR_TOKEN}"
+          mirror_compatibility ghcr.io/srcfl/ftw \
+            ghcr.io/frahlg/forty-two-watts "${CORE_DIGEST}"
+
+          for item in \
+            "${UPDATER_DIGEST}|ghcr.io/srcfl/ftw-updater|ghcr.io/frahlg/forty-two-watts-updater" \
+            "${CORE_DIGEST}|ghcr.io/srcfl/ftw|ghcr.io/frahlg/forty-two-watts"; do
+            expected="${item%%|*}"
+            remainder="${item#*|}"
+            canonical="${remainder%%|*}"
+            compatibility="${remainder#*|}"
+            for tag in "${STABLE_TAG}" "${STABLE_VERSION}" "sha-${short_sha}"; do
+              test "$(scripts/inspect-image-digest.sh "${canonical}:${tag}")" = "${expected}"
+              test "$(scripts/inspect-image-digest.sh "${compatibility}:${tag}")" = "${expected}"
+            done
+          done
+
+  publish:
+    name: verify and publish complete stable release
+    runs-on: ubuntu-latest
+    needs: [meta, assets-ready, docker]
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout stable tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Checkout release workflow helpers
+        uses: actions/checkout@v7
+        with:
+          path: .release-workflow
+          persist-credentials: false
+
+      - name: Set up Docker Buildx for final digest verification
+        uses: docker/setup-buildx-action@v4
+
+      - name: Verify every stable output and publish
+        env:
+          GH_TOKEN: ${{ secrets.CI_TOKEN }}
+          TAG: ${{ needs.meta.outputs.tag }}
+          RELEASE_ID: ${{ needs.meta.outputs.release_id }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          SOURCE_BETA: ${{ needs.meta.outputs.source_beta }}
+          CORE_DIGEST: ${{ needs.docker.outputs.core_digest }}
+          UPDATER_DIGEST: ${{ needs.docker.outputs.updater_digest }}
+          FTW_CORE_DIGEST: ${{ needs.docker.outputs.core_digest }}
+          FTW_UPDATER_DIGEST: ${{ needs.docker.outputs.updater_digest }}
+          FTW_RELEASE_TAG: ${{ needs.meta.outputs.tag }}
+          FTW_RELEASE_ID: ${{ needs.meta.outputs.release_id }}
+          FTW_RELEASE_COMMAND: .release-workflow/scripts/github-release-by-id.sh
+          FTW_CANONICAL_GHCR_USER: ${{ github.actor }}
+          FTW_CANONICAL_GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FTW_COMPATIBILITY_GHCR_USER: frahlg
+          FTW_COMPATIBILITY_GHCR_TOKEN: ${{ secrets.LEGACY_GHCR_TOKEN }}
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          tag_commit="$(git rev-list -n 1 "${TAG}")"
+          if [ "${tag_commit}" != "${commit}" ]; then
+            echo "Stable tag ${TAG} peels to ${tag_commit}, not checked out commit ${commit}." >&2
+            exit 1
+          fi
+
+          release_json="$(.release-workflow/scripts/github-release-by-id.sh show "${RELEASE_ID}" | jq '{
+            tagName: .tag_name,
+            isDraft: .draft,
+            isPrerelease: .prerelease,
+            publishedAt: .published_at
+          }')"
+          jq -e --arg tag "${TAG}" '
+            .tagName == $tag
+            and .isPrerelease == false
+            and ((.isDraft == true and .publishedAt == null)
+                 or (.isDraft == false and (.publishedAt | type == "string" and length > 0)))
+          ' <<<"${release_json}" >/dev/null
+
+          short_sha="$(git rev-parse --short=7 HEAD)"
+          for item in \
+            "${UPDATER_DIGEST}|ghcr.io/srcfl/ftw-updater|ghcr.io/frahlg/forty-two-watts-updater" \
+            "${CORE_DIGEST}|ghcr.io/srcfl/ftw|ghcr.io/frahlg/forty-two-watts"; do
+            expected="${item%%|*}"
+            remainder="${item#*|}"
+            canonical="${remainder%%|*}"
+            compatibility="${remainder#*|}"
+            for alias in "${TAG}" "${VERSION}" "sha-${short_sha}"; do
+              test "$(scripts/inspect-image-digest.sh "${canonical}:${alias}")" = "${expected}"
+              test "$(scripts/inspect-image-digest.sh "${compatibility}:${alias}")" = "${expected}"
+            done
+          done
+
+          release_is_draft="$(jq -r '.isDraft' <<<"${release_json}")"
+          if [ "${release_is_draft}" = "true" ]; then
+            # Recheck the draft immediately before the only public mutation.
+            draft_json="$(.release-workflow/scripts/github-release-by-id.sh show "${RELEASE_ID}" | jq '{
+              tagName: .tag_name,
+              isDraft: .draft,
+              isPrerelease: .prerelease,
+              publishedAt: .published_at
+            }')"
+            jq -e --arg tag "${TAG}" '
+              .tagName == $tag
+              and .isDraft == true
+              and .isPrerelease == false
+              and .publishedAt == null
+            ' <<<"${draft_json}" >/dev/null
+          fi
+          .release-workflow/scripts/promote-paired-latest.sh
 
   discord:
     name: announce release on Discord
     runs-on: ubuntu-latest
-    # Wait for binaries + docker so the message links to assets that
-    # actually exist. The independent rpi-installer channel is intentionally
-    # outside the application release critical path.
-    needs: [meta, binaries, docker]
+    # Announce only after the complete draft has become the public latest.
+    needs: [meta, publish]
     permissions:
       contents: read   # gh release view needs read access
     steps:

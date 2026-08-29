@@ -4,14 +4,28 @@ import json
 import math
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import cvxpy as cp
 import numpy as np
 
 from . import SCHEMA_VERSION
-from .model import OPTIMAL_STATUSES, _export_price, _mode, _solver_options
+from .deadline import SolveDeadline, SolveDeadlineExceeded
+from .model import (
+    OPTIMAL_STATUSES,
+    ReplayConsistencyError,
+    _STORAGE_INITIAL_ABOVE_MAXIMUM_KEY,
+    _arbitrage_spread_ore_kwh,
+    _canonicalize_storage_payload,
+    _export_price,
+    _mode,
+    _requires_direction_binary,
+    _solver_options,
+    _normalize_storage_specs,
+    _storage_relaxation_is_unsafe,
+    _validate_storage_replay,
+)
 from .protocol import ProtocolError, finite_number, positive_number, require_dict, require_list
 from .scenario_tree import (
     ScenarioSet,
@@ -130,13 +144,7 @@ class CompiledMultistage:
                 "settings.pv_charge_bonus_ore_kwh",
             ),
         )
-        spread = max(
-            0.0,
-            finite_number(
-                prepared.settings.get("min_arbitrage_spread_ore_kwh", 0),
-                "settings.min_arbitrage_spread_ore_kwh",
-            ),
-        )
+        spread = _arbitrage_spread_ore_kwh(prepared.settings, prepared.mode)
         for i, spec in enumerate(prepared.storages):
             initial = finite_number(spec.get("initial_energy_wh"), f"storages[{i}].initial_energy_wh")
             minimum = finite_number(spec.get("min_energy_wh", 0), f"storages[{i}].min_energy_wh")
@@ -161,11 +169,18 @@ class CompiledMultistage:
             )
 
 
-def solve_storage_multistage(payload: dict[str, Any]) -> dict[str, Any]:
+def solve_storage_multistage(
+    payload: dict[str, Any],
+    deadline: SolveDeadline | None = None,
+) -> dict[str, Any]:
     started = time.perf_counter()
+    if deadline is None:
+        deadline = SolveDeadline.from_payload(payload, started_at=started)
+    deadline.check("multistage model build")
     prepared_started = time.perf_counter()
     prepared = _prepare(payload)
     prepare_ms = (time.perf_counter() - prepared_started) * 1000.0
+    deadline.check("multistage preparation")
 
     decomposition_threshold = _positive_int(
         prepared.settings.get("decomposition_threshold", 20),
@@ -191,11 +206,29 @@ def solve_storage_multistage(payload: dict[str, Any]) -> dict[str, Any]:
         eligible, reason = ph_eligible(prepared)
         if eligible:
             try:
-                return solve_progressive_hedging(prepared, started, prepare_ms)
+                response = solve_progressive_hedging(
+                    prepared,
+                    started,
+                    prepare_ms,
+                    deadline,
+                )
+                _validate_storage_replay(
+                    response["plan"]["actions"], prepared.slots, prepared.storages
+                )
+                return response
+            except SolveDeadlineExceeded:
+                raise
             except ProgressiveHedgingNotConverged:
                 if decomposition_method == "progressive_hedging":
                     raise
+                deadline.check("progressive hedging fallback")
                 decomposition = "ph-fallback-scenario-reduction-extensive-dpp"
+            except ReplayConsistencyError as exc:
+                if decomposition_method == "progressive_hedging":
+                    raise
+                deadline.check("progressive hedging replay fallback")
+                prepared = _with_storage_discrete(prepared)
+                decomposition = f"ph-fallback-storage-replay-{exc}"
         elif decomposition_method == "progressive_hedging":
             raise ProtocolError(f"progressive hedging is not eligible: {reason}")
 
@@ -239,69 +272,114 @@ def solve_storage_multistage(payload: dict[str, Any]) -> dict[str, Any]:
         from .direct_highs import DirectHighsError, solve_direct_highs
 
         try:
-            return solve_direct_highs(
-                prepared, started, prepare_ms, decomposition.replace("-dpp", "")
+            response = solve_direct_highs(
+                prepared,
+                started,
+                prepare_ms,
+                decomposition.replace("-dpp", ""),
+                deadline=deadline,
             )
-        except DirectHighsError as exc:
+            _validate_storage_replay(
+                response["plan"]["actions"], prepared.slots, prepared.storages
+            )
+            return response
+        except (DirectHighsError, ReplayConsistencyError) as exc:
             if multistage_backend == "highs":
                 raise
+            deadline.check("direct HiGHS fallback")
             direct_fallback_reason = str(exc)
             decomposition = f"direct-highs-fallback-{decomposition}"
+            prepared = _with_storage_discrete(prepared)
 
-    key = _cache_key(prepared)
-    compiled = _MODEL_CACHE.get(key)
-    cache_hit = compiled is not None
-    if compiled is None:
-        compiled = _compile(prepared, key)
-        _MODEL_CACHE[key] = compiled
-        while len(_MODEL_CACHE) > _CACHE_LIMIT:
-            _MODEL_CACHE.popitem(last=False)
-    else:
-        _MODEL_CACHE.move_to_end(key)
-    compiled.assign(prepared)
+    while True:
+        key = _cache_key(prepared)
+        compiled = _MODEL_CACHE.get(key)
+        cache_hit = compiled is not None
+        if compiled is None:
+            compiled = _compile(prepared, key)
+            _MODEL_CACHE[key] = compiled
+            while len(_MODEL_CACHE) > _CACHE_LIMIT:
+                _MODEL_CACHE.popitem(last=False)
+        else:
+            _MODEL_CACHE.move_to_end(key)
+        compiled.assign(prepared)
 
-    if prepared.discrete and solver_name == "CLARABEL":
-        solver_name = "HIGHS"
-    solver_started = time.perf_counter()
-    try:
-        _run_problem(compiled.service_problem, prepared.settings, solver_name)
-    except cp.error.SolverError:
-        if prepared.discrete or solver_name == "CLARABEL":
-            raise
-        solver_name = "CLARABEL"
-        _run_problem(compiled.service_problem, prepared.settings, solver_name)
-    if compiled.service_problem.status not in OPTIMAL_STATUSES or compiled.service_problem.value is None:
-        raise RuntimeError(
-            f"multistage service-level solve failed with status {compiled.service_problem.status}"
+        if prepared.discrete and solver_name == "CLARABEL":
+            solver_name = "HIGHS"
+        solver_started = time.perf_counter()
+        try:
+            _run_problem(
+                compiled.service_problem,
+                prepared.settings,
+                solver_name,
+                deadline,
+            )
+        except cp.error.SolverError:
+            deadline.check("multistage service solver fallback")
+            if prepared.discrete or solver_name == "CLARABEL":
+                raise
+            solver_name = "CLARABEL"
+            _run_problem(
+                compiled.service_problem,
+                prepared.settings,
+                solver_name,
+                deadline,
+            )
+        if compiled.service_problem.status not in OPTIMAL_STATUSES or compiled.service_problem.value is None:
+            raise RuntimeError(
+                f"multistage service-level solve failed with status {compiled.service_problem.status}"
+            )
+        best_service = max(0.0, float(compiled.service_problem.value))
+        compiled.service_cap.value = best_service + 1e-7
+        try:
+            _run_problem(
+                compiled.economic_problem,
+                prepared.settings,
+                solver_name,
+                deadline,
+            )
+        except cp.error.SolverError:
+            deadline.check("multistage economic solver fallback")
+            if prepared.discrete or solver_name == "CLARABEL":
+                raise
+            solver_name = "CLARABEL"
+            _run_problem(
+                compiled.economic_problem,
+                prepared.settings,
+                solver_name,
+                deadline,
+            )
+        if compiled.economic_problem.status not in OPTIMAL_STATUSES or compiled.economic_problem.value is None:
+            raise RuntimeError(
+                f"multistage economic solve failed with status {compiled.economic_problem.status}"
+            )
+        solver_ms = (time.perf_counter() - solver_started) * 1000.0
+
+        response = _response(
+            prepared,
+            compiled,
+            best_service,
+            solver_name,
+            started,
+            prepare_ms,
+            solver_ms,
+            cache_hit,
+            decomposition,
+            direct_fallback_reason,
         )
-    best_service = max(0.0, float(compiled.service_problem.value))
-    compiled.service_cap.value = best_service + 1e-7
-    try:
-        _run_problem(compiled.economic_problem, prepared.settings, solver_name)
-    except cp.error.SolverError:
-        if prepared.discrete or solver_name == "CLARABEL":
-            raise
-        solver_name = "CLARABEL"
-        _run_problem(compiled.economic_problem, prepared.settings, solver_name)
-    if compiled.economic_problem.status not in OPTIMAL_STATUSES or compiled.economic_problem.value is None:
-        raise RuntimeError(
-            f"multistage economic solve failed with status {compiled.economic_problem.status}"
-        )
-    solver_ms = (time.perf_counter() - solver_started) * 1000.0
-
-    response = _response(
-        prepared,
-        compiled,
-        best_service,
-        solver_name,
-        started,
-        prepare_ms,
-        solver_ms,
-        cache_hit,
-        decomposition,
-        direct_fallback_reason,
-    )
-    return response
+        try:
+            _validate_storage_replay(
+                response["plan"]["actions"], prepared.slots, prepared.storages
+            )
+        except ReplayConsistencyError as exc:
+            if prepared.storage_discrete:
+                raise
+            deadline.check("storage replay fallback")
+            prepared = _with_storage_discrete(prepared)
+            direct_fallback_reason = str(exc)
+            decomposition = f"storage-replay-fallback-{decomposition}"
+            continue
+        return response
 
 
 def clear_multistage_cache() -> None:
@@ -309,6 +387,7 @@ def clear_multistage_cache() -> None:
 
 
 def _prepare(payload: dict[str, Any]) -> PreparedMultistage:
+    payload = _canonicalize_storage_payload(payload)
     settings = require_dict(payload.get("settings", {}), "settings")
     if require_list(payload.get("flex_loads", []), "flex_loads"):
         raise ProtocolError("multistage shadow does not yet support flex_loads")
@@ -341,7 +420,6 @@ def _prepare(payload: dict[str, Any]) -> PreparedMultistage:
     formulation = str(settings.get("formulation", "auto"))
     if formulation not in {"auto", "milp", "relaxed"}:
         raise ProtocolError("settings.formulation must be auto, milp, or relaxed")
-    force_milp = formulation == "milp"
     pv_charge_bonus = max(
         0.0,
         finite_number(
@@ -349,14 +427,7 @@ def _prepare(payload: dict[str, Any]) -> PreparedMultistage:
             "settings.pv_charge_bonus_ore_kwh",
         ),
     )
-    unsafe_cycle = bool(np.any(effective_import < -1e-9)) or pv_charge_bonus > 0
-    unsafe_meter_split = bool(
-        np.any(effective_import < effective_export - 1e-9)
-    )
-    storage_discrete = force_milp or (formulation == "auto" and unsafe_cycle)
-    meter_discrete = force_milp or (
-        formulation == "auto" and unsafe_meter_split
-    )
+    unsafe_meter_split = bool(np.any(effective_import < effective_export - 1e-9))
     base_load = np.asarray(
         [finite_number(slot.get("load_w", 0), f"slots[{i}].load_w") for i, slot in enumerate(slots)]
     )
@@ -403,13 +474,24 @@ def _prepare(payload: dict[str, Any]) -> PreparedMultistage:
         tree.branch_slots,
     )
 
-    storage_specs = tuple(
-        require_dict(raw, f"storages[{i}]")
-        for i, raw in enumerate(require_list(payload.get("storages", []), "storages"))
+    storage_specs, storage_above_maximum = _normalize_storage_specs(
+        require_list(payload.get("storages", []), "storages")
     )
     _validate_storages(storage_specs, n)
     if not storage_specs:
         raise ProtocolError("multistage shadow requires at least one storage")
+    unsafe_cycle = _storage_relaxation_is_unsafe(
+        effective_import,
+        effective_export,
+        pv_charge_bonus,
+        storage_specs,
+    )
+    meter_discrete = _requires_direction_binary(formulation, unsafe_meter_split)
+    storage_above_max = any(storage_above_maximum)
+    storage_discrete = (
+        storage_above_max
+        or _requires_direction_binary(formulation, unsafe_cycle)
+    )
 
     max_site_power = max(
         1000.0,
@@ -529,6 +611,12 @@ def _replace_scenarios(prepared: PreparedMultistage, scenario_set: ScenarioSet) 
     return PreparedMultistage(**{**prepared.__dict__, "scenario_set": scenario_set, "tree": tree, "blocks": blocks})
 
 
+def _with_storage_discrete(prepared: PreparedMultistage) -> PreparedMultistage:
+    if prepared.storage_discrete:
+        return prepared
+    return replace(prepared, storage_discrete=True, discrete=True)
+
+
 def _validate_storages(storages: tuple[dict[str, Any], ...], n: int) -> None:
     ids: set[str] = set()
     for i, spec in enumerate(storages):
@@ -559,6 +647,8 @@ def _cache_key(prepared: PreparedMultistage) -> tuple[Any, ...]:
             float(spec["capacity_wh"]),
             float(spec.get("min_energy_wh", 0)),
             float(spec.get("max_energy_wh", spec["capacity_wh"])),
+            float(spec["initial_energy_wh"]),
+            bool(spec.get(_STORAGE_INITIAL_ABOVE_MAXIMUM_KEY, False)),
             float(spec.get("max_charge_w", 0)),
             float(spec.get("max_discharge_w", 0)),
             float(spec.get("charge_efficiency", 0.95)),
@@ -836,9 +926,20 @@ def _compile(prepared: PreparedMultistage, key: tuple[Any, ...]) -> CompiledMult
     )
 
 
-def _run_problem(problem: cp.Problem, settings: dict[str, Any], solver_name: str) -> None:
+def _run_problem(
+    problem: cp.Problem,
+    settings: dict[str, Any],
+    solver_name: str,
+    deadline: SolveDeadline,
+) -> None:
     solver = cp.HIGHS if solver_name == "HIGHS" else cp.CLARABEL
-    problem.solve(solver=solver, warm_start=True, enforce_dpp=True, **_solver_options(settings, solver))
+    problem.solve(
+        solver=solver,
+        warm_start=True,
+        enforce_dpp=True,
+        **_solver_options(settings, solver, deadline),
+    )
+    deadline.check(f"multistage {solver_name} solve")
 
 
 def _response(
