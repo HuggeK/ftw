@@ -5,24 +5,21 @@
   var S = (window.FTWSettings = window.FTWSettings || { tabs: {} });
   S.tabs = S.tabs || {};
 
-  // MapLibre GL JS (BSD-3), pinned and loaded on demand exactly the way this
-  // tab already lazy-loads its other heavy optional dependency — the picker is
-  // ~1 MB and only the Weather tab needs it.
+  // MapLibre GL JS (BSD-3), vendored under /vendor/maplibre and loaded on
+  // demand exactly the way this tab already lazy-loads its other heavy
+  // optional dependency — the picker is ~1 MB and only the Weather tab needs
+  // it. Shipping it on the box follows the same policy as /vendor/three and
+  // the Leaflet copy this replaced: no third-party JS from a CDN, and the map
+  // must load when the gateway cannot reach the internet.
   //
   // v6 ships ESM only and is code-split (the entry pulls in
-  // maplibre-gl-shared.mjs), so it is loaded with a dynamic import() rather
-  // than a <script> tag. That means no integrity hash on the JS: SRI does not
-  // propagate to a module's own imports, so hashing the entry point would
-  // leave the larger shared chunk unverified regardless. The stylesheet is a
-  // single file and keeps its hash. The version is pinned so an upstream
-  // republish cannot silently change what loads.
-  //
-  // MapLibre detects that it is being served cross-origin and routes its
-  // worker through a blob, so a CSP would need `worker-src blob:` here; FTW
-  // sets no CSP today. The numeric lat/lon fields stay authoritative, so a CDN
-  // or WebGL failure costs the picker and nothing else.
-  var MAPLIBRE_VERSION = "6.0.0";
-  var MAPLIBRE_BASE = "https://unpkg.com/maplibre-gl@" + MAPLIBRE_VERSION + "/dist/";
+  // maplibre-gl-shared.mjs and spawns maplibre-gl-worker.mjs by relative
+  // URL), so it is loaded with a dynamic import() rather than a <script>
+  // tag. Same-origin also means the worker loads directly instead of through
+  // the blob: detour MapLibre uses for cross-origin serving. The numeric
+  // lat/lon fields stay authoritative, so a WebGL failure costs the picker
+  // and nothing else.
+  var MAPLIBRE_BASE = "/vendor/maplibre/";
   var maplibreLoading = null;
   function loadMapLibre() {
     if (window.maplibregl) return Promise.resolve();
@@ -33,8 +30,6 @@
       css.id = "maplibre-css";
       css.rel = "stylesheet";
       css.href = MAPLIBRE_BASE + "maplibre-gl.css";
-      css.integrity = "sha256-lGfssQQWd25OyIDWYsILvB0epOQ5rDrtpFkBvfEktgk=";
-      css.crossOrigin = "anonymous";
       document.head.appendChild(css);
     }
 
@@ -186,6 +181,12 @@
       center: [lon, lat],
       zoom: 11,
       attributionControl: { compact: true },
+      // OSM volunteer tiles 403 when the page sends no Referer. The box sends
+      // Referrer-Policy: no-referrer on every response, so tile requests must
+      // opt back in. Origin only; the path stays private.
+      transformRequest: function (url) {
+        return { url: url, referrerPolicy: "strict-origin-when-cross-origin" };
+      },
     });
     window._weatherMap = map;
     map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
