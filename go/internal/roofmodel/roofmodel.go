@@ -220,10 +220,13 @@ func (s *Service) run(ctx context.Context, lat, lon float64, mode, buildingID st
 	if !s.Enabled() {
 		return nil, ErrDisabled
 	}
-	if !coverage.Covers("lantmateriet", lat, lon) {
+	// The Sweden gate belongs to the default Lantmäteriet catalog only. An
+	// operator pointing at another country's STAC catalog knows what it
+	// covers; FTW does not, so it stops pretending to.
+	if s.cfg.StacBaseURL == "" && !coverage.Covers("lantmateriet", lat, lon) {
 		return nil, fmt.Errorf("%w: (%.4f, %.4f) is not in Sweden", ErrOutsideCoverage, lat, lon)
 	}
-	if s.cfg.GeotorgetUsername == "" || s.cfg.GeotorgetToken == "" {
+	if s.cfg.StacUser() == "" || s.cfg.StacPass() == "" {
 		return nil, ErrNoCredentials
 	}
 
@@ -235,13 +238,27 @@ func (s *Service) run(ctx context.Context, lat, lon float64, mode, buildingID st
 		"--mode", mode,
 		"--lat", fmt.Sprintf("%.6f", lat),
 		"--lon", fmt.Sprintf("%.6f", lon),
-		"--username", s.cfg.GeotorgetUsername,
-		"--token", s.cfg.GeotorgetToken,
+		"--username", s.cfg.StacUser(),
+		"--password", s.cfg.StacPass(),
 		"--radius-m", fmt.Sprintf("%.1f", s.radius()),
 		"--packing-factor", fmt.Sprintf("%.3f", s.packingFactor()),
 	}
 	if buildingID != "" {
 		args = append(args, "--building-id", buildingID)
+	}
+	// A custom catalog replaces the Lantmäteriet defaults piecewise; anything
+	// left empty falls back to the module's own Geotorget defaults.
+	if s.cfg.StacBaseURL != "" {
+		args = append(args, "--stac-base-url", s.cfg.StacBaseURL)
+	}
+	if s.cfg.StacBuildingsCollection != "" {
+		args = append(args, "--buildings-collection", s.cfg.StacBuildingsCollection)
+	}
+	if s.cfg.StacLidarCollection != "" {
+		args = append(args, "--lidar-collection", s.cfg.StacLidarCollection)
+	}
+	if s.cfg.StacBboxEPSG != 0 {
+		args = append(args, "--bbox-epsg", fmt.Sprintf("%d", s.cfg.StacBboxEPSG))
 	}
 	cmd := exec.CommandContext(ctx, s.command(), args...)
 	if s.cfg.ModuleDir != "" {

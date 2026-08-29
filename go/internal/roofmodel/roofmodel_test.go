@@ -122,7 +122,7 @@ func TestDeriveRefusesOutsideSwedenWithoutSpawning(t *testing.T) {
 	s := svc(t, &config.RoofModel{
 		Enabled:           true,
 		Command:           "definitely-not-a-real-command",
-		GeotorgetUsername: "u", GeotorgetToken: "t",
+		StacUsername: "u", StacPassword: "t",
 	})
 	for _, c := range []struct {
 		name     string
@@ -153,7 +153,7 @@ func TestSwedishBoxAdmitsSomeNonSwedishPointsByDesign(t *testing.T) {
 	s := svc(t, &config.RoofModel{
 		Enabled:           true,
 		Command:           "definitely-not-a-real-command",
-		GeotorgetUsername: "u", GeotorgetToken: "t",
+		StacUsername: "u", StacPassword: "t",
 	})
 	_, err := s.Derive(context.Background(), 59.91, 10.75, "") // Oslo
 	if errors.Is(err, ErrOutsideCoverage) {
@@ -170,7 +170,7 @@ func TestSwedishBoxCoversBorderTowns(t *testing.T) {
 	s := svc(t, &config.RoofModel{
 		Enabled:           true,
 		Command:           "definitely-not-a-real-command",
-		GeotorgetUsername: "u", GeotorgetToken: "t",
+		StacUsername: "u", StacPassword: "t",
 	})
 	for _, c := range []struct {
 		name     string
@@ -196,7 +196,7 @@ func TestDeriveRequiresCredentials(t *testing.T) {
 		{"no token", "u", ""},
 		{"neither", "", ""},
 	} {
-		s := svc(t, &config.RoofModel{Enabled: true, Command: "no-such-command", GeotorgetUsername: c.user, GeotorgetToken: c.token})
+		s := svc(t, &config.RoofModel{Enabled: true, Command: "no-such-command", StacUsername: c.user, StacPassword: c.token})
 		_, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "")
 		if !errors.Is(err, ErrNoCredentials) {
 			t.Errorf("%s: err = %v, want ErrNoCredentials", c.name, err)
@@ -211,7 +211,7 @@ func TestDeriveParsesAModel(t *testing.T) {
 		`"arrays":[{"name":"Roof south","rated_w":7200,"tilt_deg":35,"azimuth_deg":180,"area_m2":51.4,"segment_id":"seg-0"}],` +
 		`"captured_at_ms":1519862400000,"derived_at_ms":1785456000000}`
 	cmd := stubModule(t, "stdout", doc)
-	s := svc(t, &config.RoofModel{Enabled: true, Command: cmd, GeotorgetUsername: "u", GeotorgetToken: "t"})
+	s := svc(t, &config.RoofModel{Enabled: true, Command: cmd, StacUsername: "u", StacPassword: "t"})
 
 	m, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "")
 	if err != nil {
@@ -238,7 +238,7 @@ func TestDeriveCarriesHowTheLidarWasFetched(t *testing.T) {
 		`"building":{"building_id":"b-1","area_m2":144,"returns_used":220,"returns_in_radius":260},` +
 		`"arrays":[]}`
 	cmd := stubModule(t, "stdout", doc)
-	s := svc(t, &config.RoofModel{Enabled: true, Command: cmd, GeotorgetUsername: "u", GeotorgetToken: "t"})
+	s := svc(t, &config.RoofModel{Enabled: true, Command: cmd, StacUsername: "u", StacPassword: "t"})
 
 	m, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "b-1")
 	if err != nil {
@@ -260,7 +260,7 @@ func TestDerivePassesTheSiteAndCredentials(t *testing.T) {
 	cmd := stubModule(t, "record", record)
 	s := svc(t, &config.RoofModel{
 		Enabled: true, Command: cmd, ModuleDir: dir,
-		GeotorgetUsername: "operator", GeotorgetToken: "secret-token",
+		StacUsername: "operator", StacPassword: "secret-token",
 		RadiusM: 25,
 	})
 
@@ -282,7 +282,7 @@ func TestDerivePassesTheSiteAndCredentials(t *testing.T) {
 		"--lat 59.330000",
 		"--lon 18.070000",
 		"--username operator",
-		"--token secret-token",
+		"--password secret-token",
 		"--radius-m 25.0",
 	} {
 		if !strings.Contains(line, want) {
@@ -308,7 +308,7 @@ func TestDerivePassesThePickedBuilding(t *testing.T) {
 	cmd := stubModule(t, "record", record)
 	s := svc(t, &config.RoofModel{
 		Enabled: true, Command: cmd,
-		GeotorgetUsername: "u", GeotorgetToken: "t",
+		StacUsername: "u", StacPassword: "t",
 	})
 
 	if _, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "bldg-42"); err != nil {
@@ -331,7 +331,7 @@ func TestDeriveOmitsTheBuildingFlagWhenNoneIsPicked(t *testing.T) {
 	record := dir + string(os.PathSeparator) + "invocation.json"
 	cmd := stubModule(t, "record", record)
 	s := svc(t, &config.RoofModel{
-		Enabled: true, Command: cmd, GeotorgetUsername: "u", GeotorgetToken: "t",
+		Enabled: true, Command: cmd, StacUsername: "u", StacPassword: "t",
 	})
 
 	if _, err := s.Derive(context.Background(), stockholmLat, stockholmLon, ""); err != nil {
@@ -348,7 +348,7 @@ func TestBuildingsListsFootprints(t *testing.T) {
 		`{"type":"Feature","id":"b1","geometry":{"type":"Polygon","coordinates":[[[18.0,59.3],[18.001,59.3],[18.001,59.301],[18.0,59.3]]]},"properties":{"area_m2":120.5}},` +
 		`{"type":"Feature","id":"b2","geometry":{"type":"Polygon","coordinates":[[[18.01,59.3],[18.011,59.3],[18.011,59.301],[18.01,59.3]]]},"properties":{"area_m2":64.0}}]}`
 	cmd := stubModule(t, "stdout", doc)
-	s := svc(t, &config.RoofModel{Enabled: true, Command: cmd, GeotorgetUsername: "u", GeotorgetToken: "t"})
+	s := svc(t, &config.RoofModel{Enabled: true, Command: cmd, StacUsername: "u", StacPassword: "t"})
 
 	list, err := s.Buildings(context.Background(), stockholmLat, stockholmLon)
 	if err != nil {
@@ -367,7 +367,7 @@ func TestBuildingsUsesBuildingsMode(t *testing.T) {
 	dir := t.TempDir()
 	record := dir + string(os.PathSeparator) + "invocation.json"
 	cmd := stubModule(t, "record", record)
-	s := svc(t, &config.RoofModel{Enabled: true, Command: cmd, GeotorgetUsername: "u", GeotorgetToken: "t"})
+	s := svc(t, &config.RoofModel{Enabled: true, Command: cmd, StacUsername: "u", StacPassword: "t"})
 
 	// The stub answers with a roof model, not a building list; only the
 	// invocation matters here.
@@ -383,7 +383,7 @@ func TestBuildingsUsesBuildingsMode(t *testing.T) {
 func TestBuildingsRefusesOutsideCoverageAndWithoutCredentials(t *testing.T) {
 	s := svc(t, &config.RoofModel{
 		Enabled: true, Command: "definitely-not-a-real-command",
-		GeotorgetUsername: "u", GeotorgetToken: "t",
+		StacUsername: "u", StacPassword: "t",
 	})
 	if _, err := s.Buildings(context.Background(), 52.52, 13.40); !errors.Is(err, ErrOutsideCoverage) {
 		t.Errorf("Berlin: err = %v, want ErrOutsideCoverage", err)
@@ -418,7 +418,7 @@ func readInvocation(t *testing.T, path string) stubInvocation {
 func TestDeriveSurfacesTheModuleErrorMessage(t *testing.T) {
 	cmd := stubModule(t, "stderr",
 		`{"error":"Geotorget rejected the credentials","kind":"MissingCredentials"}`)
-	s := svc(t, &config.RoofModel{Enabled: true, Command: cmd, GeotorgetUsername: "u", GeotorgetToken: "t"})
+	s := svc(t, &config.RoofModel{Enabled: true, Command: cmd, StacUsername: "u", StacPassword: "t"})
 
 	_, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "")
 	if err == nil {
@@ -433,7 +433,7 @@ func TestDeriveSurfacesTheModuleErrorMessage(t *testing.T) {
 // rather than being mistaken for a successful empty model.
 func TestDeriveReportsNonJSONFailure(t *testing.T) {
 	cmd := stubModule(t, "stderr", "Traceback (most recent call last):\n  MemoryError\n")
-	s := svc(t, &config.RoofModel{Enabled: true, Command: cmd, GeotorgetUsername: "u", GeotorgetToken: "t"})
+	s := svc(t, &config.RoofModel{Enabled: true, Command: cmd, StacUsername: "u", StacPassword: "t"})
 
 	_, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "")
 	if err == nil || !strings.Contains(err.Error(), "roof model failed") {
@@ -443,7 +443,7 @@ func TestDeriveReportsNonJSONFailure(t *testing.T) {
 
 func TestDeriveRejectsUnknownSchemaVersion(t *testing.T) {
 	cmd := stubModule(t, "stdout", `{"schema_version":99,"arrays":[]}`)
-	s := svc(t, &config.RoofModel{Enabled: true, Command: cmd, GeotorgetUsername: "u", GeotorgetToken: "t"})
+	s := svc(t, &config.RoofModel{Enabled: true, Command: cmd, StacUsername: "u", StacPassword: "t"})
 
 	_, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "")
 	if err == nil || !strings.Contains(err.Error(), "schema_version") {
@@ -453,7 +453,7 @@ func TestDeriveRejectsUnknownSchemaVersion(t *testing.T) {
 
 func TestDeriveRejectsUnreadableOutput(t *testing.T) {
 	cmd := stubModule(t, "stdout", "not-json-at-all")
-	s := svc(t, &config.RoofModel{Enabled: true, Command: cmd, GeotorgetUsername: "u", GeotorgetToken: "t"})
+	s := svc(t, &config.RoofModel{Enabled: true, Command: cmd, StacUsername: "u", StacPassword: "t"})
 
 	_, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "")
 	if err == nil || !strings.Contains(err.Error(), "unreadable") {
@@ -467,7 +467,7 @@ func TestDeriveIsTimeBoxed(t *testing.T) {
 	cmd := stubModule(t, "hang", "")
 	s := svc(t, &config.RoofModel{
 		Enabled: true, Command: cmd,
-		GeotorgetUsername: "u", GeotorgetToken: "t", TimeoutS: 1,
+		StacUsername: "u", StacPassword: "t", TimeoutS: 1,
 	})
 
 	start := time.Now()
@@ -507,5 +507,95 @@ func TestToPVArraysMatchesConfigShape(t *testing.T) {
 	var nilModel *Model
 	if nilModel.ToPVArrays() != nil {
 		t.Error("nil model must yield nil arrays")
+	}
+}
+
+// A config written before the basic-auth redesign still derives: the legacy
+// geotorget_* keys resolve through the accessors and the secret reaches the
+// module as --password, whatever key it was stored under.
+func TestDeriveAcceptsLegacyGeotorgetKeys(t *testing.T) {
+	dir := t.TempDir()
+	record := dir + string(os.PathSeparator) + "invocation.json"
+	cmd := stubModule(t, "record", record)
+	s := svc(t, &config.RoofModel{
+		Enabled: true, Command: cmd, ModuleDir: dir,
+		GeotorgetUsername: "legacy-op", GeotorgetToken: "legacy-secret",
+	})
+
+	if _, err := s.Derive(context.Background(), stockholmLat, stockholmLon, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("stub recorded nothing: %v", err)
+	}
+	var got stubInvocation
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	line := strings.Join(got.Args, " ")
+	for _, want := range []string{"--username legacy-op", "--password legacy-secret"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("args %q missing %q", line, want)
+		}
+	}
+	if strings.Contains(line, "--token") {
+		t.Errorf("args %q still use the retired --token flag", line)
+	}
+}
+
+// A custom STAC catalog lifts the Sweden-only gate — FTW cannot know what a
+// third-party catalog covers — and every stac_* setting must cross the
+// process boundary.
+func TestDeriveCustomCatalogSkipsSwedenGateAndPassesStacArgs(t *testing.T) {
+	dir := t.TempDir()
+	record := dir + string(os.PathSeparator) + "invocation.json"
+	cmd := stubModule(t, "record", record)
+	s := svc(t, &config.RoofModel{
+		Enabled: true, Command: cmd, ModuleDir: dir,
+		StacUsername: "u", StacPassword: "p",
+		StacBaseURL:             "https://stac.example.org",
+		StacBuildingsCollection: "buildings-vector",
+		StacLidarCollection:     "lidar-pointcloud",
+		StacBboxEPSG:            4326,
+	})
+
+	// Berlin: outside Lantmäteriet coverage, fine for a custom catalog.
+	if _, err := s.Derive(context.Background(), 52.52, 13.40, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("stub recorded nothing: %v", err)
+	}
+	var got stubInvocation
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	line := strings.Join(got.Args, " ")
+	for _, want := range []string{
+		"--stac-base-url https://stac.example.org",
+		"--buildings-collection buildings-vector",
+		"--lidar-collection lidar-pointcloud",
+		"--bbox-epsg 4326",
+	} {
+		if !strings.Contains(line, want) {
+			t.Errorf("args %q missing %q", line, want)
+		}
+	}
+}
+
+// Without a custom catalog the Sweden gate still holds — the redesign must
+// not have quietly opened the default catalog to the whole planet.
+func TestDeriveDefaultCatalogStillRefusesOutsideSweden(t *testing.T) {
+	s := svc(t, &config.RoofModel{
+		Enabled: true, Command: "no-such-command",
+		StacUsername: "u", StacPassword: "p",
+	})
+	_, err := s.Derive(context.Background(), 52.52, 13.40, "")
+	if !errors.Is(err, ErrOutsideCoverage) {
+		t.Errorf("err = %v, want ErrOutsideCoverage", err)
 	}
 }

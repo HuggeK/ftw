@@ -12,7 +12,14 @@ import json
 import sys
 
 from .buildings import DEFAULT_SEARCH_RADIUS_M, search_buildings
-from .geotorget import Credentials, GeotorgetClient, GeotorgetError
+from .geotorget import (
+    COLLECTION_BUILDINGS,
+    COLLECTION_LIDAR,
+    DEFAULT_BASE_URL,
+    Credentials,
+    GeotorgetClient,
+    GeotorgetError,
+)
 from .pipeline import SCHEMA_VERSION, RoofModelError, derive
 
 
@@ -32,22 +39,52 @@ def main(argv: list[str] | None = None) -> int:
         help="footprint to clip the LiDAR to, from a --mode buildings run",
     )
     p.add_argument("--search-radius-m", type=float, default=DEFAULT_SEARCH_RADIUS_M)
-    p.add_argument("--username", default="", help="Geotorget username")
-    p.add_argument("--token", default="", help="Geotorget token/password")
+    p.add_argument("--username", default="", help="STAC catalog username (Geotorget account)")
+    p.add_argument(
+        "--password",
+        "--token",  # legacy spelling, from when the credential was assumed to be a token
+        dest="password",
+        default="",
+        help="STAC catalog password, sent as HTTP Basic auth (Geotorget account password)",
+    )
     p.add_argument("--radius-m", type=float, default=40.0)
     p.add_argument("--packing-factor", type=float, default=0.70)
     p.add_argument("--module-w-per-m2", type=float, default=200.0)
+    p.add_argument(
+        "--stac-base-url",
+        default=DEFAULT_BASE_URL,
+        help="STAC API root; search is POST {base}/search (default: Lantmäteriet)",
+    )
+    p.add_argument(
+        "--buildings-collection",
+        default=COLLECTION_BUILDINGS,
+        help="collection id for building footprints",
+    )
+    p.add_argument(
+        "--lidar-collection",
+        default=COLLECTION_LIDAR,
+        help="collection id for LiDAR point clouds",
+    )
+    p.add_argument(
+        "--bbox-epsg",
+        type=int,
+        choices=(3006, 4326),
+        default=3006,
+        help="CRS of the search bbox: 3006 for Lantmäteriet, 4326 per the STAC spec",
+    )
     args = p.parse_args(argv)
-    credentials = Credentials(args.username, args.token)
+    credentials = Credentials(args.username, args.password)
 
     try:
         if args.mode == "buildings":
-            client = GeotorgetClient(credentials)
+            client = GeotorgetClient(credentials, base_url=args.stac_base_url)
             found = search_buildings(
                 client,
                 latitude=args.lat,
                 longitude=args.lon,
                 radius_m=args.search_radius_m,
+                collection=args.buildings_collection,
+                bbox_epsg=args.bbox_epsg,
             )
             payload = {
                 "schema_version": SCHEMA_VERSION,
@@ -63,6 +100,10 @@ def main(argv: list[str] | None = None) -> int:
                 packing_factor=args.packing_factor,
                 module_w_per_m2=args.module_w_per_m2,
                 building_id=args.building_id or None,
+                base_url=args.stac_base_url,
+                buildings_collection=args.buildings_collection,
+                lidar_collection=args.lidar_collection,
+                bbox_epsg=args.bbox_epsg,
             )
     except (GeotorgetError, RoofModelError) as exc:
         json.dump({"error": str(exc), "kind": type(exc).__name__}, sys.stderr)
