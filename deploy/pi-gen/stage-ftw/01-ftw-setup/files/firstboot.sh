@@ -21,6 +21,15 @@ echo "[$(date -Is)] ftw-firstboot starting"
 
 cd /opt/ftw
 
+# The image build parks Docker's apt source so pi-gen's export-image apt
+# step cannot OOM on it (see 01-ftw-setup/00-run.sh). Restore it on the
+# real device: without it the engine is frozen at the image's build
+# version for the appliance's whole service life (srcfl/ftw#770). The
+# signing key at /etc/apt/keyrings/docker.asc was never removed.
+if [ -f /etc/apt/sources.list.d/docker.list.disabled ]; then
+    mv /etc/apt/sources.list.d/docker.list.disabled /etc/apt/sources.list.d/docker.list
+fi
+
 # Retry loop: GHCR and general LAN DHCP can be flaky for the first
 # couple of minutes after boot, and slow connections may need many
 # minutes per attempt. Retry indefinitely — the sentinel is only
