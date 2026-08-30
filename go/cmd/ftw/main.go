@@ -1036,6 +1036,10 @@ func main() {
 				}
 			}
 			ocppSrv.Handler().SetApprovedIDs(approved)
+			// A charger adopted by this save booted long ago and will not
+			// boot again just because we changed our mind, so its device
+			// row has to be written here rather than waiting for one.
+			registerOCPPDevices(st, ocppSrv)
 		}
 
 		// Notifications: rebuild the provider from fresh config
@@ -1319,16 +1323,26 @@ func main() {
 				approved = append(approved, lp.DriverName)
 			}
 		}
-		srv, err := ocpp.Start(ctx, &ocpp.Config{
+		ocppCfg := &ocpp.Config{
 			Enabled:            cfg.OCPP.Enabled,
+			Bind:               cfg.OCPP.Bind,
 			Port:               cfg.OCPP.Port,
 			PortV201:           cfg.OCPP.PortV201,
 			Path:               cfg.OCPP.Path,
 			Username:           cfg.OCPP.Username,
 			Password:           cfg.OCPP.Password,
 			HeartbeatIntervalS: cfg.OCPP.HeartbeatIntervalS,
+			ChargerSecrets:     cfg.OCPP.ChargerSecrets(),
 			ApprovedIDs:        approved,
-		}, tel)
+		}
+		if t := cfg.OCPP.TLS; t != nil {
+			ocppCfg.TLS = &ocpp.TLSConfig{
+				CertFile:     t.CertFile,
+				KeyFile:      t.KeyFile,
+				ClientCAFile: t.ClientCAFile,
+			}
+		}
+		srv, err := ocpp.Start(ctx, ocppCfg, tel)
 		if err != nil {
 			// A charger that cannot reach us is a missing device, not a
 			// broken site, so keep the rest of the process running.
@@ -1343,6 +1357,11 @@ func main() {
 			// profile's charging policy. An identity matching no profile
 			// changes nothing (the visitor default); it still shows in the
 			// Chargers panel so the operator can paste it into a profile.
+			// An adopted charger becomes a device the moment it says what
+			// it is, keyed on vendor+serial like any driver-backed one.
+			ocppSrv.Handler().SetIdentityReported(func(ident ocpp.ChargerIdentity) {
+				registerOCPPDevice(st, ident)
+			})
 			ocppSrv.Handler().SetVehicleIdentified(func(chargerID, vehicleID, source string) {
 				cfgMu.RLock()
 				lpID := ""
@@ -1382,6 +1401,60 @@ func main() {
 					"source", source, "capacity_wh", vehicle.CapacityWh,
 					"surplus_only", vehicle.SurplusOnly,
 					"target_soc", vehicle.TargetSoC)
+			})
+			// Charging needs: on an ISO 15118 session the car states what
+			// it wants — energy, departure, and on DC its own capacity and
+			// state of charge. That is the car actually plugged in rather
+			// than an operator's estimate of it, so it takes precedence for
+			// the session and reverts on plug-out with everything else.
+			ocppSrv.Handler().SetChargingNeeds(func(chargerID string, needs ocpp.ChargingNeeds) {
+				cfgMu.RLock()
+				lpID := ""
+				for _, lp := range cfg.Loadpoints {
+					if lp.DriverName == chargerID {
+						lpID = lp.ID
+						break
+					}
+				}
+				cfgMu.RUnlock()
+				if lpID == "" {
+					return
+				}
+				// Capacity first: the SoC anchor below divides delivered
+				// energy by it, so anchoring against a stale capacity would
+				// re-base the session estimate on the wrong battery.
+				if needs.CapacityWh > 0 {
+					lpMgr.SetSessionCapacityWh(lpID, needs.CapacityWh)
+				}
+				if needs.PresentSoC != nil {
+					lpMgr.AnchorVehicleSoC(lpID, *needs.PresentSoC)
+				}
+				target, haveTarget := needs.TargetSoC()
+				switch {
+				case haveTarget:
+					// A departure the car did not state must not erase one
+					// the operator did.
+					when := needs.DepartureTime
+					if when.IsZero() {
+						if st, ok := lpMgr.State(lpID); ok {
+							when = st.TargetTime
+						}
+					}
+					lpMgr.SetTarget(lpID, target, when)
+				case !needs.DepartureTime.IsZero():
+					// AC states energy without a battery size, so there is
+					// no fraction to derive — but the deadline is still the
+					// car's, and it belongs on the operator's own target.
+					if st, ok := lpMgr.State(lpID); ok && st.TargetSoC > 0 {
+						lpMgr.SetTarget(lpID, st.TargetSoC, needs.DepartureTime)
+					}
+				}
+				slog.Info("ocpp: charging needs applied",
+					"charger", chargerID, "lp", lpID,
+					"mode", needs.TransferMode, "energy_wh", needs.EnergyWh,
+					"capacity_wh", needs.CapacityWh,
+					"departure", needs.DepartureTime,
+					"target_soc", target, "target_derived", haveTarget)
 			})
 			slog.Info("ocpp: central system started",
 				"port", ocppSrv.Port(),
@@ -1755,6 +1828,25 @@ func main() {
 	// driver_failure_default.go.
 	actuation := newDriverActuationTracker(tel)
 
+	// An OCPP charge point is not in the driver registry — it connected to us
+	// rather than being dialled — so route by name: if an online charger
+	// answers to it, command it over OCPP, otherwise fall through to the Lua
+	// driver registry. Everything above stays unaware of the difference.
+	//
+	// Hoisted out of the loadpoint controller below because the API needs the
+	// same routing: the dashboard's Pause / Resume / Force start post to
+	// /api/ev/command, and sending those straight to the registry finds no
+	// driver for a charger that has none.
+	evSend := reg.Send
+	if ocppSrv != nil {
+		evSend = func(ctx context.Context, name string, payload []byte) error {
+			if ocppSrv.Handler().IsOnline(name) {
+				return ocppSrv.Command(ctx, name, payload)
+			}
+			return reg.Send(ctx, name, payload)
+		}
+	}
+
 	// ---- EV loadpoint controller ----
 	// loadpoint.Controller owns per-tick EV dispatch, including the
 	// energy-allocation contract, snapping and phase transitions.
@@ -1802,20 +1894,9 @@ func main() {
 				RequestActive: reqActive,
 			}, true
 		}
-		// An OCPP charge point is not in the driver registry — it connected to
-		// us rather than being dialled — so route by name: if an online charger
-		// answers to it, command it over OCPP, otherwise fall through to the
-		// Lua driver registry. Loadpoints stay unaware of the difference.
-		send := reg.Send
-		if ocppSrv != nil {
-			send = func(ctx context.Context, name string, payload []byte) error {
-				if ocppSrv.Handler().IsOnline(name) {
-					return ocppSrv.Command(ctx, name, payload)
-				}
-				return reg.Send(ctx, name, payload)
-			}
-		}
-		lpController = loadpoint.NewController(lpMgr, planAdapter, telAdapter, send)
+		// evSend routes OCPP chargers past the driver registry; loadpoints
+		// stay unaware of the difference.
+		lpController = loadpoint.NewController(lpMgr, planAdapter, telAdapter, evSend)
 		// A charger that answers every poll and refuses every setpoint is
 		// the storage bug of #800 on the EV wire: it holds its last
 		// current and the plan keeps counting the load. Only the periodic
@@ -2486,6 +2567,7 @@ func main() {
 		Loadpoints:       lpMgr,
 		LoadpointCtrl:    lpController,
 		OCPPChargers:     ocppChargersFn,
+		EVSend:           evSend,
 		CalDAV:           calSvc,
 		HA:               haBridge,
 		Registry:         reg,
@@ -3365,6 +3447,49 @@ func doRolloff(ctx context.Context, st *state.Store, coldDir string) {
 	if dRows > 0 {
 		slog.Info("diagnostics parquet rolloff",
 			"rows", dRows, "files", len(dFiles))
+	}
+}
+
+// registerOCPPDevice writes one charge point's row in the device registry.
+//
+// A charger is not in the driver registry — it dialled us, so there is no
+// driver, no endpoint we chose and no HostEnv identity to read. What it does
+// have is a BootNotification, and vendor+serial out of that is a
+// hardware-stable key exactly like a driver's. The name it dialled with is
+// not: an installer typed it and the charger's own web page can change it, so
+// it is recorded as the endpoint and only becomes the key when the charger
+// reports no serial at all.
+func registerOCPPDevice(st *state.Store, ident ocpp.ChargerIdentity) {
+	if st == nil || ident.ID == "" {
+		return
+	}
+	dev := state.Device{
+		DriverName: ident.ID,
+		Make:       ident.Vendor,
+		Serial:     ident.Serial,
+		Endpoint:   "ocpp://" + ident.ID,
+	}
+	id, err := st.RegisterDevice(dev)
+	if err != nil {
+		slog.Warn("ocpp: could not register charger as a device",
+			"charger", ident.ID, "err", err)
+		return
+	}
+	slog.Info("ocpp: charger registered as a device",
+		"charger", ident.ID, "device_id", id,
+		"vendor", ident.Vendor, "model", ident.Model, "serial", ident.Serial)
+}
+
+// registerOCPPDevices catches up every adopted charger that has already
+// booted. Adoption usually happens long after a BootNotification — an
+// operator sees a pending charger in the UI and binds it to a loadpoint — and
+// the charger will not boot again just because we changed our mind about it.
+func registerOCPPDevices(st *state.Store, srv *ocpp.Server) {
+	if st == nil || srv == nil {
+		return
+	}
+	for _, ident := range srv.Handler().Identities() {
+		registerOCPPDevice(st, ident)
 	}
 }
 
