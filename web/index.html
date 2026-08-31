@@ -69,9 +69,10 @@
     <div class="header-right">
       <button id="theme-toggle" class="icon-btn" data-menu-label="Dark mode" title="Toggle light / dark theme">&#9790;</button>
       <!-- Advanced toggle moved below the Plan chart so it's visually
-           colocated with the controls + diagnostics it reveals (twins,
-           drivers, models, manual mode buttons). The button still
-           lives in the DOM as #ui-mode-toggle, just rendered there. -->
+           colocated with the diagnostics it reveals (twins, drivers,
+           models). The button still lives in the DOM as #ui-mode-toggle,
+           just rendered there. Manual strategy fallbacks stay on the
+           Plan card itself. -->
       <ftw-notif-history poll-ms="30000" data-menu-label="Notification history"></ftw-notif-history>
       <!-- Always-available entry into the setup wizard. The wizard
            currently REPLACES config on save, so the copy says "Run setup
@@ -566,14 +567,29 @@
             <p id="plan-export-unknown" class="plan-export-unknown" hidden>Not checked — battery export stays off.</p>
           </div>
           <p id="plan-export-sentence" class="plan-export-sentence"></p>
+          <!-- The way back to the planner. Without it a house left in a
+               manual mode has no control here that starts planning again.
+               Which planner mode it lands on is the server's answer
+               (GET /api/planner/prefs → mapped_mode), so this button never
+               decides on its own whether the battery may sell. Shown only
+               while a manual mode is driving. -->
+          <div class="mode-buttons mode-buttons-primary" id="plan-use-row" hidden>
+            <button type="button" id="plan-use-btn"
+                    title="Hand the battery back to the plan">Use the plan</button>
+          </div>
           <!-- Remaining /api/modes entries (manual) still render here.
                Planner keys are skipped in renderModeCatalog. -->
           <div class="mode-buttons mode-buttons-primary" id="mode-buttons-primary" hidden></div>
           <div class="strategy-hint" id="strategy-hint"></div>
-          <div class="mode-advanced-toggle advanced-only">
+          <!-- Manual fallbacks are a drawer on this card, not a diagnostic.
+               They used to be `.advanced-only`, so the simple view hid both
+               the current manual mode and the way back to a planner
+               strategy. Keep them behind "Manual…" — that is already the
+               progressive disclosure. -->
+          <div class="mode-advanced-toggle">
             <button class="btn-link" id="mode-advanced-btn" title="Show manual modes">Manual…</button>
           </div>
-          <div class="mode-buttons mode-buttons-advanced advanced-only" id="mode-buttons" style="display:none"></div>
+          <div class="mode-buttons mode-buttons-advanced" id="mode-buttons" style="display:none"></div>
         </div>
         <p class="plan-help">
           Forecast-driven battery schedule for the next 48&nbsp;h, recomputed every few minutes.

@@ -34,6 +34,9 @@
   const STATUS_DISPLAY_TAU_MS = 8 * 1000;
   let chartRange = "5m";             // current selected range
   let currentMode = null;
+  let lastRevealedMode = null;       // last mode the manual drawer auto-opened for
+  let pendingMode = null;            // mode tapped here, not yet confirmed by the server
+  let pendingModeUntil = 0;          // browser-clock deadline for that optimistic paint
   let animating = !document.hidden;  // 30fps redraw loop flag
   let lastDataTs = 0;                // browser-clock timestamp of newest pushed point
   let lastPushAt = 0;                // browser-clock timestamp of last push attempt — for dedupe (NEVER mix with server ts)
@@ -782,13 +785,25 @@
     // Buttons come from GET /api/modes; if that hasn't landed yet (offline at
     // first paint), this confirmed-live poll is the retry trigger.
     if (!modeCatalogRendered) renderModeCatalog();
+    // A tap paints its button before the POST returns. A status read already
+    // in flight still answers with the old mode, so prefer the tapped one
+    // until the server confirms it or the short wait runs out.
+    if (pendingMode && (data.mode === pendingMode || Date.now() >= pendingModeUntil)) pendingMode = null;
+    var activeMode = pendingMode || data.mode;
     var allModeButtons = document.querySelectorAll("#mode-buttons-primary button, #mode-buttons button");
     allModeButtons.forEach(function (btn) {
-      if (btn.dataset.mode === data.mode) btn.classList.add("active");
+      if (btn.dataset.mode === activeMode) btn.classList.add("active");
       else btn.classList.remove("active");
     });
+    revealManualModes(activeMode);
     // When planner is driving, grey out the grid-target slider and show a hint.
     var plannerActive = (data.mode || "").indexOf("planner_") === 0;
+    // "Use the plan" is the way out of a manual mode. It has nothing to
+    // offer while the planner already drives, so it only shows when it does.
+    var planUseRow = document.getElementById("plan-use-row");
+    var planUseBtn = document.getElementById("plan-use-btn");
+    if (planUseBtn) planUseBtn.hidden = plannerActive;
+    if (planUseRow) planUseRow.hidden = plannerActive;
     var gridSlider = document.getElementById("grid-target-slider");
     var gridSend = document.getElementById("grid-target-send");
     var gridHint = document.getElementById("grid-target-hint");
@@ -2306,6 +2321,10 @@
   }
 
   function setMode(mode) {
+    markModeActive(mode);
+    revealManualModes(mode);
+    pendingMode = mode;
+    pendingModeUntil = Date.now() + 4000;
     apiFetch("/api/mode", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -2317,8 +2336,40 @@
         fetchStatus();
       })
       .catch(function () {
+        pendingMode = null; // the write failed — show server truth again
         setConnected(false);
       });
+  }
+
+  function markModeActive(mode) {
+    document.querySelectorAll("#mode-buttons-primary button, #mode-buttons button").forEach(function (btn) {
+      if (btn.dataset.mode === mode) btn.classList.add("active");
+      else btn.classList.remove("active");
+    });
+  }
+
+  // Open the manual drawer when the live mode lives there, so a reload
+  // (or a change made from the phone app / HA) never leaves the current
+  // setting with no button on screen.
+  //
+  // Only on a transition. The status poll repeats the same mode every couple
+  // of seconds; re-opening on every repeat would undo an explicit "Hide
+  // manual" a second after the user pressed it. A move to a *different*
+  // manual mode still opens the drawer — that button has to be on screen.
+  function revealManualModes(mode) {
+    if (!mode || mode === lastRevealedMode) return;
+    var panel = document.getElementById("mode-buttons");
+    if (!panel) return;
+    var match = panel.querySelector('button[data-mode="' + mode + '"]');
+    // Before the catalog paints, a missing button means "not rendered yet",
+    // not "not a manual mode" — don't record it, or the catalog's own call
+    // would come back as a repeat and never open the drawer.
+    if (!match && !modeCatalogRendered) return;
+    lastRevealedMode = mode;
+    if (!match) return;
+    panel.style.display = "flex";
+    var advBtn = document.getElementById("mode-advanced-btn");
+    if (advBtn) advBtn.textContent = "Hide manual";
   }
 
   // ---- Mode buttons, built from the server's canonical catalog ----
@@ -2365,6 +2416,7 @@
         advanced.replaceChildren(frags.advanced);
         primary.hidden = !primary.childElementCount;
         modeCatalogRendered = true;
+        revealManualModes(currentMode);
         return true;
       })
       .catch(function () {
@@ -2455,6 +2507,34 @@
       if (e.target.tagName === "BUTTON" && e.target.dataset.mode) {
         setMode(e.target.dataset.mode);
       }
+    });
+  }
+  // Permission to sell from the battery is a deliberate household answer, so
+  // a prefs read that fails or answers with nothing usable lands on the mode
+  // that never exports.
+  var PLANNER_FALLBACK_MODE = "planner_passive_arbitrage";
+  // "Use the plan" — the one control that hands a manually-driven house back
+  // to the planner. Which planner mode that is follows from the household's
+  // own prefs, and the server already maps them (mapped_mode), so the two
+  // surfaces cannot drift. setMode() from here on, so the optimistic paint,
+  // the pending-mode hold and the drawer all behave as they do for a tap.
+  var planUseBtn = document.getElementById("plan-use-btn");
+  if (planUseBtn) {
+    planUseBtn.addEventListener("click", function () {
+      apiFetch("/api/planner/prefs", { headers: { Accept: "application/json" } })
+        .then(function (r) {
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          return r.json();
+        })
+        .then(function (prefs) {
+          var mapped = prefs && prefs.mapped_mode;
+          setMode(typeof mapped === "string" && mapped.indexOf("planner_") === 0
+            ? mapped
+            : PLANNER_FALLBACK_MODE);
+        })
+        .catch(function () {
+          setMode(PLANNER_FALLBACK_MODE);
+        });
     });
   }
   var advBtn = document.getElementById("mode-advanced-btn");
