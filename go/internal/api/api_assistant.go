@@ -138,6 +138,9 @@ func (s *Server) handleAssistantAsk(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 	progress("status", "Reading the site")
+	facts := s.assistantFacts()
+	// Complete emits "Asking the model" once per round. Saying it here
+	// too would double every line in the activity log.
 	cli := &assistant.Client{HTTP: s.deps.AssistantHTTP}
 	reply, err := cli.Complete(r.Context(), assistant.Request{
 		APIKey:   asst.APIKey,
@@ -146,7 +149,7 @@ func (s *Server) handleAssistantAsk(w http.ResponseWriter, r *http.Request) {
 		Question: body.Question,
 		Trigger:  formatAssistantTrigger(body.Trigger),
 		History:  body.History,
-		Snapshot: s.assistantFacts(),
+		Snapshot: facts,
 		Run:      s.runAssistantTool,
 		Progress: progress,
 	})
@@ -218,6 +221,7 @@ func writeAssistantSSE(w http.ResponseWriter, flush http.Flusher, v any) {
 	if w.Header().Get("Content-Type") == "" {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Accel-Buffering", "no")
 		w.WriteHeader(http.StatusOK)
 	}
 	raw, err := json.Marshal(v)

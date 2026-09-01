@@ -18,13 +18,82 @@
     return div.innerHTML;
   }
 
-  function formatAnswer(text) {
-    var s = escHtml(text);
+  // Inline marks. Code spans are lifted out first so ** and * inside a
+  // span stay literal.
+  function inlineMd(s) {
+    var codes = [];
+    s = escHtml(s);
+    s = s.replace(/`([^`]+)`/g, function (m, c) {
+      codes.push(c);
+      return "\u0000" + (codes.length - 1) + "\u0000";
+    });
     s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-    s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
-    s = s.replace(/^(\d+)\.\s/gm, "<br>$1. ");
-    s = s.replace(/\n/g, "<br>");
-    return s;
+    s = s.replace(/(^|[\s(])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+    return s.replace(/\u0000(\d+)\u0000/g, function (m, i) {
+      return "<code>" + codes[Number(i)] + "</code>";
+    });
+  }
+
+  // The model is asked for markdown, so render markdown: headings, both
+  // kinds of list, fenced code and paragraphs.
+  function formatAnswer(text) {
+    var lines = String(text == null ? "" : text).replace(/\r\n/g, "\n").split("\n");
+    var out = [];
+    var para = [];
+    var listTag = null;
+    var items = [];
+    var code = null;
+    function flushPara() {
+      if (!para.length) return;
+      out.push("<p>" + inlineMd(para.join("\n")).replace(/\n/g, "<br>") + "</p>");
+      para = [];
+    }
+    function flushList() {
+      if (!listTag) return;
+      out.push("<" + listTag + ">" + items.map(function (i) {
+        return "<li>" + inlineMd(i) + "</li>";
+      }).join("") + "</" + listTag + ">");
+      listTag = null;
+      items = [];
+    }
+    function flushAll() { flushPara(); flushList(); }
+    function openList(tag, item) {
+      flushPara();
+      if (listTag !== tag) { flushList(); listTag = tag; }
+      items.push(item);
+    }
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i];
+      if (code !== null) {
+        if (/^\s*```/.test(line)) {
+          out.push("<pre><code>" + escHtml(code.join("\n")) + "</code></pre>");
+          code = null;
+        } else {
+          code.push(line);
+        }
+        continue;
+      }
+      if (/^\s*```/.test(line)) { flushAll(); code = []; continue; }
+      if (!line.trim()) { flushAll(); continue; }
+      var head = line.match(/^\s*(#{1,4})\s+(.*)$/);
+      if (head) {
+        flushAll();
+        var lvl = Math.min(head[1].length + 2, 6);
+        out.push("<h" + lvl + ">" + inlineMd(head[2].trim()) + "</h" + lvl + ">");
+        continue;
+      }
+      var bullet = line.match(/^\s*[-*•]\s+(.*)$/);
+      if (bullet) { openList("ul", bullet[1]); continue; }
+      var numbered = line.match(/^\s*\d+[.)]\s+(.*)$/);
+      if (numbered) { openList("ol", numbered[1]); continue; }
+      flushList();
+      para.push(line);
+    }
+    if (code !== null) {
+      out.push("<pre><code>" + escHtml(code.join("\n")) + "</code></pre>");
+    }
+    flushAll();
+    return out.join("");
   }
 
   function toolLabel(name) {
@@ -42,23 +111,41 @@
     style.id = "ftw-ask-styles";
     style.textContent = [
       ".ftw-ask-backdrop{position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:9000;display:flex;align-items:center;justify-content:center;}",
-      ".ftw-ask-shell{width:min(680px,94vw);max-height:90vh;display:flex;flex-direction:column;background:var(--ink-raised,#161616);border:1px solid var(--line,#2a2a2a);border-radius:10px;overflow:hidden;}",
-      ".ftw-ask-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 18px;border-bottom:1px solid var(--line,#2a2a2a);background:var(--ink,#111);}",
+      ".ftw-ask-shell{width:min(680px,94vw);max-height:90vh;min-height:0;display:flex;flex-direction:column;background:var(--ink-raised,#161616);border:1px solid var(--line,#2a2a2a);border-radius:10px;overflow:hidden;}",
+      ".ftw-ask-head{flex:0 0 auto;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 18px;border-bottom:1px solid var(--line,#2a2a2a);background:var(--ink,#111);}",
       ".ftw-ask-title{font-family:var(--mono,monospace);font-size:0.7rem;letter-spacing:0.18em;text-transform:uppercase;color:var(--accent-e,#f5b942);font-weight:500;}",
       ".ftw-ask-close{font-size:1.4rem;line-height:1;background:transparent;border:none;color:var(--fg-muted,#858585);cursor:pointer;padding:4px 8px;}",
       ".ftw-ask-close:hover{color:var(--fg,#e8e8e8);}",
-      ".ftw-ask-thread{padding:16px 18px;overflow:auto;flex:1;display:flex;flex-direction:column;gap:10px;}",
-      ".ftw-ask-msg{max-width:92%;padding:10px 12px;border-radius:10px;font:0.9rem/1.5 var(--sans,sans-serif);overflow-wrap:anywhere;}",
+      ".ftw-ask-body{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;overflow:hidden;}",
+      ".ftw-ask-thread{padding:16px 18px;overflow:auto;flex:1 1 auto;min-height:0;display:flex;flex-direction:column;gap:10px;}",
+      ".ftw-ask-msg{max-width:92%;padding:10px 12px;border-radius:10px;font:0.9rem/1.5 var(--sans,sans-serif);overflow-wrap:anywhere;word-break:break-word;}",
       ".ftw-ask-msg.user{align-self:flex-end;background:var(--ink,#111);border:1px solid var(--line,#2a2a2a);color:var(--fg,#e8e8e8);}",
       ".ftw-ask-msg.assistant{align-self:flex-start;background:var(--ink-sunken,#0d0d0d);border:1px solid var(--line,#2a2a2a);color:var(--fg,#e8e8e8);}",
       ".ftw-ask-msg.assistant strong{color:var(--fg,#e8e8e8);}",
       ".ftw-ask-msg.assistant code{font-family:var(--mono,monospace);font-size:0.82em;}",
-      ".ftw-ask-progress{align-self:flex-start;color:var(--fg-dim,#a0a0a0);font:0.8rem/1.4 var(--sans,sans-serif);}",
+      ".ftw-ask-msg.assistant > *:first-child{margin-top:0;}",
+      ".ftw-ask-msg.assistant > *:last-child{margin-bottom:0;}",
+      ".ftw-ask-msg.assistant p{margin:0 0 0.7em;}",
+      ".ftw-ask-msg.assistant h3,.ftw-ask-msg.assistant h4,.ftw-ask-msg.assistant h5,.ftw-ask-msg.assistant h6{margin:0.9em 0 0.4em;font-size:0.86rem;font-weight:600;color:var(--fg,#e8e8e8);}",
+      ".ftw-ask-msg.assistant ul,.ftw-ask-msg.assistant ol{margin:0 0 0.7em;padding-left:1.35em;}",
+      ".ftw-ask-msg.assistant li{margin:0.15em 0;}",
+      ".ftw-ask-msg.assistant pre{margin:0 0 0.7em;padding:8px 10px;background:var(--ink,#111);border:1px solid var(--line,#2a2a2a);border-radius:6px;overflow-x:auto;}",
+      ".ftw-ask-msg.assistant pre code{font-size:0.78em;white-space:pre;}",
+      // The caret is the sign the model is still writing.
+      ".ftw-ask-msg.is-streaming > *:last-child::after{content:'';display:inline-block;width:0.5em;height:1em;margin-left:2px;vertical-align:text-bottom;background:var(--accent-e,#f5b942);animation:ftw-ask-caret 1s steps(2,start) infinite;}",
+      "@keyframes ftw-ask-caret{to{visibility:hidden;}}",
+      "@media (prefers-reduced-motion:reduce){.ftw-ask-msg.is-streaming > *:last-child::after{animation:none;}}",
+      ".ftw-ask-activity{align-self:flex-start;display:flex;flex-direction:column;gap:4px;padding:2px 0 4px;max-width:100%;}",
+      ".ftw-ask-step{display:flex;align-items:center;gap:8px;color:var(--fg-dim,#a0a0a0);font:0.78rem/1.4 var(--sans,sans-serif);}",
+      ".ftw-ask-step::before{content:'';width:6px;height:6px;border-radius:50%;background:var(--fg-muted,#858585);flex:0 0 auto;}",
+      ".ftw-ask-step.is-live{color:var(--accent-e,#f5b942);}",
+      ".ftw-ask-step.is-live::before{background:var(--accent-e,#f5b942);box-shadow:0 0 0 3px rgba(245,185,66,0.22);}",
+      ".ftw-ask-step.is-tool{font-family:var(--mono,monospace);font-size:0.72rem;letter-spacing:0.02em;}",
       ".ftw-ask-note{color:var(--fg-dim,#a0a0a0);font-size:0.84rem;line-height:1.45;margin:0;}",
       ".ftw-ask-error{color:var(--red-e,#ef4444);font-size:0.84rem;}",
-      ".ftw-ask-foot{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:0 18px 10px;flex-wrap:wrap;}",
+      ".ftw-ask-foot{flex:0 0 auto;display:flex;justify-content:space-between;align-items:center;gap:8px;padding:0 18px 10px;flex-wrap:wrap;}",
       ".ftw-ask-status{color:var(--fg-dim,#a0a0a0);font-size:0.78rem;}",
-      ".ftw-ask-composer{display:flex;gap:8px;padding:12px 18px 16px;border-top:1px solid var(--line,#2a2a2a);}",
+      ".ftw-ask-composer{flex:0 0 auto;display:flex;gap:8px;padding:12px 18px 16px;border-top:1px solid var(--line,#2a2a2a);}",
       ".ftw-ask-composer input{flex:1;min-width:0;background:var(--ink-sunken,#0d0d0d);color:var(--fg,#e8e8e8);border:1px solid var(--line,#2a2a2a);border-radius:8px;padding:10px 12px;font:0.9rem var(--sans,sans-serif);}",
       ".ftw-ask-btn{font-family:var(--sans,sans-serif);font-size:0.78rem;font-weight:500;letter-spacing:0.02em;padding:8px 14px;border:1px solid var(--line,#2a2a2a);border-radius:8px;background:transparent;color:var(--fg,#e8e8e8);cursor:pointer;}",
       ".ftw-ask-btn:hover{border-color:var(--fg-dim,#a0a0a0);}",
@@ -134,6 +221,13 @@
     return gen === state.generation && !!state.backdrop;
   }
 
+  // Abort the in-flight question but keep the dialog and the thread.
+  // close() aborts too, but bumps the generation and drops everything.
+  function stop() {
+    if (!state.abort) return;
+    try { state.abort.abort(); } catch (e) { /* already finished */ }
+  }
+
   function threadEl() {
     return state.backdrop && state.backdrop.querySelector('[data-role="thread"]');
   }
@@ -158,25 +252,88 @@
     thread.scrollTop = thread.scrollHeight;
   }
 
-  function setProgress(text) {
+  function visibleAnswer(s) {
+    s = String(s || "");
+    var cut = s.search(/\n#{1,3}\s*Issue title\b/i);
+    if (cut < 0) cut = s.search(/\n\*\*Issue title\*\*/i);
+    if (cut >= 0) s = s.slice(0, cut);
+    s = s.replace(/^#{1,3}\s*Answer\s*\n+/i, "");
+    s = s.replace(/^\*\*Answer\*\*\s*\n+/i, "");
+    return s;
+  }
+
+  // One run is one question. Its activity log and draft bubble are held
+  // by reference, never looked up in the thread: a DOM query would find
+  // the previous question's nodes and append this answer above the one
+  // before it.
+  function newRun() {
+    return { activity: null, draft: null, streamed: "" };
+  }
+
+  function addActivity(run, text, kind) {
     var thread = threadEl();
     if (!thread) return;
-    var el = thread.querySelector('[data-role="progress"]');
-    if (!el) {
-      el = document.createElement("div");
-      el.className = "ftw-ask-progress";
-      el.setAttribute("data-role", "progress");
-      thread.appendChild(el);
+    if (!run.activity) {
+      run.activity = document.createElement("div");
+      run.activity.className = "ftw-ask-activity";
+      thread.appendChild(run.activity);
     }
-    el.hidden = !text;
-    el.textContent = text || "";
+    var live = run.activity.querySelector(".is-live");
+    if (live) live.classList.remove("is-live");
+    var el = document.createElement("div");
+    el.className = "ftw-ask-step" + (kind === "tool" ? " is-tool is-live" : " is-live");
+    el.textContent = text;
+    run.activity.appendChild(el);
     thread.scrollTop = thread.scrollHeight;
   }
 
-  function clearProgress() {
-    setProgress("");
-    var el = threadEl() && threadEl().querySelector('[data-role="progress"]');
-    if (el && el.parentNode) el.parentNode.removeChild(el);
+  function settleActivity(run) {
+    if (!run.activity) return;
+    var live = run.activity.querySelector(".is-live");
+    if (live) live.classList.remove("is-live");
+  }
+
+  // The last line is half-written while tokens arrive. Rendering it would
+  // flash a partial "## Issue title" as a heading, so hold that line back
+  // until it ends.
+  function streamingText(s) {
+    return visibleAnswer(s).replace(/\n#{1,4}[^\n]*$/, "");
+  }
+
+  function appendDelta(run) {
+    var thread = threadEl();
+    if (!thread) return;
+    if (!run.draft) {
+      run.draft = document.createElement("div");
+      run.draft.className = "ftw-ask-msg assistant is-streaming";
+      thread.appendChild(run.draft);
+    }
+    // Rendered as it arrives: raw ** and - for the length of a slow free
+    // model's answer reads as broken output.
+    run.draft.innerHTML = formatAnswer(streamingText(run.streamed));
+    thread.scrollTop = thread.scrollHeight;
+  }
+
+  // A new model round discards what streamed in the previous one: that
+  // text led up to a tool call, it is not the answer being written.
+  function resetDraft(run) {
+    run.streamed = "";
+    if (run.draft && run.draft.parentNode) {
+      run.draft.parentNode.removeChild(run.draft);
+    }
+    run.draft = null;
+  }
+
+  function finishAssistant(run, text) {
+    var thread = threadEl();
+    if (!run.draft) {
+      addAssistant(text);
+      return;
+    }
+    run.draft.classList.remove("is-streaming");
+    run.draft.innerHTML = formatAnswer(text);
+    run.draft = null;
+    if (thread) thread.scrollTop = thread.scrollHeight;
   }
 
   function setFoot(html) {
@@ -213,14 +370,17 @@
     var q = String(question || "").trim();
     if (!q || state.busy) return;
     var gen = state.generation;
+    var run = newRun();
     state.busy = true;
     addUser(q);
-    setProgress("This can take a minute. Reading the site…");
     setFoot("");
     var askBtn = state.backdrop && state.backdrop.querySelector('[data-role="ask"]');
     var input = state.backdrop && state.backdrop.querySelector('[data-role="input"]');
-    if (askBtn) askBtn.disabled = true;
-    if (input) input.value = "";
+    // The button becomes Stop while the model works. A free model can
+    // run for a minute; leaving no way out but closing the dialog threw
+    // the thread away.
+    if (askBtn) askBtn.textContent = "Stop";
+    if (input) { input.value = ""; input.disabled = true; }
     var payload = { question: q, history: state.turns.slice() };
     if (state.trigger) payload.trigger = state.trigger;
     var fetchOpts = {
@@ -247,8 +407,13 @@
               if (chunk.value) buf += decoder.decode(chunk.value, { stream: true });
               buf = parseSSEChunk(buf, function (ev) {
                 if (!stillOpen(gen)) return;
-                if (ev.type === "status") setProgress(ev.text || "Working…");
-                if (ev.type === "tool") setProgress(toolLabel(ev.text) + "…");
+                if (ev.type === "round") resetDraft(run);
+                if (ev.type === "status") addActivity(run, ev.text || "Working");
+                if (ev.type === "tool") addActivity(run, toolLabel(ev.text), "tool");
+                if (ev.type === "delta") {
+                  run.streamed += ev.text || "";
+                  appendDelta(run);
+                }
                 if (ev.type === "error") throw new Error(ev.error || "Ask why failed");
                 if (ev.type === "done") donePayload = ev;
               });
@@ -269,12 +434,12 @@
       })
       .then(function (j) {
         if (!stillOpen(gen) || !j) return;
-        clearProgress();
+        settleActivity(run);
         state.last = j;
         state.turns.push({ role: "user", text: q });
         state.turns.push({ role: "assistant", text: j.answer || "" });
         if (state.turns.length > 6) state.turns = state.turns.slice(-6);
-        addAssistant(j.answer || "");
+        finishAssistant(run, j.answer || "");
         var used = j.resolved_model || j.model || "";
         var foot = '<span class="ftw-ask-status">' + escHtml(used ? "Answered by " + used : "Done") + "</span>";
         if (j.issue_title) {
@@ -286,22 +451,37 @@
       })
       .catch(function (err) {
         if (!stillOpen(gen)) return;
-        if (err && err.name === "AbortError") return;
-        clearProgress();
+        settleActivity(run);
+        // Stopped by the operator: keep whatever arrived, as an answer
+        // that is simply cut short.
+        if (err && err.name === "AbortError") {
+          if (run.streamed.trim()) {
+            finishAssistant(run, visibleAnswer(run.streamed));
+            addActivity(run, "Stopped");
+          } else {
+            resetDraft(run);
+            addActivity(run, "Stopped before the model answered");
+          }
+          return;
+        }
+        // A failed stream must not leave a half-written bubble behind:
+        // the next question would otherwise stream into it.
+        resetDraft(run);
         var thread = threadEl();
         if (thread) {
           var el = document.createElement("div");
           el.className = "ftw-ask-error";
-          el.textContent = err.message || String(err);
+          el.textContent = (err && err.message) || String(err);
           thread.appendChild(el);
+          thread.scrollTop = thread.scrollHeight;
         }
       })
       .then(function () {
         if (!stillOpen(gen)) return;
         state.busy = false;
         state.abort = null;
-        if (askBtn) askBtn.disabled = false;
-        if (input) input.focus();
+        if (askBtn) { askBtn.disabled = false; askBtn.textContent = "Ask why"; }
+        if (input) { input.disabled = false; input.focus(); }
       });
   }
 
@@ -330,6 +510,7 @@
     var input = host.querySelector('[data-role="input"]');
     form.addEventListener("submit", function (e) {
       e.preventDefault();
+      if (state.busy) { stop(); return; }
       ask(input.value);
     });
     if (opts.question) {
@@ -354,7 +535,7 @@
       '<div class="ftw-ask-shell" role="dialog" aria-modal="true" aria-labelledby="ftw-ask-title">' +
       '  <div class="ftw-ask-head"><span class="ftw-ask-title" id="ftw-ask-title">' + escHtml(title) + '</span>' +
       '    <button class="ftw-ask-close" data-role="close" aria-label="Close" type="button">×</button></div>' +
-      '  <div data-role="body"><p class="ftw-ask-note" style="padding:16px 18px">Loading…</p></div>' +
+      '  <div class="ftw-ask-body" data-role="body"><p class="ftw-ask-note" style="padding:16px 18px">Loading…</p></div>' +
       "</div>";
     document.body.appendChild(backdrop);
     state.backdrop = backdrop;
@@ -430,5 +611,5 @@
     bind();
   }
 
-  window.FTWAskWhy = { open: open, close: close, updateChip: updateChip, _test: { parseSSEChunk: parseSSEChunk } };
+  window.FTWAskWhy = { open: open, close: close, updateChip: updateChip, _test: { parseSSEChunk: parseSSEChunk, visibleAnswer: visibleAnswer, formatAnswer: formatAnswer } };
 })();
