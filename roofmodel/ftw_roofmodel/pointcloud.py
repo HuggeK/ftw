@@ -31,6 +31,7 @@ __all__ = [
     "PointCloudError",
     "HttpRangeFile",
     "bounds_of",
+    "copc_query_z_range",
     "load_points",
     "read_copc_window",
 ]
@@ -193,6 +194,22 @@ def _import_laspy():
     return laspy
 
 
+def copc_query_z_range(center_z: float, halfsize: float) -> tuple[float, float]:
+    """The vertical range a windowed COPC query must span: the whole cube.
+
+    Lantmäteriet's COPC writer emits octree z-keys measured from some other
+    origin than the file's own cube (observed live on Laserdata Skog: a level-6
+    node keyed z=19, implying a -1698..-1542 m slab, holds points at +18..+42 m
+    while its x/y keys are exact). A 2D query lets laspy fill z from the header
+    and prune nodes by those broken slabs, which silently discards every dense
+    deep level and leaves only the sparse preview points. Spanning the full
+    cube keeps z from ever pruning; x/y pruning and the exact post-filter still
+    bound the read.
+    """
+    pad = abs(halfsize) + 1.0
+    return (center_z - 2.0 * pad, center_z + 2.0 * pad)
+
+
 def read_copc_window(
     session: Any,
     url: str,
@@ -217,7 +234,9 @@ def read_copc_window(
     handle = HttpRangeFile(session, url, timeout=timeout)
     try:
         with CopcReader.open(handle) as reader:
-            query = Bounds(mins=[min_x, min_y], maxs=[max_x, max_y])
+            info = reader.copc_info
+            z_lo, z_hi = copc_query_z_range(float(info.center[2]), float(info.halfsize))
+            query = Bounds(mins=[min_x, min_y, z_lo], maxs=[max_x, max_y, z_hi])
             points = reader.query(query)
     except PointCloudError:
         raise
