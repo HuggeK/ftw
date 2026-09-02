@@ -168,16 +168,82 @@ def _feature_tables(conn: sqlite3.Connection) -> list[tuple[str, str]]:
     return [(str(t), str(c)) for t, c in rows]
 
 
-def read_features(data: bytes, *, limit: int = 5000) -> list[dict[str, Any]]:
+def _blob_envelope(blob: bytes) -> tuple[float, float, float, float] | None:
+    """The header envelope of a geometry blob as (minx, miny, maxx, maxy).
+
+    GeoPackage stores it as [minx, maxx, miny, maxy] doubles right after the
+    8-byte header (OGC 12-128r19, clause 2.1.3), in the header's own byte
+    order. None when the writer chose not to include one.
+    """
+    if len(blob) < 8 or blob[:2] != GPKG_MAGIC:
+        return None
+    flags = blob[3]
+    if ((flags >> 1) & 0x07) == 0 or flags & 0x10:
+        return None
+    endian = "<" if flags & 0x01 else ">"
+    try:
+        minx, maxx, miny, maxy = _unpack(endian + "dddd", blob, 8)
+    except GeoPackageError:
+        return None
+    return (minx, miny, maxx, maxy)
+
+
+def _intersects(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> bool:
+    return a[0] <= b[2] and a[2] >= b[0] and a[1] <= b[3] and a[3] >= b[1]
+
+
+def _geometry_bounds(geometry: dict[str, Any]) -> tuple[float, float, float, float] | None:
+    """(minx, miny, maxx, maxy) over every ring of a parsed geometry.
+
+    The fallback when a writer omitted the header envelope — Lantmaeteriet's
+    municipality files do (flags 0x00 on every blob), so without this the
+    bbox filter would keep all 90k+ rows and the row limit would truncate the
+    table before it ever reached the site.
+    """
+    polys = geometry.get("coordinates") or []
+    if geometry.get("type") == "Polygon":
+        polys = [polys]
+    xs: list[float] = []
+    ys: list[float] = []
+    for poly in polys:
+        for ring in poly:
+            for point in ring:
+                xs.append(point[0])
+                ys.append(point[1])
+    if not xs:
+        return None
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def read_features(
+    data: bytes,
+    *,
+    limit: int = 5000,
+    bboxes: list[tuple[float, float, float, float]] | None = None,
+) -> list[dict[str, Any]]:
     """Every polygon feature in a GeoPackage, as GeoJSON-shaped dicts.
 
     Attributes travel alongside the geometry so the picker can label a building
     with whatever the source calls it.
+
+    `bboxes` filters by the geometry blobs' header envelopes: a row is kept
+    when its envelope intersects ANY of the boxes (each (minx, miny, maxx,
+    maxy)). More than one box exists because the file's CRS isn't declared to
+    this reader — the caller passes the same window in every frame the file
+    could be in, and the frames' coordinate magnitudes are so far apart
+    (degrees vs. six-figure metres) that only the matching one can intersect.
+    Lantmaeteriet ships one GeoPackage per *municipality*, so without a filter
+    a 150 m search would decode a whole city.
     """
-    return list(iter_features(data, limit=limit))
+    return list(iter_features(data, limit=limit, bboxes=bboxes))
 
 
-def iter_features(data: bytes, *, limit: int = 5000) -> Iterator[dict[str, Any]]:
+def iter_features(
+    data: bytes,
+    *,
+    limit: int = 5000,
+    bboxes: list[tuple[float, float, float, float]] | None = None,
+) -> Iterator[dict[str, Any]]:
     if not data.startswith(b"SQLite format 3\x00"):
         raise GeoPackageError(
             "asset is not a GeoPackage (missing the SQLite file header)"
@@ -200,6 +266,11 @@ def iter_features(data: bytes, *, limit: int = 5000) -> Iterator[dict[str, Any]]
                     blob = row[geom_col]
                     if not isinstance(blob, (bytes, bytearray)):
                         continue
+                    env = None
+                    if bboxes:
+                        env = _blob_envelope(bytes(blob))
+                        if env is not None and not any(_intersects(env, b) for b in bboxes):
+                            continue
                     try:
                         geometry = parse_geometry_blob(bytes(blob))
                     except GeoPackageError:
@@ -208,6 +279,10 @@ def iter_features(data: bytes, *, limit: int = 5000) -> Iterator[dict[str, Any]]
                         continue
                     if geometry is None:
                         continue
+                    if bboxes and env is None:
+                        bounds = _geometry_bounds(geometry)
+                        if bounds is not None and not any(_intersects(bounds, b) for b in bboxes):
+                            continue
                     props = {
                         k: row[k]
                         for k in row.keys()

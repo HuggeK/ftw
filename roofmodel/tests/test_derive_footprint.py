@@ -9,7 +9,7 @@ import pytest
 
 from ftw_roofmodel import pipeline, sweref
 from ftw_roofmodel.buildings import clip_to_footprint
-from ftw_roofmodel.geotorget import Credentials, StacItem
+from ftw_roofmodel.geotorget import COLLECTION_BUILDINGS, Credentials, StacItem
 from ftw_roofmodel.pipeline import RoofModelError, derive
 from ftw_roofmodel.segment import segment_roof
 
@@ -43,7 +43,7 @@ class FakeClient:
 
     def search(self, collection, bbox, limit=20):
         self.searched.append(collection)
-        if collection == "byggnad-nedladdning-vektor":
+        if collection == COLLECTION_BUILDINGS:
             return [StacItem(f["id"], collection, {}, None, raw=f) for f in self._buildings]
         return [StacItem("lidar-1", collection, {"data": "http://x/tile.laz"}, None, raw={})]
 
@@ -119,7 +119,7 @@ def test_derive_without_a_building_id_does_not_search_for_buildings(scene):
         latitude=STOCKHOLM[0], longitude=STOCKHOLM[1],
         credentials=Credentials("u", "t"), client=client,
     )
-    assert "byggnad-nedladdning-vektor" not in client.searched
+    assert COLLECTION_BUILDINGS not in client.searched
     assert model["building"] is None
 
 

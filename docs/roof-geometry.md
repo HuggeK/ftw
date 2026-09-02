@@ -7,7 +7,7 @@ already flew a laser over it, so FTW can read the numbers instead.
 This is **optional, and Sweden-only by default** (any standard STAC catalog
 can stand in — see [Other countries, other catalogs](#other-countries-other-catalogs)).
 Everywhere else, and whenever anything below is missing, the numeric fields in
-**Settings → Weather → PV arrays** stay the way they work today.
+**Settings → Planner → PV arrays** stay the way they work today.
 
 ## What you need
 
@@ -20,9 +20,15 @@ so Lantmäteriet can see who is downloading, not to charge you.
 | [Byggnad Nedladdning, vektor](https://geotorget.lantmateriet.se/geodataprodukter/byggnad-nedladdning-vektor-api) | STAC → **GeoPackage** | Building footprints, so you can point at your house |
 | [Laserdata Nedladdning, Skog](https://geotorget.lantmateriet.se/geodataprodukter/laserdata-nedladdning-skog-api) | STAC → **LAZ as COPC** | The laser scan the roof planes are fitted to |
 
-Both are STAC APIs behind the same account, so one set of credentials covers
-both and FTW searches them the same way. They differ only in what the items
-point at, and FTW picks the right asset by its declared media type rather than
+Both sit behind the same account, so one set of credentials covers both and
+FTW searches them the same way. As verified against the live service
+(2026-09-02), they are **two separate STAC roots**: buildings are collection
+`byggnader` on `api.lantmateriet.se/stac-vektor/v1` — one item per
+municipality whose asset is a ZIP holding the GeoPackage — and Laserdata Skog
+is collection `dsm-skoglig-copc` on `api.lantmateriet.se/stac-hojd/v1`. Both
+searches take the STAC spec's WGS84 bbox, the catalogue metadata is readable
+anonymously, and the credentials are enforced where it matters — on the asset
+downloads. FTW picks the right asset by its declared media type rather than
 by its name — a catalogue that renames `data` to `punktmoln` keeps working.
 
 Authentication is **HTTP Basic with your Geotorget account username and
@@ -73,7 +79,7 @@ bbox, and an anonymous HEAD on a returned asset.
 
 | Catalog | LiDAR | Auth | Licence | Caveat |
 |---|---|---|---|---|
-| [Lantmäteriet](https://api.lantmateriet.se/stac) (default) | LAZ/COPC | HTTP Basic (Geotorget account) | CC BY 4.0 | Sweden; bbox in EPSG:3006 |
+| [Lantmäteriet](https://api.lantmateriet.se/stac-vektor/v1) (default; LiDAR on [stac-hojd](https://api.lantmateriet.se/stac-hojd/v1)) | buildings as zipped GeoPackage + LAZ/COPC | HTTP Basic (Geotorget account), enforced on downloads | CC BY 4.0 | Sweden; WGS84 bbox per the spec; end-to-end verified with a real account 2026-09-02 |
 | [IGN LiDAR HD via MTD](https://api.stac.teledetection.fr) (`lidarhd`) | COPC, served by IGN itself | none | etalab-2.0 | France; catalog is run by Université de Montpellier, not IGN, and IGN's download host rate-limits (~1 req/s) |
 | [KAGIS Carinthia](https://gis.ktn.gv.at/api/stac/v1/) (`KAGIS_coll_ALS2_pc_*`) | COPC | none | CC BY 4.0 | four Alpine regions only; ~700 MB tiles, so the COPC window path matters |
 | [swisstopo](https://data.geo.admin.ch/api/stac/v1) (`ch.swisstopo.swisssurface3d`) | LAS zipped as `.las.zip` | none | swisstopo open data terms | Switzerland; the zip wrapper is not yet unpacked by the module, so this one is search-verified but not derive-ready |
@@ -112,7 +118,7 @@ tile whole — slower, same answer. The result records which path ran as
 
 ## Using it
 
-1. Open **Settings → Weather**.
+1. Open **Settings → Planner**.
 2. Put the map marker on your building.
 3. Under **Roof geometry from Lantmäteriet**, tick **Enable roof derivation**,
    enter your Geotorget username and password, and **Save**.

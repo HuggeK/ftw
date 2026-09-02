@@ -16,6 +16,7 @@ import pytest
 from ftw_roofmodel import pipeline, sweref
 from ftw_roofmodel.buildings import BuildingLookupError, search_buildings
 from ftw_roofmodel.geotorget import (
+    COLLECTION_BUILDINGS,
     MEDIA_COPC,
     MEDIA_GEOJSON,
     MEDIA_GEOPACKAGE,
@@ -66,7 +67,7 @@ class FakeClient:
         self.downloaded: list[str] = []
 
     def search(self, collection, bbox, limit=20):
-        if collection == "byggnad-nedladdning-vektor":
+        if collection == COLLECTION_BUILDINGS:
             if self._building_asset is None:
                 return []
             return [StacItem("tile-b", collection, {"data": self._building_asset}, None,
@@ -102,6 +103,84 @@ def test_buildings_come_out_of_a_geopackage_asset():
     assert found[0].area_m2 == pytest.approx(144.0, rel=0.01)
     assert found[0].properties["andamal"] == "Bostad"
     assert client.downloaded == [url]
+
+
+def test_buildings_come_out_of_a_zipped_geopackage_asset():
+    """The live Lantmaeteriet shape: one item per municipality whose only
+    asset is byggnad_kn<code>.zip with the GeoPackage inside."""
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("byggnad_kn0180.gpkg", a_geopackage_of_two_buildings())
+        zf.writestr("licens.txt", "CC BY 4.0")
+    url = "https://dl1.lantmateriet.se/byggnadsverk/byggnad_kn0180.zip"
+    client = FakeClient(
+        building_asset=Asset(url, "application/zip"),
+        payloads={url: buf.getvalue()},
+    )
+    found = search_buildings(client, latitude=STOCKHOLM[0], longitude=STOCKHOLM[1])
+
+    assert [b.building_id for b in found] == ["house-1", "shed-1"]
+    assert client.downloaded == [url]
+
+
+def test_a_tile_asset_wins_over_the_tile_outline():
+    """The live municipality items carry their own geometry — the TILE's
+    outline, not a building. With a data asset present, the asset must be
+    read and the outline ignored; treating the outline as a building both
+    invented a giant footprint and skipped the 90k real ones (found live:
+    'found=0' with no error, because the outline failed the area filter)."""
+    url = "https://dl1.lantmateriet.se/byggnadsverk/byggnad_kn0180.zip"
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("byggnad_kn0180.gpkg", a_geopackage_of_two_buildings())
+    kommun_outline = {
+        "type": "Polygon",
+        "coordinates": [[[E - 20000, N - 20000], [E + 20000, N - 20000],
+                         [E + 20000, N + 20000], [E - 20000, N + 20000],
+                         [E - 20000, N - 20000]]],
+    }
+
+    class TileClient(FakeClient):
+        def search(self, collection, bbox, limit=20):
+            return [StacItem("0180", collection, {"data": Asset(url, "application/zip")},
+                             None, raw={"id": "0180", "geometry": kommun_outline})]
+
+    client = TileClient(payloads={url: buf.getvalue()})
+    found = search_buildings(client, latitude=STOCKHOLM[0], longitude=STOCKHOLM[1])
+
+    assert [b.building_id for b in found] == ["house-1", "shed-1"]
+    assert client.downloaded == [url]
+
+
+def test_a_municipality_tile_is_filtered_to_the_search_window():
+    """One GeoPackage covers a whole municipality — Stockholm's has 90k+
+    buildings — so rows outside the search window must be dropped, or the
+    reader's row limit truncates the table before it reaches the site.
+
+    Both drop paths matter: a stored header envelope skips the row before
+    its WKB is decoded, and the live Lantmaeteriet files write NO envelopes
+    (flags 0x00), where the parsed geometry's own bounds must do it."""
+    far_e, far_n = E + 5000, N + 5000
+    gpkg = build_gpkg([
+        # Near the site, no envelope: kept via its parsed bounds.
+        ("near-1", "Bostad", gpkg_blob(wkb_polygon(square(E - 6, N - 3, 12, 12)))),
+        # Far away with an envelope: dropped before the WKB is decoded.
+        ("far-1", "Bostad", gpkg_blob(wkb_polygon(square(far_e, far_n, 12, 12)),
+                                      envelope=(far_e, far_e + 12, far_n, far_n + 12))),
+        # Far away without an envelope: dropped via its parsed bounds.
+        ("far-2", "Bostad", gpkg_blob(wkb_polygon(square(far_e, far_n - 60, 12, 12)))),
+    ])
+    url = "https://api.lantmateriet.se/x/byggnad_kn0180.gpkg"
+    client = FakeClient(building_asset=Asset(url, MEDIA_GEOPACKAGE), payloads={url: gpkg})
+    found = search_buildings(client, latitude=STOCKHOLM[0], longitude=STOCKHOLM[1])
+
+    assert [b.building_id for b in found] == ["near-1"]
 
 
 def test_buildings_come_out_of_a_geojson_asset_too():

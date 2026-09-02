@@ -191,7 +191,7 @@ def derive(
     base_url: str = geotorget.DEFAULT_BASE_URL,
     buildings_collection: str = COLLECTION_BUILDINGS,
     lidar_collection: str = COLLECTION_LIDAR,
-    bbox_epsg: int = 3006,
+    bbox_epsg: int = 4326,
 ) -> dict[str, Any]:
     """Derive a roof model for one site and return it as a JSON-ready dict.
 
@@ -204,8 +204,18 @@ def derive(
     catalog can stand in (see geotorget.py), as long as its data arrives in
     SWEREF 99 TM -- the segmentation works in that frame.
     """
+    # Lantmaeteriet splits its STAC service per product family: buildings live
+    # on the vector root, the point clouds on the elevation root. An injected
+    # client (tests, the demo) serves both; so does a custom single-root
+    # catalog. Only the Lantmaeteriet default needs the second client.
+    lidar_client = client
     if client is None:
         client = GeotorgetClient(credentials, base_url=base_url)
+        lidar_client = client
+        if base_url == geotorget.DEFAULT_BASE_URL:
+            lidar_client = GeotorgetClient(
+                credentials, base_url=geotorget.DEFAULT_LIDAR_BASE_URL
+            )
 
     chosen: Building | None = None
     if building_id:
@@ -223,7 +233,7 @@ def derive(
     bbox = sweref.stac_search_bbox(latitude, longitude, radius_m, bbox_epsg)
 
     try:
-        lidar_items: list[StacItem] = client.search(lidar_collection, bbox)
+        lidar_items: list[StacItem] = lidar_client.search(lidar_collection, bbox)
     except GeotorgetError:
         raise
     if not lidar_items:
@@ -233,7 +243,7 @@ def derive(
             f"collection {lidar_collection!r}{hint}"
         )
 
-    points, fetch = _read_lidar(client, lidar_items, chosen)
+    points, fetch = _read_lidar(lidar_client, lidar_items, chosen)
     if points is None or len(points) == 0:
         raise RoofModelError("LiDAR tiles carried no readable point data")
 

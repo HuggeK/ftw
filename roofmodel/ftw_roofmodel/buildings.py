@@ -22,8 +22,9 @@ the derived face is then identical to segmenting that building in isolation.
 
 Coordinate frames
 -----------------
-GeoJSON mandates WGS84, but Lantmaeteriet publishes this catalogue in
-SWEREF 99 TM (EPSG:3006) and its STAC search takes a SWEREF bbox. Rather than
+GeoJSON mandates WGS84, and the live Lantmaeteriet STAC search takes a WGS84
+bbox per the spec -- but the GeoPackages it hands out store their rings in
+SWEREF 99 TM (EPSG:3006), and another catalogue may do either. Rather than
 guess which one a given deployment returns, the frame is detected from the
 magnitude of the numbers -- SWEREF eastings and northings are six and seven
 figures, WGS84 degrees never are.
@@ -41,6 +42,7 @@ from .geotorget import (
     COLLECTION_BUILDINGS,
     MEDIA_GEOJSON,
     MEDIA_GEOPACKAGE,
+    MEDIA_ZIP,
     GeotorgetClient,
     GeotorgetError,
     StacItem,
@@ -213,29 +215,66 @@ def _to_sweref(ring: list[tuple[float, float]]) -> list[tuple[float, float]]:
     ]
 
 
-def _features_from_item(item: StacItem, client: GeotorgetClient | None = None) -> list[dict[str, Any]]:
+def _gpkg_from_zip(payload: bytes) -> bytes:
+    """The GeoPackage inside a ZIP asset.
+
+    Lantmaeteriet's live `byggnader` collection carries one item per
+    municipality whose only asset is `byggnad_kn<code>.zip` with the
+    GeoPackage inside. The largest `.gpkg` member wins if there are several;
+    anything else in the archive (metadata PDFs, licence texts) is ignored.
+    """
+    import io
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+            members = [i for i in zf.infolist() if i.filename.lower().endswith(".gpkg")]
+            if not members:
+                raise BuildingLookupError(
+                    "the building tile ZIP holds no GeoPackage"
+                )
+            member = max(members, key=lambda i: i.file_size)
+            return zf.read(member)
+    except zipfile.BadZipFile as exc:
+        raise BuildingLookupError(
+            f"the building tile was announced as ZIP but did not open: {exc}"
+        ) from exc
+
+
+def _features_from_item(
+    item: StacItem,
+    client: GeotorgetClient | None = None,
+    window_boxes: list[tuple[float, float, float, float]] | None = None,
+) -> list[dict[str, Any]]:
     """Every building-like feature an item carries.
 
     A STAC item may *be* the building -- geometry inline, no download -- or it
-    may be a tile whose asset holds thousands of them. Lantmaeteriet publishes
-    *Byggnad Nedladdning, vektor* as **GeoPackage**, so the asset path is the
-    normal one and the inline path is the exception.
+    may be a tile whose asset holds thousands of them. Lantmaeteriet's live
+    catalogue publishes `byggnader` as one zipped **GeoPackage** per
+    municipality, so the asset path is the normal one and the inline path the
+    exception — and `window_boxes` (the search window, in each frame the file
+    could be in) keeps a whole city from being decoded for a 150 m search.
     """
-    geom = (item.raw or {}).get("geometry")
-    if geom:
-        return [{"geometry": geom, "properties": (item.raw or {}).get("properties") or {},
-                 "id": item.item_id}]
-    if client is None:
-        return []
-    asset = item.pick(MEDIA_GEOPACKAGE, MEDIA_GEOJSON)
-    if asset is None or not asset.href:
+    # A usable data asset wins over the item's own geometry: a tile item's
+    # geometry is the TILE's outline — for Lantmaeteriet, the whole
+    # municipality — and reading it as a building both invents a footprint
+    # nobody has and skips the real ones in the asset. Inline geometry is the
+    # fallback for catalogues whose items *are* the buildings.
+    asset = item.pick(MEDIA_GEOPACKAGE, MEDIA_ZIP, MEDIA_GEOJSON)
+    if asset is None or not asset.href or client is None:
+        geom = (item.raw or {}).get("geometry")
+        if geom:
+            return [{"geometry": geom, "properties": (item.raw or {}).get("properties") or {},
+                     "id": item.item_id}]
         return []
     media = asset.effective_media_type
     payload = client.download(asset.href)
     if media == MEDIA_GEOJSON:
         return _features_from_geojson(payload)
+    if payload[:4] == b"PK\x03\x04":
+        payload = _gpkg_from_zip(payload)
     try:
-        return read_features(payload)
+        return read_features(payload, bboxes=window_boxes)
     except GeoPackageError as exc:
         raise BuildingLookupError(
             f"the building tile for this site could not be read: {exc}"
@@ -299,14 +338,24 @@ def search_buildings(
     radius_m: float = DEFAULT_SEARCH_RADIUS_M,
     limit: int = 50,
     collection: str = COLLECTION_BUILDINGS,
-    bbox_epsg: int = 3006,
+    bbox_epsg: int = 4326,
 ) -> list[Building]:
     """Building footprints near a site, nearest first."""
     bbox = sweref.stac_search_bbox(latitude, longitude, radius_m, bbox_epsg)
+    # The same window in every frame and axis order a tile could be stored
+    # in. Coordinate magnitude keeps the frames apart (degrees never look
+    # like metres), and carrying both axis orders costs nothing but a few
+    # extra decoded rows — a box only ever widens what is kept.
+    def swapped(b):
+        return (b[1], b[0], b[3], b[2])
+
+    wgs = sweref.stac_search_bbox(latitude, longitude, radius_m, 4326)
+    swe = sweref.stac_search_bbox(latitude, longitude, radius_m, 3006)
+    window_boxes = [wgs, swapped(wgs), swe, swapped(swe)]
     items = client.search(collection, bbox, limit=limit)
     features: list[dict[str, Any]] = []
     for item in items:
-        features.extend(_features_from_item(item, client))
+        features.extend(_features_from_item(item, client, window_boxes))
     if not features:
         raise BuildingLookupError(
             "no building footprints were returned for this site. The Geotorget "
