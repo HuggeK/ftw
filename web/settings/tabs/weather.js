@@ -308,7 +308,8 @@
         'access to "Byggnad Nedladdning, vektor" and "Laserdata Nedladdning, Skog" — ' +
         'sign in with the account\'s own username and password (Lantmäteriet offers no ' +
         'OAuth for these APIs). Other countries\' STAC catalogs can be configured in ' +
-        'the config file via roofmodel.stac_base_url.') +
+        'the config file via roofmodel.stac_base_url — open catalogs need no ' +
+        'credentials, so both fields stay empty.') +
       '</legend>' +
       '<label><input type="checkbox" data-checkbox-path="roofmodel.enabled"' +
       (config.roofmodel.enabled ? " checked" : "") + '> Enable roof derivation</label>' +

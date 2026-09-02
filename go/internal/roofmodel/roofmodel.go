@@ -226,7 +226,10 @@ func (s *Service) run(ctx context.Context, lat, lon float64, mode, buildingID st
 	if s.cfg.StacBaseURL == "" && !coverage.Covers("lantmateriet", lat, lon) {
 		return nil, fmt.Errorf("%w: (%.4f, %.4f) is not in Sweden", ErrOutsideCoverage, lat, lon)
 	}
-	if s.cfg.StacUser() == "" || s.cfg.StacPass() == "" {
+	// Lantmäteriet always needs the operator's own Geotorget credentials. A
+	// custom catalog may be open — many national STAC catalogs are — so with a
+	// base URL set, absent credentials mean anonymous access, not a mistake.
+	if s.cfg.StacBaseURL == "" && (s.cfg.StacUser() == "" || s.cfg.StacPass() == "") {
 		return nil, ErrNoCredentials
 	}
 
@@ -238,13 +241,17 @@ func (s *Service) run(ctx context.Context, lat, lon float64, mode, buildingID st
 		"--mode", mode,
 		"--lat", fmt.Sprintf("%.6f", lat),
 		"--lon", fmt.Sprintf("%.6f", lon),
-		"--username", s.cfg.StacUser(),
-		"--password", s.cfg.StacPass(),
 		"--radius-m", fmt.Sprintf("%.1f", s.radius()),
 		"--packing-factor", fmt.Sprintf("%.3f", s.packingFactor()),
 	}
 	if buildingID != "" {
 		args = append(args, "--building-id", buildingID)
+	}
+	if u := s.cfg.StacUser(); u != "" {
+		args = append(args, "--username", u)
+	}
+	if p := s.cfg.StacPass(); p != "" {
+		args = append(args, "--password", p)
 	}
 	// A custom catalog replaces the Lantmäteriet defaults piecewise; anything
 	// left empty falls back to the module's own Geotorget defaults.

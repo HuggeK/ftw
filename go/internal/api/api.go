@@ -2545,8 +2545,10 @@ func roofModelErrorStatus(err error) int {
 	return 502
 }
 
-// roofModelHasCredentials reports whether STAC catalog credentials are
-// stored, without revealing them.
+// roofModelHasCredentials reports whether the configured STAC catalog can be
+// asked, without revealing any secret: credentials are stored, or a custom
+// catalog is configured — open catalogs need none, and the module goes
+// anonymous. The default Lantmäteriet catalog always needs credentials.
 func (s *Server) roofModelHasCredentials() bool {
 	if s.deps.CfgMu == nil {
 		return false
@@ -2557,6 +2559,9 @@ func (s *Server) roofModelHasCredentials() bool {
 		return false
 	}
 	rm := s.deps.Cfg.RoofModel
+	if rm.StacBaseURL != "" {
+		return true
+	}
 	return rm.StacUser() != "" && rm.StacPass() != ""
 }
 

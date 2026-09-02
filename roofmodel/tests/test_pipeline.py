@@ -79,6 +79,34 @@ def test_missing_credentials_are_rejected_before_any_request():
     assert session.posts == [], "must not contact Geotorget without credentials"
 
 
+def test_open_catalog_needs_no_credentials():
+    session = FakeSession(search={"features": []})
+    client = GeotorgetClient(
+        Credentials("", ""), session=session, base_url="https://stac.example.org"
+    )
+    client.search(COLLECTION_LIDAR, (0, 0, 1, 1))
+    assert session.posts, "anonymous search must reach an open catalog"
+
+
+def test_open_catalog_still_refuses_half_a_credential():
+    for creds in (Credentials("u", ""), Credentials("", "p")):
+        with pytest.raises(MissingCredentials):
+            GeotorgetClient(
+                creds, session=FakeSession(), base_url="https://stac.example.org"
+            )
+
+
+def test_anonymous_rejection_says_to_configure_credentials():
+    client = GeotorgetClient(
+        Credentials("", ""),
+        session=FakeSession(status=401),
+        base_url="https://stac.example.org",
+    )
+    with pytest.raises(MissingCredentials) as exc:
+        client.search(COLLECTION_LIDAR, (0, 0, 1, 1))
+    assert "stac_username" in str(exc.value)
+
+
 def test_rejected_credentials_say_what_to_check():
     client = GeotorgetClient(CREDS, session=FakeSession(status=403))
     with pytest.raises(MissingCredentials) as exc:

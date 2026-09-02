@@ -12,4 +12,6 @@ The STAC client is catalog-agnostic while it is at it: `stac_base_url`,
 `stac_buildings_collection`, `stac_lidar_collection` and `stac_bbox_epsg`
 point FTW at any STAC-conformant catalog (search is the spec's
 `POST {base}/search`), with Lantmäteriet as the default. A custom catalog also
-lifts the Sweden-only coordinate gate.
+lifts the Sweden-only coordinate gate, and needs no credentials at all when it
+is open — anonymous access is only refused for the default Lantmäteriet
+catalog, which always requires the operator's own account.
