@@ -302,7 +302,7 @@
   // brings their own credentials. Everything degrades to the numeric fields
   // above when the module, the credentials or the coverage is missing.
 
-  var roofState = { features: [], selectedId: null };
+  var roofState = { features: [], selectedId: null, drawnFootprint: null };
 
   // Known point-cloud catalogs, verified live 2026-09-02. `base: ""` means
   // the module's built-in Lantmäteriet defaults; `base: null` marks the
@@ -567,6 +567,9 @@
 
   function selectBuilding(id) {
     roofState.selectedId = id;
+    // A picked building and a drawn footprint answer the same question;
+    // the newest answer wins.
+    roofState.drawnFootprint = null;
     drawBuildings();
     var list = document.getElementById("roof-buildings");
     if (list) {
@@ -604,12 +607,24 @@
   }
 
   function deriveRoof(ctx) {
-    if (!roofState.selectedId) return;
+    if (!roofState.selectedId && !roofState.drawnFootprint) return;
     roofSay("Reading the laser scan and fitting roof planes… this can take a minute.");
+    // Send the same coordinates the building search used — the live form
+    // state, saved or not. Deriving against the stored site while the pin
+    // has moved makes the picked id "not found near this site".
+    var w = (ctx.config && ctx.config.weather) || {};
+    var payload = {};
+    if (roofState.selectedId) payload.building_id = roofState.selectedId;
+    else payload.footprint = roofState.drawnFootprint;
+    var lat = parseFloat(w.latitude), lon = parseFloat(w.longitude);
+    if (isFinite(lat) && isFinite(lon)) {
+      payload.latitude = lat;
+      payload.longitude = lon;
+    }
     fetch("/api/roofmodel/derive", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ building_id: roofState.selectedId }),
+      body: JSON.stringify(payload),
     })
       .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
       .then(function (res) {
@@ -708,7 +723,7 @@
         renderPVArrays(ctx);
         refreshArraysSummary(ctx.config);
       });
-      roofState = { features: [], selectedId: null };
+      roofState = { features: [], selectedId: null, drawnFootprint: null };
       var catalogSel = document.getElementById("roof-catalog");
       if (catalogSel) catalogSel.addEventListener("change", function () {
         var chosen = null;

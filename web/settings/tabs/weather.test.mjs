@@ -146,4 +146,13 @@ describe("roof buildings on the map", () => {
   it("retries the draw once the style has loaded", () => {
     assert.match(source, /map\.once\("load", drawBuildings\)/);
   });
+
+  it("derives at the same coordinates the picker searched", () => {
+    // Both requests read the live form state; deriving against the stored
+    // site while the pin has moved makes the picked building "not found
+    // near this site".
+    assert.match(source, /payload\.latitude = lat/);
+    assert.match(source, /payload\.longitude = lon/);
+    assert.match(source, /body: JSON\.stringify\(payload\)/);
+  });
 });

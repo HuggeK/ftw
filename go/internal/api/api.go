@@ -2471,22 +2471,37 @@ func (s *Server) handleRoofModelDerive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	lat, lon, haveSite := s.siteLocation()
-	if !haveSite {
-		writeJSON(w, 400, map[string]any{"error": "site latitude/longitude is not configured"})
-		return
-	}
 	// Optional: which footprint to clip the LiDAR to. An absent or empty body
-	// keeps the old behaviour of segmenting the whole search radius.
+	// keeps the old behaviour of segmenting the whole search radius. The
+	// coordinates mirror the buildings endpoint: the map lets you drag the
+	// pin before saving, and the derive must search where the picker
+	// searched, or the picked id is "not found near this site".
 	var body struct {
-		BuildingID string `json:"building_id"`
+		BuildingID string      `json:"building_id"`
+		Latitude   *float64    `json:"latitude"`
+		Longitude  *float64    `json:"longitude"`
+		Footprint  [][]float64 `json:"footprint"`
 	}
 	if r.Body != nil {
 		_ = json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body)
 	}
+	if body.Latitude != nil && body.Longitude != nil {
+		lat, lon, haveSite = *body.Latitude, *body.Longitude, true
+	}
+	if !haveSite {
+		writeJSON(w, 400, map[string]any{"error": "site latitude/longitude is not configured"})
+		return
+	}
+	// A hand-drawn footprint replaces the picked building where the catalog
+	// has no building dataset. Shape errors are the operator's to fix.
+	if n := len(body.Footprint); n > 0 && n < 3 {
+		writeJSON(w, 400, map[string]any{"error": "a drawn footprint needs at least three [lon, lat] corners"})
+		return
+	}
 
 	// A derive downloads and segments LiDAR tiles; the service time-boxes it,
 	// but the request should also die with the client rather than outliving it.
-	model, err := s.deps.RoofModel.Derive(r.Context(), lat, lon, body.BuildingID)
+	model, err := s.deps.RoofModel.Derive(r.Context(), lat, lon, body.BuildingID, body.Footprint)
 	if err != nil {
 		writeJSON(w, roofModelErrorStatus(err), map[string]any{"error": err.Error()})
 		return

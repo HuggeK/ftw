@@ -20,7 +20,9 @@ from typing import Any
 from . import geotorget, pointcloud, sweref
 from .buildings import (
     DEFAULT_EAVES_BUFFER_M,
+    DEFAULT_SEARCH_RADIUS_M,
     Building,
+    building_from_drawn_footprint,
     clip_to_footprint,
     search_buildings,
 )
@@ -187,6 +189,7 @@ def derive(
     packing_factor: float = DEFAULT_PACKING_FACTOR,
     module_w_per_m2: float = DEFAULT_MODULE_W_PER_M2,
     building_id: str | None = None,
+    footprint: list[Any] | None = None,
     now: dt.datetime | None = None,
     base_url: str = geotorget.DEFAULT_BASE_URL,
     buildings_collection: str = COLLECTION_BUILDINGS,
@@ -196,9 +199,12 @@ def derive(
     """Derive a roof model for one site and return it as a JSON-ready dict.
 
     Pass `building_id` -- one the operator picked from `search_buildings` -- to
-    clip the LiDAR to that footprint before segmenting. Without it the whole
-    radius is segmented, which will happily return the neighbour's roof and lets
-    coplanar buildings steal each other's points; see buildings.py.
+    clip the LiDAR to that footprint before segmenting, or `footprint` -- a
+    hand-drawn [lon, lat] ring -- where the catalog publishes no building
+    dataset to pick from. A drawn footprint wins over a building id. Without
+    either the whole radius is segmented, which will happily return the
+    neighbour's roof and lets coplanar buildings steal each other's points;
+    see buildings.py.
 
     The catalog parameters default to Lantmaeteriet; any STAC-conformant
     catalog can stand in (see geotorget.py), as long as its data arrives in
@@ -218,9 +224,16 @@ def derive(
             )
 
     chosen: Building | None = None
-    if building_id:
+    if footprint:
+        chosen = building_from_drawn_footprint(footprint)
+    elif building_id:
+        # Re-find the picked footprint with the same reach the picker's own
+        # search had. `radius_m` is the LiDAR/segmentation radius (tens of
+        # metres); a building the operator picked from the 150 m search would
+        # vanish here if it alone bounded the re-search.
         candidates = search_buildings(
-            client, latitude=latitude, longitude=longitude, radius_m=radius_m,
+            client, latitude=latitude, longitude=longitude,
+            radius_m=max(radius_m, DEFAULT_SEARCH_RADIUS_M),
             collection=buildings_collection, bbox_epsg=bbox_epsg,
         )
         chosen = next((b for b in candidates if b.building_id == building_id), None)
@@ -230,7 +243,13 @@ def derive(
                 "have been picked against a different coordinate"
             )
 
-    bbox = sweref.stac_search_bbox(latitude, longitude, radius_m, bbox_epsg)
+    # The LiDAR lookup centres on the roof being derived: for a picked
+    # building that is its centroid, not the site pin — a barn at the edge of
+    # the search radius must find *its* tile, not the pin's.
+    lidar_lat, lidar_lon = latitude, longitude
+    if chosen is not None:
+        lidar_lat, lidar_lon = chosen.centroid_wgs84()
+    bbox = sweref.stac_search_bbox(lidar_lat, lidar_lon, radius_m, bbox_epsg)
 
     try:
         lidar_items: list[StacItem] = lidar_client.search(lidar_collection, bbox)
@@ -239,7 +258,7 @@ def derive(
     if not lidar_items:
         hint = "; Lantmaeteriet data is Sweden only" if lidar_collection == COLLECTION_LIDAR else ""
         raise RoofModelError(
-            f"no LiDAR tiles cover ({latitude:.5f}, {longitude:.5f}) in "
+            f"no LiDAR tiles cover ({lidar_lat:.5f}, {lidar_lon:.5f}) in "
             f"collection {lidar_collection!r}{hint}"
         )
 

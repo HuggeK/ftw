@@ -129,6 +129,45 @@ def _looks_like_sweref(ring: Iterable[Iterable[float]]) -> bool:
     return False
 
 
+def building_from_drawn_footprint(points: list[Any]) -> Building:
+    """A hand-drawn outline as a Building, for catalogs with no footprints.
+
+    `points` are GeoJSON-style [lon, lat] pairs traced on the map. The
+    operator's drawing stands in for the picker where no building dataset is
+    published (IGN's LiDAR HD, for instance, ships point clouds but no
+    footprints). The ring is projected to the pipeline's working frame; where
+    the point cloud arrives in another projection the clip fails loudly with
+    "no returns fall on the footprint" rather than clipping the wrong spot.
+    """
+    ring: list[tuple[float, float]] = []
+    for pt in points or []:
+        seq = list(pt)
+        if len(seq) < 2:
+            continue
+        lon, lat = float(seq[0]), float(seq[1])
+        n, e = sweref.wgs84_to_sweref99tm(lat, lon)
+        ring.append((e, n))
+    if len(ring) >= 2 and ring[0] == ring[-1]:
+        ring.pop()
+    if len(ring) < 3:
+        raise BuildingLookupError(
+            "a drawn footprint needs at least three corners"
+        )
+    area = _shoelace_area(ring)
+    if area < MIN_FOOTPRINT_AREA_M2:
+        raise BuildingLookupError(
+            f"the drawn footprint encloses {area:.1f} m2, too small to hold a "
+            "roof; draw the building's outline, not a point"
+        )
+    return Building(
+        building_id="drawn-footprint",
+        ring_sweref=ring,
+        area_m2=area,
+        distance_m=0.0,
+        properties={"source": "drawn"},
+    )
+
+
 def _shoelace_area(ring: list[tuple[float, float]]) -> float:
     """Planar polygon area in square metres. Ring must be projected."""
     n = len(ring)

@@ -38,6 +38,13 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="footprint to clip the LiDAR to, from a --mode buildings run",
     )
+    p.add_argument(
+        "--footprint-json",
+        default="",
+        help="hand-drawn footprint to clip the LiDAR to, as a JSON array of "
+        "[lon, lat] pairs — for catalogs that publish no building dataset. "
+        "Wins over --building-id.",
+    )
     p.add_argument("--search-radius-m", type=float, default=DEFAULT_SEARCH_RADIUS_M)
     p.add_argument("--username", default="", help="STAC catalog username (Geotorget account)")
     p.add_argument(
@@ -93,6 +100,15 @@ def main(argv: list[str] | None = None) -> int:
                 "buildings": [b.to_geojson() for b in found],
             }
         else:
+            footprint = None
+            if args.footprint_json:
+                try:
+                    footprint = json.loads(args.footprint_json)
+                except ValueError as exc:
+                    json.dump({"error": f"--footprint-json is not valid JSON: {exc}",
+                               "kind": "ValueError"}, sys.stderr)
+                    sys.stderr.write("\n")
+                    return 1
             payload = derive(
                 latitude=args.lat,
                 longitude=args.lon,
@@ -101,6 +117,7 @@ def main(argv: list[str] | None = None) -> int:
                 packing_factor=args.packing_factor,
                 module_w_per_m2=args.module_w_per_m2,
                 building_id=args.building_id or None,
+                footprint=footprint,
                 base_url=args.stac_base_url,
                 buildings_collection=args.buildings_collection,
                 lidar_collection=args.lidar_collection,

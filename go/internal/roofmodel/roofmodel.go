@@ -203,7 +203,7 @@ func packingFactorFrom(cfg *config.RoofModel) float64 {
 // so a second building sharing the ridge orientation lands inside the first
 // one's inlier band however far away it is and steals its returns.
 func (s *Service) Buildings(ctx context.Context, lat, lon float64) (*BuildingList, error) {
-	out, err := s.run(ctx, lat, lon, "buildings", "")
+	out, err := s.run(ctx, lat, lon, "buildings", "", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -223,12 +223,15 @@ func (s *Service) Buildings(ctx context.Context, lat, lon float64) (*BuildingLis
 // buildingID is optional; pass one from Buildings to clip the LiDAR to that
 // footprint before segmenting, which is what makes the derived tilt and azimuth
 // belong to the operator's own roof rather than to whatever else stood in range.
+// footprint is the hand-drawn alternative — a [lon, lat] ring traced on the
+// map, for catalogs that publish no building dataset to pick from. It wins
+// over buildingID.
 //
 // Coverage and credentials are checked before spawning anything: a site outside
 // Sweden can never succeed, and a missing credential fails the same way every
 // time, so neither is worth an interpreter start and a network round trip.
-func (s *Service) Derive(ctx context.Context, lat, lon float64, buildingID string) (*Model, error) {
-	out, err := s.run(ctx, lat, lon, "derive", buildingID)
+func (s *Service) Derive(ctx context.Context, lat, lon float64, buildingID string, footprint [][]float64) (*Model, error) {
+	out, err := s.run(ctx, lat, lon, "derive", buildingID, footprint)
 	if err != nil {
 		return nil, err
 	}
@@ -246,7 +249,7 @@ func (s *Service) Derive(ctx context.Context, lat, lon float64, buildingID strin
 }
 
 // run spawns the module and returns its stdout.
-func (s *Service) run(ctx context.Context, lat, lon float64, mode, buildingID string) ([]byte, error) {
+func (s *Service) run(ctx context.Context, lat, lon float64, mode, buildingID string, footprint [][]float64) ([]byte, error) {
 	cfg := s.config()
 	if cfg == nil || !cfg.Enabled {
 		return nil, ErrDisabled
@@ -277,6 +280,11 @@ func (s *Service) run(ctx context.Context, lat, lon float64, mode, buildingID st
 	}
 	if buildingID != "" {
 		args = append(args, "--building-id", buildingID)
+	}
+	if len(footprint) > 0 {
+		// Marshalling [][]float64 cannot fail; the module validates the shape.
+		fp, _ := json.Marshal(footprint)
+		args = append(args, "--footprint-json", string(fp))
 	}
 	if u := cfg.StacUser(); u != "" {
 		args = append(args, "--username", u)
