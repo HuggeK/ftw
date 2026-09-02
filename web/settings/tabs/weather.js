@@ -1,13 +1,15 @@
-// Settings → Weather tab: forecast provider + location + PV arrays.
-// Owns its own MapLibre loader + PV-array editor + 3D preview loader
-// so the Settings shell stays weather-agnostic.
+// Forecast-input sections of the Settings → Control tab: forecast
+// provider + location + PV arrays. Registered as S.tabs.weather but
+// rendered inside the Control tab (control.js delegates here); there is
+// no Weather tab button. Owns its own MapLibre loader + PV-array editor
+// + 3D preview loader so the Settings shell stays weather-agnostic.
 (function () {
   var S = (window.FTWSettings = window.FTWSettings || { tabs: {} });
   S.tabs = S.tabs || {};
 
   // MapLibre GL JS (BSD-3), vendored under /vendor/maplibre and loaded on
   // demand exactly the way this tab already lazy-loads its other heavy
-  // optional dependency — the picker is ~1 MB and only the Weather tab needs
+  // optional dependency — the picker is ~1 MB and only these sections need
   // it. Shipping it on the box follows the same policy as /vendor/three and
   // the Leaflet copy this replaced: no third-party JS from a CDN, and the map
   // must load when the gateway cannot reach the internet.
