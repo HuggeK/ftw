@@ -297,26 +297,80 @@
 
   var roofState = { features: [], selectedId: null };
 
+  // Known point-cloud catalogs, verified live 2026-09-02. `base: ""` means
+  // the module's built-in Lantmäteriet defaults; `base: null` marks the
+  // custom entry, which leaves whatever the operator typed alone.
+  var STAC_CATALOGS = [
+    { key: "lantmateriet", label: "Lantmäteriet (Sweden — Geotorget account)",
+      base: "", buildings: "", lidar: "" },
+    { key: "ign-france", label: "IGN LiDAR HD (France — open, no account)",
+      base: "https://api.stac.teledetection.fr", buildings: "", lidar: "lidarhd" },
+    { key: "kagis", label: "KAGIS ALS (Austria/Carinthia — open, no account)",
+      base: "https://gis.ktn.gv.at/api/stac/v1", buildings: "", lidar: "" },
+    { key: "custom", label: "Custom STAC endpoint…", base: null },
+  ];
+
+  // Set when the operator picks "Custom" while the base URL is still empty,
+  // so the re-render doesn't snap the select back to Lantmäteriet before
+  // they had a chance to type the root.
+  var roofCustomCatalog = false;
+
+  function catalogPresetKey(rm) {
+    var base = String(rm.stac_base_url || "").replace(/\/+$/, "");
+    if (!base) return roofCustomCatalog ? "custom" : "lantmateriet";
+    for (var i = 0; i < STAC_CATALOGS.length; i++) {
+      var c = STAC_CATALOGS[i];
+      if (c.base && c.base.replace(/\/+$/, "") === base) return c.key;
+    }
+    return "custom";
+  }
+
   function roofFieldset(ctx) {
     var field = ctx.field, help = ctx.help, config = ctx.config;
     if (!config.roofmodel) config.roofmodel = {};
     var stored = config.roofmodel.has_stac_password;
-    return '<fieldset><legend>Roof geometry from Lantmäteriet ' + help(
-        'Optional. Reads the tilt and azimuth of each roof face from ' +
-        'Lantmäteriet\'s laser scanning data (Laserdata Skog) for a building you pick on ' +
-        'the map, and fills in the PV arrays above. Needs a free Geotorget account with ' +
-        'access to "Byggnad Nedladdning, vektor" and "Laserdata Nedladdning, Skog" — ' +
-        'sign in with the account\'s own username and password (Lantmäteriet offers no ' +
-        'OAuth for these APIs). Other countries\' STAC catalogs can be configured in ' +
-        'the config file via roofmodel.stac_base_url — open catalogs need no ' +
-        'credentials, so both fields stay empty.') +
+    var preset = catalogPresetKey(config.roofmodel);
+    var isDefault = preset === "lantmateriet";
+    var options = STAC_CATALOGS.map(function (c) {
+      return '<option value="' + c.key + '"' + (c.key === preset ? " selected" : "") + '>' +
+        ctx.escHtml(c.label) + '</option>';
+    }).join("");
+    return '<fieldset><legend>Roof geometry from LiDAR ' + help(
+        'Optional. Reads the tilt and azimuth of each roof face out of a ' +
+        'LiDAR point cloud for a building you pick on the map, and fills in ' +
+        'the PV arrays above. The default catalog is Lantmäteriet (Sweden), ' +
+        'which needs a free Geotorget account — sign in with the account\'s ' +
+        'own username and password. The open catalogs need no account, and ' +
+        'any STAC-conformant endpoint can be entered as a custom catalog.') +
       '</legend>' +
       '<label><input type="checkbox" data-checkbox-path="roofmodel.enabled"' +
       (config.roofmodel.enabled ? " checked" : "") + '> Enable roof derivation</label>' +
+      '<label>Data catalog ' + help(
+        'Where the building footprints and the point cloud come from. ' +
+        'Lantmäteriet covers all of Sweden (buildings + LiDAR). IGN LiDAR HD ' +
+        'covers France with open COPC point clouds but publishes no building ' +
+        'footprints, so the building picker cannot narrow the derive there. ' +
+        'KAGIS covers Carinthia (Austria): pick the ALS2 point-cloud ' +
+        'collection for your zone as the LiDAR collection — mind that its ' +
+        'tiles run to hundreds of MB. For anything else, choose Custom and ' +
+        'paste the STAC API root; open catalogs need no credentials.') + '</label>' +
+      '<select id="roof-catalog">' + options + '</select>' +
+      '<div id="roof-catalog-fields" style="display:' + (isDefault ? "none" : "block") + '">' +
+      field("STAC API root", "roofmodel.stac_base_url", "text", "") +
       '<div class="field-row"><div>' +
-      field("Geotorget username", "roofmodel.stac_username", "text", "") +
+      field("Buildings collection", "roofmodel.stac_buildings_collection", "text", "",
+        "STAC collection id for building footprints. Leave empty if the catalog has none — the derive then reads the whole search radius.") +
       '</div><div>' +
-      field(stored ? "Geotorget password (stored — type to replace)" : "Geotorget password",
+      field("LiDAR collection", "roofmodel.stac_lidar_collection", "text", "",
+        "STAC collection id for the point cloud.") +
+      '</div></div>' +
+      '</div>' +
+      '<div class="field-row"><div>' +
+      field(isDefault ? "Geotorget username" : "Catalog username (empty for open catalogs)",
+            "roofmodel.stac_username", "text", "") +
+      '</div><div>' +
+      field((isDefault ? "Geotorget password" : "Catalog password") +
+            (stored ? " (stored — type to replace)" : ""),
             "roofmodel.stac_password", "password", "") +
       '</div></div>' +
       '<div style="display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 0">' +
@@ -326,7 +380,10 @@
       '<div id="roof-status" style="font-size:0.75rem;color:var(--text-dim);margin:8px 0 0"></div>' +
       '<div id="roof-buildings" style="margin:6px 0 0"></div>' +
       '<p style="color:var(--text-dim);font-size:0.72rem;margin:8px 0 0">' +
-      'Data © Lantmäteriet (CC BY 4.0). Derived values are a starting point — check them ' +
+      (isDefault
+        ? 'Data © Lantmäteriet (CC BY 4.0). '
+        : 'Check the catalog\'s licence and attribution terms. ') +
+      'Derived values are a starting point — check them ' +
       'against your installation before relying on the forecast.' +
       '</p>' +
       '</fieldset>';
@@ -580,6 +637,28 @@
         refreshArraysSummary(ctx.config);
       });
       roofState = { features: [], selectedId: null };
+      var catalogSel = document.getElementById("roof-catalog");
+      if (catalogSel) catalogSel.addEventListener("change", function () {
+        var chosen = null;
+        for (var i = 0; i < STAC_CATALOGS.length; i++) {
+          if (STAC_CATALOGS[i].key === catalogSel.value) chosen = STAC_CATALOGS[i];
+        }
+        if (!chosen) return;
+        roofCustomCatalog = chosen.key === "custom";
+        // Keep everything already typed on this tab, then swap the catalog
+        // fields to the preset. Custom leaves the operator's values alone —
+        // it only reveals the fields.
+        ctx.captureCurrentTab();
+        if (!ctx.config.roofmodel) ctx.config.roofmodel = {};
+        if (chosen.base !== null) {
+          ctx.setByPath(ctx.config, "roofmodel.stac_base_url", chosen.base);
+          ctx.setByPath(ctx.config, "roofmodel.stac_buildings_collection", chosen.buildings || "");
+          ctx.setByPath(ctx.config, "roofmodel.stac_lidar_collection", chosen.lidar || "");
+        }
+        // Re-render so the fields, labels and attribution follow the pick.
+        var active = document.querySelector("#settings-tabs button.active");
+        if (ctx.renderTab && active) ctx.renderTab(active.dataset.tab);
+      });
       var findBtn = document.getElementById("roof-find");
       if (findBtn) findBtn.addEventListener("click", function () { findBuildings(ctx); });
       var deriveBtn = document.getElementById("roof-derive");
