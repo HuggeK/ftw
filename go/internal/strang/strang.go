@@ -1,5 +1,7 @@
 // Package strang fetches historical solar irradiance from SMHI's STRÅNG
-// mesoscale model (https://strang.smhi.se/).
+// mesoscale model. The model is described at
+// https://www.smhi.se/forskning/modeller-och-data/strang---en-modell-for-solstralning
+// and the API is documented at https://opendata.smhi.se/metanalys/strang.
 //
 // STRÅNG is an analysis/reanalysis product: it covers the Nordic region hourly
 // at ~2.5 km resolution from 1999 to ~1 day ago. It has NO forward horizon, so
@@ -36,7 +38,8 @@ var ErrOutsideDomain = errors.New("outside STRÅNG domain")
 // These are the complete set — probing 100..130 against the live API on
 // 2026-07-31 returned 200 for exactly 116..122 and 404 for everything else.
 // Names were confirmed by their magnitudes on a clear day at Stockholm rather
-// than from documentation, since SMHI's apidocs pages currently 404: parameter
+// than taken on faith from the documentation, which names the quantities but
+// not the code-to-quantity mapping: parameter
 // 119 caps at exactly 60 (minutes in an hour), 118 exceeds 117 the way direct
 // *normal* irradiance exceeds global, and at solar noon 121 + 122 = 723.0 +
 // 87.5 = 810.5, which is exactly 117 — the direct-plus-diffuse identity that
