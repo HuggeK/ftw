@@ -12,7 +12,7 @@ import json
 import numpy as np
 import pytest
 
-from ftw_roofmodel import pipeline
+from ftw_roofmodel import pipeline, sweref
 from ftw_roofmodel.geotorget import (
     COLLECTION_LIDAR,
     Credentials,
@@ -130,9 +130,9 @@ def test_search_sends_the_collection_and_bbox():
 
     assert len(items) == 1
     (url, body), = session.posts
-    # The default catalog root is Lantmaeteriet's /stac, so the standard
-    # {base}/search lands on the same URL it always has.
-    assert url.endswith("/stac/search")
+    # The client's default root is the live vector catalogue; search is the
+    # spec's POST {base}/search on whatever root the client was given.
+    assert url.endswith("/stac-vektor/v1/search")
     assert body["collections"] == [COLLECTION_LIDAR]
     assert body["bbox"] == [600000.0, 6500000.0, 600100.0, 6500100.0]
 
@@ -268,7 +268,7 @@ def test_derive_produces_a_versioned_document(monkeypatch):
     json.dumps(model)
 
 
-def test_derive_searches_the_projected_bbox(monkeypatch):
+def test_derive_searches_the_spec_bbox(monkeypatch):
     _patched_points(monkeypatch, make_plane(tilt_deg=35, azimuth_deg=180))
     session = FakeSession(search={"features": [feature()]}, asset=b"x")
     pipeline.derive(
@@ -276,12 +276,53 @@ def test_derive_searches_the_projected_bbox(monkeypatch):
         client=GeotorgetClient(CREDS, session=session), radius_m=40.0,
     )
     (_, body), = session.posts
-    min_e, min_n, max_e, max_n = body["bbox"]
-    # Stockholm in SWEREF 99 TM, and an 80 m box give or take projection bow.
-    assert 600_000 < min_e < 700_000, body["bbox"]
-    assert 6_500_000 < min_n < 6_600_000, body["bbox"]
-    assert 75 < (max_e - min_e) < 90
-    assert 75 < (max_n - min_n) < 90
+    # WGS84 lon/lat per the STAC spec, the live service's frame — and still
+    # square on the ground: built by stepping metres in SWEREF and
+    # unprojecting, which is what stac_search_bbox does.
+    expected = sweref.stac_search_bbox(59.33, 18.07, 40.0, 4326)
+    assert list(body["bbox"]) == pytest.approx(list(expected))
+
+
+def test_derive_uses_both_lantmateriet_roots_by_default(monkeypatch):
+    """The live service splits its STAC per product family: buildings on the
+    vector root, point clouds on the elevation root. The default derive must
+    build a client for each."""
+    made = []
+
+    class RecordingClient:
+        def __init__(self, credentials, base_url=None, **kw):
+            made.append(base_url)
+
+        def search(self, collection, bbox, limit=20):
+            return []
+
+    monkeypatch.setattr(pipeline, "GeotorgetClient", RecordingClient)
+    with pytest.raises(RoofModelError):
+        pipeline.derive(latitude=59.33, longitude=18.07, credentials=CREDS)
+    assert made == [
+        pipeline.geotorget.DEFAULT_BASE_URL,
+        pipeline.geotorget.DEFAULT_LIDAR_BASE_URL,
+    ]
+
+
+def test_derive_uses_one_client_for_a_custom_catalog(monkeypatch):
+    """A custom single-root catalog serves both collections itself."""
+    made = []
+
+    class RecordingClient:
+        def __init__(self, credentials, base_url=None, **kw):
+            made.append(base_url)
+
+        def search(self, collection, bbox, limit=20):
+            return []
+
+    monkeypatch.setattr(pipeline, "GeotorgetClient", RecordingClient)
+    with pytest.raises(RoofModelError):
+        pipeline.derive(
+            latitude=59.33, longitude=18.07, credentials=CREDS,
+            base_url="https://stac.example.org",
+        )
+    assert made == ["https://stac.example.org"]
 
 
 def test_derive_outside_sweden_says_so(monkeypatch):

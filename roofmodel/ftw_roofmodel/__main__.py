@@ -69,8 +69,9 @@ def main(argv: list[str] | None = None) -> int:
         "--bbox-epsg",
         type=int,
         choices=(3006, 4326),
-        default=3006,
-        help="CRS of the search bbox: 3006 for Lantmäteriet, 4326 per the STAC spec",
+        default=4326,
+        help="CRS of the search bbox: 4326 per the STAC spec (Lantmäteriet "
+        "included, verified live), 3006 for a catalog that wants SWEREF",
     )
     args = p.parse_args(argv)
     credentials = Credentials(args.username, args.password)

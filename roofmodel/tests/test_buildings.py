@@ -138,8 +138,10 @@ def test_search_queries_the_building_collection_and_maps_results():
     assert [b.building_id for b in got] == ["b1"]
     (_, body), = session.posts
     assert body["collections"] == [COLLECTION_BUILDINGS]
-    # The bbox must be the SWEREF box around the site, not raw degrees.
-    assert body["bbox"][0] > 1000
+    # The bbox is WGS84 lon/lat per the STAC spec — verified against the live
+    # Lantmaeteriet service, which follows it.
+    assert 17.9 < body["bbox"][0] < 18.2, body["bbox"]
+    assert 59.2 < body["bbox"][1] < 59.5, body["bbox"]
 
 
 def test_search_says_what_to_do_when_nothing_comes_back():

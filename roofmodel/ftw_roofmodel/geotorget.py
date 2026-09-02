@@ -34,23 +34,32 @@ import dataclasses
 import datetime as dt
 from typing import Any, Iterable
 
-# Root of the STAC API. The standard search endpoint is POST {base}/search.
-DEFAULT_BASE_URL = "https://api.lantmateriet.se/stac"
+# Roots of the STAC APIs, as verified against the live service (2026-09-02):
+# Lantmaeteriet does not serve one catalogue — vector products and elevation
+# products have separate STAC roots. The standard search endpoint is
+# POST {base}/search on each, it takes a WGS84 (lon/lat) bbox per the STAC
+# spec, and the catalogue metadata is anonymously readable; the Geotorget
+# credentials are enforced on the asset downloads (dl1.lantmateriet.se
+# answers 401 without them).
+DEFAULT_BASE_URL = "https://api.lantmateriet.se/stac-vektor/v1"
+DEFAULT_LIDAR_BASE_URL = "https://api.lantmateriet.se/stac-hojd/v1"
 
-# Collection ids as published in Lantmaeteriet's STAC catalogue. Both products
-# are STAC APIs over the same base URL and the same credentials; they differ
-# only in what their items point at, which is what the media types below say.
-COLLECTION_BUILDINGS = "byggnad-nedladdning-vektor"
-COLLECTION_LIDAR = "laserdata-nedladdning-skog"
+# Collection ids as published in the live catalogues. Buildings are one item
+# per municipality whose asset is a ZIP holding a GeoPackage; "Laserdata Skog"
+# is published as `dsm-skoglig-copc` — a surface-model point cloud in
+# LAZ/COPC — on the elevation root.
+COLLECTION_BUILDINGS = "byggnader"
+COLLECTION_LIDAR = "dsm-skoglig-copc"
 
 # Media types, so an asset is chosen by *what it is* rather than by hoping the
-# publisher named the key "data". Byggnad-vektor delivers GeoPackage; Laserdata
-# Skog delivers LAZ organised as COPC (Cloud Optimized Point Cloud).
+# publisher named the key "data". Byggnader delivers a zipped GeoPackage;
+# Laserdata Skog delivers LAZ organised as COPC (Cloud Optimized Point Cloud).
 MEDIA_GEOPACKAGE = "application/geopackage+sqlite3"
 MEDIA_COPC = "application/vnd.laszip+copc"
 MEDIA_LAZ = "application/vnd.laszip"
 MEDIA_LAS = "application/vnd.las"
 MEDIA_GEOJSON = "application/geo+json"
+MEDIA_ZIP = "application/zip"
 
 # Longest suffix first: a COPC file is also a .laz, and reading it as a plain
 # one would download the whole tile instead of the part we asked for.
@@ -60,6 +69,7 @@ _EXTENSION_MEDIA: tuple[tuple[str, str], ...] = (
     (".geojson", MEDIA_GEOJSON),
     (".laz", MEDIA_LAZ),
     (".las", MEDIA_LAS),
+    (".zip", MEDIA_ZIP),
 )
 
 
@@ -238,7 +248,7 @@ class StacClient:
         # A custom catalog may be open: no credentials means anonymous access,
         # while half a credential is still an error either way.
         self._anonymous = not (credentials.username or credentials.password)
-        if not self._anonymous or self._base_url == DEFAULT_BASE_URL:
+        if not self._anonymous or self._base_url in (DEFAULT_BASE_URL, DEFAULT_LIDAR_BASE_URL):
             credentials.validate()
         self._credentials = credentials
         self._timeout = timeout
@@ -264,9 +274,9 @@ class StacClient:
         """POST {base}/search for one collection over a bbox.
 
         The bbox is (min_x, min_y, max_x, max_y) in whatever CRS the catalog
-        expects -- the STAC spec says WGS84 lon/lat, Lantmaeteriet expects
-        SWEREF 99 TM -- so the caller chooses what to send and no reprojection
-        happens here.
+        expects -- the STAC spec says WGS84 lon/lat, and the live Lantmaeteriet
+        service follows it -- so the caller chooses what to send and no
+        reprojection happens here.
         """
         body = {
             "collections": [collection],
