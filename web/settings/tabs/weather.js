@@ -334,6 +334,13 @@
       setCoord(ll.lat, ll.lng);
     });
     map.on("click", function (e) {
+      // A click on a building footprint selects that building (the layer's own
+      // handler). It must not also drag the site pin there and silently
+      // rewrite the saved coordinates.
+      if (map.getLayer("roof-buildings-fill") &&
+          map.queryRenderedFeatures(e.point, { layers: ["roof-buildings-fill"] }).length) {
+        return;
+      }
       marker.setLngLat(e.lngLat);
       setCoord(e.lngLat.lat, e.lngLat.lng);
     });
@@ -556,7 +563,10 @@
         roofSay("Found " + roofState.features.length +
                 " building(s). Pick yours on the map or in the list.");
         drawBuildings();
+        fitToBuildings(d.latitude, d.longitude);
         renderBuildingList(ctx);
+        var mapEl = document.getElementById("weather-map");
+        if (mapEl && mapEl.scrollIntoView) mapEl.scrollIntoView({ block: "nearest" });
       })
       .catch(function (e) { roofSay(ctx.escHtml(String(e && e.message || e)), "bad"); });
   }
@@ -574,9 +584,12 @@
 
   // MapLibre paints with concrete colours and cannot read var(), the same
   // problem the canvas charts have. Resolve the theme tokens through a hidden
-  // probe that inherits :root, exactly as app.js's cssColor does. Resolved once
-  // per layer creation, so a theme toggle mid-pick keeps the old hue until the
-  // tab is reopened — the footprints stay legible either way.
+  // probe that inherits :root, exactly as app.js's cssColor does. The theme
+  // authors its tokens in oklch(), which getComputedStyle passes through
+  // verbatim and MapLibre's parser rejects — so bake the resolved colour to
+  // sRGB bytes through a 1x1 canvas, whose getImageData is sRGB by contract.
+  // Resolved once per layer creation, so a theme toggle mid-pick keeps the old
+  // hue until the tab is reopened — the footprints stay legible either way.
   var _probe = null;
   function themeColor(name, fallback) {
     if (!_probe) {
@@ -585,12 +598,35 @@
       document.body.appendChild(_probe);
     }
     _probe.style.color = "var(" + name + ", " + fallback + ")";
-    return getComputedStyle(_probe).color || fallback;
+    var resolved = getComputedStyle(_probe).color || fallback;
+    try {
+      var ctx = document.createElement("canvas").getContext("2d", { willReadFrequently: true });
+      ctx.fillStyle = fallback;  // an unparseable resolved value leaves this
+      ctx.fillStyle = resolved;
+      ctx.fillRect(0, 0, 1, 1);
+      var px = ctx.getImageData(0, 0, 1, 1).data;
+      return "rgb(" + px[0] + "," + px[1] + "," + px[2] + ")";
+    } catch (e) {
+      return fallback;
+    }
+  }
+
+  // A "case" condition must be a typed boolean: a bare ["get", ...] is value-
+  // typed, and MapLibre rejects the whole layer through its error event without
+  // throwing — the picker then looks enabled while the map stays empty.
+  function whenSelected(then, otherwise) {
+    return ["case", ["boolean", ["get", "selected"], false], then, otherwise];
   }
 
   function drawBuildings() {
     var map = window._weatherMap;
-    if (!map || !map.isStyleLoaded || !map.isStyleLoaded()) return;
+    if (!map) return;
+    if (!map.isStyleLoaded || !map.isStyleLoaded()) {
+      // A find can win the race against the style. Idempotent, so a stacked
+      // retry only costs a setData with identical data.
+      map.once("load", drawBuildings);
+      return;
+    }
     var data = featureCollection();
     var src = map.getSource("roof-buildings");
     if (src) { src.setData(data); return; }
@@ -600,15 +636,15 @@
     map.addLayer({
       id: "roof-buildings-fill", type: "fill", source: "roof-buildings",
       paint: {
-        "fill-color": ["case", ["get", "selected"], picked, candidate],
-        "fill-opacity": ["case", ["get", "selected"], 0.55, 0.25],
+        "fill-color": whenSelected(picked, candidate),
+        "fill-opacity": whenSelected(0.55, 0.25),
       },
     });
     map.addLayer({
       id: "roof-buildings-line", type: "line", source: "roof-buildings",
       paint: {
-        "line-color": ["case", ["get", "selected"], picked, candidate],
-        "line-width": ["case", ["get", "selected"], 2.5, 1],
+        "line-color": whenSelected(picked, candidate),
+        "line-width": whenSelected(2.5, 1),
       },
     });
     map.on("click", "roof-buildings-fill", function (e) {
@@ -622,6 +658,42 @@
     map.on("mouseleave", "roof-buildings-fill", function () {
       map.getCanvas().style.cursor = "";
     });
+  }
+
+  // [[west, south], [east, north]] around the buildings someone would actually
+  // pick — the nearby ones the list also shows — plus the site pin. Fitting
+  // the whole search radius leaves every footprint a few pixels wide.
+  function buildingsBounds(features, siteLat, siteLon) {
+    var west = null, south = null, east = null, north = null;
+    function extend(lon, lat) {
+      if (typeof lon !== "number" || typeof lat !== "number") return;
+      if (west === null || lon < west) west = lon;
+      if (east === null || lon > east) east = lon;
+      if (south === null || lat < south) south = lat;
+      if (north === null || lat > north) north = lat;
+    }
+    extend(siteLon, siteLat);
+    var near = features.filter(function (f) {
+      return ((f.properties || {}).distance_m || 0) <= 150;
+    });
+    if (near.length < 3) near = features;
+    near.forEach(function (f) {
+      var rings = (f.geometry && f.geometry.coordinates) || [];
+      (rings[0] || []).forEach(function (pt) { extend(pt[0], pt[1]); });
+    });
+    if (west === null) return null;
+    return [[west, south], [east, north]];
+  }
+
+  // The picker opens at city zoom, where a footprint is smaller than a pixel.
+  // Zoom to the search results once per find; selection redraws leave the
+  // camera where the operator put it.
+  function fitToBuildings(siteLat, siteLon) {
+    var map = window._weatherMap;
+    if (!map || !roofState.features.length) return;
+    var bounds = buildingsBounds(roofState.features, siteLat, siteLon);
+    if (!bounds) return;
+    map.fitBounds(bounds, { padding: 48, maxZoom: 17.5, duration: 600 });
   }
 
   function selectBuilding(id) {
@@ -823,5 +895,9 @@
     },
   };
 
-  S.tabs.weather._pure = { arraysSummary: arraysSummary };
+  S.tabs.weather._pure = {
+    arraysSummary: arraysSummary,
+    whenSelected: whenSelected,
+    buildingsBounds: buildingsBounds,
+  };
 })();
