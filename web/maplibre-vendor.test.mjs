@@ -25,7 +25,7 @@ test('weather map sends a Referer on OSM tiles so volunteer servers do not 403',
   assert.match(shared, /referrerPolicy/);
 });
 
-test('vendored MapLibre GL JS 6.0.0 files are present', () => {
+test('vendored MapLibre GL JS 6.7.0 files are present', () => {
   for (const rel of [
     'maplibre-gl.mjs',
     'maplibre-gl-shared.mjs',

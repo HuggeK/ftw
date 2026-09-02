@@ -1,6 +1,6 @@
 # MapLibre GL JS, vendored
 
-MapLibre GL JS 6.0.0, BSD-3-Clause. See `LICENSE.txt`.
+MapLibre GL JS 6.7.0, BSD-3-Clause. See `LICENSE.txt`.
 
 Vendored rather than pulled from a CDN, for the same reason as
 `/vendor/three/`, `/vendor/ace/` and the Leaflet copy this replaced: the box
