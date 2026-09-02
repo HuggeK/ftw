@@ -66,6 +66,28 @@ roofmodel:
 Setting `stac_base_url` also lifts the Sweden-only coordinate gate, since FTW
 cannot know what a third-party catalog covers.
 
+### Catalogs verified to answer (2026-09-02)
+
+Each row was checked live: the STAC landing page, an item search over a real
+bbox, and an anonymous HEAD on a returned asset.
+
+| Catalog | LiDAR | Auth | Licence | Caveat |
+|---|---|---|---|---|
+| [Lantmäteriet](https://api.lantmateriet.se/stac) (default) | LAZ/COPC | HTTP Basic (Geotorget account) | CC BY 4.0 | Sweden; bbox in EPSG:3006 |
+| [IGN LiDAR HD via MTD](https://api.stac.teledetection.fr) (`lidarhd`) | COPC, served by IGN itself | none | etalab-2.0 | France; catalog is run by Université de Montpellier, not IGN, and IGN's download host rate-limits (~1 req/s) |
+| [KAGIS Carinthia](https://gis.ktn.gv.at/api/stac/v1/) (`KAGIS_coll_ALS2_pc_*`) | COPC | none | CC BY 4.0 | four Alpine regions only; ~700 MB tiles, so the COPC window path matters |
+| [swisstopo](https://data.geo.admin.ch/api/stac/v1) (`ch.swisstopo.swisssurface3d`) | LAS zipped as `.las.zip` | none | swisstopo open data terms | Switzerland; the zip wrapper is not yet unpacked by the module, so this one is search-verified but not derive-ready |
+
+USGS 3DEP (`3dep-lidar-copc` on the [Planetary
+Computer](https://planetarycomputer.microsoft.com/api/stac/v1)) is one small
+extension away: search is anonymous, but asset downloads need a SAS token
+fetched from an open endpoint and appended to the URL.
+
+Building footprints are the scarce half. No other verified catalog serves them
+as GeoPackage or GeoJSON — swisstopo publishes DXF/FileGDB, Microsoft and
+Overture publish GeoParquet — so outside Sweden the practical path today is a
+LiDAR-only catalog plus drawing the outline yourself on the map.
+
 Two caveats. The search bbox CRS is per-catalog: the STAC spec mandates WGS84
 (`stac_bbox_epsg: 4326`), but Lantmäteriet expects SWEREF 99 TM, which is why
 the default stays `3006`. And the *data* itself must arrive in SWEREF 99 TM

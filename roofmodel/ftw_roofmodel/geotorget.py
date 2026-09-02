@@ -232,15 +232,22 @@ class StacClient:
         base_url: str = DEFAULT_BASE_URL,
         timeout: float = 60.0,
     ) -> None:
-        credentials.validate()
-        self._credentials = credentials
         self._base_url = base_url.rstrip("/")
+        # Lantmäteriet always demands the operator's Geotorget account, so
+        # missing credentials there deserve the ordering instructions early.
+        # A custom catalog may be open: no credentials means anonymous access,
+        # while half a credential is still an error either way.
+        self._anonymous = not (credentials.username or credentials.password)
+        if not self._anonymous or self._base_url == DEFAULT_BASE_URL:
+            credentials.validate()
+        self._credentials = credentials
         self._timeout = timeout
         if session is None:
             import requests  # imported lazily so tests can inject a fake session
 
             session = requests.Session()
-            session.auth = (credentials.username, credentials.password)
+            if not self._anonymous:
+                session.auth = (credentials.username, credentials.password)
         self._session = session
 
     @property
@@ -272,6 +279,12 @@ class StacClient:
         except Exception as exc:  # network, DNS, TLS
             raise GeotorgetError(f"STAC search failed: {exc}") from exc
         if resp.status_code in (401, 403):
+            if self._anonymous:
+                raise MissingCredentials(
+                    f"the STAC catalog requires credentials for {collection} "
+                    f"(HTTP {resp.status_code}). Set roofmodel.stac_username "
+                    "and roofmodel.stac_password for this catalog."
+                )
             raise MissingCredentials(
                 f"the STAC catalog rejected the credentials for {collection} "
                 f"(HTTP {resp.status_code}). Check the username and password, and "

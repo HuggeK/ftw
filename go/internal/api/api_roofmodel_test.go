@@ -151,6 +151,22 @@ func TestRoofModelNeverEchoesTheToken(t *testing.T) {
 	}
 }
 
+// An open custom catalog is usable with no stored secret at all, and the UI
+// must not keep asking for credentials it does not need.
+func TestRoofModelCustomCatalogCountsAsCredentialed(t *testing.T) {
+	deps := depsAt(52.52, 13.40)
+	deps.Cfg.RoofModel = &config.RoofModel{
+		Enabled: true, StacBaseURL: "https://stac.example.org",
+	}
+	deps.RoofModel = roofmodel.FromConfig(deps.Cfg.RoofModel)
+
+	_, status := getJSON(t, deps, http.MethodGet, "/api/roofmodel")
+	if status["has_credentials"] != true {
+		t.Errorf("has_credentials = %v, want true for an anonymous open catalog",
+			status["has_credentials"])
+	}
+}
+
 // Lantmäteriet must appear in the coverage listing alongside every other
 // source, so an operator finds it without knowing it exists.
 func TestLantmaterietAppearsInDataSources(t *testing.T) {

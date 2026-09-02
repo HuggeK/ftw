@@ -587,6 +587,41 @@ func TestDeriveCustomCatalogSkipsSwedenGateAndPassesStacArgs(t *testing.T) {
 	}
 }
 
+// An open catalog needs no credentials: with a custom base URL and neither
+// half of a credential stored, the derive runs anonymously and no empty
+// --username/--password ever reaches the command line.
+func TestDeriveCustomCatalogWorksAnonymously(t *testing.T) {
+	dir := t.TempDir()
+	record := dir + string(os.PathSeparator) + "invocation.json"
+	cmd := stubModule(t, "record", record)
+	s := svc(t, &config.RoofModel{
+		Enabled: true, Command: cmd, ModuleDir: dir,
+		StacBaseURL: "https://stac.example.org",
+	})
+
+	if _, err := s.Derive(context.Background(), 52.52, 13.40, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("stub recorded nothing: %v", err)
+	}
+	var got stubInvocation
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	line := strings.Join(got.Args, " ")
+	if !strings.Contains(line, "--stac-base-url https://stac.example.org") {
+		t.Errorf("args %q missing the base URL", line)
+	}
+	for _, banned := range []string{"--username", "--password"} {
+		if strings.Contains(line, banned) {
+			t.Errorf("args %q carry %s despite no stored credential", line, banned)
+		}
+	}
+}
+
 // Without a custom catalog the Sweden gate still holds — the redesign must
 // not have quietly opened the default catalog to the whole planet.
 func TestDeriveDefaultCatalogStillRefusesOutsideSweden(t *testing.T) {
