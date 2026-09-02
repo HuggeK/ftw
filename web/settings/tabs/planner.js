@@ -1,6 +1,6 @@
-// Settings → Planner tab: MPC planner scalars, plus the forecast inputs
-// (location, weather source, PV arrays, roof geometry) rendered via
-// tabs/weather.js — they parameterise the plan, so they live here.
+// Settings → Planner tab: MPC planner scalars. The forecast inputs the
+// planner consumes (location, weather source, PV arrays, roof geometry)
+// render on the Control tab via tabs/weather.js.
 (function () {
   var S = (window.FTWSettings = window.FTWSettings || { tabs: {} });
   S.tabs = S.tabs || {};
@@ -84,11 +84,6 @@
           "Highest SoC the planner will charge to. 0.90 = 90%.") +
         '</div></div>' +
         '</fieldset>';
-      // The forecast inputs — location, weather source, PV arrays, roof
-      // geometry — are planner inputs, so they live on this tab. The
-      // sections are still owned by tabs/weather.js; it just no longer
-      // has a tab button of its own.
-      var forecastHtml = (S.tabs.weather && S.tabs.weather.render) ? S.tabs.weather.render(ctx) : "";
       var engineHtml = '<details class="engine-details">' +
         '<summary>Engine controls — leave these unless you are debugging.</summary>' +
         '<fieldset><legend>Engine</legend>' +
@@ -182,9 +177,9 @@
         '</div></div>' +
         '</fieldset>' +
         '</details>';
-      return mpcHtml + forecastHtml + engineHtml +
+      return mpcHtml + engineHtml +
         '<p style="color:var(--text-dim);font-size:0.8rem;margin-top:8px">' +
-        'The planner also needs a working price forecast — set that up on the Price tab. When disabled the system runs in the manual mode set on the Control page.' +
+        'The planner reads its forecast inputs — location, weather source, PV arrays, roof geometry — from the Control tab, and needs a working price forecast from the Price tab. When disabled the system runs in the manual mode set on the Control page.' +
         '</p>';
     },
     after: function (ctx) {
@@ -230,9 +225,6 @@
           .catch(function () {}); // unreachable → line stays hidden
       }
 
-      // Wire the forecast-input sections rendered above (map, PV arrays,
-      // roof derivation) — weather.js owns their behaviour.
-      if (S.tabs.weather && S.tabs.weather.after) S.tabs.weather.after(ctx);
     },
   };
 

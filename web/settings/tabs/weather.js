@@ -1,6 +1,6 @@
-// Forecast-input sections of the Settings → Planner tab: forecast
+// Forecast-input sections of the Settings → Control tab: forecast
 // provider + location + PV arrays. Registered as S.tabs.weather but
-// rendered inside the Planner tab (planner.js delegates here); there is
+// rendered inside the Control tab (control.js delegates here); there is
 // no Weather tab button. Owns its own MapLibre loader + PV-array editor
 // + 3D preview loader so the Settings shell stays weather-agnostic.
 (function () {
