@@ -126,6 +126,11 @@ tile whole — slower, same answer. The result records which path ran as
 5. Click your building. It highlights green.
 6. Press **Read roof from LiDAR**.
 
+Where the catalog publishes no building footprints over STAC — the open
+LiDAR catalogs mostly ship point clouds only — press **Draw the footprint on
+the map** instead of step 4 and trace your building's outline; the laser scan
+is clipped to what you drew. Drawing is optional everywhere else.
+
 The PV arrays above fill in with one entry per usable roof face. **Nothing is
 saved yet** — look at the numbers, correct anything that is wrong, then press
 Save. FTW never rewrites your panel configuration on its own: the derivation is
