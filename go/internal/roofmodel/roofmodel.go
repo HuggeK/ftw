@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os/exec"
+	"sync"
 	"time"
 
 	"github.com/srcfl/ftw/go/internal/config"
@@ -122,45 +123,74 @@ type moduleError struct {
 
 // Service derives roof models. The zero value is unusable; use FromConfig.
 type Service struct {
+	mu  sync.RWMutex
 	cfg *config.RoofModel
 }
 
-// FromConfig returns a Service, or nil when the module is not configured. A nil
-// Service is safe to call: every method reports ErrDisabled.
+// FromConfig returns a Service even when the module is disabled or
+// unconfigured, so a later Reconfigure can enable it without a restart. A
+// Service without a usable config — and a nil Service — is safe to call:
+// every method reports ErrDisabled.
 func FromConfig(cfg *config.RoofModel) *Service {
-	if cfg == nil || !cfg.Enabled {
-		return nil
-	}
 	return &Service{cfg: cfg}
 }
 
-// Enabled reports whether derives are possible.
-func (s *Service) Enabled() bool { return s != nil && s.cfg != nil && s.cfg.Enabled }
+// Reconfigure swaps the module's config so enablement or credentials saved
+// through the API count on the next call rather than the next restart. The
+// service used to keep its boot-time snapshot, which silently ignored
+// Geotorget credentials typed into Settings while GET /api/roofmodel —
+// reading the live config — reported them present.
+func (s *Service) Reconfigure(cfg *config.RoofModel) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.cfg = cfg
+	s.mu.Unlock()
+}
 
-func (s *Service) timeout() time.Duration {
-	if s.cfg.TimeoutS > 0 {
-		return time.Duration(s.cfg.TimeoutS) * time.Second
+// config returns the current snapshot. Loaded config structs are never
+// mutated in place — a reload builds a fresh one and Reconfigure swaps the
+// pointer — so the snapshot stays coherent for the length of a call.
+func (s *Service) config() *config.RoofModel {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cfg
+}
+
+// Enabled reports whether derives are possible.
+func (s *Service) Enabled() bool {
+	c := s.config()
+	return c != nil && c.Enabled
+}
+
+func timeoutFrom(cfg *config.RoofModel) time.Duration {
+	if cfg.TimeoutS > 0 {
+		return time.Duration(cfg.TimeoutS) * time.Second
 	}
 	return defaultTimeout
 }
 
-func (s *Service) command() string {
-	if s.cfg.Command != "" {
-		return s.cfg.Command
+func commandFrom(cfg *config.RoofModel) string {
+	if cfg.Command != "" {
+		return cfg.Command
 	}
 	return defaultCommand
 }
 
-func (s *Service) radius() float64 {
-	if s.cfg.RadiusM > 0 {
-		return s.cfg.RadiusM
+func radiusFrom(cfg *config.RoofModel) float64 {
+	if cfg.RadiusM > 0 {
+		return cfg.RadiusM
 	}
 	return defaultRadiusM
 }
 
-func (s *Service) packingFactor() float64 {
-	if s.cfg.PackingFactor > 0 {
-		return s.cfg.PackingFactor
+func packingFactorFrom(cfg *config.RoofModel) float64 {
+	if cfg.PackingFactor > 0 {
+		return cfg.PackingFactor
 	}
 	return defaultPackingFactor
 }
@@ -217,23 +247,24 @@ func (s *Service) Derive(ctx context.Context, lat, lon float64, buildingID strin
 
 // run spawns the module and returns its stdout.
 func (s *Service) run(ctx context.Context, lat, lon float64, mode, buildingID string) ([]byte, error) {
-	if !s.Enabled() {
+	cfg := s.config()
+	if cfg == nil || !cfg.Enabled {
 		return nil, ErrDisabled
 	}
 	// The Sweden gate belongs to the default Lantmäteriet catalog only. An
 	// operator pointing at another country's STAC catalog knows what it
 	// covers; FTW does not, so it stops pretending to.
-	if s.cfg.StacBaseURL == "" && !coverage.Covers("lantmateriet", lat, lon) {
+	if cfg.StacBaseURL == "" && !coverage.Covers("lantmateriet", lat, lon) {
 		return nil, fmt.Errorf("%w: (%.4f, %.4f) is not in Sweden", ErrOutsideCoverage, lat, lon)
 	}
 	// Lantmäteriet always needs the operator's own Geotorget credentials. A
 	// custom catalog may be open — many national STAC catalogs are — so with a
 	// base URL set, absent credentials mean anonymous access, not a mistake.
-	if s.cfg.StacBaseURL == "" && (s.cfg.StacUser() == "" || s.cfg.StacPass() == "") {
+	if cfg.StacBaseURL == "" && (cfg.StacUser() == "" || cfg.StacPass() == "") {
 		return nil, ErrNoCredentials
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, s.timeout())
+	ctx, cancel := context.WithTimeout(ctx, timeoutFrom(cfg))
 	defer cancel()
 
 	args := []string{
@@ -241,35 +272,35 @@ func (s *Service) run(ctx context.Context, lat, lon float64, mode, buildingID st
 		"--mode", mode,
 		"--lat", fmt.Sprintf("%.6f", lat),
 		"--lon", fmt.Sprintf("%.6f", lon),
-		"--radius-m", fmt.Sprintf("%.1f", s.radius()),
-		"--packing-factor", fmt.Sprintf("%.3f", s.packingFactor()),
+		"--radius-m", fmt.Sprintf("%.1f", radiusFrom(cfg)),
+		"--packing-factor", fmt.Sprintf("%.3f", packingFactorFrom(cfg)),
 	}
 	if buildingID != "" {
 		args = append(args, "--building-id", buildingID)
 	}
-	if u := s.cfg.StacUser(); u != "" {
+	if u := cfg.StacUser(); u != "" {
 		args = append(args, "--username", u)
 	}
-	if p := s.cfg.StacPass(); p != "" {
+	if p := cfg.StacPass(); p != "" {
 		args = append(args, "--password", p)
 	}
 	// A custom catalog replaces the Lantmäteriet defaults piecewise; anything
 	// left empty falls back to the module's own Geotorget defaults.
-	if s.cfg.StacBaseURL != "" {
-		args = append(args, "--stac-base-url", s.cfg.StacBaseURL)
+	if cfg.StacBaseURL != "" {
+		args = append(args, "--stac-base-url", cfg.StacBaseURL)
 	}
-	if s.cfg.StacBuildingsCollection != "" {
-		args = append(args, "--buildings-collection", s.cfg.StacBuildingsCollection)
+	if cfg.StacBuildingsCollection != "" {
+		args = append(args, "--buildings-collection", cfg.StacBuildingsCollection)
 	}
-	if s.cfg.StacLidarCollection != "" {
-		args = append(args, "--lidar-collection", s.cfg.StacLidarCollection)
+	if cfg.StacLidarCollection != "" {
+		args = append(args, "--lidar-collection", cfg.StacLidarCollection)
 	}
-	if s.cfg.StacBboxEPSG != 0 {
-		args = append(args, "--bbox-epsg", fmt.Sprintf("%d", s.cfg.StacBboxEPSG))
+	if cfg.StacBboxEPSG != 0 {
+		args = append(args, "--bbox-epsg", fmt.Sprintf("%d", cfg.StacBboxEPSG))
 	}
-	cmd := exec.CommandContext(ctx, s.command(), args...)
-	if s.cfg.ModuleDir != "" {
-		cmd.Env = append(cmd.Environ(), "PYTHONPATH="+s.cfg.ModuleDir)
+	cmd := exec.CommandContext(ctx, commandFrom(cfg), args...)
+	if cfg.ModuleDir != "" {
+		cmd.Env = append(cmd.Environ(), "PYTHONPATH="+cfg.ModuleDir)
 	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -278,13 +309,24 @@ func (s *Service) run(ctx context.Context, lat, lon float64, mode, buildingID st
 	err := cmd.Run()
 
 	if ctx.Err() == context.DeadlineExceeded {
-		return nil, fmt.Errorf("roof model timed out after %s", s.timeout())
+		return nil, fmt.Errorf("roof model timed out after %s", timeoutFrom(cfg))
 	}
 	if err != nil {
 		// The module reports failures as JSON on stderr so an operator sees a
-		// reason ("credentials rejected") rather than a Python traceback.
+		// reason ("credentials rejected") rather than a Python traceback. It
+		// is not alone on that stream: third-party libraries write warnings
+		// there too (requests' RequestsDependencyWarning buried the real
+		// message behind a generic "exit status 1" in live testing), so when
+		// the whole stream doesn't parse, the module's contract — one JSON
+		// document as the final line — still does.
 		var me moduleError
-		if jsonErr := json.Unmarshal(bytes.TrimSpace(stderr.Bytes()), &me); jsonErr == nil && me.Error != "" {
+		errOut := bytes.TrimSpace(stderr.Bytes())
+		if jsonErr := json.Unmarshal(errOut, &me); jsonErr != nil || me.Error == "" {
+			if i := bytes.LastIndexByte(errOut, '\n'); i >= 0 {
+				_ = json.Unmarshal(bytes.TrimSpace(errOut[i+1:]), &me)
+			}
+		}
+		if me.Error != "" {
 			return nil, fmt.Errorf("roof model: %s", me.Error)
 		}
 		return nil, fmt.Errorf("roof model failed: %w", err)

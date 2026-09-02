@@ -883,6 +883,12 @@ func main() {
 	// Assigned where the OCPP server starts (optional; nil-guarded).
 	var ocppSrv *ocpp.Server
 
+	// Forward-declared so the reload callback can hand hot-edited roofmodel
+	// config to the service. Geotorget credentials arrive through Settings
+	// while the process is running; a boot-time snapshot stranded them until
+	// a restart nothing announced. Assigned later (roofmodel.FromConfig).
+	var roofModelSvc *roofmodel.Service
+
 	// ---- Config hot-reload watcher ----
 	// Named because two callers share it: the fsnotify watcher created
 	// below and POST /api/config (Deps.ConfigApplier), so a config saved
@@ -989,6 +995,11 @@ func main() {
 				PhaseCnt: newCfg.Fuse.Phases,
 			})
 		}
+
+		// Roof-derivation module: swap in the fresh config so the enable
+		// toggle and Geotorget credentials saved through the API work on
+		// the next click. Nil-receiver safe until the service is built.
+		roofModelSvc.Reconfigure(newCfg.RoofModel)
 
 		// Site-meter swap propagation. The configreload watcher
 		// already updated ctrl.SiteMeterDriver under ctrlMu before
@@ -1211,9 +1222,10 @@ func main() {
 	// PV scoring. Nil when the site has no PV geometry to score against. This is
 	// read-only with respect to control: it only fetches weather data and writes
 	// the irradiance_history + pv_performance_daily tables.
-	// Optional roof-geometry module: nil unless explicitly enabled, and
+	// Optional roof-geometry module: always constructed (so a hot-reloaded
+	// enable works without a restart) but inert until config enables it, and
 	// stateless — it only runs when an operator asks for a derive.
-	roofModelSvc := roofmodel.FromConfig(cfg.RoofModel)
+	roofModelSvc = roofmodel.FromConfig(cfg.RoofModel)
 
 	pvPerfSvc := pvperf.FromConfig(cfg.Weather, ratedPVW, st,
 		"ftw/"+Version+" github.com/srcfl/ftw")

@@ -100,11 +100,17 @@ func svc(t *testing.T, cfg *config.RoofModel) *Service {
 const stockholmLat, stockholmLon = 59.33, 18.07
 
 func TestDisabledWhenAbsentOrOff(t *testing.T) {
-	if FromConfig(nil) != nil {
-		t.Error("nil config must not produce a service")
+	// The service is always constructed — a later Reconfigure may enable it —
+	// but stays inert until config says otherwise.
+	if FromConfig(nil).Enabled() {
+		t.Error("nil config must report disabled")
 	}
-	if FromConfig(&config.RoofModel{Enabled: false}) != nil {
-		t.Error("disabled config must not produce a service")
+	off := FromConfig(&config.RoofModel{Enabled: false})
+	if off.Enabled() {
+		t.Error("disabled config must report disabled")
+	}
+	if _, err := off.Derive(context.Background(), stockholmLat, stockholmLon, ""); !errors.Is(err, ErrDisabled) {
+		t.Errorf("err = %v, want ErrDisabled", err)
 	}
 	// A nil *Service must be safe to call, not a panic.
 	var s *Service
@@ -113,6 +119,33 @@ func TestDisabledWhenAbsentOrOff(t *testing.T) {
 	}
 	if _, err := s.Derive(context.Background(), stockholmLat, stockholmLon, ""); !errors.Is(err, ErrDisabled) {
 		t.Errorf("err = %v, want ErrDisabled", err)
+	}
+	s.Reconfigure(&config.RoofModel{Enabled: true}) // no-op, not a panic
+}
+
+// Geotorget credentials arrive through Settings while the process runs; the
+// service used to keep its boot-time config, so the very save that stored them
+// changed nothing until a restart nothing asked for. Reconfigure is what the
+// hot-reload applier calls — it must both deliver credentials and flip
+// enablement, in both directions.
+func TestReconfigureAppliesCredentialsWithoutRestart(t *testing.T) {
+	s := svc(t, &config.RoofModel{Enabled: true})
+	if _, err := s.Derive(context.Background(), stockholmLat, stockholmLon, ""); !errors.Is(err, ErrNoCredentials) {
+		t.Fatalf("before reconfigure: err = %v, want ErrNoCredentials", err)
+	}
+
+	s.Reconfigure(&config.RoofModel{
+		Enabled: true,
+		Command: stubModule(t, "stdout", minimalModel),
+		StacUsername: "operator", StacPassword: "secret",
+	})
+	if _, err := s.Derive(context.Background(), stockholmLat, stockholmLon, ""); err != nil {
+		t.Fatalf("after reconfigure with credentials: %v", err)
+	}
+
+	s.Reconfigure(&config.RoofModel{Enabled: false})
+	if _, err := s.Derive(context.Background(), stockholmLat, stockholmLon, ""); !errors.Is(err, ErrDisabled) {
+		t.Fatalf("after disabling: err = %v, want ErrDisabled", err)
 	}
 }
 
@@ -426,6 +459,27 @@ func TestDeriveSurfacesTheModuleErrorMessage(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "Geotorget rejected the credentials") {
 		t.Errorf("err = %v, want the module's own message", err)
+	}
+}
+
+// Third-party libraries write warnings to stderr above the module's JSON —
+// requests' RequestsDependencyWarning did exactly this in live testing and
+// reduced a real "STAC search returned HTTP 404" to "exit status 1". The
+// module's contract is one JSON document as the final line; the parse must
+// hold whatever gets printed above it.
+func TestModuleErrorSurvivesLibraryWarnings(t *testing.T) {
+	cmd := stubModule(t, "stderr",
+		"site-packages/requests/__init__.py:113: RequestsDependencyWarning: urllib3 mismatch\n"+
+			"  warnings.warn(\n"+
+			`{"error":"STAC search returned HTTP 404","kind":"GeotorgetError"}`+"\n")
+	s := svc(t, &config.RoofModel{Enabled: true, Command: cmd, StacUsername: "u", StacPassword: "t"})
+
+	_, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "")
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if !strings.Contains(err.Error(), "STAC search returned HTTP 404") {
+		t.Errorf("err = %v, want the module's own message despite the warnings above it", err)
 	}
 }
 
