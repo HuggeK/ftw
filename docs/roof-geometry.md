@@ -118,13 +118,18 @@ tile whole — slower, same answer. The result records which path ran as
 
 ## Using it
 
-1. Open **Settings → Planner**.
+1. Open **Settings → Control**.
 2. Put the map marker on your building.
-3. Under **Roof geometry from Lantmäteriet**, tick **Enable roof derivation**,
+3. Under **Roof geometry from LiDAR**, tick **Enable roof derivation**,
    enter your Geotorget username and password, and **Save**.
 4. Press **Find buildings here**. Footprints appear on the map and as a list.
-5. Click your building. It highlights green.
+5. Click your building. It highlights on the map.
 6. Press **Read roof from LiDAR**.
+
+Where the catalog publishes no building footprints over STAC — the open
+LiDAR catalogs mostly ship point clouds only — press **Draw the footprint on
+the map** instead of step 4 and trace your building's outline; the laser scan
+is clipped to what you drew. Drawing is optional everywhere else.
 
 The PV arrays above fill in with one entry per usable roof face. **Nothing is
 saved yet** — look at the numbers, correct anything that is wrong, then press

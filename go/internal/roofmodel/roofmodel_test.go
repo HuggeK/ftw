@@ -109,7 +109,7 @@ func TestDisabledWhenAbsentOrOff(t *testing.T) {
 	if off.Enabled() {
 		t.Error("disabled config must report disabled")
 	}
-	if _, err := off.Derive(context.Background(), stockholmLat, stockholmLon, ""); !errors.Is(err, ErrDisabled) {
+	if _, err := off.Derive(context.Background(), stockholmLat, stockholmLon, "", nil); !errors.Is(err, ErrDisabled) {
 		t.Errorf("err = %v, want ErrDisabled", err)
 	}
 	// A nil *Service must be safe to call, not a panic.
@@ -117,7 +117,7 @@ func TestDisabledWhenAbsentOrOff(t *testing.T) {
 	if s.Enabled() {
 		t.Error("nil service must report disabled")
 	}
-	if _, err := s.Derive(context.Background(), stockholmLat, stockholmLon, ""); !errors.Is(err, ErrDisabled) {
+	if _, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "", nil); !errors.Is(err, ErrDisabled) {
 		t.Errorf("err = %v, want ErrDisabled", err)
 	}
 	s.Reconfigure(&config.RoofModel{Enabled: true}) // no-op, not a panic
@@ -130,7 +130,7 @@ func TestDisabledWhenAbsentOrOff(t *testing.T) {
 // enablement, in both directions.
 func TestReconfigureAppliesCredentialsWithoutRestart(t *testing.T) {
 	s := svc(t, &config.RoofModel{Enabled: true})
-	if _, err := s.Derive(context.Background(), stockholmLat, stockholmLon, ""); !errors.Is(err, ErrNoCredentials) {
+	if _, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "", nil); !errors.Is(err, ErrNoCredentials) {
 		t.Fatalf("before reconfigure: err = %v, want ErrNoCredentials", err)
 	}
 
@@ -139,12 +139,12 @@ func TestReconfigureAppliesCredentialsWithoutRestart(t *testing.T) {
 		Command: stubModule(t, "stdout", minimalModel),
 		StacUsername: "operator", StacPassword: "secret",
 	})
-	if _, err := s.Derive(context.Background(), stockholmLat, stockholmLon, ""); err != nil {
+	if _, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "", nil); err != nil {
 		t.Fatalf("after reconfigure with credentials: %v", err)
 	}
 
 	s.Reconfigure(&config.RoofModel{Enabled: false})
-	if _, err := s.Derive(context.Background(), stockholmLat, stockholmLon, ""); !errors.Is(err, ErrDisabled) {
+	if _, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "", nil); !errors.Is(err, ErrDisabled) {
 		t.Fatalf("after disabling: err = %v, want ErrDisabled", err)
 	}
 }
@@ -166,7 +166,7 @@ func TestDeriveRefusesOutsideSwedenWithoutSpawning(t *testing.T) {
 		{"New York", 40.71, -74.01},
 		{"north of Sweden", 71.0, 20.0},
 	} {
-		_, err := s.Derive(context.Background(), c.lat, c.lon, "")
+		_, err := s.Derive(context.Background(), c.lat, c.lon, "", nil)
 		if !errors.Is(err, ErrOutsideCoverage) {
 			t.Errorf("%s: err = %v, want ErrOutsideCoverage", c.name, err)
 		}
@@ -188,7 +188,7 @@ func TestSwedishBoxAdmitsSomeNonSwedishPointsByDesign(t *testing.T) {
 		Command:           "definitely-not-a-real-command",
 		StacUsername: "u", StacPassword: "t",
 	})
-	_, err := s.Derive(context.Background(), 59.91, 10.75, "") // Oslo
+	_, err := s.Derive(context.Background(), 59.91, 10.75, "", nil) // Oslo
 	if errors.Is(err, ErrOutsideCoverage) {
 		t.Skip("box now excludes Oslo; verify it still admits Strömstad and Haparanda")
 	}
@@ -214,7 +214,7 @@ func TestSwedishBoxCoversBorderTowns(t *testing.T) {
 		{"Karesuando (far north)", 68.44, 22.49},
 		{"Smygehuk (far south)", 55.34, 13.36},
 	} {
-		_, err := s.Derive(context.Background(), c.lat, c.lon, "")
+		_, err := s.Derive(context.Background(), c.lat, c.lon, "", nil)
 		if errors.Is(err, ErrOutsideCoverage) {
 			t.Errorf("%s: must not be excluded", c.name)
 		}
@@ -230,7 +230,7 @@ func TestDeriveRequiresCredentials(t *testing.T) {
 		{"neither", "", ""},
 	} {
 		s := svc(t, &config.RoofModel{Enabled: true, Command: "no-such-command", StacUsername: c.user, StacPassword: c.token})
-		_, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "")
+		_, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "", nil)
 		if !errors.Is(err, ErrNoCredentials) {
 			t.Errorf("%s: err = %v, want ErrNoCredentials", c.name, err)
 		}
@@ -246,7 +246,7 @@ func TestDeriveParsesAModel(t *testing.T) {
 	cmd := stubModule(t, "stdout", doc)
 	s := svc(t, &config.RoofModel{Enabled: true, Command: cmd, StacUsername: "u", StacPassword: "t"})
 
-	m, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "")
+	m, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +273,7 @@ func TestDeriveCarriesHowTheLidarWasFetched(t *testing.T) {
 	cmd := stubModule(t, "stdout", doc)
 	s := svc(t, &config.RoofModel{Enabled: true, Command: cmd, StacUsername: "u", StacPassword: "t"})
 
-	m, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "b-1")
+	m, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "b-1", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,7 +297,7 @@ func TestDerivePassesTheSiteAndCredentials(t *testing.T) {
 		RadiusM: 25,
 	})
 
-	if _, err := s.Derive(context.Background(), stockholmLat, stockholmLon, ""); err != nil {
+	if _, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -344,7 +344,7 @@ func TestDerivePassesThePickedBuilding(t *testing.T) {
 		StacUsername: "u", StacPassword: "t",
 	})
 
-	if _, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "bldg-42"); err != nil {
+	if _, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "bldg-42", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -354,6 +354,31 @@ func TestDerivePassesThePickedBuilding(t *testing.T) {
 	}
 	if !strings.Contains(line, "--mode derive") {
 		t.Errorf("args %q did not select derive mode", line)
+	}
+}
+
+// A hand-drawn footprint is the picker for catalogs with no building dataset;
+// it must reach the module as the exact [lon, lat] ring that was traced.
+func TestDerivePassesTheDrawnFootprint(t *testing.T) {
+	dir := t.TempDir()
+	record := dir + string(os.PathSeparator) + "invocation.json"
+	cmd := stubModule(t, "record", record)
+	s := svc(t, &config.RoofModel{
+		Enabled: true, Command: cmd,
+		StacUsername: "u", StacPassword: "t",
+	})
+
+	ring := [][]float64{{18.06, 59.32}, {18.07, 59.32}, {18.07, 59.33}}
+	if _, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "", ring); err != nil {
+		t.Fatal(err)
+	}
+
+	line := strings.Join(readInvocation(t, record).Args, " ")
+	if !strings.Contains(line, `--footprint-json [[18.06,59.32],[18.07,59.32],[18.07,59.33]]`) {
+		t.Errorf("args %q did not carry the drawn footprint", line)
+	}
+	if strings.Contains(line, "--building-id") {
+		t.Errorf("args %q sent a building id nobody picked", line)
 	}
 }
 
@@ -367,7 +392,7 @@ func TestDeriveOmitsTheBuildingFlagWhenNoneIsPicked(t *testing.T) {
 		Enabled: true, Command: cmd, StacUsername: "u", StacPassword: "t",
 	})
 
-	if _, err := s.Derive(context.Background(), stockholmLat, stockholmLon, ""); err != nil {
+	if _, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -453,7 +478,7 @@ func TestDeriveSurfacesTheModuleErrorMessage(t *testing.T) {
 		`{"error":"Geotorget rejected the credentials","kind":"MissingCredentials"}`)
 	s := svc(t, &config.RoofModel{Enabled: true, Command: cmd, StacUsername: "u", StacPassword: "t"})
 
-	_, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "")
+	_, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "", nil)
 	if err == nil {
 		t.Fatal("want an error")
 	}
@@ -474,7 +499,7 @@ func TestModuleErrorSurvivesLibraryWarnings(t *testing.T) {
 			`{"error":"STAC search returned HTTP 404","kind":"GeotorgetError"}`+"\n")
 	s := svc(t, &config.RoofModel{Enabled: true, Command: cmd, StacUsername: "u", StacPassword: "t"})
 
-	_, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "")
+	_, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "", nil)
 	if err == nil {
 		t.Fatal("want an error")
 	}
@@ -489,7 +514,7 @@ func TestDeriveReportsNonJSONFailure(t *testing.T) {
 	cmd := stubModule(t, "stderr", "Traceback (most recent call last):\n  MemoryError\n")
 	s := svc(t, &config.RoofModel{Enabled: true, Command: cmd, StacUsername: "u", StacPassword: "t"})
 
-	_, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "")
+	_, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "", nil)
 	if err == nil || !strings.Contains(err.Error(), "roof model failed") {
 		t.Errorf("err = %v, want a plain failure", err)
 	}
@@ -499,7 +524,7 @@ func TestDeriveRejectsUnknownSchemaVersion(t *testing.T) {
 	cmd := stubModule(t, "stdout", `{"schema_version":99,"arrays":[]}`)
 	s := svc(t, &config.RoofModel{Enabled: true, Command: cmd, StacUsername: "u", StacPassword: "t"})
 
-	_, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "")
+	_, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "", nil)
 	if err == nil || !strings.Contains(err.Error(), "schema_version") {
 		t.Errorf("err = %v, want a schema-version rejection", err)
 	}
@@ -509,7 +534,7 @@ func TestDeriveRejectsUnreadableOutput(t *testing.T) {
 	cmd := stubModule(t, "stdout", "not-json-at-all")
 	s := svc(t, &config.RoofModel{Enabled: true, Command: cmd, StacUsername: "u", StacPassword: "t"})
 
-	_, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "")
+	_, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "", nil)
 	if err == nil || !strings.Contains(err.Error(), "unreadable") {
 		t.Errorf("err = %v, want an unreadable-output error", err)
 	}
@@ -525,7 +550,7 @@ func TestDeriveIsTimeBoxed(t *testing.T) {
 	})
 
 	start := time.Now()
-	_, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "")
+	_, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "", nil)
 	if err == nil || !strings.Contains(err.Error(), "timed out") {
 		t.Errorf("err = %v, want a timeout", err)
 	}
@@ -576,7 +601,7 @@ func TestDeriveAcceptsLegacyGeotorgetKeys(t *testing.T) {
 		GeotorgetUsername: "legacy-op", GeotorgetToken: "legacy-secret",
 	})
 
-	if _, err := s.Derive(context.Background(), stockholmLat, stockholmLon, ""); err != nil {
+	if _, err := s.Derive(context.Background(), stockholmLat, stockholmLon, "", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -616,7 +641,7 @@ func TestDeriveCustomCatalogSkipsSwedenGateAndPassesStacArgs(t *testing.T) {
 	})
 
 	// Berlin: outside Lantmäteriet coverage, fine for a custom catalog.
-	if _, err := s.Derive(context.Background(), 52.52, 13.40, ""); err != nil {
+	if _, err := s.Derive(context.Background(), 52.52, 13.40, "", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -653,7 +678,7 @@ func TestDeriveCustomCatalogWorksAnonymously(t *testing.T) {
 		StacBaseURL: "https://stac.example.org",
 	})
 
-	if _, err := s.Derive(context.Background(), 52.52, 13.40, ""); err != nil {
+	if _, err := s.Derive(context.Background(), 52.52, 13.40, "", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -683,7 +708,7 @@ func TestDeriveDefaultCatalogStillRefusesOutsideSweden(t *testing.T) {
 		Enabled: true, Command: "no-such-command",
 		StacUsername: "u", StacPassword: "p",
 	})
-	_, err := s.Derive(context.Background(), 52.52, 13.40, "")
+	_, err := s.Derive(context.Background(), 52.52, 13.40, "", nil)
 	if !errors.Is(err, ErrOutsideCoverage) {
 		t.Errorf("err = %v, want ErrOutsideCoverage", err)
 	}

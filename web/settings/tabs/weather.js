@@ -184,6 +184,10 @@
   var drawGeometry = null;
   var drawHandled = {};
   var lastDrawnArray = null;
+  // What the next finished shape means: a PV array rectangle, or the
+  // building footprint the LiDAR should be clipped to. One Terra Draw
+  // instance serves both; the entry points set the purpose.
+  var drawPurpose = "array";
 
   function drawStatus(html) {
     var el = document.getElementById("pv-draw-status");
@@ -196,7 +200,7 @@
     return isNaN(v) ? drawGeometry.DEFAULT_TILT_DEG : Math.min(Math.max(v, 0), 90);
   }
 
-  function onRectangleFinished(ctx, id) {
+  function onShapeFinished(ctx, id) {
     if (drawHandled[id]) return;
     drawHandled[id] = true;
     var snapshot = drawInstance.getSnapshot() || [];
@@ -205,6 +209,10 @@
       if (snapshot[i] && snapshot[i].id === id) feature = snapshot[i];
     }
     if (!feature || !feature.geometry || feature.geometry.type !== "Polygon") return;
+    if (drawPurpose === "footprint") {
+      onFootprintFinished(feature);
+      return;
+    }
     var weather = ctx.config.weather;
     var derived = drawGeometry.arrayFromRing(feature.geometry.coordinates[0], {
       latitude: weather.latitude,
@@ -228,6 +236,21 @@
     );
   }
 
+  function ensureDrawInstance(ctx, map) {
+    if (drawInstance) return;
+    drawInstance = new window.terraDraw.TerraDraw({
+      adapter: new window.terraDrawMaplibreGlAdapter.TerraDrawMapLibreGLAdapter({
+        map: map,
+      }),
+      modes: [
+        new window.terraDraw.TerraDrawAngledRectangleMode(),
+        new window.terraDraw.TerraDrawPolygonMode(),
+      ],
+    });
+    drawInstance.start();
+    drawInstance.on("finish", function (id) { onShapeFinished(ctx, id); });
+  }
+
   function startArrayDrawing(ctx) {
     var map = window._weatherMap;
     if (!map) {
@@ -238,16 +261,8 @@
     Promise.all([loadTerraDraw(), import("/components/pv-array-geometry.js")])
       .then(function (loaded) {
         drawGeometry = loaded[1];
-        if (!drawInstance) {
-          drawInstance = new window.terraDraw.TerraDraw({
-            adapter: new window.terraDrawMaplibreGlAdapter.TerraDrawMapLibreGLAdapter({
-              map: map,
-            }),
-            modes: [new window.terraDraw.TerraDrawAngledRectangleMode()],
-          });
-          drawInstance.start();
-          drawInstance.on("finish", function (id) { onRectangleFinished(ctx, id); });
-        }
+        ensureDrawInstance(ctx, map);
+        drawPurpose = "array";
         drawInstance.setMode("angled-rectangle");
         var container = document.getElementById("weather-map");
         if (container && container.scrollIntoView) {
@@ -262,6 +277,50 @@
         drawStatus("Drawing is unavailable (" + ctx.escHtml(e.message) +
           "). The numbers below still work.");
       });
+  }
+
+  function startFootprintDrawing(ctx) {
+    var map = window._weatherMap;
+    if (!map) {
+      roofSay("The map has to finish loading before you can draw on it.", "bad");
+      return;
+    }
+    roofSay("Loading the drawing tools…");
+    loadTerraDraw()
+      .then(function () {
+        ensureDrawInstance(ctx, map);
+        drawPurpose = "footprint";
+        drawInstance.setMode("polygon");
+        var container = document.getElementById("weather-map");
+        if (container && container.scrollIntoView) {
+          container.scrollIntoView({ block: "nearest" });
+        }
+        roofSay(
+          "Click each corner of the building on the map, then click the " +
+          "first corner again to close the outline."
+        );
+      })
+      .catch(function (e) {
+        roofSay("Drawing is unavailable (" + ctx.escHtml(e.message) + ").", "bad");
+      });
+  }
+
+  function onFootprintFinished(feature) {
+    var ring = (feature.geometry.coordinates || [])[0] || [];
+    if (ring.length < 4) { // GeoJSON rings close themselves: 3 corners = 4 points
+      roofSay("That outline has too few corners — draw it again.", "bad");
+      return;
+    }
+    roofState.drawnFootprint = ring;
+    // A drawn footprint and a picked building answer the same question;
+    // the newest answer wins.
+    roofState.selectedId = null;
+    drawBuildings();
+    try { drawInstance.setMode("static"); } catch (e) { /* keeps drawing */ }
+    var derive = document.getElementById("roof-derive");
+    if (derive) derive.disabled = false;
+    roofSay("Footprint drawn (" + (ring.length - 1) + " corners). " +
+            "<em>Read roof from LiDAR</em> will clip the laser scan to it.");
   }
 
   function stopArrayDrawing() {
@@ -433,7 +492,7 @@
   // brings their own credentials. Everything degrades to the numeric fields
   // above when the module, the credentials or the coverage is missing.
 
-  var roofState = { features: [], selectedId: null };
+  var roofState = { features: [], selectedId: null, drawnFootprint: null };
 
   // Known point-cloud catalogs, verified live 2026-09-02. `base: ""` means
   // the module's built-in Lantmäteriet defaults; `base: null` marks the
@@ -513,8 +572,16 @@
       '</div></div>' +
       '<div style="display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 0">' +
       '<button class="btn-add" id="roof-find" type="button">Find buildings here</button>' +
+      '<button class="btn-add" id="roof-draw-footprint" type="button">Draw the footprint on the map</button>' +
       '<button class="btn-add" id="roof-derive" type="button" disabled>Read roof from LiDAR</button>' +
       '</div>' +
+      '<p style="color:var(--text-dim);font-size:0.72rem;margin:6px 0 0">' +
+      'Drawing the footprint yourself is optional: it stands in for ' +
+      '<em>Find buildings here</em> when the catalog publishes no building ' +
+      'footprints over STAC for your region — the open LiDAR catalogs ' +
+      'mostly ship point clouds only. Trace your building\'s outline and ' +
+      'the laser scan is clipped to it.' +
+      '</p>' +
       '<div id="roof-status" style="font-size:0.75rem;color:var(--text-dim);margin:8px 0 0"></div>' +
       '<div id="roof-buildings" style="margin:6px 0 0"></div>' +
       '<p style="color:var(--text-dim);font-size:0.72rem;margin:8px 0 0">' +
@@ -698,6 +765,9 @@
 
   function selectBuilding(id) {
     roofState.selectedId = id;
+    // A picked building and a drawn footprint answer the same question;
+    // the newest answer wins.
+    roofState.drawnFootprint = null;
     drawBuildings();
     var list = document.getElementById("roof-buildings");
     if (list) {
@@ -735,12 +805,24 @@
   }
 
   function deriveRoof(ctx) {
-    if (!roofState.selectedId) return;
+    if (!roofState.selectedId && !roofState.drawnFootprint) return;
     roofSay("Reading the laser scan and fitting roof planes… this can take a minute.");
+    // Send the same coordinates the building search used — the live form
+    // state, saved or not. Deriving against the stored site while the pin
+    // has moved makes the picked id "not found near this site".
+    var w = (ctx.config && ctx.config.weather) || {};
+    var payload = {};
+    if (roofState.selectedId) payload.building_id = roofState.selectedId;
+    else payload.footprint = roofState.drawnFootprint;
+    var lat = parseFloat(w.latitude), lon = parseFloat(w.longitude);
+    if (isFinite(lat) && isFinite(lon)) {
+      payload.latitude = lat;
+      payload.longitude = lon;
+    }
     fetch("/api/roofmodel/derive", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ building_id: roofState.selectedId }),
+      body: JSON.stringify(payload),
     })
       .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
       .then(function (res) {
@@ -850,7 +932,7 @@
         renderPVArrays(ctx);
         refreshArraysSummary(ctx.config);
       });
-      roofState = { features: [], selectedId: null };
+      roofState = { features: [], selectedId: null, drawnFootprint: null };
       var catalogSel = document.getElementById("roof-catalog");
       if (catalogSel) catalogSel.addEventListener("change", function () {
         var chosen = null;
@@ -875,6 +957,8 @@
       });
       var findBtn = document.getElementById("roof-find");
       if (findBtn) findBtn.addEventListener("click", function () { findBuildings(ctx); });
+      var footprintBtn = document.getElementById("roof-draw-footprint");
+      if (footprintBtn) footprintBtn.addEventListener("click", function () { startFootprintDrawing(ctx); });
       var deriveBtn = document.getElementById("roof-derive");
       if (deriveBtn) deriveBtn.addEventListener("click", function () { deriveRoof(ctx); });
       var drawBtn = document.getElementById("pv-array-draw");

@@ -123,6 +123,46 @@ func TestRoofModelBuildingsAcceptsAnExplicitCoordinate(t *testing.T) {
 	}
 }
 
+// The derive must search where the picker searched. The picker honours the
+// dragged, unsaved pin; if the derive silently used the stored site instead,
+// every pick made after moving the pin would die with "not found near this
+// site".
+func TestRoofModelDeriveAcceptsAnExplicitCoordinate(t *testing.T) {
+	deps := depsAt(59.33, 18.07)
+	deps.RoofModel = roofmodel.FromConfig(&config.RoofModel{
+		Enabled: true, Command: "definitely-not-a-real-command",
+		StacUsername: "u", StacPassword: "p",
+	})
+	srv := New(deps)
+
+	// Berlin is outside Lantmateriet coverage; if the body coordinates were
+	// ignored the stored Stockholm ones would be used and this would not 400.
+	req := httptest.NewRequest(http.MethodPost, "/api/roofmodel/derive",
+		strings.NewReader(`{"building_id":"b1","latitude":52.52,"longitude":13.40}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != 400 {
+		t.Fatalf("status = %d, want 400 for a site outside Sweden (body %s)", rr.Code, rr.Body.String())
+	}
+
+	// Without coordinates in the body the stored site still serves.
+	req = httptest.NewRequest(http.MethodPost, "/api/roofmodel/derive",
+		strings.NewReader(`{"building_id":"b1"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	var body map[string]any
+	_ = json.Unmarshal(rr.Body.Bytes(), &body)
+	msg, _ := body["error"].(string)
+	if msg == "" {
+		t.Fatal("want the spawn to fail, since the command does not exist")
+	}
+	if strings.Contains(msg, "not in Sweden") {
+		t.Errorf("the stored Stockholm site was not used: %v", msg)
+	}
+}
+
 // The catalog password is the operator's credential. Status may be reported;
 // the secret itself must never appear in a response. This test deliberately
 // stores it under the legacy geotorget_token key: a config written before the

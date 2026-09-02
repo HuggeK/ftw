@@ -146,4 +146,23 @@ describe("roof buildings on the map", () => {
   it("retries the draw once the style has loaded", () => {
     assert.match(source, /map\.once\("load", drawBuildings\)/);
   });
+
+  it("offers footprint drawing as the fallback for catalogs without buildings", () => {
+    const html = tab.render(stubCtx());
+    assert.ok(html.includes('id="roof-draw-footprint"'));
+    assert.ok(html.includes("Drawing the footprint yourself is optional"));
+    // The drawn ring must reach the derive, and beat a stale building pick.
+    assert.match(source, /payload\.footprint = roofState\.drawnFootprint/);
+    assert.match(source, /TerraDrawPolygonMode/);
+    assert.match(source, /roofState\.drawnFootprint = null/);
+  });
+
+  it("derives at the same coordinates the picker searched", () => {
+    // Both requests read the live form state; deriving against the stored
+    // site while the pin has moved makes the picked building "not found
+    // near this site".
+    assert.match(source, /payload\.latitude = lat/);
+    assert.match(source, /payload\.longitude = lon/);
+    assert.match(source, /body: JSON\.stringify\(payload\)/);
+  });
 });
