@@ -1,5 +1,122 @@
 # Changelog
 
+## 2.13.0
+
+### Minor Changes
+
+- e374e77: Ask why keeps earlier conversations. The box stores each thread, so a question asked from a laptop is readable from a phone and closing the dialog no longer throws the answer away. Open one from Earlier to read it or carry it on; the box keeps the 50 most recent.
+
+### Patch Changes
+
+- 711346b: Ask why streams the answer as it is written, shows each tool call while it waits, and keeps long replies inside the dialog. The reply renders as markdown — headings, lists and code, not raw dashes and asterisks — and a Stop button ends a slow model without losing the thread.
+
+## 2.12.1
+
+### Patch Changes
+
+- b129a83: Ask why follow-ups keep the conversation, a closed dialog cannot steal a late answer, and pasting a key no longer forces Enable on.
+- d464e47: Ask why can explain the current plan from a question under the Plan card, shows live progress in a conversation, and opens a GitHub issue with one filled text field.
+
+## 2.12.0
+
+### Minor Changes
+
+- bd3ecdc: Ask why: paste an OpenRouter key and the Plan card can explain the live site and draft a GitHub issue. It uses read-only tools (help report, driver health, logs, current plan slot). A header chip appears when a driver is offline; clicking it opens Ask why. Off until enabled. Default model is openrouter/free. The helper never issues driver commands.
+
+## 2.11.0
+
+### Minor Changes
+
+- ba64f5b: The planner now runs inside Core by default. The Go solver — measured
+  within öre of the external MILP on real site snapshots and structurally
+  immune to the relaxation failure modes the external stack needed guard
+  rails for — plans against the per-slot PV downside at 201×401
+  resolution. The Python/HiGHS optimizer is no longer the champion: with
+  planner.shadow_python (default on) it runs after each replan as a
+  comparison shadow on identical inputs, and every replan logs and
+  records the terminal-corrected cost difference — the field evidence
+  for its scheduled removal. Set planner.engine: python to keep the old
+  arrangement during the transition.
+  
+  A battery that has drifted outside soc_min…soc_max no longer stops
+  Core from planning. The planner starts from the nearest band edge,
+  warns with the real reading and the difference in Wh, and records the
+  unclamped value on the diagnostic as initial_soc_unclamped; the
+  dispatch clamp and the driver's own floor still bound what any plan
+  can ask the hardware for. A reading that is not physically possible —
+  outside 0–1 — is still refused, and the previous plan stands.
+
+### Patch Changes
+
+- aa8bf39: Keep Manual… strategy buttons on the Plan card in simple view, open them when the live mode changes to a manual fallback, and mark a tap before the server confirms. Hide manual now stays hidden — the status poll no longer reopens the drawer — and a tap no longer flickers back to the previous strategy.
+  
+  A house left in a manual mode can start planning again: the Plan card shows "Use the plan" whenever the planner is not driving. It hands the battery to the planner mode this household's own prefs imply — the passive one unless battery export is allowed — and never grants export rights on its own.
+
+## 2.10.0
+
+### Minor Changes
+
+- 82b069b: The forecast-trust slider becomes a real dial: 41 positions (0–2 in
+  0.05 steps) instead of three, stored as the numeric safety factor the
+  planner actually uses. With the per-slot PV hedge this is now a
+  tangible control — each notch changes the share of every slot's own
+  forecast uncertainty the plan holds in reserve, the hedge line updates
+  live while dragging, and releasing the slider replans immediately.
+  Existing three-step choices and the enum API field keep working; old
+  clients read the nearest step.
+
+## 2.9.0
+
+### Minor Changes
+
+- 5658cf3: The planner's PV-forecast hedge is now proportional per slot instead of
+  one flat watt figure across the whole horizon: the PV model learns the
+  relative forecast error online, and each slot's downside is that share
+  of its own expected generation — large on variable cloudy days, zero at
+  night, no longer erasing morning and evening shoulders or hedging a
+  clear tomorrow with today's uncertainty. Measured against real
+  snapshots the flat haircut cost 25–65 SEK per 48 h plan. Sites where
+  the model has not yet learned the relative error keep the previous
+  flat behavior.
+
+### Patch Changes
+
+- 1887965: A plan that rides the site's grid limit exactly is no longer rejected
+  for solver float noise: the external-plan validator's grid-limits
+  check gains the same ±2 W tolerance every other power check already
+  had. Rejection discarded the whole plan and silently degraded the
+  site to the fallback planner — observed in the field as
+  "slot 34 grid_w 11040.000 violates grid limits" on an 11 040 W fuse.
+
+## 2.8.0
+
+### Minor Changes
+
+- 44c62d1: The Plan card's forecast-trust slider always works now. An explicit
+  `pv_forecast_safety_k` in config.yaml used to win over it and render it
+  permanently disabled with a "config.yaml wins" note; the field is now a
+  first-boot seed only — it maps to the nearest trust step once when no
+  preference is stored, and the slider owns the live value from then on,
+  the same stored-wins contract `forecast_trust` already had.
+
+### Patch Changes
+
+- 8f0c2f9: Planner parity fixes ported from the MILP formulation (#1020): the
+  strict self-consumption bias clamps at zero price instead of
+  inverting into an import bonus on negative-price slots; the PV-charge
+  bonus applies in every mode (still bounded by live PV surplus);
+  horizon mean prices are length-weighted for mixed slot lengths; the
+  simulated plan starts at the battery's real state of charge instead
+  of the nearest grid point; and replan diagnostics persist the
+  arbitrage spread and PV-uncertainty inputs so a snapshot re-solves
+  under the exact economics the replan used.
+- 2a21b7f: The planner's DP grid resolution rises from 41 SoC × 81 action levels
+  to 201 × 401 (about 0.4 % SoC and 24 W steps), closing most of the
+  measured discretization gap to the external MILP; replans with an
+  active EV loadpoint automatically derate to 101 × 201 to keep the
+  extended state space near one second. Solve budgets were measured on
+  the snapshot replay bench before raising the defaults.
+
 ## 2.7.0
 
 ### Minor Changes

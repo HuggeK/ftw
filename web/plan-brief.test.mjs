@@ -30,7 +30,9 @@ describe("plan brief normalization", () => {
       tone: "idle",
     });
     assert.equal(brief.next.action, "Manual control is active");
-    assert.match(brief.next.time, /planning strategy/);
+    // Both manual sentences name the button that actually exists on the
+    // card. There is no strategy picker to send anyone to any more.
+    assert.match(brief.next.time, /Use the plan/);
     assert.equal(brief.soc, null);
   });
 
@@ -112,6 +114,29 @@ describe("plan brief normalization", () => {
     assert.match(brief.constraint, /schedule is old/);
   });
 
+  it("shows the Core planner as an ordinary active plan, not a fallback", () => {
+    const brief = derivePlanBrief({
+      enabled: true,
+      plan: {
+        actions: [slot(-7, { battery_w: 2400, soc: 0.48 }), slot(8)],
+        solver: {
+          engine: "core",
+          backend: "dp",
+          status: "optimal",
+          soc_levels: 201,
+          action_levels: 401,
+        },
+      },
+      status: { mode: "planner_arbitrage", bat_soc: 0.46 },
+      now,
+    });
+
+    assert.equal(brief.state.key, "active");
+    assert.equal(brief.state.label, "Plan active");
+    assert.equal(brief.planner.label, "core / dp");
+    assert.equal(brief.planner.detail, "Plan result: Optimal");
+  });
+
   it("names the built-in solver fallback without losing its reason", () => {
     const brief = derivePlanBrief({
       enabled: true,
@@ -167,8 +192,10 @@ describe("plan brief normalization", () => {
     assert.equal(brief.state.label, "Cannot plan");
     assert.match(brief.next.action, /controllable battery/);
     assert.match(brief.next.time, /Devices/);
-    assert.doesNotMatch(brief.next.time, /planning strategy/);
-    assert.doesNotMatch(brief.planner.detail, /Select a planning strategy/);
+    // A house with no controllable battery is not one button away from a
+    // plan, so it must not be told to press one.
+    assert.doesNotMatch(brief.next.time, /Use the plan/);
+    assert.doesNotMatch(brief.planner.detail, /Use the plan/);
     assert.equal(brief.soc.label, "40% now");
   });
 

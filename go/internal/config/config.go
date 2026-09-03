@@ -45,6 +45,7 @@ type Config struct {
 	Nova             *Nova              `yaml:"nova,omitempty" json:"nova,omitempty"`
 	DeviceRepository *DeviceRepository  `yaml:"device_repository,omitempty" json:"device_repository,omitempty"`
 	OCPP             *OCPP              `yaml:"ocpp,omitempty" json:"ocpp,omitempty"`
+	Assistant        *Assistant         `yaml:"assistant,omitempty" json:"assistant,omitempty"`
 
 	// LoadWarnings collects recoverable problems Parse repaired instead of
 	// refusing the file: an on-disk config an older version accepted must
@@ -339,6 +340,78 @@ const (
 	legacyDriverRepositoryName        = "FTW official drivers"
 	legacyDriverRepositoryManifestURL = "https://github.com/srcfl/ftw/releases/download/drivers-stable/manifest.json"
 )
+
+// Assistant is the optional Ask why helper: a user-supplied OpenRouter
+// (or OpenAI-compatible) key used to explain the local help report.
+// Nil or disabled is the unavailable state. The helper never issues
+// driver commands or writes config.
+type Assistant struct {
+	Enabled bool   `yaml:"enabled" json:"enabled"`
+	APIKey  string `yaml:"api_key,omitempty" json:"api_key,omitempty"`
+	// Model is an OpenRouter model id. Empty means openrouter/free.
+	Model string `yaml:"model,omitempty" json:"model,omitempty"`
+	// BaseURL is the OpenAI-compatible root (no /chat/completions suffix).
+	// Empty means https://openrouter.ai/api/v1. A later Sourceful proxy
+	// can set this without a code change.
+	BaseURL string `yaml:"base_url,omitempty" json:"base_url,omitempty"`
+
+	// HasAPIKey is JSON-only: true when a key exists on disk. Set by
+	// MaskSecrets before APIKey is blanked so Settings can render
+	// "configured — hidden". Never written to YAML.
+	HasAPIKey bool `yaml:"-" json:"has_api_key,omitempty"`
+}
+
+const (
+	DefaultAssistantModel   = "openrouter/free"
+	DefaultAssistantBaseURL = "https://openrouter.ai/api/v1"
+)
+
+// Ready is true when Ask why can make an outbound call.
+func (a *Assistant) Ready() bool {
+	return a != nil && a.Enabled && strings.TrimSpace(a.APIKey) != ""
+}
+
+// ResolvedModel returns the configured model or the free-router default.
+func (a *Assistant) ResolvedModel() string {
+	if a == nil || strings.TrimSpace(a.Model) == "" {
+		return DefaultAssistantModel
+	}
+	return strings.TrimSpace(a.Model)
+}
+
+// ResolvedBaseURL returns the OpenAI-compatible root without a trailing slash.
+func (a *Assistant) ResolvedBaseURL() string {
+	if a == nil || strings.TrimSpace(a.BaseURL) == "" {
+		return DefaultAssistantBaseURL
+	}
+	return strings.TrimRight(strings.TrimSpace(a.BaseURL), "/")
+}
+
+// Validate checks optional assistant settings. A missing key is allowed:
+// the Ask why endpoint reports that as unavailable rather than refusing
+// the whole config.
+func (a *Assistant) Validate() error {
+	if a == nil {
+		return nil
+	}
+	if strings.TrimSpace(a.Model) != "" && len(a.Model) > 120 {
+		return errors.New("assistant.model is too long")
+	}
+	if strings.TrimSpace(a.BaseURL) == "" {
+		return nil
+	}
+	u, err := url.Parse(strings.TrimSpace(a.BaseURL))
+	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
+		return errors.New("assistant.base_url must be an http(s) URL")
+	}
+	if u.User != nil {
+		return errors.New("assistant.base_url must carry no credentials")
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return errors.New("assistant.base_url must carry no query or fragment")
+	}
+	return nil
+}
 
 // Notifications configures outbound push notifications. Exactly one
 // transport provider is active at a time, selected by Provider. Today
@@ -845,9 +918,17 @@ type Planner struct {
 	// BatteryExport is the first-boot battery-sale permission:
 	// unknown | not_allowed | allowed. Live value is SQLite battery_export.
 	BatteryExport string `yaml:"battery_export,omitempty" json:"battery_export,omitempty"`
-	// Engine selects the primary optimizer: "python" (default) runs the
-	// CVXPY/HiGHS worker; "dp" is the legacy in-process rollback engine.
+	// Engine selects the planner that produces the active plan: "core"
+	// (default) solves in process with the Go DP; "python" hands the
+	// champion role to the CVXPY/HiGHS worker. "go" and "dp" are accepted
+	// spellings of "core". Read it through EngineName.
 	Engine string `yaml:"engine,omitempty" json:"engine,omitempty"`
+	// ShadowPython runs the Python/HiGHS worker after each Core replan, on
+	// the inputs the champion solved, and records the terminal-corrected
+	// cost difference. Shadow output never reaches dispatch. Pointer so an
+	// unset field keeps the default (on) and an explicit false turns the
+	// comparison off. Ignored when Engine is python.
+	ShadowPython *bool `yaml:"shadow_python,omitempty" json:"shadow_python,omitempty"`
 	// OptimizerCommand is the Python executable used for the local worker.
 	// It is an executable path, not a shell command. The module invocation is
 	// fixed by the host to avoid shell parsing and configuration injection.
@@ -889,8 +970,13 @@ type Planner struct {
 	// down betting on PV that may not arrive — a reserve emerges from the
 	// live forecast uncertainty itself, sized to the real risk (large on
 	// variable cloudy days, ~zero on clear days or in winter), not a flat
-	// SoC %. Pointer so unset (→ default 1.0) is distinct from an explicit
-	// 0 (= raw forecast, no hedge: "use the battery you have").
+	// SoC %. Pointer so unset is distinct from an explicit 0.
+	//
+	// FIRST-BOOT SEED ONLY. The live value follows the Plan card's
+	// slider (SQLite key planner_safety_k, same stored-wins contract as
+	// forecast_trust); this field seeds that float verbatim once when
+	// nothing is stored, and never overrides the slider — the old
+	// precedence disabled the slider for as long as the field existed.
 	PVForecastSafetyK *float64 `yaml:"pv_forecast_safety_k,omitempty" json:"pv_forecast_safety_k,omitempty"`
 
 	// PVChargeBonusOreKwh credits each kWh of battery charge fed from
@@ -934,6 +1020,36 @@ type Planner struct {
 	UseEnergyDispatch *bool `yaml:"use_energy_dispatch,omitempty" json:"use_energy_dispatch,omitempty"`
 }
 
+// PlannerEngineCore and PlannerEnginePython are the two planners that can hold
+// the champion role.
+const (
+	PlannerEngineCore   = "core"
+	PlannerEnginePython = "python"
+)
+
+// EngineName resolves planner.engine to one of the two champions. Unset means
+// core: the Go DP measured within öre of the external MILP on replayed site
+// snapshots, and it needs no sidecar to be running to produce a plan.
+func (p *Planner) EngineName() string {
+	if p == nil {
+		return PlannerEngineCore
+	}
+	if strings.EqualFold(strings.TrimSpace(p.Engine), PlannerEnginePython) {
+		return PlannerEnginePython
+	}
+	return PlannerEngineCore
+}
+
+// ShadowPythonEnabled reports whether the external optimizer runs behind a Core
+// champion as a comparison shadow. Default on: the per-replan cost difference
+// it records is the field evidence for retiring the external stack.
+func (p *Planner) ShadowPythonEnabled() bool {
+	if p == nil || p.ShadowPython == nil {
+		return true
+	}
+	return *p.ShadowPython
+}
+
 // OptimizerTimeout returns the runtime contract value for an unset timeout.
 // Parsing also fills it so API clients do not invent a shorter default when
 // they save an otherwise unchanged planner.
@@ -942,16 +1058,6 @@ func (p *Planner) OptimizerTimeout() time.Duration {
 		return optimizercontract.DefaultTimeout
 	}
 	return time.Duration(p.OptimizerTimeoutS * float64(time.Second))
-}
-
-// PVSafetyK resolves the downside-PV haircut scale (forecast − k·σ). Unset
-// config (nil Planner or nil field) → default 1.0; an explicit value is
-// honored verbatim, including 0 (no hedge — "use the battery you have").
-func (p *Planner) PVSafetyK() float64 {
-	if p == nil || p.PVForecastSafetyK == nil {
-		return 1.0
-	}
-	return *p.PVForecastSafetyK
 }
 
 // Site is the top-level control loop config.
@@ -1463,6 +1569,12 @@ func (c Config) MaskSecrets() Config {
 		cp.APIKey = ""
 		out.Weather = &cp
 	}
+	if out.Assistant != nil {
+		cp := *out.Assistant
+		cp.HasAPIKey = strings.TrimSpace(cp.APIKey) != ""
+		cp.APIKey = ""
+		out.Assistant = &cp
+	}
 	if out.Notifications != nil {
 		cp := *out.Notifications
 		if cp.Ntfy != nil {
@@ -1554,6 +1666,9 @@ func (incoming *Config) PreserveMaskedSecrets(existing *Config) {
 	}
 	if incoming.Weather != nil && existing.Weather != nil && incoming.Weather.APIKey == "" {
 		incoming.Weather.APIKey = existing.Weather.APIKey
+	}
+	if incoming.Assistant != nil && existing.Assistant != nil && incoming.Assistant.APIKey == "" {
+		incoming.Assistant.APIKey = existing.Assistant.APIKey
 	}
 	if incoming.Notifications != nil && existing.Notifications != nil &&
 		incoming.Notifications.Ntfy != nil && existing.Notifications.Ntfy != nil {
@@ -2052,6 +2167,9 @@ func (c *Config) Validate() error {
 	if err := c.OCPP.Validate(); err != nil {
 		return err
 	}
+	if err := c.Assistant.Validate(); err != nil {
+		return err
+	}
 	if err := c.validateVehicles(); err != nil {
 		return err
 	}
@@ -2264,10 +2382,11 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("planner.battery_export must be unknown, not_allowed, or allowed, got %q", p.BatteryExport)
 			}
 		}
-		switch p.Engine {
-		case "", "python", "dp":
+		switch strings.ToLower(strings.TrimSpace(p.Engine)) {
+		case "", PlannerEngineCore, "go", "dp", PlannerEnginePython:
 		default:
-			return fmt.Errorf("planner.engine must be \"python\" or \"dp\", got %q", p.Engine)
+			return fmt.Errorf("planner.engine must be %q or %q, got %q",
+				PlannerEngineCore, PlannerEnginePython, p.Engine)
 		}
 		switch strings.ToUpper(p.OptimizerSolver) {
 		case "", "HIGHS", "CLARABEL":

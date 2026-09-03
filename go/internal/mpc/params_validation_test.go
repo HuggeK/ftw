@@ -223,6 +223,8 @@ func TestValidatePlanningParamsRejectsInvalidAggregateValues(t *testing.T) {
 		{"negative pv bonus", "pv_charge_bonus", func(p *Params) { p.PVChargeBonusOreKwh = -1 }},
 		{"negative spread", "min_arbitrage_spread", func(p *Params) { p.MinArbitrageSpreadOreKwh = -1 }},
 		{"negative uncertainty", "pv_uncertainty", func(p *Params) { p.PVUncertaintyW = -1 }},
+		{"negative relative uncertainty", "pv_relative_uncertainty", func(p *Params) { p.PVRelativeUncertainty = -1 }},
+		{"nan relative uncertainty", "pv_relative_uncertainty", func(p *Params) { p.PVRelativeUncertainty = math.NaN() }},
 		{"nan safety", "pv_forecast_safety", func(p *Params) { p.PVForecastSafetyK = math.NaN() }},
 	}
 	for _, tc := range tests {
@@ -734,10 +736,13 @@ func TestReplanRecoveryKeepsPreviousPlanWhenDPWouldBeRequired(t *testing.T) {
 		wantFailCalls int32
 		setupRecovery func(*Service)
 	}{
-		{name: "aggregate go only", setupRecovery: func(svc *Service) { svc.Defaults.InitialSoC = 0.05 }},
+		// Only the external-champion path still refuses: its operating-band
+		// recovery ratchet is what the DP cannot represent, so a failed primary
+		// must not silently become a DP plan solved from a snapped SoC. With
+		// Core as the configured planner the same state is clamped and planned
+		// — see TestCoreChampionClampsOutOfBandSoC.
 		{name: "aggregate failed primary", baseline: &physicsGateCountingOptimizer{}, recovery: &physicsGateFailingOptimizer{}, wantFailCalls: 1,
 			setupRecovery: func(svc *Service) { svc.Defaults.InitialSoC = 0.05 }},
-		{name: "storage member go only", setupRecovery: func(svc *Service) { configurePhysicsGateFleet(svc, 0.05, 0.55) }},
 		{name: "storage member failed primary", baseline: &physicsGateCountingOptimizer{}, recovery: &physicsGateFailingOptimizer{}, wantFailCalls: 1,
 			setupRecovery: func(svc *Service) { configurePhysicsGateFleet(svc, 0.05, 0.55) }},
 	}
@@ -809,15 +814,22 @@ func TestReplanSnapshotsPVUncertaintyOnce(t *testing.T) {
 	svc.BaseLoad = 500
 	svc.PVForecastSafetyK = 1
 	svc.Optimizer = &physicsGateCountingOptimizer{}
-	var calls atomic.Int32
+	var calls, relCalls atomic.Int32
 	svc.PVUncertaintyW = func() float64 {
 		calls.Add(1)
 		return 300
+	}
+	svc.PVRelativeUncertainty = func() float64 {
+		relCalls.Add(1)
+		return 0.2
 	}
 	if plan := svc.Replan(context.Background()); plan == nil {
 		t.Fatal("Replan returned nil")
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("PV uncertainty sampled %d times, want exactly 1", calls.Load())
+	}
+	if relCalls.Load() != 1 {
+		t.Fatalf("PV relative uncertainty sampled %d times, want exactly 1", relCalls.Load())
 	}
 }

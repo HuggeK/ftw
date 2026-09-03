@@ -170,6 +170,58 @@ func TestValidatePlanModeErrorIncludesPowerValues(t *testing.T) {
 	}
 }
 
+// gridLimitFixture builds a single arbitrage slot whose baseline grid flow is
+// exactly gridW, under an 11 040 W fuse (16 A x 3 x 230 V) and an 8 000 W
+// export cap, plus the matching zero-battery plan. Grid balance, mode and cost
+// all reconcile, so only the grid-limit check can reject it.
+func gridLimitFixture(gridW float64) ([]Slot, Params, Plan) {
+	slot := Slot{
+		StartMs: 1, LenMin: 15, PriceOre: 100, SpotOre: 80, Confidence: 1,
+		Limits: PowerLimits{MaxImportW: 11040, MaxExportW: 8000},
+	}
+	if gridW >= 0 {
+		slot.LoadW = gridW
+	} else {
+		slot.PVW = gridW
+	}
+	p := Params{
+		Mode: ModeArbitrage, CapacityWh: 10000,
+		SoCMin: 0.1, SoCMax: 0.95, InitialSoC: 0.5,
+		MaxChargeW: 5000, MaxDischargeW: 5000,
+		ChargeEfficiency: 1, DischargeEfficiency: 1,
+	}
+	costOre := SlotGridCostOre(slot, gridW*0.25/1000, p)
+	plan := Plan{TotalCostOre: costOre, Actions: []Action{{
+		SlotStartMs: 1, SlotLenMin: 15, BatteryW: 0, GridW: gridW,
+		SoC: p.InitialSoC, CostOre: costOre,
+	}}}
+	return []Slot{slot}, p, plan
+}
+
+func TestValidatePlanAcceptsGridFlowRidingTheLimit(t *testing.T) {
+	slots, p, plan := gridLimitFixture(11040 + 1e-9)
+	if err := ValidatePlan(slots, p, &plan); err != nil {
+		t.Fatalf("ValidatePlan rejected solver residue at the import limit: %v", err)
+	}
+	slots, p, plan = gridLimitFixture(-8000 - 1e-9)
+	if err := ValidatePlan(slots, p, &plan); err != nil {
+		t.Fatalf("ValidatePlan rejected solver residue at the export limit: %v", err)
+	}
+}
+
+func TestValidatePlanRejectsGridFlowPastTheLimit(t *testing.T) {
+	slots, p, plan := gridLimitFixture(11040 + 5)
+	err := ValidatePlan(slots, p, &plan)
+	if err == nil || !strings.Contains(err.Error(), "violates grid limits") {
+		t.Fatalf("ValidatePlan 5 W over the import limit = %v, want a grid-limit rejection", err)
+	}
+	slots, p, plan = gridLimitFixture(-8000 - 5)
+	err = ValidatePlan(slots, p, &plan)
+	if err == nil || !strings.Contains(err.Error(), "violates grid limits") {
+		t.Fatalf("ValidatePlan 5 W past the export limit = %v, want a grid-limit rejection", err)
+	}
+}
+
 func TestExternalOptimizerStopsWorkerAfterIdleTimeout(t *testing.T) {
 	if len(os.Args) > 0 && os.Args[len(os.Args)-1] == "external-worker-helper" {
 		time.Sleep(10 * time.Second)
@@ -430,5 +482,84 @@ func TestExternalOptimizerPlansAndValidatesMultipleStorages(t *testing.T) {
 	plan.Actions[0].StorageEnergyWh["battery-a"] += 100
 	if err := ValidatePlan(slots, p, &plan); err == nil {
 		t.Fatal("ValidatePlan accepted a corrupted per-storage energy trajectory")
+	}
+}
+
+// The champion's scenarios and the Go fallback's downside slots have to
+// describe the same physics. Once the twin has learned a relative error, the
+// scenario spread is a share of each slot's own generation, not one watt
+// figure repeated across the horizon.
+func TestBuildRequestScenarioSpreadIsPerSlotWhenRelativeIsLearned(t *testing.T) {
+	start := time.Date(2026, 8, 30, 4, 0, 0, 0, time.UTC).UnixMilli()
+	gen := []float64{0, 500, 6000}
+	slots := make([]Slot, len(gen))
+	for i, g := range gen {
+		slots[i] = Slot{
+			StartMs: start + int64(i)*15*60*1000, LenMin: 15,
+			PriceOre: 100, SpotOre: 50, LoadW: 400, PVW: -g, Confidence: 1,
+		}
+	}
+	p := Params{
+		Mode: ModeArbitrage, SoCMin: 0.1, SoCMax: 0.95, SoCLevels: 11,
+		InitialSoC: 0.5, ActionLevels: 7, CapacityWh: 10000,
+		MaxChargeW: 5000, MaxDischargeW: 5000,
+		ChargeEfficiency: 0.95, DischargeEfficiency: 0.95,
+		PVUncertaintyW: 1891, PVRelativeUncertainty: 0.25, PVForecastSafetyK: 1,
+	}
+
+	req := (&ExternalOptimizer{}).buildRequest(slots, p)
+	if len(req.Scenarios) != 3 {
+		t.Fatalf("got %d scenarios, want 3", len(req.Scenarios))
+	}
+	down, ok := req.Scenarios[1]["pv_w"].([]float64)
+	if !ok {
+		t.Fatalf("downside pv_w has type %T", req.Scenarios[1]["pv_w"])
+	}
+	up, ok := req.Scenarios[2]["pv_w"].([]float64)
+	if !ok {
+		t.Fatalf("upside pv_w has type %T", req.Scenarios[2]["pv_w"])
+	}
+	for i, g := range gen {
+		wantDown, wantUp := -(g * 0.75), -(g * 1.25)
+		if g == 0 {
+			wantDown, wantUp = 0, 0 // night slots carry no spread either way
+		}
+		if down[i] != wantDown {
+			t.Errorf("downside[%d] = %v, want %v", i, down[i], wantDown)
+		}
+		if up[i] != wantUp {
+			t.Errorf("upside[%d] = %v, want %v", i, up[i], wantUp)
+		}
+	}
+}
+
+// With no learned relative error the scenarios keep the flat watt spread, so
+// a fresh site's champion sees exactly what it saw before.
+func TestBuildRequestScenarioSpreadStaysFlatWhenRelativeIsUnlearned(t *testing.T) {
+	start := time.Date(2026, 8, 30, 10, 0, 0, 0, time.UTC).UnixMilli()
+	slots := []Slot{
+		{StartMs: start, LenMin: 15, PriceOre: 100, SpotOre: 50,
+			LoadW: 400, PVW: -6000, Confidence: 1},
+		{StartMs: start + 15*60*1000, LenMin: 15, PriceOre: 100, SpotOre: 50,
+			LoadW: 400, PVW: -500, Confidence: 1},
+	}
+	p := Params{
+		Mode: ModeArbitrage, SoCMin: 0.1, SoCMax: 0.95, SoCLevels: 11,
+		InitialSoC: 0.5, ActionLevels: 7, CapacityWh: 10000,
+		MaxChargeW: 5000, MaxDischargeW: 5000,
+		ChargeEfficiency: 0.95, DischargeEfficiency: 0.95,
+		PVUncertaintyW: 2000, PVForecastSafetyK: 1,
+	}
+
+	req := (&ExternalOptimizer{}).buildRequest(slots, p)
+	if len(req.Scenarios) != 3 {
+		t.Fatalf("got %d scenarios, want 3", len(req.Scenarios))
+	}
+	down := req.Scenarios[1]["pv_w"].([]float64)
+	if down[0] != -4000 {
+		t.Errorf("downside[0] = %v, want -4000 (6000 − 2000)", down[0])
+	}
+	if down[1] != 0 {
+		t.Errorf("downside[1] = %v, want 0 (500 W shoulder minus a 2000 W flat cut)", down[1])
 	}
 }

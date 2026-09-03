@@ -541,14 +541,20 @@ func main() {
 	}
 	storedTrust, _ := st.LoadConfig(config.StateKeyForecastTrust)
 	storedExport, _ := st.LoadConfig(config.StateKeyBatteryExport)
+	storedSafetyK, _ := st.LoadConfig(config.StateKeySafetyK)
 	yamlTrust, yamlExport := "", ""
+	var yamlK *float64
 	if cfg.Planner != nil {
 		yamlTrust = cfg.Planner.ForecastTrust
 		yamlExport = cfg.Planner.BatteryExport
+		yamlK = cfg.Planner.PVForecastSafetyK
 	}
-	trust, export, missingPrefs := config.ResolvePlannerPrefs(storedTrust, storedExport, string(ctrl.Mode), yamlTrust, yamlExport)
-	plannerPrefs := config.NewPlannerPrefs(trust, export)
+	trust, export, safetyK, missingPrefs := config.ResolvePlannerPrefs(storedTrust, storedExport, storedSafetyK, string(ctrl.Mode), yamlTrust, yamlExport, yamlK)
+	plannerPrefs := config.NewPlannerPrefs(trust, export, safetyK)
 	if missingPrefs {
+		if err := st.SaveConfig(config.StateKeySafetyK, config.FormatSafetyK(safetyK)); err != nil {
+			slog.Warn("failed to persist planner_safety_k", "err", err)
+		}
 		if err := st.SaveConfig(config.StateKeyForecastTrust, string(trust)); err != nil {
 			slog.Warn("failed to persist forecast_trust", "err", err)
 		}
@@ -1499,10 +1505,12 @@ func main() {
 			mpcSvc.PV = pvSvc.PredictStructural
 			mpcSvc.PVResidualCorrect = pvSvc.ResidualCorrect
 			mpcSvc.PVUncertaintyW = pvSvc.ResidualStdW
+			mpcSvc.PVRelativeUncertainty = pvSvc.RelativeUncertainty
 		}
 		// Downside-PV safety planning (forecast − k·σ) — replaces the old SoC
-		// safety floor. Unset config → default 1.0; explicit 0 → raw forecast.
-		mpcSvc.PVForecastSafetyK = cfg.Planner.EffectiveSafetyK(trust)
+		// safety floor. k comes from the Plan card's slider (resolved above);
+		// nothing stored → 1.0, k=0 → raw forecast.
+		mpcSvc.PVForecastSafetyK = cfg.Planner.EffectiveSafetyK(safetyK)
 		if cfg.Planner != nil {
 			mpcSvc.MinArbitrageSpreadOreKwh = cfg.Planner.MinArbitrageSpreadOreKwh
 		}
@@ -2404,8 +2412,8 @@ func main() {
 		// release and light the update badge on an up-to-date stable site.
 		// /api/components calls SetCurrentVersion once a handshake succeeds.
 		optimizerCurrent := ""
-		if mpcSvc != nil && mpcSvc.Optimizer != nil {
-			if health, ok := mpcSvc.Optimizer.(interface {
+		if worker := mpcSvc.ConfiguredOptimizer(); worker != nil {
+			if health, ok := worker.(interface {
 				Health(context.Context) (mpc.OptimizerRuntimeInfo, error)
 			}); ok {
 				healthCtx, healthCancel := context.WithTimeout(ctx, 2*time.Second)
@@ -4026,23 +4034,32 @@ func buildMPC(cfg *config.Config, st *state.Store, tel *telemetry.Store, capacit
 	}
 	params := mpc.Params{
 		Mode:                mode,
-		SoCLevels:           41,
+		SoCLevels:           201,
 		CapacityWh:          totalCap,
 		SoCMin:              socMin,
 		SoCMax:              socMax,
 		PVChargeBonusOreKwh: pvBonus,
 		InitialSoC:          0.50,
-		// ActionLevels = 81 → 225 W discretization step on a ±9 kW
-		// action range. Coarser values (21=900 W, 41=450 W) lose
-		// borderline-PV slots: on a 273 W net surplus the 450 W min
-		// charge action overshoots ModeSelfConsumption's no-battery-
-		// export rule (gridW ends up positive past tolerance) and the
-		// DP falls back to idle/export the surplus. 81 levels lets the
-		// DP land on +225 W and absorb the surplus into the battery.
-		// DP complexity is O(N×S×A×EL×EA) — at the production 192-slot
-		// × 41-SoC × 1-EV grid, 81 actions is ~636k evaluations,
-		// still ~5 ms per replan on the Pi.
-		ActionLevels:        81,
+		// Coarse action grids lose borderline-PV slots: at 21 levels
+		// (900 W step on a ±9 kW range) or 41 (450 W), the smallest
+		// legal charge action on a 273 W net surplus overshoots
+		// ModeSelfConsumption's no-battery-export rule (gridW ends up
+		// positive past tolerance) and the DP falls back to idle and
+		// exports the surplus. 81 levels (225 W) was the first grid
+		// that could land inside that slot; it is still the floor
+		// pinned by self_consumption_horizon_test.go.
+		//
+		// Discretization is now the last measured gap to the external
+		// MILP (−72 öre per 48 h plan, terminal-corrected, on the
+		// 12-snapshot replay bench), so the grid is sized to the solve
+		// budget rather than to one slot. DP complexity is
+		// O(N×S×A×EL×EA): 193 slots × 201 SoC × 401 actions ≈ 15.6M
+		// evaluations, ~100 ms-scale on a Pi 5 — the same bench
+		// measured 3–6 ms at 41×81 — well inside the seconds budget.
+		// An active EV loadpoint multiplies this grid, so service.go
+		// derates it to 101×201 for those replans; see
+		// derateResolutionForLoadpoint.
+		ActionLevels:        401,
 		MaxChargeW:          maxChg,
 		MaxDischargeW:       maxDis,
 		ChargeEfficiency:    chgEff,
@@ -4051,11 +4068,11 @@ func buildMPC(cfg *config.Config, st *state.Store, tel *telemetry.Store, capacit
 	}
 	svc := mpc.New(st, tel, zone, params)
 	svc.UpdateBatteryFleet(fleet, totalCap, maxChg, maxDis)
-	engine := pl.Engine
-	if engine == "" {
-		engine = "python"
-	}
-	if engine == "python" {
+	// Core is the champion (#1020). The external optimizer keeps two roles:
+	// planner.engine: python restores it as champion for the transition, and
+	// planner.shadow_python runs it behind Core as a measurement.
+	engine := pl.EngineName()
+	if engine == config.PlannerEnginePython || pl.ShadowPythonEnabled() {
 		transportMode := pl.OptimizerTransport
 		if fromEnv := os.Getenv("FTW_OPTIMIZER_TRANSPORT"); fromEnv != "" {
 			transportMode = fromEnv
@@ -4113,9 +4130,13 @@ func buildMPC(cfg *config.Config, st *state.Store, tel *telemetry.Store, capacit
 			IdleTimeout: idleTimeout,
 			Multistage:  multistage,
 		})
-		if err != nil {
-			slog.Error("mpc: configure primary optimizer failed; using Go DP", "err", err)
-		} else {
+		switch {
+		case err != nil && engine == config.PlannerEnginePython:
+			slog.Error("mpc: configure primary optimizer failed; using Core DP", "err", err)
+		case err != nil:
+			slog.Info("mpc: python shadow unavailable; Core plans without a comparison",
+				"err", err)
+		case engine == config.PlannerEnginePython:
 			svc.Optimizer = ext
 			svc.EnableRecourseShadow = pl.OptimizerRecourseShadow
 			svc.RecourseNonAnticipativeSlots = pl.OptimizerRecourseNonAnticipativeSlots
@@ -4126,15 +4147,24 @@ func buildMPC(cfg *config.Config, st *state.Store, tel *telemetry.Store, capacit
 			if svc.RecourseNonAnticipativeSlots <= 0 {
 				svc.RecourseNonAnticipativeSlots = 1
 			}
-			slog.Info("mpc: Python optimizer configured", "python", python,
+			slog.Warn("mpc: Python optimizer holds the champion role (planner.engine: python)",
+				"python", python,
 				"module_dir", moduleDir, "transport", transportMode, "socket", socketPath,
 				"timeout", timeout, "idle_timeout", idleTimeout,
 				"recourse_shadow", svc.EnableRecourseShadow,
 				"challenger_policy", svc.ChallengerPolicy,
 				"recourse_non_anticipative_slots", svc.RecourseNonAnticipativeSlots)
+		default:
+			// Shadow only. The recourse/multistage challengers stay off: they
+			// exist to challenge the external champion, and there isn't one.
+			svc.ShadowOptimizer = ext
+			slog.Info("mpc: Core planner with Python comparison shadow",
+				"python", python, "module_dir", moduleDir,
+				"transport", transportMode, "socket", socketPath,
+				"timeout", timeout, "idle_timeout", idleTimeout)
 		}
 	} else {
-		slog.Warn("mpc: legacy Go DP selected explicitly", "engine", engine)
+		slog.Info("mpc: Core planner, no comparison shadow (planner.shadow_python: false)")
 	}
 	svc.BaseLoad = pl.BaseLoadW
 	if pl.HorizonHours > 0 {
