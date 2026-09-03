@@ -45,7 +45,20 @@ turns *seen* into *trusted*.
 
 Once adopted it behaves like any other EV reading: `MeterValues` and
 `StatusNotification` become telemetry, and dispatch stops the home battery
-discharging into an active EV charge.
+discharging into an active EV charge. It also gets a row in `/api/devices`
+alongside the driver-backed hardware, under **Settings → Devices**.
+
+That row is keyed on the vendor and serial from `BootNotification`, not on the
+name above — a name an installer typed and the charger's own web page can
+change is not hardware identity, and state keyed on it would not survive a
+re-commissioning. Rename a charger and its row follows it; the persistent
+state stays attached to the box on the wall. A charger that reports no serial
+(plenty do not) falls back to the dialled name, recorded as an endpoint so it
+reads as what it is: stable only until someone changes it.
+
+Pending chargers get no row. A device row says this hardware is part of the
+site, and quarantine says an unadopted charge point is not; it gets one on the
+save that adopts it.
 
 ## Protocol versions
 
@@ -128,32 +141,87 @@ ocpp:
 **Credentials are mandatory.** FTW refuses to start with `enabled: true` and an
 empty username or password. That is deliberate, and the reason is below.
 
-## Security: the listener is on every interface
+## Security: the socket is on every interface
 
 The OCPP library builds its listen address from the port alone, so the socket
-binds to every interface the host has. There is no bind-address setting, and
-there is no TLS on this path yet.
+is open on every interface the host has and nothing FTW can configure changes
+that. `bind` therefore works one layer up: a connection that arrived on any
+other address is refused at the WebSocket handshake, before it can speak OCPP.
 
-On a Raspberry Pi with one LAN connection that is usually fine. It is not fine
-if the host also has a public interface or a permissive port forward.
+That is an access control, not a smaller attack surface. A port scan still
+finds the port open on every interface; what it cannot do is talk to it.
 
-So:
+```yaml
+ocpp:
+  bind: 192.168.1.10   # only chargers reaching the box this way
+```
+
+On a Raspberry Pi with one LAN connection the default (every interface) is
+usually fine. Set `bind` when the host also has a VPN interface, a second NIC,
+or a public one.
+
+Whatever you set:
 
 - Keep the port closed at your router. Never forward it from the internet.
-- Treat the password as a real secret; it is the only gate in front of the
-  server.
-- Basic auth over `ws://` sends the credential unencrypted. Anyone who can sniff
-  your LAN can read it.
+- Treat the password as a real secret.
 
-Behind the password sits a second gate: a charge point no charger entry names
-stays pending, outside telemetry and dispatch (see above). A stolen password
-gets an attacker a row in the Chargers table, not influence over the site.
-What it does not stop is impersonation — a device that knows the password *and*
-an adopted charger's id can still pose as it, which is what per-charger
-credentials and TLS would fix.
+### The four gates
 
-Credentials being required is a mitigation, not a fix. Binding to one interface
-needs a change to the upstream library.
+1. **Basic auth.** Required — an enabled server without a username and
+   password is refused at startup.
+2. **Identity binding.** A charger listed under `ocpp.chargers` has a password
+   of its own and must present it under its own name. This is what closes
+   impersonation: without it, identity is client-chosen and shared, so a device
+   that knows the password *and* an adopted charger's id can pose as it.
+3. **Bind.** As above.
+4. **Quarantine.** A charge point no charger entry names stays pending, outside
+   telemetry and dispatch. A stolen password gets an attacker a row in the
+   Chargers table, not influence over the site.
+
+### Per-charger credentials
+
+```yaml
+ocpp:
+  username: ftw
+  password: "the-shared-one"
+  chargers:
+    - id: garage
+      password: "a-different-long-random-string"
+```
+
+The `id` is what the charger dials with — the last segment of its URL, and the
+same string a charger entry adopts. On OCPP the basic-auth username *is* that
+identity, so a listed charger presents `garage` / its own password, and the
+shared credential no longer buys its name.
+
+This is opt-in per charger: anything not listed keeps using the shared
+username and password, so adding one entry does not lock the others out. A
+charger you have not listed can still be impersonated by something holding the
+shared password — list the ones that matter.
+
+### TLS
+
+```yaml
+ocpp:
+  tls:
+    cert_file: /etc/ftw/ocpp/server.crt
+    key_file: /etc/ftw/ocpp/server.key
+    client_ca_file: /etc/ftw/ocpp/charger-ca.crt   # optional
+```
+
+Chargers then dial `wss://` instead of `ws://`. Without it, basic auth over
+`ws://` sends the credential unencrypted and anyone who can sniff your LAN can
+read it.
+
+`client_ca_file` additionally requires every charge point to present a
+certificate signed by that CA — OCPP 2.0.1 security profile 3. It is the
+strongest identity available here: unlike a password, it cannot be copied out
+of one charger's configuration and replayed by another device unless the
+private key was copied too.
+
+Half a TLS section is refused at startup rather than quietly serving `ws://`.
+An operator who asked for `wss://` and silently got plaintext would have no way
+to tell the link was never encrypted.
 
 ## Pointing a charger at FTW
 
@@ -253,6 +321,28 @@ would strand a driver with an uncharged car because the EMS went down, and the
 last limit was already judged safe for the site. This matches what every EV
 driver in FTW already does.
 
+### How the profile is shaped, and why
+
+The limit goes out as a `TxDefaultProfile` with one schedule period at second
+zero and no end: *hold this until I send another*. Two details of that are
+load-bearing, and both come from chargers disagreeing with the specification
+in ways that fail silently:
+
+- **The profile kind is `Relative`, not `Absolute`.** An absolute schedule
+  states when it starts; FTW's has no start, and the specification says an
+  absolute schedule without one is relative to the start of charging anyway.
+  A charger that instead reads the missing timestamp as "not valid yet"
+  answers **Accepted** and charges on at full rate — the worst failure
+  available here, because FTW logs a limit it never imposed. Relative carries
+  no timestamp to misread, and does not depend on the charger's clock agreeing
+  with ours.
+- **Connector 0, then connector 1.** A profile on connector 0 applies to every
+  connector, which avoids depending on per-connector ids — unreliable on
+  dual-socket units such as the Charge Amps Aura. Some chargers read the
+  connector-0 rule as `ChargePointMaxProfile`-only and reject it, so a refusal
+  is retried once on connector 1. Refusing both is reported as an error: a
+  charger FTW cannot steer must not look like one it can.
+
 ## One capacity, several cars: vehicle profiles
 
 `vehicle_capacity_wh` on a charger entry describes the **one** car the charger
@@ -288,19 +378,48 @@ What "identifies" means depends on the dialect:
   card, not the car — profiles work when each card lives permanently in one
   car.
 - **OCPP 2.0.1**: idTokens can name the actual vehicle — `MacAddress`
-  (autocharge) or `eMAID` (ISO 15118 Plug & Charge) — no card involved. With
-  ISO 15118 hardware, `NotifyEVChargingNeeds` can additionally state the
-  energy the car actually wants; consuming that is future work, tracked with
-  OCPP 2.1 in issue #835.
+  (autocharge) or `eMAID` (ISO 15118 Plug & Charge) — no card involved.
 
 A wrong or missing capacity skews planning accuracy only, never safety — the
 car's own BMS always protects it. An unprofiled car larger than the configured
 capacity makes the SoC estimate rise too fast, so a target charge can stop
 early; correct the SoC in the dashboard EV modal, or use Force start.
 
+## When the car speaks for itself
+
+With ISO 15118 hardware on OCPP 2.0.1 the car states its own needs, and the
+charger forwards them as `NotifyEVChargingNeeds`. That outranks every figure
+above: a profile and `vehicle_capacity_wh` are both an operator's estimate of
+the car that usually parks here, this is the car actually plugged in.
+
+What FTW takes from it, for the session only:
+
+| The car says | FTW does |
+|---|---|
+| battery capacity (DC) | replaces the session capacity, over a profile's too |
+| present state of charge (DC) | re-anchors the session SoC estimate |
+| energy requested | with the two above, derives the target the planner fills to |
+| departure time | becomes the loadpoint's target time |
+
+All of it reverts on plug-out, exactly like a profile. A departure time the car
+does not state never erases one the operator set.
+
+An **AC** session states energy without a battery size, so there is no fraction
+to derive and the target is left alone — a guess there would feed the planner a
+number the car never claimed. A departure time still applies.
+
+The last report is shown in the Chargers tab and on `GET /api/ocpp/chargers` as
+`charging_needs`. Quarantine applies as everywhere else: a pending charge
+point's needs are visible so you can see what asked, and reach no loadpoint.
+
+Most chargers never send this. It needs ISO 15118 on both the charger and the
+car; without it, profiles and `vehicle_capacity_wh` remain the whole story.
+
 ## Current limits
 
-- **No TLS**, and the listener cannot be pinned to one interface.
+- **The socket cannot be pinned to one interface.** `bind` refuses the
+  handshake instead, so the port stays open on every interface even when only
+  one is served.
 - Chargers that also have a native protocol may work better through a driver.
   Easee over Modbus and Zaptec over its cloud API already have drivers; OCPP is
   the option when you want the cloud out of the loop.

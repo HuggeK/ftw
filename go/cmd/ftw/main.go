@@ -541,14 +541,20 @@ func main() {
 	}
 	storedTrust, _ := st.LoadConfig(config.StateKeyForecastTrust)
 	storedExport, _ := st.LoadConfig(config.StateKeyBatteryExport)
+	storedSafetyK, _ := st.LoadConfig(config.StateKeySafetyK)
 	yamlTrust, yamlExport := "", ""
+	var yamlK *float64
 	if cfg.Planner != nil {
 		yamlTrust = cfg.Planner.ForecastTrust
 		yamlExport = cfg.Planner.BatteryExport
+		yamlK = cfg.Planner.PVForecastSafetyK
 	}
-	trust, export, missingPrefs := config.ResolvePlannerPrefs(storedTrust, storedExport, string(ctrl.Mode), yamlTrust, yamlExport)
-	plannerPrefs := config.NewPlannerPrefs(trust, export)
+	trust, export, safetyK, missingPrefs := config.ResolvePlannerPrefs(storedTrust, storedExport, storedSafetyK, string(ctrl.Mode), yamlTrust, yamlExport, yamlK)
+	plannerPrefs := config.NewPlannerPrefs(trust, export, safetyK)
 	if missingPrefs {
+		if err := st.SaveConfig(config.StateKeySafetyK, config.FormatSafetyK(safetyK)); err != nil {
+			slog.Warn("failed to persist planner_safety_k", "err", err)
+		}
 		if err := st.SaveConfig(config.StateKeyForecastTrust, string(trust)); err != nil {
 			slog.Warn("failed to persist forecast_trust", "err", err)
 		}
@@ -1036,6 +1042,10 @@ func main() {
 				}
 			}
 			ocppSrv.Handler().SetApprovedIDs(approved)
+			// A charger adopted by this save booted long ago and will not
+			// boot again just because we changed our mind, so its device
+			// row has to be written here rather than waiting for one.
+			registerOCPPDevices(st, ocppSrv)
 		}
 
 		// Notifications: rebuild the provider from fresh config
@@ -1319,16 +1329,26 @@ func main() {
 				approved = append(approved, lp.DriverName)
 			}
 		}
-		srv, err := ocpp.Start(ctx, &ocpp.Config{
+		ocppCfg := &ocpp.Config{
 			Enabled:            cfg.OCPP.Enabled,
+			Bind:               cfg.OCPP.Bind,
 			Port:               cfg.OCPP.Port,
 			PortV201:           cfg.OCPP.PortV201,
 			Path:               cfg.OCPP.Path,
 			Username:           cfg.OCPP.Username,
 			Password:           cfg.OCPP.Password,
 			HeartbeatIntervalS: cfg.OCPP.HeartbeatIntervalS,
+			ChargerSecrets:     cfg.OCPP.ChargerSecrets(),
 			ApprovedIDs:        approved,
-		}, tel)
+		}
+		if t := cfg.OCPP.TLS; t != nil {
+			ocppCfg.TLS = &ocpp.TLSConfig{
+				CertFile:     t.CertFile,
+				KeyFile:      t.KeyFile,
+				ClientCAFile: t.ClientCAFile,
+			}
+		}
+		srv, err := ocpp.Start(ctx, ocppCfg, tel)
 		if err != nil {
 			// A charger that cannot reach us is a missing device, not a
 			// broken site, so keep the rest of the process running.
@@ -1343,6 +1363,11 @@ func main() {
 			// profile's charging policy. An identity matching no profile
 			// changes nothing (the visitor default); it still shows in the
 			// Chargers panel so the operator can paste it into a profile.
+			// An adopted charger becomes a device the moment it says what
+			// it is, keyed on vendor+serial like any driver-backed one.
+			ocppSrv.Handler().SetIdentityReported(func(ident ocpp.ChargerIdentity) {
+				registerOCPPDevice(st, ident)
+			})
 			ocppSrv.Handler().SetVehicleIdentified(func(chargerID, vehicleID, source string) {
 				cfgMu.RLock()
 				lpID := ""
@@ -1382,6 +1407,60 @@ func main() {
 					"source", source, "capacity_wh", vehicle.CapacityWh,
 					"surplus_only", vehicle.SurplusOnly,
 					"target_soc", vehicle.TargetSoC)
+			})
+			// Charging needs: on an ISO 15118 session the car states what
+			// it wants — energy, departure, and on DC its own capacity and
+			// state of charge. That is the car actually plugged in rather
+			// than an operator's estimate of it, so it takes precedence for
+			// the session and reverts on plug-out with everything else.
+			ocppSrv.Handler().SetChargingNeeds(func(chargerID string, needs ocpp.ChargingNeeds) {
+				cfgMu.RLock()
+				lpID := ""
+				for _, lp := range cfg.Loadpoints {
+					if lp.DriverName == chargerID {
+						lpID = lp.ID
+						break
+					}
+				}
+				cfgMu.RUnlock()
+				if lpID == "" {
+					return
+				}
+				// Capacity first: the SoC anchor below divides delivered
+				// energy by it, so anchoring against a stale capacity would
+				// re-base the session estimate on the wrong battery.
+				if needs.CapacityWh > 0 {
+					lpMgr.SetSessionCapacityWh(lpID, needs.CapacityWh)
+				}
+				if needs.PresentSoC != nil {
+					lpMgr.AnchorVehicleSoC(lpID, *needs.PresentSoC)
+				}
+				target, haveTarget := needs.TargetSoC()
+				switch {
+				case haveTarget:
+					// A departure the car did not state must not erase one
+					// the operator did.
+					when := needs.DepartureTime
+					if when.IsZero() {
+						if st, ok := lpMgr.State(lpID); ok {
+							when = st.TargetTime
+						}
+					}
+					lpMgr.SetTarget(lpID, target, when)
+				case !needs.DepartureTime.IsZero():
+					// AC states energy without a battery size, so there is
+					// no fraction to derive — but the deadline is still the
+					// car's, and it belongs on the operator's own target.
+					if st, ok := lpMgr.State(lpID); ok && st.TargetSoC > 0 {
+						lpMgr.SetTarget(lpID, st.TargetSoC, needs.DepartureTime)
+					}
+				}
+				slog.Info("ocpp: charging needs applied",
+					"charger", chargerID, "lp", lpID,
+					"mode", needs.TransferMode, "energy_wh", needs.EnergyWh,
+					"capacity_wh", needs.CapacityWh,
+					"departure", needs.DepartureTime,
+					"target_soc", target, "target_derived", haveTarget)
 			})
 			slog.Info("ocpp: central system started",
 				"port", ocppSrv.Port(),
@@ -1426,10 +1505,12 @@ func main() {
 			mpcSvc.PV = pvSvc.PredictStructural
 			mpcSvc.PVResidualCorrect = pvSvc.ResidualCorrect
 			mpcSvc.PVUncertaintyW = pvSvc.ResidualStdW
+			mpcSvc.PVRelativeUncertainty = pvSvc.RelativeUncertainty
 		}
 		// Downside-PV safety planning (forecast − k·σ) — replaces the old SoC
-		// safety floor. Unset config → default 1.0; explicit 0 → raw forecast.
-		mpcSvc.PVForecastSafetyK = cfg.Planner.EffectiveSafetyK(trust)
+		// safety floor. k comes from the Plan card's slider (resolved above);
+		// nothing stored → 1.0, k=0 → raw forecast.
+		mpcSvc.PVForecastSafetyK = cfg.Planner.EffectiveSafetyK(safetyK)
 		if cfg.Planner != nil {
 			mpcSvc.MinArbitrageSpreadOreKwh = cfg.Planner.MinArbitrageSpreadOreKwh
 		}
@@ -1755,6 +1836,25 @@ func main() {
 	// driver_failure_default.go.
 	actuation := newDriverActuationTracker(tel)
 
+	// An OCPP charge point is not in the driver registry — it connected to us
+	// rather than being dialled — so route by name: if an online charger
+	// answers to it, command it over OCPP, otherwise fall through to the Lua
+	// driver registry. Everything above stays unaware of the difference.
+	//
+	// Hoisted out of the loadpoint controller below because the API needs the
+	// same routing: the dashboard's Pause / Resume / Force start post to
+	// /api/ev/command, and sending those straight to the registry finds no
+	// driver for a charger that has none.
+	evSend := reg.Send
+	if ocppSrv != nil {
+		evSend = func(ctx context.Context, name string, payload []byte) error {
+			if ocppSrv.Handler().IsOnline(name) {
+				return ocppSrv.Command(ctx, name, payload)
+			}
+			return reg.Send(ctx, name, payload)
+		}
+	}
+
 	// ---- EV loadpoint controller ----
 	// loadpoint.Controller owns per-tick EV dispatch, including the
 	// energy-allocation contract, snapping and phase transitions.
@@ -1802,20 +1902,9 @@ func main() {
 				RequestActive: reqActive,
 			}, true
 		}
-		// An OCPP charge point is not in the driver registry — it connected to
-		// us rather than being dialled — so route by name: if an online charger
-		// answers to it, command it over OCPP, otherwise fall through to the
-		// Lua driver registry. Loadpoints stay unaware of the difference.
-		send := reg.Send
-		if ocppSrv != nil {
-			send = func(ctx context.Context, name string, payload []byte) error {
-				if ocppSrv.Handler().IsOnline(name) {
-					return ocppSrv.Command(ctx, name, payload)
-				}
-				return reg.Send(ctx, name, payload)
-			}
-		}
-		lpController = loadpoint.NewController(lpMgr, planAdapter, telAdapter, send)
+		// evSend routes OCPP chargers past the driver registry; loadpoints
+		// stay unaware of the difference.
+		lpController = loadpoint.NewController(lpMgr, planAdapter, telAdapter, evSend)
 		// A charger that answers every poll and refuses every setpoint is
 		// the storage bug of #800 on the EV wire: it holds its last
 		// current and the plan keeps counting the load. Only the periodic
@@ -2323,8 +2412,8 @@ func main() {
 		// release and light the update badge on an up-to-date stable site.
 		// /api/components calls SetCurrentVersion once a handshake succeeds.
 		optimizerCurrent := ""
-		if mpcSvc != nil && mpcSvc.Optimizer != nil {
-			if health, ok := mpcSvc.Optimizer.(interface {
+		if worker := mpcSvc.ConfiguredOptimizer(); worker != nil {
+			if health, ok := worker.(interface {
 				Health(context.Context) (mpc.OptimizerRuntimeInfo, error)
 			}); ok {
 				healthCtx, healthCancel := context.WithTimeout(ctx, 2*time.Second)
@@ -2486,6 +2575,7 @@ func main() {
 		Loadpoints:       lpMgr,
 		LoadpointCtrl:    lpController,
 		OCPPChargers:     ocppChargersFn,
+		EVSend:           evSend,
 		CalDAV:           calSvc,
 		HA:               haBridge,
 		Registry:         reg,
@@ -3368,6 +3458,49 @@ func doRolloff(ctx context.Context, st *state.Store, coldDir string) {
 	}
 }
 
+// registerOCPPDevice writes one charge point's row in the device registry.
+//
+// A charger is not in the driver registry — it dialled us, so there is no
+// driver, no endpoint we chose and no HostEnv identity to read. What it does
+// have is a BootNotification, and vendor+serial out of that is a
+// hardware-stable key exactly like a driver's. The name it dialled with is
+// not: an installer typed it and the charger's own web page can change it, so
+// it is recorded as the endpoint and only becomes the key when the charger
+// reports no serial at all.
+func registerOCPPDevice(st *state.Store, ident ocpp.ChargerIdentity) {
+	if st == nil || ident.ID == "" {
+		return
+	}
+	dev := state.Device{
+		DriverName: ident.ID,
+		Make:       ident.Vendor,
+		Serial:     ident.Serial,
+		Endpoint:   "ocpp://" + ident.ID,
+	}
+	id, err := st.RegisterDevice(dev)
+	if err != nil {
+		slog.Warn("ocpp: could not register charger as a device",
+			"charger", ident.ID, "err", err)
+		return
+	}
+	slog.Info("ocpp: charger registered as a device",
+		"charger", ident.ID, "device_id", id,
+		"vendor", ident.Vendor, "model", ident.Model, "serial", ident.Serial)
+}
+
+// registerOCPPDevices catches up every adopted charger that has already
+// booted. Adoption usually happens long after a BootNotification — an
+// operator sees a pending charger in the UI and binds it to a loadpoint — and
+// the charger will not boot again just because we changed our mind about it.
+func registerOCPPDevices(st *state.Store, srv *ocpp.Server) {
+	if st == nil || srv == nil {
+		return
+	}
+	for _, ident := range srv.Handler().Identities() {
+		registerOCPPDevice(st, ident)
+	}
+}
+
 // registerAllDevices snapshots the identity HostEnv has gathered for each
 // running driver and upserts a row in the devices table. Idempotent.
 // Called periodically because some drivers (notably MQTT) only learn their
@@ -3901,23 +4034,32 @@ func buildMPC(cfg *config.Config, st *state.Store, tel *telemetry.Store, capacit
 	}
 	params := mpc.Params{
 		Mode:                mode,
-		SoCLevels:           41,
+		SoCLevels:           201,
 		CapacityWh:          totalCap,
 		SoCMin:              socMin,
 		SoCMax:              socMax,
 		PVChargeBonusOreKwh: pvBonus,
 		InitialSoC:          0.50,
-		// ActionLevels = 81 → 225 W discretization step on a ±9 kW
-		// action range. Coarser values (21=900 W, 41=450 W) lose
-		// borderline-PV slots: on a 273 W net surplus the 450 W min
-		// charge action overshoots ModeSelfConsumption's no-battery-
-		// export rule (gridW ends up positive past tolerance) and the
-		// DP falls back to idle/export the surplus. 81 levels lets the
-		// DP land on +225 W and absorb the surplus into the battery.
-		// DP complexity is O(N×S×A×EL×EA) — at the production 192-slot
-		// × 41-SoC × 1-EV grid, 81 actions is ~636k evaluations,
-		// still ~5 ms per replan on the Pi.
-		ActionLevels:        81,
+		// Coarse action grids lose borderline-PV slots: at 21 levels
+		// (900 W step on a ±9 kW range) or 41 (450 W), the smallest
+		// legal charge action on a 273 W net surplus overshoots
+		// ModeSelfConsumption's no-battery-export rule (gridW ends up
+		// positive past tolerance) and the DP falls back to idle and
+		// exports the surplus. 81 levels (225 W) was the first grid
+		// that could land inside that slot; it is still the floor
+		// pinned by self_consumption_horizon_test.go.
+		//
+		// Discretization is now the last measured gap to the external
+		// MILP (−72 öre per 48 h plan, terminal-corrected, on the
+		// 12-snapshot replay bench), so the grid is sized to the solve
+		// budget rather than to one slot. DP complexity is
+		// O(N×S×A×EL×EA): 193 slots × 201 SoC × 401 actions ≈ 15.6M
+		// evaluations, ~100 ms-scale on a Pi 5 — the same bench
+		// measured 3–6 ms at 41×81 — well inside the seconds budget.
+		// An active EV loadpoint multiplies this grid, so service.go
+		// derates it to 101×201 for those replans; see
+		// derateResolutionForLoadpoint.
+		ActionLevels:        401,
 		MaxChargeW:          maxChg,
 		MaxDischargeW:       maxDis,
 		ChargeEfficiency:    chgEff,
@@ -3926,11 +4068,11 @@ func buildMPC(cfg *config.Config, st *state.Store, tel *telemetry.Store, capacit
 	}
 	svc := mpc.New(st, tel, zone, params)
 	svc.UpdateBatteryFleet(fleet, totalCap, maxChg, maxDis)
-	engine := pl.Engine
-	if engine == "" {
-		engine = "python"
-	}
-	if engine == "python" {
+	// Core is the champion (#1020). The external optimizer keeps two roles:
+	// planner.engine: python restores it as champion for the transition, and
+	// planner.shadow_python runs it behind Core as a measurement.
+	engine := pl.EngineName()
+	if engine == config.PlannerEnginePython || pl.ShadowPythonEnabled() {
 		transportMode := pl.OptimizerTransport
 		if fromEnv := os.Getenv("FTW_OPTIMIZER_TRANSPORT"); fromEnv != "" {
 			transportMode = fromEnv
@@ -3988,9 +4130,13 @@ func buildMPC(cfg *config.Config, st *state.Store, tel *telemetry.Store, capacit
 			IdleTimeout: idleTimeout,
 			Multistage:  multistage,
 		})
-		if err != nil {
-			slog.Error("mpc: configure primary optimizer failed; using Go DP", "err", err)
-		} else {
+		switch {
+		case err != nil && engine == config.PlannerEnginePython:
+			slog.Error("mpc: configure primary optimizer failed; using Core DP", "err", err)
+		case err != nil:
+			slog.Info("mpc: python shadow unavailable; Core plans without a comparison",
+				"err", err)
+		case engine == config.PlannerEnginePython:
 			svc.Optimizer = ext
 			svc.EnableRecourseShadow = pl.OptimizerRecourseShadow
 			svc.RecourseNonAnticipativeSlots = pl.OptimizerRecourseNonAnticipativeSlots
@@ -4001,15 +4147,24 @@ func buildMPC(cfg *config.Config, st *state.Store, tel *telemetry.Store, capacit
 			if svc.RecourseNonAnticipativeSlots <= 0 {
 				svc.RecourseNonAnticipativeSlots = 1
 			}
-			slog.Info("mpc: Python optimizer configured", "python", python,
+			slog.Warn("mpc: Python optimizer holds the champion role (planner.engine: python)",
+				"python", python,
 				"module_dir", moduleDir, "transport", transportMode, "socket", socketPath,
 				"timeout", timeout, "idle_timeout", idleTimeout,
 				"recourse_shadow", svc.EnableRecourseShadow,
 				"challenger_policy", svc.ChallengerPolicy,
 				"recourse_non_anticipative_slots", svc.RecourseNonAnticipativeSlots)
+		default:
+			// Shadow only. The recourse/multistage challengers stay off: they
+			// exist to challenge the external champion, and there isn't one.
+			svc.ShadowOptimizer = ext
+			slog.Info("mpc: Core planner with Python comparison shadow",
+				"python", python, "module_dir", moduleDir,
+				"transport", transportMode, "socket", socketPath,
+				"timeout", timeout, "idle_timeout", idleTimeout)
 		}
 	} else {
-		slog.Warn("mpc: legacy Go DP selected explicitly", "engine", engine)
+		slog.Info("mpc: Core planner, no comparison shadow (planner.shadow_python: false)")
 	}
 	svc.BaseLoad = pl.BaseLoadW
 	if pl.HorizonHours > 0 {

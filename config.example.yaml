@@ -184,19 +184,35 @@ caldav:
 #
 # Credentials are required when enabled, and FTW refuses to start without them:
 # the OCPP library builds its listen address from the port alone, so the socket
-# is reachable on every interface and basic auth is the only gate. Keep the port
-# closed at your router. See docs/ocpp.md.
+# is open on every interface whatever bind says — bind refuses the handshake for
+# a connection that arrived elsewhere, which controls access without closing the
+# port. Keep it closed at your router. See docs/ocpp.md.
 # Each version needs its own port: a charger picks its dialect in the WebSocket
 # handshake, so one listener cannot serve both. 2.1 is not supported — no
 # production-grade Go implementation of it exists yet.
 ocpp:
   enabled: false
+  # bind: 192.168.1.10             # refuse chargers reaching the box any other
+                                   # way; omit for every interface
   port: 8887                       # OCPP 1.6J
   # port_v201: 8888                # OCPP 2.0.1; omit to disable
   path: /
   username: ftw
   password: ""                     # required when enabled; use a long random string
   heartbeat_interval_s: 60
+  # Serve wss:// instead of ws://. client_ca_file additionally requires each
+  # charger to present a certificate signed by that CA — OCPP 2.0.1 security
+  # profile 3, and the only identity here that cannot be copied between devices.
+  # tls:
+  #   cert_file: /etc/ftw/ocpp/server.crt
+  #   key_file: /etc/ftw/ocpp/server.key
+  #   client_ca_file: /etc/ftw/ocpp/charger-ca.crt
+  # Give a charger a credential of its own, so the shared password above stops
+  # being enough to connect under its name. The id is what the charger dials
+  # with, and the same string a loadpoint's driver_name adopts.
+  # chargers:
+  #   - id: garage
+  #     password: ""               # a long random string, different per charger
 
 # Persistent state (SQLite)
 state:
@@ -224,6 +240,17 @@ app_link:
 fleet_ping:
   enabled: true
   # endpoint: https://relay.ftw.energy/fleet
+
+# Ask why — optional. Paste an OpenRouter key (free account, no card) and
+# the Plan card can explain the live help report and draft a GitHub issue.
+# Off until enabled. The key is stored on this box and sent only as a
+# bearer token to the API you set. Default model openrouter/free stays on
+# free models. The helper never issues driver commands.
+# assistant:
+#   enabled: true
+#   api_key: sk-or-v1-...
+#   model: openrouter/free
+#   # base_url: https://openrouter.ai/api/v1
 
 # Independently distributed Lua drivers. The signed stable catalog is refreshed
 # by default, but refresh never downloads, activates, or restarts a driver.
@@ -253,12 +280,17 @@ fleet_ping:
 #         ftw-drivers-2026-01: MX+j27UBkyM099hTyJlmMLK9qlTTDUJsaK/vH12fFKc=
 # Refresh only updates the signed catalog. Install and activation stay explicit.
 
-# Mathematical MPC optimizer. Official Compose runs it as the independently
-# updatable ftw-optimizer service; native installs can point optimizer_command
-# at their venv's Python executable.
+# The planner. Core solves it in process; the Python/HiGHS optimizer is the
+# legacy external engine, still shipped as the independently updatable
+# ftw-optimizer service (native installs point optimizer_command at their
+# venv's Python executable). Every optimizer_* setting below applies to that
+# worker in either role, champion or shadow.
 # planner:
 #   enabled: true
-#   engine: python
+#   engine: core        # core (default) | python (legacy external champion)
+#   shadow_python: true # run the external optimizer after each Core replan on
+#                       # the same inputs and log the terminal-corrected cost
+#                       # difference. Measurement only — never dispatched.
 #   mode: passive_arbitrage
 #   forecast_trust: balanced   # cautious | balanced | bold (first boot; live value is SQLite)
 #   battery_export: unknown    # unknown | not_allowed | allowed (unknown = no battery sale)

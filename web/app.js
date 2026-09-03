@@ -34,6 +34,9 @@
   const STATUS_DISPLAY_TAU_MS = 8 * 1000;
   let chartRange = "5m";             // current selected range
   let currentMode = null;
+  let lastRevealedMode = null;       // last mode the manual drawer auto-opened for
+  let pendingMode = null;            // mode tapped here, not yet confirmed by the server
+  let pendingModeUntil = 0;          // browser-clock deadline for that optimistic paint
   let animating = !document.hidden;  // 30fps redraw loop flag
   let lastDataTs = 0;                // browser-clock timestamp of newest pushed point
   let lastPushAt = 0;                // browser-clock timestamp of last push attempt — for dedupe (NEVER mix with server ts)
@@ -782,13 +785,25 @@
     // Buttons come from GET /api/modes; if that hasn't landed yet (offline at
     // first paint), this confirmed-live poll is the retry trigger.
     if (!modeCatalogRendered) renderModeCatalog();
+    // A tap paints its button before the POST returns. A status read already
+    // in flight still answers with the old mode, so prefer the tapped one
+    // until the server confirms it or the short wait runs out.
+    if (pendingMode && (data.mode === pendingMode || Date.now() >= pendingModeUntil)) pendingMode = null;
+    var activeMode = pendingMode || data.mode;
     var allModeButtons = document.querySelectorAll("#mode-buttons-primary button, #mode-buttons button");
     allModeButtons.forEach(function (btn) {
-      if (btn.dataset.mode === data.mode) btn.classList.add("active");
+      if (btn.dataset.mode === activeMode) btn.classList.add("active");
       else btn.classList.remove("active");
     });
+    revealManualModes(activeMode);
     // When planner is driving, grey out the grid-target slider and show a hint.
     var plannerActive = (data.mode || "").indexOf("planner_") === 0;
+    // "Use the plan" is the way out of a manual mode. It has nothing to
+    // offer while the planner already drives, so it only shows when it does.
+    var planUseRow = document.getElementById("plan-use-row");
+    var planUseBtn = document.getElementById("plan-use-btn");
+    if (planUseBtn) planUseBtn.hidden = plannerActive;
+    if (planUseRow) planUseRow.hidden = plannerActive;
     var gridSlider = document.getElementById("grid-target-slider");
     var gridSend = document.getElementById("grid-target-send");
     var gridHint = document.getElementById("grid-target-hint");
@@ -2158,6 +2173,8 @@
         // Isolate render errors from connection state / timestamp
         try { render(data); }
         catch (e) { console.error("render error:", e); }
+        try { window.dispatchEvent(new CustomEvent("ftw-status", { detail: data })); }
+        catch (e3) { /* assistant chip is optional */ }
         // Show a subtle prompt when no drivers are configured
         try { updateNoDevicesPrompt(data.drivers); }
         catch (e2) { /* silent */ }
@@ -2306,6 +2323,10 @@
   }
 
   function setMode(mode) {
+    markModeActive(mode);
+    revealManualModes(mode);
+    pendingMode = mode;
+    pendingModeUntil = Date.now() + 4000;
     apiFetch("/api/mode", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -2317,8 +2338,40 @@
         fetchStatus();
       })
       .catch(function () {
+        pendingMode = null; // the write failed — show server truth again
         setConnected(false);
       });
+  }
+
+  function markModeActive(mode) {
+    document.querySelectorAll("#mode-buttons-primary button, #mode-buttons button").forEach(function (btn) {
+      if (btn.dataset.mode === mode) btn.classList.add("active");
+      else btn.classList.remove("active");
+    });
+  }
+
+  // Open the manual drawer when the live mode lives there, so a reload
+  // (or a change made from the phone app / HA) never leaves the current
+  // setting with no button on screen.
+  //
+  // Only on a transition. The status poll repeats the same mode every couple
+  // of seconds; re-opening on every repeat would undo an explicit "Hide
+  // manual" a second after the user pressed it. A move to a *different*
+  // manual mode still opens the drawer — that button has to be on screen.
+  function revealManualModes(mode) {
+    if (!mode || mode === lastRevealedMode) return;
+    var panel = document.getElementById("mode-buttons");
+    if (!panel) return;
+    var match = panel.querySelector('button[data-mode="' + mode + '"]');
+    // Before the catalog paints, a missing button means "not rendered yet",
+    // not "not a manual mode" — don't record it, or the catalog's own call
+    // would come back as a repeat and never open the drawer.
+    if (!match && !modeCatalogRendered) return;
+    lastRevealedMode = mode;
+    if (!match) return;
+    panel.style.display = "flex";
+    var advBtn = document.getElementById("mode-advanced-btn");
+    if (advBtn) advBtn.textContent = "Hide manual";
   }
 
   // ---- Mode buttons, built from the server's canonical catalog ----
@@ -2365,6 +2418,7 @@
         advanced.replaceChildren(frags.advanced);
         primary.hidden = !primary.childElementCount;
         modeCatalogRendered = true;
+        revealManualModes(currentMode);
         return true;
       })
       .catch(function () {
@@ -2455,6 +2509,34 @@
       if (e.target.tagName === "BUTTON" && e.target.dataset.mode) {
         setMode(e.target.dataset.mode);
       }
+    });
+  }
+  // Permission to sell from the battery is a deliberate household answer, so
+  // a prefs read that fails or answers with nothing usable lands on the mode
+  // that never exports.
+  var PLANNER_FALLBACK_MODE = "planner_passive_arbitrage";
+  // "Use the plan" — the one control that hands a manually-driven house back
+  // to the planner. Which planner mode that is follows from the household's
+  // own prefs, and the server already maps them (mapped_mode), so the two
+  // surfaces cannot drift. setMode() from here on, so the optimistic paint,
+  // the pending-mode hold and the drawer all behave as they do for a tap.
+  var planUseBtn = document.getElementById("plan-use-btn");
+  if (planUseBtn) {
+    planUseBtn.addEventListener("click", function () {
+      apiFetch("/api/planner/prefs", { headers: { Accept: "application/json" } })
+        .then(function (r) {
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          return r.json();
+        })
+        .then(function (prefs) {
+          var mapped = prefs && prefs.mapped_mode;
+          setMode(typeof mapped === "string" && mapped.indexOf("planner_") === 0
+            ? mapped
+            : PLANNER_FALLBACK_MODE);
+        })
+        .catch(function () {
+          setMode(PLANNER_FALLBACK_MODE);
+        });
     });
   }
   var advBtn = document.getElementById("mode-advanced-btn");
@@ -2589,6 +2671,90 @@
     evModalBody.appendChild(p);
   }
 
+  function evFmtClock(ms) {
+    // 24-hour clock, matching plan-brief.js's formatClock — the rest of
+    // the plan UI speaks 24 h regardless of browser locale.
+    var d = new Date(ms);
+    return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+  }
+
+  // renderEvPlanStatus answers the question the status table can't:
+  // "why isn't it charging right now, and when will it?" Field
+  // experience: a car plugged in against a schedule sits at 0 W until
+  // the cheap slots arrive, the modal looks dead, and the operator
+  // presses Start — which overrides the plan for the whole session.
+  // One honest sentence here is what prevents that. Returns null when
+  // there is nothing worth saying (no loadpoint, or unplugged — the
+  // schedule note covers that case).
+  function renderEvPlanStatus(lp, d) {
+    if (!lp || !lp.plugged_in) return null;
+    var text = null;
+    var tone = "var(--text-dim)";
+    var kwPlanned = lp.plan_total_wh > 0 ? " ~" + (lp.plan_total_wh / 1000).toFixed(1) + " kWh planned." : "";
+    var winActive = lp.plan_next_start_ms > 0 && lp.plan_next_start_ms <= Date.now() && Date.now() < lp.plan_next_end_ms;
+    var charging = (lp.current_power_w || 0) >= 100;
+    var hasSchedule = lp.schedule && lp.schedule.soc > 0;
+    if (lp.manual_active) {
+      text = lp.manual_release_soc > 0
+        ? "Charging now at " + formatW(lp.manual_charge_w || 0) + " → returns to plan at " +
+          Math.round(lp.manual_release_soc * 100) + " %."
+        : "Manual charge pinned at " + formatW(lp.manual_charge_w || 0) +
+          " — plan and PV logic are off until Stop or unplug.";
+    } else if (charging) {
+      text = winActive
+        ? "Charging on plan until " + evFmtClock(lp.plan_next_end_ms) + "." + kwPlanned
+        : "Charging.";
+      if (lp.commanded_reason === "fuse_limit") {
+        text += " Rate is limited by the main fuse right now.";
+      }
+    } else if (lp.commanded_known && lp.commanded_w > 0) {
+      text = "Charger offers " + formatW(lp.commanded_w) +
+        " but the car isn't drawing — it may be full or at its own charge limit.";
+      if (d && d.reason_no_current_label) {
+        text += " Charger reports: " + d.reason_no_current_label + ".";
+      }
+      tone = "var(--text)";
+    } else if (lp.commanded_known && !lp.commanded_w &&
+        (lp.commanded_reason === "fuse_cooldown" || lp.commanded_reason === "fuse_limit")) {
+      // The specific pauses beat the generic branches — this is the
+      // line that stops an operator debugging cable and charger while
+      // the box is protecting the main fuse (#1009).
+      text = "Paused: main-fuse protection — the house is using the headroom; charging resumes on its own." + kwPlanned;
+      tone = "var(--text)";
+    } else if (lp.commanded_known && !lp.commanded_w && lp.commanded_reason === "site_meter_stale") {
+      text = "Paused for safety: site-meter data is stale — charging resumes when telemetry recovers.";
+      tone = "var(--text)";
+    } else if (lp.grid_deferred) {
+      // Richer than the pv_surplus_pause reason it usually co-occurs
+      // with: it also says when normal planning resumes.
+      text = "Waiting for tomorrow's electricity prices — until they arrive (~13:00) the car charges from PV surplus only.";
+    } else if (lp.commanded_known && !lp.commanded_w && lp.commanded_reason === "pv_surplus_pause") {
+      text = "Paused: waiting for PV surplus — solar is below the charger's minimum step right now." + kwPlanned;
+    } else if (winActive) {
+      text = "Paused by the box — charging resumes on its own." + kwPlanned;
+    } else if (lp.plan_next_start_ms > Date.now()) {
+      text = "Charging planned " + evFmtClock(lp.plan_next_start_ms) + "–" +
+        evFmtClock(lp.plan_next_end_ms) + "." + kwPlanned +
+        " The planner picks the cheapest hours before your target.";
+    } else if (lp.surplus_only) {
+      text = "PV surplus only — charges when solar exceeds house load.";
+    } else if (!hasSchedule) {
+      text = "Nothing will start charging: set a schedule, turn on PV only, or press Start.";
+      tone = "var(--text)";
+    } else {
+      text = "No charge window in the current plan — the target may already be reached.";
+    }
+    if (!text) return null;
+    var p = document.createElement("p");
+    p.style.color = tone;
+    p.style.margin = "0 0 0.6rem 0";
+    p.style.padding = "0.35rem 0.5rem";
+    p.style.borderLeft = "3px solid var(--accent, #888)";
+    p.style.background = "color-mix(in srgb, var(--accent, #888) 8%, transparent)";
+    p.textContent = text;
+    return p;
+  }
+
   // EV modal sub-elements held across refreshes. The status table is
   // updated in place on every poll. The tabbed control (PV charging /
   // Manual / Scheduled) is mounted exactly once per (modal-open × LP)
@@ -2598,6 +2764,7 @@
   // next poll rebuilds from the new authoritative server state. The
   // active tab persists across rebuilds via evActiveTab.
   var statusTableEl = null;
+  var planStatusEl = null;
   var evTabsEl = null;
   var evTabsLpId = null;
   var schedNeedsRebuild = false;
@@ -2646,6 +2813,7 @@
       if (!carConnected && !hasLoadpoints) {
         setEvModalMessage("No EV charger connected");
         statusTableEl = null;
+        planStatusEl = null;
         evTabsEl = null;
         evTabsLpId = null;
         return;
@@ -2705,6 +2873,21 @@
           matched = lps.loadpoints[0];
         }
       }
+      // Plan-status strip: one sentence on why the charger is (not)
+      // charging and when it will. Refreshed on every poll, anchored
+      // right below the status table so it reads as part of the live
+      // state rather than the (once-built) tabbed controls.
+      var freshPlan = renderEvPlanStatus(matched, d);
+      if (planStatusEl && planStatusEl.parentNode === evModalBody) {
+        if (freshPlan) {
+          evModalBody.replaceChild(freshPlan, planStatusEl);
+        } else {
+          evModalBody.removeChild(planStatusEl);
+        }
+      } else if (freshPlan) {
+        evModalBody.insertBefore(freshPlan, statusTableEl.nextSibling);
+      }
+      planStatusEl = freshPlan;
       if (matched) {
         // Build the tabbed control (PV charging / Manual / Scheduled)
         // exactly once per LP. Polling never rebuilds it — inputs keep
@@ -2762,6 +2945,12 @@
     if (curA < minA) { curA = minA; }
     if (curA > maxA) { curA = maxA; }
 
+    // "Charge now" stops at the schedule's target SoC when one is set
+    // (80 % default otherwise), then hands back to the plan — pressing
+    // Start no longer kills the planner for the rest of the session.
+    var releasePct = (lp && lp.schedule && lp.schedule.soc > 0)
+      ? Math.round(lp.schedule.soc * 100) : 80;
+
     var box = document.createElement("div");
     box.style.marginTop = "0.75rem";
     box.style.paddingTop = "0.6rem";
@@ -2816,8 +3005,10 @@
     status.style.marginTop = "0.35rem";
     status.style.minHeight = "1em";
     status.textContent = active
-      ? "Manual override active — overriding PV surplus (fuse still limits)."
-      : "Stopped = automatic (PV-surplus-only if enabled below). Start overrides it.";
+      ? (lp && lp.manual_release_soc > 0
+        ? "Charging now → stops at " + Math.round(lp.manual_release_soc * 100) + " %, then back to the plan (fuse still limits)."
+        : "Manual override active — overriding PV surplus (fuse still limits).")
+      : "Charge now runs at the slider's amps until " + releasePct + " %, then hands back to the plan.";
     box.appendChild(status);
 
     // Start / Stop buttons.
@@ -2828,7 +3019,7 @@
 
     var startBtn = document.createElement("button");
     startBtn.type = "button";
-    startBtn.textContent = active ? "Update" : "Start";
+    startBtn.textContent = active ? "Update" : "Charge now → " + releasePct + " %";
     startBtn.style.flex = "1";
     startBtn.style.padding = "0.4rem 0.6rem";
     startBtn.style.border = "none";
@@ -2867,9 +3058,10 @@
           power_w: aToW(a),
           hold_s: 0,
           phase_mode: phases === 1 ? "1p" : "3p",
+          release_at_soc_pct: releasePct,
         }),
       }).then(function () {
-        status.textContent = "Charging at " + a + " A — overriding PV surplus.";
+        status.textContent = "Charging at " + a + " A → stops at " + releasePct + " %, then back to the plan.";
         manualNeedsRebuild = true; // reflect active state on next poll
       }).catch(function () {
         startBtn.disabled = false;
