@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -44,6 +45,7 @@ type Config struct {
 	Nova             *Nova              `yaml:"nova,omitempty" json:"nova,omitempty"`
 	DeviceRepository *DeviceRepository  `yaml:"device_repository,omitempty" json:"device_repository,omitempty"`
 	OCPP             *OCPP              `yaml:"ocpp,omitempty" json:"ocpp,omitempty"`
+	Assistant        *Assistant         `yaml:"assistant,omitempty" json:"assistant,omitempty"`
 
 	// LoadWarnings collects recoverable problems Parse repaired instead of
 	// refusing the file: an on-disk config an older version accepted must
@@ -58,20 +60,62 @@ type Config struct {
 // appears as a device the moment it sends its first BootNotification, keyed by
 // the identity segment of the URL it dialled.
 //
-// Disabled by default, and enabling it requires credentials. The listener
-// cannot be restricted to one interface: the OCPP library builds its own
-// listen address from the port alone, so the socket is reachable on every
-// interface the host has. Basic auth is the only thing standing in front of
-// it, which is why an empty Username or Password is rejected rather than
-// silently accepted.
+// Disabled by default, and enabling it requires credentials. The socket cannot
+// be restricted to one interface: the OCPP library builds its own listen
+// address from the port alone, so it is open on every interface the host has.
+// Bind therefore refuses the handshake for a connection that arrived
+// elsewhere, which controls access without shrinking the attack surface — an
+// empty Username or Password is still rejected rather than silently accepted.
 type OCPP struct {
-	Enabled            bool   `yaml:"enabled" json:"enabled"`
+	Enabled bool `yaml:"enabled" json:"enabled"`
+
+	// Bind is the address chargers are served on. Empty or 0.0.0.0 accepts
+	// every interface, which is the default and what a flat home LAN wants.
+	// Set it to one LAN address to refuse chargers reaching the box any
+	// other way — over a VPN interface, say, or a second NIC.
+	Bind string `yaml:"bind,omitempty" json:"bind,omitempty"`
+
 	Port               int    `yaml:"port,omitempty" json:"port,omitempty"`
 	PortV201           int    `yaml:"port_v201,omitempty" json:"port_v201,omitempty"`
 	Path               string `yaml:"path,omitempty" json:"path,omitempty"`
 	Username           string `yaml:"username,omitempty" json:"username,omitempty"`
 	Password           string `yaml:"password,omitempty" json:"password,omitempty"`
 	HeartbeatIntervalS int    `yaml:"heartbeat_interval_s,omitempty" json:"heartbeat_interval_s,omitempty"`
+
+	// TLS serves wss:// instead of ws://. Optional, and worth the
+	// certificate management on any site where the charger and the box are
+	// not on the same trusted wire.
+	TLS *OCPPTLS `yaml:"tls,omitempty" json:"tls,omitempty"`
+
+	// Chargers gives named charge points a credential of their own, so the
+	// shared password stops being enough to claim their identity. Optional
+	// and per charger: anything not listed keeps using Username/Password.
+	Chargers []OCPPCharger `yaml:"chargers,omitempty" json:"chargers,omitempty"`
+}
+
+// OCPPTLS points at the certificate the OCPP listener presents, and optionally
+// at the CA that signs the charge points allowed to connect.
+type OCPPTLS struct {
+	CertFile string `yaml:"cert_file,omitempty" json:"cert_file,omitempty"`
+	KeyFile  string `yaml:"key_file,omitempty" json:"key_file,omitempty"`
+
+	// ClientCAFile turns on mutual TLS: every charge point must present a
+	// certificate signed by this CA. That is OCPP 2.0.1 security profile 3,
+	// and the only identity here that cannot be copied out of one charger's
+	// configuration and replayed by another device.
+	ClientCAFile string `yaml:"client_ca_file,omitempty" json:"client_ca_file,omitempty"`
+}
+
+// OCPPCharger is one charge point's own credential.
+//
+// The ID is the identity the charger dials with — the last segment of its URL,
+// and the same string a loadpoint's driver_name uses to adopt it. On OCPP the
+// basic-auth username is that identity, so a charger listed here must present
+// both, and a device holding only the shared password can no longer connect
+// under its name.
+type OCPPCharger struct {
+	ID       string `yaml:"id" json:"id"`
+	Password string `yaml:"password,omitempty" json:"password,omitempty"`
 }
 
 // Validate rejects an enabled server that would accept anonymous charge
@@ -96,7 +140,65 @@ func (o *OCPP) Validate() error {
 	if o.HeartbeatIntervalS < 0 {
 		return fmt.Errorf("ocpp.heartbeat_interval_s must be >= 0, got %d", o.HeartbeatIntervalS)
 	}
+	// A bind address that does not parse would silently fall back to "every
+	// interface" — the opposite of what the operator asked for.
+	if o.Bind != "" && net.ParseIP(o.Bind) == nil {
+		return fmt.Errorf("ocpp.bind must be an IP address, got %q", o.Bind)
+	}
+	if err := o.TLS.validate(); err != nil {
+		return err
+	}
+	seen := make(map[string]bool, len(o.Chargers))
+	for i, c := range o.Chargers {
+		if c.ID == "" {
+			return fmt.Errorf("ocpp.chargers[%d].id is required", i)
+		}
+		if seen[c.ID] {
+			return fmt.Errorf("ocpp.chargers has two entries for %q", c.ID)
+		}
+		seen[c.ID] = true
+		// An entry with no password would quietly fall back to the shared
+		// one, leaving the operator believing this charger was pinned to a
+		// credential of its own.
+		if c.Password == "" {
+			return fmt.Errorf("ocpp.chargers[%d] (%s) needs a password; remove the entry to use the shared one", i, c.ID)
+		}
+	}
 	return nil
+}
+
+// validate checks the TLS section without touching the filesystem — the paths
+// are read when the listener starts, which is where a missing file is
+// reported. A nil section means plaintext ws://, which is the default.
+func (t *OCPPTLS) validate() error {
+	if t == nil {
+		return nil
+	}
+	if t.CertFile == "" && t.KeyFile == "" {
+		if t.ClientCAFile != "" {
+			return errors.New("ocpp.tls.client_ca_file needs cert_file and key_file: client certificates are only verified on a TLS listener")
+		}
+		return nil
+	}
+	if t.CertFile == "" || t.KeyFile == "" {
+		return errors.New("ocpp.tls needs both cert_file and key_file")
+	}
+	return nil
+}
+
+// ChargerSecrets is the per-charger credential map, keyed by charge point
+// identity. Empty when none are configured.
+func (o *OCPP) ChargerSecrets() map[string]string {
+	if o == nil || len(o.Chargers) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(o.Chargers))
+	for _, c := range o.Chargers {
+		if c.ID != "" && c.Password != "" {
+			out[c.ID] = c.Password
+		}
+	}
+	return out
 }
 
 // AppLink controls the outbound connection the FTW app reaches this box
@@ -238,6 +340,78 @@ const (
 	legacyDriverRepositoryName        = "FTW official drivers"
 	legacyDriverRepositoryManifestURL = "https://github.com/srcfl/ftw/releases/download/drivers-stable/manifest.json"
 )
+
+// Assistant is the optional Ask why helper: a user-supplied OpenRouter
+// (or OpenAI-compatible) key used to explain the local help report.
+// Nil or disabled is the unavailable state. The helper never issues
+// driver commands or writes config.
+type Assistant struct {
+	Enabled bool   `yaml:"enabled" json:"enabled"`
+	APIKey  string `yaml:"api_key,omitempty" json:"api_key,omitempty"`
+	// Model is an OpenRouter model id. Empty means openrouter/free.
+	Model string `yaml:"model,omitempty" json:"model,omitempty"`
+	// BaseURL is the OpenAI-compatible root (no /chat/completions suffix).
+	// Empty means https://openrouter.ai/api/v1. A later Sourceful proxy
+	// can set this without a code change.
+	BaseURL string `yaml:"base_url,omitempty" json:"base_url,omitempty"`
+
+	// HasAPIKey is JSON-only: true when a key exists on disk. Set by
+	// MaskSecrets before APIKey is blanked so Settings can render
+	// "configured — hidden". Never written to YAML.
+	HasAPIKey bool `yaml:"-" json:"has_api_key,omitempty"`
+}
+
+const (
+	DefaultAssistantModel   = "openrouter/free"
+	DefaultAssistantBaseURL = "https://openrouter.ai/api/v1"
+)
+
+// Ready is true when Ask why can make an outbound call.
+func (a *Assistant) Ready() bool {
+	return a != nil && a.Enabled && strings.TrimSpace(a.APIKey) != ""
+}
+
+// ResolvedModel returns the configured model or the free-router default.
+func (a *Assistant) ResolvedModel() string {
+	if a == nil || strings.TrimSpace(a.Model) == "" {
+		return DefaultAssistantModel
+	}
+	return strings.TrimSpace(a.Model)
+}
+
+// ResolvedBaseURL returns the OpenAI-compatible root without a trailing slash.
+func (a *Assistant) ResolvedBaseURL() string {
+	if a == nil || strings.TrimSpace(a.BaseURL) == "" {
+		return DefaultAssistantBaseURL
+	}
+	return strings.TrimRight(strings.TrimSpace(a.BaseURL), "/")
+}
+
+// Validate checks optional assistant settings. A missing key is allowed:
+// the Ask why endpoint reports that as unavailable rather than refusing
+// the whole config.
+func (a *Assistant) Validate() error {
+	if a == nil {
+		return nil
+	}
+	if strings.TrimSpace(a.Model) != "" && len(a.Model) > 120 {
+		return errors.New("assistant.model is too long")
+	}
+	if strings.TrimSpace(a.BaseURL) == "" {
+		return nil
+	}
+	u, err := url.Parse(strings.TrimSpace(a.BaseURL))
+	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
+		return errors.New("assistant.base_url must be an http(s) URL")
+	}
+	if u.User != nil {
+		return errors.New("assistant.base_url must carry no credentials")
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return errors.New("assistant.base_url must carry no query or fragment")
+	}
+	return nil
+}
 
 // Notifications configures outbound push notifications. Exactly one
 // transport provider is active at a time, selected by Provider. Today
@@ -744,9 +918,17 @@ type Planner struct {
 	// BatteryExport is the first-boot battery-sale permission:
 	// unknown | not_allowed | allowed. Live value is SQLite battery_export.
 	BatteryExport string `yaml:"battery_export,omitempty" json:"battery_export,omitempty"`
-	// Engine selects the primary optimizer: "python" (default) runs the
-	// CVXPY/HiGHS worker; "dp" is the legacy in-process rollback engine.
+	// Engine selects the planner that produces the active plan: "core"
+	// (default) solves in process with the Go DP; "python" hands the
+	// champion role to the CVXPY/HiGHS worker. "go" and "dp" are accepted
+	// spellings of "core". Read it through EngineName.
 	Engine string `yaml:"engine,omitempty" json:"engine,omitempty"`
+	// ShadowPython runs the Python/HiGHS worker after each Core replan, on
+	// the inputs the champion solved, and records the terminal-corrected
+	// cost difference. Shadow output never reaches dispatch. Pointer so an
+	// unset field keeps the default (on) and an explicit false turns the
+	// comparison off. Ignored when Engine is python.
+	ShadowPython *bool `yaml:"shadow_python,omitempty" json:"shadow_python,omitempty"`
 	// OptimizerCommand is the Python executable used for the local worker.
 	// It is an executable path, not a shell command. The module invocation is
 	// fixed by the host to avoid shell parsing and configuration injection.
@@ -788,8 +970,13 @@ type Planner struct {
 	// down betting on PV that may not arrive — a reserve emerges from the
 	// live forecast uncertainty itself, sized to the real risk (large on
 	// variable cloudy days, ~zero on clear days or in winter), not a flat
-	// SoC %. Pointer so unset (→ default 1.0) is distinct from an explicit
-	// 0 (= raw forecast, no hedge: "use the battery you have").
+	// SoC %. Pointer so unset is distinct from an explicit 0.
+	//
+	// FIRST-BOOT SEED ONLY. The live value follows the Plan card's
+	// slider (SQLite key planner_safety_k, same stored-wins contract as
+	// forecast_trust); this field seeds that float verbatim once when
+	// nothing is stored, and never overrides the slider — the old
+	// precedence disabled the slider for as long as the field existed.
 	PVForecastSafetyK *float64 `yaml:"pv_forecast_safety_k,omitempty" json:"pv_forecast_safety_k,omitempty"`
 
 	// PVChargeBonusOreKwh credits each kWh of battery charge fed from
@@ -833,6 +1020,36 @@ type Planner struct {
 	UseEnergyDispatch *bool `yaml:"use_energy_dispatch,omitempty" json:"use_energy_dispatch,omitempty"`
 }
 
+// PlannerEngineCore and PlannerEnginePython are the two planners that can hold
+// the champion role.
+const (
+	PlannerEngineCore   = "core"
+	PlannerEnginePython = "python"
+)
+
+// EngineName resolves planner.engine to one of the two champions. Unset means
+// core: the Go DP measured within öre of the external MILP on replayed site
+// snapshots, and it needs no sidecar to be running to produce a plan.
+func (p *Planner) EngineName() string {
+	if p == nil {
+		return PlannerEngineCore
+	}
+	if strings.EqualFold(strings.TrimSpace(p.Engine), PlannerEnginePython) {
+		return PlannerEnginePython
+	}
+	return PlannerEngineCore
+}
+
+// ShadowPythonEnabled reports whether the external optimizer runs behind a Core
+// champion as a comparison shadow. Default on: the per-replan cost difference
+// it records is the field evidence for retiring the external stack.
+func (p *Planner) ShadowPythonEnabled() bool {
+	if p == nil || p.ShadowPython == nil {
+		return true
+	}
+	return *p.ShadowPython
+}
+
 // OptimizerTimeout returns the runtime contract value for an unset timeout.
 // Parsing also fills it so API clients do not invent a shorter default when
 // they save an otherwise unchanged planner.
@@ -841,16 +1058,6 @@ func (p *Planner) OptimizerTimeout() time.Duration {
 		return optimizercontract.DefaultTimeout
 	}
 	return time.Duration(p.OptimizerTimeoutS * float64(time.Second))
-}
-
-// PVSafetyK resolves the downside-PV haircut scale (forecast − k·σ). Unset
-// config (nil Planner or nil field) → default 1.0; an explicit value is
-// honored verbatim, including 0 (no hedge — "use the battery you have").
-func (p *Planner) PVSafetyK() float64 {
-	if p == nil || p.PVForecastSafetyK == nil {
-		return 1.0
-	}
-	return *p.PVForecastSafetyK
 }
 
 // Site is the top-level control loop config.
@@ -1336,9 +1543,20 @@ func (c Config) MaskSecrets() Config {
 	}
 	// The OCPP password is the only thing standing in front of a listener that
 	// is reachable on every interface, so it must never leave over the API.
+	// The per-charger passwords are the same secret with a narrower blast
+	// radius, and the slice has to be copied rather than blanked in place —
+	// the struct copy above shares its backing array with the live config.
 	if out.OCPP != nil {
 		cp := *out.OCPP
 		cp.Password = ""
+		if len(cp.Chargers) > 0 {
+			chargers := make([]OCPPCharger, len(cp.Chargers))
+			for i, c := range cp.Chargers {
+				c.Password = ""
+				chargers[i] = c
+			}
+			cp.Chargers = chargers
+		}
 		out.OCPP = &cp
 	}
 	if out.Price != nil {
@@ -1350,6 +1568,12 @@ func (c Config) MaskSecrets() Config {
 		cp := *out.Weather
 		cp.APIKey = ""
 		out.Weather = &cp
+	}
+	if out.Assistant != nil {
+		cp := *out.Assistant
+		cp.HasAPIKey = strings.TrimSpace(cp.APIKey) != ""
+		cp.APIKey = ""
+		out.Assistant = &cp
 	}
 	if out.Notifications != nil {
 		cp := *out.Notifications
@@ -1416,8 +1640,23 @@ func (incoming *Config) PreserveMaskedSecrets(existing *Config) {
 	// Masked out on the way to the UI, so an unchanged password comes back
 	// empty. Without this a save from the settings tab would blank it, and an
 	// enabled server would then fail validation on the next reload.
-	if incoming.OCPP != nil && existing.OCPP != nil && incoming.OCPP.Password == "" {
-		incoming.OCPP.Password = existing.OCPP.Password
+	if incoming.OCPP != nil && existing.OCPP != nil {
+		if incoming.OCPP.Password == "" {
+			incoming.OCPP.Password = existing.OCPP.Password
+		}
+		// Per-charger passwords are masked the same way, and are matched by
+		// charger id rather than position: the settings UI can reorder the
+		// list or drop an entry, and restoring by index would then hand one
+		// charger another's credential.
+		if len(incoming.OCPP.Chargers) > 0 {
+			stored := existing.OCPP.ChargerSecrets()
+			for i := range incoming.OCPP.Chargers {
+				c := &incoming.OCPP.Chargers[i]
+				if c.Password == "" {
+					c.Password = stored[c.ID]
+				}
+			}
+		}
 	}
 	if incoming.HomeAssistant != nil && existing.HomeAssistant != nil && incoming.HomeAssistant.Password == "" {
 		incoming.HomeAssistant.Password = existing.HomeAssistant.Password
@@ -1427,6 +1666,9 @@ func (incoming *Config) PreserveMaskedSecrets(existing *Config) {
 	}
 	if incoming.Weather != nil && existing.Weather != nil && incoming.Weather.APIKey == "" {
 		incoming.Weather.APIKey = existing.Weather.APIKey
+	}
+	if incoming.Assistant != nil && existing.Assistant != nil && incoming.Assistant.APIKey == "" {
+		incoming.Assistant.APIKey = existing.Assistant.APIKey
 	}
 	if incoming.Notifications != nil && existing.Notifications != nil &&
 		incoming.Notifications.Ntfy != nil && existing.Notifications.Ntfy != nil {
@@ -1925,6 +2167,9 @@ func (c *Config) Validate() error {
 	if err := c.OCPP.Validate(); err != nil {
 		return err
 	}
+	if err := c.Assistant.Validate(); err != nil {
+		return err
+	}
 	if err := c.validateVehicles(); err != nil {
 		return err
 	}
@@ -2137,10 +2382,11 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("planner.battery_export must be unknown, not_allowed, or allowed, got %q", p.BatteryExport)
 			}
 		}
-		switch p.Engine {
-		case "", "python", "dp":
+		switch strings.ToLower(strings.TrimSpace(p.Engine)) {
+		case "", PlannerEngineCore, "go", "dp", PlannerEnginePython:
 		default:
-			return fmt.Errorf("planner.engine must be \"python\" or \"dp\", got %q", p.Engine)
+			return fmt.Errorf("planner.engine must be %q or %q, got %q",
+				PlannerEngineCore, PlannerEnginePython, p.Engine)
 		}
 		switch strings.ToUpper(p.OptimizerSolver) {
 		case "", "HIGHS", "CLARABEL":

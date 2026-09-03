@@ -1,5 +1,273 @@
 # Changelog
 
+## 2.13.0
+
+### Minor Changes
+
+- e374e77: Ask why keeps earlier conversations. The box stores each thread, so a question asked from a laptop is readable from a phone and closing the dialog no longer throws the answer away. Open one from Earlier to read it or carry it on; the box keeps the 50 most recent.
+
+### Patch Changes
+
+- 711346b: Ask why streams the answer as it is written, shows each tool call while it waits, and keeps long replies inside the dialog. The reply renders as markdown — headings, lists and code, not raw dashes and asterisks — and a Stop button ends a slow model without losing the thread.
+
+## 2.12.1
+
+### Patch Changes
+
+- b129a83: Ask why follow-ups keep the conversation, a closed dialog cannot steal a late answer, and pasting a key no longer forces Enable on.
+- d464e47: Ask why can explain the current plan from a question under the Plan card, shows live progress in a conversation, and opens a GitHub issue with one filled text field.
+
+## 2.12.0
+
+### Minor Changes
+
+- bd3ecdc: Ask why: paste an OpenRouter key and the Plan card can explain the live site and draft a GitHub issue. It uses read-only tools (help report, driver health, logs, current plan slot). A header chip appears when a driver is offline; clicking it opens Ask why. Off until enabled. Default model is openrouter/free. The helper never issues driver commands.
+
+## 2.11.0
+
+### Minor Changes
+
+- ba64f5b: The planner now runs inside Core by default. The Go solver — measured
+  within öre of the external MILP on real site snapshots and structurally
+  immune to the relaxation failure modes the external stack needed guard
+  rails for — plans against the per-slot PV downside at 201×401
+  resolution. The Python/HiGHS optimizer is no longer the champion: with
+  planner.shadow_python (default on) it runs after each replan as a
+  comparison shadow on identical inputs, and every replan logs and
+  records the terminal-corrected cost difference — the field evidence
+  for its scheduled removal. Set planner.engine: python to keep the old
+  arrangement during the transition.
+  
+  A battery that has drifted outside soc_min…soc_max no longer stops
+  Core from planning. The planner starts from the nearest band edge,
+  warns with the real reading and the difference in Wh, and records the
+  unclamped value on the diagnostic as initial_soc_unclamped; the
+  dispatch clamp and the driver's own floor still bound what any plan
+  can ask the hardware for. A reading that is not physically possible —
+  outside 0–1 — is still refused, and the previous plan stands.
+
+### Patch Changes
+
+- aa8bf39: Keep Manual… strategy buttons on the Plan card in simple view, open them when the live mode changes to a manual fallback, and mark a tap before the server confirms. Hide manual now stays hidden — the status poll no longer reopens the drawer — and a tap no longer flickers back to the previous strategy.
+  
+  A house left in a manual mode can start planning again: the Plan card shows "Use the plan" whenever the planner is not driving. It hands the battery to the planner mode this household's own prefs imply — the passive one unless battery export is allowed — and never grants export rights on its own.
+
+## 2.10.0
+
+### Minor Changes
+
+- 82b069b: The forecast-trust slider becomes a real dial: 41 positions (0–2 in
+  0.05 steps) instead of three, stored as the numeric safety factor the
+  planner actually uses. With the per-slot PV hedge this is now a
+  tangible control — each notch changes the share of every slot's own
+  forecast uncertainty the plan holds in reserve, the hedge line updates
+  live while dragging, and releasing the slider replans immediately.
+  Existing three-step choices and the enum API field keep working; old
+  clients read the nearest step.
+
+## 2.9.0
+
+### Minor Changes
+
+- 5658cf3: The planner's PV-forecast hedge is now proportional per slot instead of
+  one flat watt figure across the whole horizon: the PV model learns the
+  relative forecast error online, and each slot's downside is that share
+  of its own expected generation — large on variable cloudy days, zero at
+  night, no longer erasing morning and evening shoulders or hedging a
+  clear tomorrow with today's uncertainty. Measured against real
+  snapshots the flat haircut cost 25–65 SEK per 48 h plan. Sites where
+  the model has not yet learned the relative error keep the previous
+  flat behavior.
+
+### Patch Changes
+
+- 1887965: A plan that rides the site's grid limit exactly is no longer rejected
+  for solver float noise: the external-plan validator's grid-limits
+  check gains the same ±2 W tolerance every other power check already
+  had. Rejection discarded the whole plan and silently degraded the
+  site to the fallback planner — observed in the field as
+  "slot 34 grid_w 11040.000 violates grid limits" on an 11 040 W fuse.
+
+## 2.8.0
+
+### Minor Changes
+
+- 44c62d1: The Plan card's forecast-trust slider always works now. An explicit
+  `pv_forecast_safety_k` in config.yaml used to win over it and render it
+  permanently disabled with a "config.yaml wins" note; the field is now a
+  first-boot seed only — it maps to the nearest trust step once when no
+  preference is stored, and the slider owns the live value from then on,
+  the same stored-wins contract `forecast_trust` already had.
+
+### Patch Changes
+
+- 8f0c2f9: Planner parity fixes ported from the MILP formulation (#1020): the
+  strict self-consumption bias clamps at zero price instead of
+  inverting into an import bonus on negative-price slots; the PV-charge
+  bonus applies in every mode (still bounded by live PV surplus);
+  horizon mean prices are length-weighted for mixed slot lengths; the
+  simulated plan starts at the battery's real state of charge instead
+  of the nearest grid point; and replan diagnostics persist the
+  arbitrage spread and PV-uncertainty inputs so a snapshot re-solves
+  under the exact economics the replan used.
+- 2a21b7f: The planner's DP grid resolution rises from 41 SoC × 81 action levels
+  to 201 × 401 (about 0.4 % SoC and 24 W steps), closing most of the
+  measured discretization gap to the external MILP; replans with an
+  active EV loadpoint automatically derate to 101 × 201 to keep the
+  extended state space near one second. Solve budgets were measured on
+  the snapshot replay bench before raising the defaults.
+
+## 2.7.0
+
+### Minor Changes
+
+- b824000: FTW now listens to what the car itself asks for. On an ISO 15118 session an
+  OCPP 2.0.1 charger forwards the vehicle's own `NotifyEVChargingNeeds` —
+  the energy it wants, when it expects to leave, and on DC its battery capacity
+  and present state of charge. Core takes that as the session's truth: the
+  reported capacity replaces the configured `vehicle_capacity_wh` (measured beats
+  an operator's estimate of the car that usually parks here), the reported SoC
+  re-anchors the session estimate, and the two together with the requested energy
+  derive the target the planner sizes on. A departure time the car states becomes
+  the loadpoint's target time, and one it does not state never erases the
+  operator's own. Everything is session-scoped and reverts on plug-out, like an
+  identified vehicle profile. The report is visible on `GET /api/ocpp/chargers`
+  as `charging_needs`, and quarantine still applies — a pending charge point's
+  needs are shown but never reach a loadpoint.
+  
+  An AC session states energy without a battery size, so no target fraction is
+  derived from it; guessing one would feed the planner a number the car never
+  claimed.
+- b824000: An adopted OCPP charger is now a device like any other. It gets a row in
+  `/api/devices` and under Settings → Devices, keyed on the vendor and serial
+  from its `BootNotification` rather than on the name it dialled with — that
+  name is one an installer typed and the charger's own web page can change, so
+  persistent state keyed on it would not survive a re-commissioning. Rename a
+  charger and the row follows it. A charger that reports no serial falls back to
+  the dialled name, recorded as an endpoint so it reads as stable-until-changed.
+  Pending chargers get no row: a device row says this hardware is part of the
+  site, and quarantine says an unadopted charge point is not.
+  
+  `GET /api/ocpp/chargers` now also reports each charger's `serial` and
+  `firmware`, and OCPP 1.6's deprecated `chargeBoxSerialNumber` is read when the
+  current field is empty — shipped firmware disagrees about which to fill, and
+  losing it loses the only stable identity some chargers ever report.
+  
+  The OCPP server's own settings — on/off, bind address, both ports, path,
+  username and password — are editable under Settings → Chargers instead of
+  only in `config.yaml`. TLS paths and per-charger credentials stay in the file:
+  they are host filesystem paths and one secret per charger, set once at
+  commissioning.
+- b824000: The OCPP listener can now be pinned to one interface, served over TLS, and
+  given a credential per charger.
+  
+  `ocpp.bind` finally does something. The library builds its listen address from
+  the port alone, so the socket is unavoidably open on every interface; FTW now
+  refuses the WebSocket handshake for a connection that arrived on any other
+  address. That is an access control rather than a smaller attack surface — the
+  port still answers a scan — and the docs say so.
+  
+  `ocpp.tls` serves `wss://` instead of `ws://`, ending the plaintext basic auth
+  anyone on the LAN could sniff. `client_ca_file` additionally requires every
+  charge point to present a certificate signed by that CA (OCPP 2.0.1 security
+  profile 3). Half a TLS section is refused at startup rather than quietly
+  serving plaintext.
+  
+  `ocpp.chargers` gives a named charge point a password of its own. On OCPP the
+  basic-auth username is the charge point identity, so a listed charger must
+  present both, and the shared password stops being enough to connect under its
+  name — the impersonation hole the pending-charger quarantine could not close.
+  It is opt-in per charger; anything unlisted keeps using the shared credential.
+  Per-charger passwords are masked out of `GET /api/config` and survive a
+  settings save, matched by charger id rather than position.
+
+### Patch Changes
+
+- b824000: Three fixes from running the OCPP central system against Sourceful's device
+  simulator. Each one let FTW report a limit it had not actually imposed, or
+  refuse a control that should have worked.
+  
+  **Charging profiles are sent as Relative, not Absolute.** FTW's schedule is a
+  single period at second 0 with no end — "hold this limit until I say
+  otherwise". Absolute expresses that only with a `startSchedule` timestamp, and
+  while the specification says an absolute schedule without one is relative to
+  the start of charging anyway, a charger that parses the missing timestamp
+  strictly finds no valid start, treats the profile as not yet active, and
+  answers **Accepted** while charging on at full rate. Relative carries no
+  timestamp, so there is nothing to misparse — and nothing that depends on the
+  charger's clock agreeing with ours.
+  
+  **A charger that refuses a charge-point-wide profile is retried on connector
+  1.** OCPP 1.6 permits a `TxDefaultProfile` on connector 0 — it is how a profile
+  applies to every connector — but some chargers read the connector-0 rule as
+  `ChargePointMaxProfile`-only and reject it. Rejecting means no limit at all, so
+  one retry on the first connector is the difference between a charger FTW steers
+  and one it can only meter.
+  
+  **Manual EV controls reach an OCPP charger.** Pause, Resume, Force start and
+  set-current posted to `/api/ev/command` went straight to the Lua driver
+  registry, which an OCPP charge point is not in — it dialled us rather than
+  being dialled. They failed with `driver "<id>" not found` while automatic
+  dispatch steered the same charger correctly.
+- 4f6060d: Enabling the OCPP server from the Chargers panel now works on the first
+  try: the username field carries the real default ("ftw") instead of a
+  placeholder that validation then rejected, and saving an OCPP change
+  honestly reports that a restart is required — the central system
+  listener only starts at boot, so the previous "no restart needed"
+  answer left the port silently closed after an apparently successful
+  save.
+
+## 2.6.0
+
+### Minor Changes
+
+- 87136d2: The EV modal names the exact clamp behind a paused charger instead of
+  the generic "paused by the box": main-fuse protection (with automatic
+  resume), waiting for PV surplus, stale site-meter safety hold — and an
+  ongoing charge says when the main fuse is limiting its rate. Every
+  dispatch branch now records why it chose the commanded watts, exposed
+  as `commanded_reason` on GET /api/loadpoints ("plan", "no_plan_budget",
+  "pv_surplus", "pv_surplus_pause", "fuse_limit", "fuse_cooldown",
+  "site_meter_stale", "manual_hold", "wake_kick"). Prompted by a field
+  report where the plan showed charging while the box sent 0 A and the
+  operator spent the evening debugging cable and charger.
+
+## 2.5.0
+
+### Minor Changes
+
+- 4082a64: The EV modal's Start button becomes "Charge now → target": the manual
+  hold charges at the slider's amps and releases itself once the car's
+  estimated state of charge reaches the schedule's target (80 % when no
+  schedule is set), falling straight back to planned dispatch — pressing
+  Start no longer overrides the planner for the rest of the session. The
+  release target survives restarts with the hold, holds without a target
+  keep the old pin-until-Stop-or-unplug contract, and
+  POST /api/loadpoints/{id}/manual_hold accepts the new
+  `release_at_soc_pct` field.
+- 3d99dd8: The EV modal now says why the charger is or is not charging, and when it
+  will: the next planned charge window from the active plan ("Charging
+  planned 02:15–06:30, ~18 kWh"), an explicit "waiting for tomorrow's
+  prices — PV surplus only until then" state when grid-funded planning is
+  deferred past the published price horizon, "charger offers X kW but the
+  car isn't drawing" with the charger's own reason when the vehicle
+  declines, and a plain warning when nothing (schedule, PV-only, Start)
+  will ever start a charge. GET /api/loadpoints carries the new fields:
+  `plan_next_start_ms` / `plan_next_end_ms` / `plan_next_wh` /
+  `plan_total_wh`, `grid_deferred`, and `commanded_w` / `commanded_known`.
+
+### Patch Changes
+
+- 940783e: Bundle easee_cloud 1.2.0 (srcfl/device-drivers#103): the driver now
+  emits `request_active`, so Core can tell "the car has stopped
+  requesting current" (Easee reason 50 / charging completed) from "the
+  box paused it". This turns on three existing protections for Easee
+  sites: the session-completion latch stops the planner allocating
+  energy to a full car, a manual Start hold auto-releases instead of
+  offering power all night, and the charging-interrupted notification
+  stops firing on the car's own renegotiation bursts. The driver's HTTP
+  transport is also pcall-hardened.
+
 ## 2.4.0
 
 ### Minor Changes

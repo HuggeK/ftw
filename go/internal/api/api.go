@@ -166,6 +166,13 @@ type Deps struct {
 	// failed to start; the endpoint then reports an empty list.
 	OCPPChargers func() map[string]ocpp.ChargerView
 
+	// EVSend delivers a command to an EV charger by name, routing an OCPP
+	// charge point past the driver registry it is not in. Nil falls back to
+	// Registry.Send, which is correct for a build with no OCPP server and
+	// wrong for one with a charger that has no driver — the dashboard's
+	// Pause / Resume / Force start would find no such driver and fail.
+	EVSend func(ctx context.Context, name string, payload []byte) error
+
 	// Optional: CalDAV calendar-constraints client (#498). Nil when the
 	// feature is disabled; GET /api/caldav/status then reports disabled.
 	CalDAV *calendar.Service
@@ -227,6 +234,10 @@ type Deps struct {
 	Bundle *components.Bundle
 
 	Version string
+
+	// AssistantHTTP is the outbound client for Ask why. Nil uses a
+	// client with assistant.Timeout. Tests inject httptest.Server's client.
+	AssistantHTTP *http.Client
 }
 
 // Server wraps the http.ServeMux and adds shared middleware (logging,
@@ -271,6 +282,7 @@ type Server struct {
 	versionUpdateMu sync.Mutex
 	driverUpdateMu  sync.Mutex
 	backupMu        sync.Mutex
+	assistantAskMu  sync.Mutex
 
 	// Timers that put a driver back after an edit has been tried for its
 	// window. The record on disk is what survives a restart; these only make
@@ -433,6 +445,12 @@ func (s *Server) routes() {
 	s.handle("GET  /api/support/dump", Local, s.handleSupportDump)
 	s.handle("GET  /api/ocpp/chargers", Local, s.handleOCPPChargers)
 	s.handle("GET  /api/support/report", Local, s.handleSupportReport)
+	s.handle("GET  /api/assistant/status", Read, s.handleAssistantStatus)
+	s.handle("POST /api/assistant/ask", Local, s.handleAssistantAsk)
+	s.handle("GET  /api/assistant/threads", Read, s.handleAssistantThreads)
+	s.handle("GET  /api/assistant/threads/{id}", Read, s.handleAssistantThread)
+	s.handle("DELETE /api/assistant/threads/{id}", Configure, s.handleAssistantThreadDelete)
+	s.handle("DELETE /api/assistant/threads", Configure, s.handleAssistantThreadsClear)
 	s.handle("POST   /api/drivers/{name}/control", Actuate, s.handleDriverControl)
 	s.handle("DELETE /api/drivers/{name}/control", Actuate, s.handleDriverControlRelease)
 	s.handle("POST /api/drivers/{name}/restart", Configure, s.handleDriverRestart)
@@ -1149,15 +1167,15 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	v2xPolicy := s.v2xPolicyStatus(v2xGridW)
 
-	trust, export, yamlCustom, mappedK, mappedMode := s.plannerPrefsSnapshot()
+	trust, export, safetyK, mappedMode := s.plannerPrefsSnapshot()
 
 	resp := map[string]any{
 		"version":               s.deps.Version,
 		"mode":                  ctrl.Mode,
 		"forecast_trust":        trust,
 		"battery_export":        export,
-		"planner_yaml_custom":   yamlCustom,
-		"planner_mapped_k":      mappedK,
+		"safety_k":              safetyK,
+		"planner_mapped_k":      safetyK,
 		"planner_mapped_mode":   mappedMode,
 		"troubleshooting_mode":  troubleshootingMode,
 		"plan_stale":            ctrl.PlanStale,
@@ -2917,6 +2935,7 @@ func (s *Server) handlePVModel(w http.ResponseWriter, r *http.Request) {
 		"enabled":                    true,
 		"samples":                    m.Samples,
 		"mae_w":                      m.MAE,
+		"rel_mae":                    m.RelMAE,
 		"rated_w":                    m.RatedW,
 		"quality":                    m.Quality(),
 		"last_ms":                    m.LastMs,
@@ -3058,7 +3077,10 @@ func (s *Server) handleEVCommand(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if s.deps.Registry == nil {
+	// An OCPP-only site has chargers and no Lua driver behind them, so the
+	// registry being absent is not by itself a reason to refuse: EVSend can
+	// still deliver. Both missing is.
+	if s.deps.Registry == nil && s.deps.EVSend == nil {
 		writeJSON(w, 503, map[string]string{"error": "driver registry not available"})
 		return
 	}
@@ -3076,11 +3098,22 @@ func (s *Server) handleEVCommand(w http.ResponseWriter, r *http.Request) {
 		applyManualEVHold(s.deps, driverName, req.Action)
 	}
 	payload, _ := json.Marshal(map[string]any{"action": req.Action})
-	if err := s.deps.Registry.Send(r.Context(), driverName, payload); err != nil {
+	if err := s.sendEV(r.Context(), driverName, payload); err != nil {
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
 	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// sendEV delivers an EV command, routing an OCPP charge point past the driver
+// registry it is not in. Without this an OCPP charger answers telemetry and
+// automatic dispatch but refuses every manual control on the dashboard, which
+// reads as the charger being broken rather than unrouted.
+func (s *Server) sendEV(ctx context.Context, driverName string, payload []byte) error {
+	if s.deps.EVSend != nil {
+		return s.deps.EVSend(ctx, driverName, payload)
+	}
+	return s.deps.Registry.Send(ctx, driverName, payload)
 }
 
 var validV2XActions = map[string]bool{
@@ -3482,6 +3515,7 @@ func (s *Server) handleLoadpoints(w http.ResponseWriter, r *http.Request) {
 	}
 	s.decorateLoadpointsWithManual(states)
 	s.decorateLoadpointsWithBatteryBoost(states)
+	s.decorateLoadpointsWithPlan(states)
 	writeJSON(w, 200, map[string]any{
 		"enabled":    true,
 		"loadpoints": states,

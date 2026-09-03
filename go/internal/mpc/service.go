@@ -94,11 +94,18 @@ type Service struct {
 	// forecasts are hard-cut to this so a wild twin cannot plan 50 kW
 	// of house load. 0 disables the upper cut.
 	LoadMaxW float64
-	// Optimizer is the primary mathematical planning engine. Nil selects the
-	// legacy in-process Go DP explicitly. When non-nil, any engine/process/
-	// validation failure falls back to the DP for this replan and is recorded
-	// in Plan.Solver.
+	// Optimizer is the external mathematical planning engine. Nil — the
+	// default since #1020 — makes the in-process Go DP the champion. When
+	// non-nil, any engine/process/validation failure falls back to the DP for
+	// this replan and is recorded in Plan.Solver.
 	Optimizer PlanOptimizer
+	// ShadowOptimizer runs the external optimizer AFTER a Core plan is
+	// published, on the same slots and params, and records the
+	// terminal-corrected cost difference. It is never consulted for dispatch,
+	// never promoted to champion, and never allowed to fail or delay a replan.
+	// Ignored while Optimizer is set — the external engine cannot shadow
+	// itself.
+	ShadowOptimizer PlanOptimizer
 	// EnableRecourseShadow runs a storage-only stochastic recourse challenger
 	// after each successful champion solve. It shares the primary worker and is
 	// diagnostic-only: no challenger action is ever read by SlotDirectiveAt.
@@ -112,6 +119,11 @@ type Service struct {
 	// the pvmodel residual std. Drives downside-PV safety planning (Alt 2).
 	// Optional; nil → no downside haircut.
 	PVUncertaintyW func() float64
+	// PVRelativeUncertainty returns the PV twin's learned relative forecast
+	// error (0..1) — wired to pvmodel.Service.RelativeUncertainty. When > 0
+	// the haircut is sized per slot against that slot's own generation;
+	// 0 or nil keeps the flat k·σ form.
+	PVRelativeUncertainty func() float64
 	// PVForecastSafetyK scales the downside-PV haircut: the DP plans against
 	// forecast PV minus k·σ. 0 = raw forecast (no hedge). main.go defaults the
 	// unset config to 1.0.
@@ -233,6 +245,17 @@ type Service struct {
 	lastParams      Params // params that went into the most recent Optimize call
 	lastLoadpointID string // ID of the loadpoint active in the most recent plan (empty = none)
 	shadowEvaluator *StatefulShadowEvaluator
+
+	// Python field shadow, all guarded by mu. lastPythonShadow belongs to the
+	// decision named by lastPythonShadowFor and is dropped once a newer plan
+	// takes over; shadowBusy keeps at most one challenger solve in flight so a
+	// slow worker cannot pile up behind a 15-minute replan interval.
+	shadowBusy          bool
+	shadowCancel        context.CancelFunc
+	shadowWG            sync.WaitGroup
+	lastPythonShadow    *ShadowPlan
+	lastPythonShadowFor string
+	shadowErrWindows    map[string]shadowErrWindow
 
 	stop chan struct{}
 	done chan struct{}
@@ -505,6 +528,71 @@ func (s *Service) SlotDirectiveAt(now time.Time) (SlotDirective, bool) {
 	return SlotDirective{}, false
 }
 
+// PlanWindow is one contiguous run of plan slots in which the active
+// plan allocates charge energy to a loadpoint. Exposed so the API can
+// answer the operator's first question at plug-in — "when will it
+// charge?" — without the UI re-deriving the plan's loadpoint columns.
+type PlanWindow struct {
+	Start    time.Time
+	End      time.Time
+	EnergyWh float64
+}
+
+// LoadpointPlanWindows returns the contiguous windows, ending after
+// `now`, in which the active plan allocates charge energy to loadpoint
+// `id`, plus the total Wh the plan still intends to deliver across the
+// horizon. A window already underway is included with its full slot
+// bounds. At most `max` windows are returned (0 = unlimited); the Wh
+// total always covers every remaining slot. Returns (nil, 0) when
+// there is no fresh plan — same MaxPlanAge cutoff as SlotDirectiveAt,
+// because a stale plan must not promise start times.
+func (s *Service) LoadpointPlanWindows(id string, now time.Time, max int) ([]PlanWindow, float64) {
+	if s == nil || id == "" {
+		return nil, 0
+	}
+	s.mu.RLock()
+	p := s.last
+	legacyID := s.lastLoadpointID
+	s.mu.RUnlock()
+	if p == nil || time.Since(time.UnixMilli(p.GeneratedAtMs)) > MaxPlanAge {
+		return nil, 0
+	}
+	nowMs := now.UnixMilli()
+	var windows []PlanWindow
+	var totalWh float64
+	for _, a := range p.Actions {
+		endMs := a.SlotStartMs + int64(a.SlotLenMin)*60*1000
+		if endMs <= nowMs {
+			continue
+		}
+		powerW := 0.0
+		if len(a.LoadpointPowerW) > 0 {
+			powerW = a.LoadpointPowerW[id]
+		} else if id == legacyID {
+			powerW = a.LoadpointW
+		}
+		if powerW <= 0 {
+			continue
+		}
+		wh := powerW * float64(a.SlotLenMin) / 60.0
+		totalWh += wh
+		start := time.UnixMilli(a.SlotStartMs)
+		end := time.UnixMilli(endMs)
+		if n := len(windows); n > 0 && windows[n-1].End.Equal(start) {
+			windows[n-1].End = end
+			windows[n-1].EnergyWh += wh
+			continue
+		}
+		if max > 0 && len(windows) == max {
+			// Window cap reached: keep accumulating the Wh total,
+			// just stop growing the list.
+			continue
+		}
+		windows = append(windows, PlanWindow{Start: start, End: end, EnergyWh: wh})
+	}
+	return windows, totalWh
+}
+
 // livePVSurplusSoCCap returns a quantified ceiling for moving later
 // grid-funded charging into live PV in the current slot. This is deliberately
 // derived from decisions already present in the plan rather than a blanket
@@ -686,16 +774,48 @@ func (s *Service) Stop() {
 	if s.activeReplanCancel != nil {
 		s.activeReplanCancel()
 	}
+	if s.shadowCancel != nil {
+		s.shadowCancel()
+	}
 	s.mu.Unlock()
 	close(s.stop)
 	<-s.done
 	// beginReplanLocked performs Add while holding the same lock that set
 	// stopping, so no new Add can race with this Wait.
 	s.replanWG.Wait()
+	// startPythonShadow adds under the same lock that set stopping, so no new
+	// challenger can start after this point; closing the worker before its
+	// in-flight call returned would only manufacture a shadow error.
+	s.shadowWG.Wait()
 	if s.Optimizer != nil {
 		_ = s.Optimizer.Close()
 	}
+	if s.ShadowOptimizer != nil {
+		_ = s.ShadowOptimizer.Close()
+	}
 	close(s.stopped)
+}
+
+// ConfiguredOptimizer returns the external optimizer attached to this service
+// in either role, champion or shadow. Health, version and update surfaces use
+// it: the sidecar has to stay visible and updatable while it runs as a
+// measurement, or the soak that justifies retiring it cannot be maintained.
+// Which engine actually produced the active plan is a separate question, and
+// Plan.Solver answers it.
+func (s *Service) ConfiguredOptimizer() PlanOptimizer {
+	if s == nil {
+		return nil
+	}
+	if s.Optimizer != nil {
+		return s.Optimizer
+	}
+	return s.ShadowOptimizer
+}
+
+// OptimizerIsChampion reports whether the external optimizer produces the
+// active plan, as opposed to shadowing the Core planner.
+func (s *Service) OptimizerIsChampion() bool {
+	return s != nil && s.Optimizer != nil
 }
 
 func (s *Service) loop(ctx context.Context) {
@@ -1075,6 +1195,29 @@ func (s *Service) canceledReplan(request replanRequest, stage string) *Plan {
 	return s.Latest()
 }
 
+// Resolution caps for a replan whose state space carries an EV
+// loadpoint. See derateResolutionForLoadpoint.
+const (
+	loadpointSoCLevelCap    = 101
+	loadpointActionLevelCap = 201
+)
+
+// derateResolutionForLoadpoint caps the battery grid once a loadpoint
+// extends the state space. DP complexity is O(N·S·A·EL·EA), and the EV
+// dimensions multiply the battery grid by ~50×: carrying the
+// battery-only 201×401 into an EV replan pushes it from ~0.1 s toward
+// ~5 s, past the replan budget. The caps hold EV replans near 1 s.
+// Grids already at or below them pass through untouched.
+func derateResolutionForLoadpoint(socLevels, actionLevels int) (int, int) {
+	if socLevels > loadpointSoCLevelCap {
+		socLevels = loadpointSoCLevelCap
+	}
+	if actionLevels > loadpointActionLevelCap {
+		actionLevels = loadpointActionLevelCap
+	}
+	return socLevels, actionLevels
+}
+
 func (s *Service) runReplan(request replanRequest) *Plan {
 	if !request.accepted {
 		request.cancel()
@@ -1149,13 +1292,17 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	// a separate downside copy for the emergency Go-DP path, preserving the
 	// previous safety behavior if the worker is unavailable.
 	fallbackSlots := append([]Slot(nil), slots...)
-	var pvUncertaintyW float64
+	var pvUncertaintyW, pvRelativeUncertainty float64
 	pvUncertainty := s.PVUncertaintyW
+	pvRelative := s.PVRelativeUncertainty
 	if pvUncertainty != nil {
 		// One replan must use one uncertainty snapshot. Reading the live model
 		// twice could give the external scenarios and Go fallback different
 		// physics for the same request.
 		pvUncertaintyW = pvUncertainty()
+	}
+	if pvRelative != nil {
+		pvRelativeUncertainty = pvRelative()
 	}
 
 	// Plumb the site fuse + export ceiling into per-slot limits so the DP
@@ -1203,7 +1350,11 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	if pvUncertainty != nil {
 		p.PVUncertaintyW = pvUncertaintyW
 	}
-	applyPVDownside(fallbackSlots, p.PVForecastSafetyK, p.PVUncertaintyW)
+	if pvRelative != nil {
+		p.PVRelativeUncertainty = pvRelativeUncertainty
+	}
+	applyPVDownsidePerSlot(fallbackSlots, p.PVForecastSafetyK,
+		p.PVRelativeUncertainty, p.PVUncertaintyW)
 
 	// Default terminal valuation. Mode-dependent because self-consumption
 	// is a constrained game: the battery can only offset local load, not
@@ -1267,6 +1418,7 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 			p.Loadpoints = active
 			p.Loadpoint = active[0]
 			loadpointID = active[0].ID
+			p.SoCLevels, p.ActionLevels = derateResolutionForLoadpoint(p.SoCLevels, p.ActionLevels)
 		}
 	}
 
@@ -1284,11 +1436,28 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	}
 	recoveryRequired := planningParamsRequireRecovery(p)
 	if recoveryRequired && s.Optimizer == nil {
-		slog.Error("mpc: battery state requires operating-bound recovery that Go DP cannot model; keeping previous plan",
-			"soc_start", p.InitialSoC,
-			"soc_min", p.SoCMin,
-			"soc_max", p.SoCMax)
-		return s.Latest()
+		// Core is the planner, so this state has to produce a plan. Clamp onto
+		// the band edge and record the real reading; the argument for clamping
+		// over refusing is in clampParamsIntoOperatingBand.
+		clamped, ok := clampParamsIntoOperatingBand(&p)
+		if !ok {
+			slog.Error("mpc: battery state is not physically possible; keeping previous plan",
+				"soc_start", p.InitialSoC,
+				"soc_min", p.SoCMin,
+				"soc_max", p.SoCMax)
+			return s.Latest()
+		}
+		if clamped {
+			slog.Warn("mpc: planning from clamped SoC",
+				"soc_real", p.InitialSoCUnclamped,
+				"soc_clamped", p.InitialSoC,
+				"delta_wh", (p.InitialSoC-p.InitialSoCUnclamped)*p.CapacityWh,
+				"soc_min", p.SoCMin,
+				"soc_max", p.SoCMax)
+		}
+		// The state is inside the band now, so this is an ordinary solve:
+		// baselines and shadows apply as usual.
+		recoveryRequired = false
 	}
 
 	slog.Info("mpc: optimize params",
@@ -1310,13 +1479,15 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	var shadowRecoursePlan *Plan
 	var shadowError string
 	publishShadow := false
-	if s.Optimizer == nil {
+	coreChampion := s.Optimizer == nil
+	if coreChampion {
+		// Core is the planner. It solves the downside-PV slots — forecast
+		// minus k·σ per slot — so the plan it publishes is the one that does
+		// not bet on sun that may not arrive.
 		slots = fallbackSlots
+		solveStart := time.Now()
 		plan = Optimize(slots, p)
-		plan.Solver = &SolverInfo{
-			Engine: "go-dp", Backend: "bellman", Status: "optimal-grid",
-			Formulation: "discrete-dp",
-		}
+		plan.Solver = coreSolverInfo(p, msSince(solveStart))
 	} else {
 		candidate, err := s.Optimizer.Optimize(ctx, slots, p)
 		if request.wasCanceledByService() {
@@ -1332,11 +1503,9 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 					"soc_min", p.SoCMin,
 					"soc_max", p.SoCMax)
 			} else {
+				evaluationStart := time.Now()
 				dpEvaluation := Optimize(slots, p)
-				dpEvaluation.Solver = &SolverInfo{
-					Engine: "go-dp", Backend: "bellman", Status: "optimal-grid",
-					Formulation: "discrete-dp",
-				}
+				dpEvaluation.Solver = coreSolverInfo(p, msSince(evaluationStart))
 				candidate.DPEvaluationShadow = compareDPShadow(candidate, dpEvaluation)
 				candidate.DPEvaluationShadow.ForecastBasis = "same base forecast input"
 				candidate.DPEvaluationShadow.Solver = dpEvaluation.Solver
@@ -1347,11 +1516,9 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 					candidate.DPEvaluationShadow.FirstAction.EMSMode = mode
 				}
 
+				downsideStart := time.Now()
 				dpShadow := Optimize(fallbackSlots, p)
-				dpShadow.Solver = &SolverInfo{
-					Engine: "go-dp", Backend: "bellman", Status: "optimal-grid",
-					Formulation: "discrete-dp",
-				}
+				dpShadow.Solver = coreSolverInfo(p, msSince(downsideStart))
 				candidate.DPShadow = compareDPShadow(candidate, dpShadow)
 				candidate.DPShadow.ForecastBasis = "downside-pv fallback input"
 				candidate.DPShadow.Solver = dpShadow.Solver
@@ -1445,14 +1612,17 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 					"soc_max", p.SoCMax)
 				return s.Latest()
 			}
-			slog.Error("mpc: primary optimizer failed; using Go DP fallback", "err", err)
+			slog.Error("mpc: primary optimizer failed; using Core DP fallback", "err", err)
 			slots = fallbackSlots
+			solveStart := time.Now()
 			plan = Optimize(slots, p)
-			plan.Solver = &SolverInfo{
-				Engine: "go-dp", Backend: "bellman", Status: "fallback",
-				Formulation: "discrete-dp", Fallback: true,
-				FallbackReason: err.Error(),
-			}
+			plan.Solver = coreSolverInfo(p, msSince(solveStart))
+			// Same solver, different standing: the operator asked for the
+			// external planner and did not get it. Everything that warns about
+			// a degraded optimizer keys on this flag, not on the engine name.
+			plan.Solver.Status = "fallback"
+			plan.Solver.Fallback = true
+			plan.Solver.FallbackReason = err.Error()
 		}
 	}
 	if err := validatePlanSlotAlignment(slots, plan.Actions); err != nil {
@@ -1578,7 +1748,34 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 			}
 		}
 	}
+	// The plan is published and persisted before the challenger starts, so the
+	// shadow can only ever add a measurement to it. `plan` is copied by value
+	// and its actions are read-only from here on.
+	if coreChampion {
+		s.startPythonShadow(plan, slots, p, reason, replanAtMs)
+	}
 	return &plan
+}
+
+// msSince reports elapsed milliseconds with sub-millisecond resolution — a DP
+// solve on a small grid finishes in a fraction of a millisecond and must not
+// report as zero.
+func msSince(start time.Time) float64 {
+	return float64(time.Since(start).Microseconds()) / 1000.0
+}
+
+// coreSolverInfo labels a plan the in-process Go DP produced. The grid travels
+// with it because the discretization is what bounds the DP's distance from a
+// continuous optimum: at 201×401 the terminal-corrected replay bench put it
+// within 12.7 öre per plan of the external MILP across 12 site snapshots.
+func coreSolverInfo(p Params, solveMs float64) *SolverInfo {
+	return &SolverInfo{
+		Engine: "core", Backend: "dp", Status: "optimal",
+		Formulation:  "discrete-dp",
+		SoCLevels:    p.SoCLevels,
+		ActionLevels: p.ActionLevels,
+		SolveMs:      solveMs,
+	}
 }
 
 // nextDecisionIDLocked returns an opaque ID for a plan that has passed the
@@ -1836,27 +2033,64 @@ func buildSlots(prices []state.PricePoint, forecasts []state.ForecastPoint, base
 	return out
 }
 
-// applyPVDownside reduces each slot's planned PV generation by k·σ (the recent
-// PV forecast error std, in W), flooring at zero. Planning the DP against this
-// downside is the Alt-2 safety mechanism: the optimizer won't run the battery
-// down betting on PV that may not arrive, so a reserve emerges from the
-// forecast uncertainty itself — sized to the real risk, not a flat SoC %.
-// On a clear, stable day σ is small (use the battery freely); on a variable
-// cloudy day σ grows (keep more reserve). k=0 or σ=0 → raw forecast (no hedge,
-// e.g. operators who want "use the battery you have"). Night slots (PVW=0) are
-// unaffected — the haircut only ever shaves real generation.
-// applyPVDownsideToSlots is the Service-level seam over applyPVDownside: it
-// reads the live σ from the PVUncertaintyW hook and the configured k, and
-// applies the downside haircut to the plan's slots. No-op when the hook is
-// unwired (PVUncertaintyW nil) or on a nil Service — the planner then runs
+// applyPVDownsideToSlots is the Service-level seam over the haircut: it reads
+// the live uncertainties from the PVUncertaintyW / PVRelativeUncertainty hooks
+// and the configured k, and applies the downside to the plan's slots. No-op
+// when both hooks are unwired or on a nil Service — the planner then runs
 // against the raw forecast.
 func (s *Service) applyPVDownsideToSlots(slots []Slot) {
-	if s == nil || s.PVUncertaintyW == nil {
+	if s == nil || (s.PVUncertaintyW == nil && s.PVRelativeUncertainty == nil) {
 		return
 	}
-	applyPVDownside(slots, s.PVForecastSafetyK, s.PVUncertaintyW())
+	var sigmaAbsW, sigmaRel float64
+	if s.PVUncertaintyW != nil {
+		sigmaAbsW = s.PVUncertaintyW()
+	}
+	if s.PVRelativeUncertainty != nil {
+		sigmaRel = s.PVRelativeUncertainty()
+	}
+	applyPVDownsidePerSlot(slots, s.PVForecastSafetyK, sigmaRel, sigmaAbsW)
 }
 
+// applyPVDownsidePerSlot is the proportional form: each slot loses k·σ_rel of
+// its OWN expected generation rather than one flat watt figure repeated across
+// the horizon. The flat form erased the morning and evening shoulders outright
+// and hedged a possibly-clear tomorrow with today's cloudy-sky σ; on real
+// snapshots that cost 25-65 SEK per 48 h plan.
+//
+// sigmaRel ≤ 0 means the twin has not learned its relative error yet (or the
+// value is not finite) — fall back to the flat haircut so a fresh site is
+// never less hedged than before.
+func applyPVDownsidePerSlot(slots []Slot, k, sigmaRel, sigmaAbsW float64) {
+	if !(sigmaRel > 0) {
+		applyPVDownside(slots, k, sigmaAbsW)
+		return
+	}
+	if k <= 0 {
+		return
+	}
+	for i := range slots {
+		gen := -slots[i].PVW // PVW is site-signed (≤ 0); -PVW is generation
+		if gen <= 0 {
+			continue // night: nothing to shave, and never add generation
+		}
+		gen -= k * sigmaRel * gen
+		if gen < 0 {
+			gen = 0 // k·σ_rel may exceed 1; negative generation is not physical
+		}
+		slots[i].PVW = -gen
+	}
+}
+
+// applyPVDownside is the flat fallback: it reduces every slot's planned PV
+// generation by the same k·σ (the recent PV forecast error std, in W),
+// flooring at zero. Planning the DP against a downside is the Alt-2 safety
+// mechanism — the optimizer won't run the battery down betting on PV that may
+// not arrive, so a reserve emerges from the forecast uncertainty itself rather
+// than from a flat SoC %. k=0 or σ=0 → raw forecast (no hedge, e.g. operators
+// who want "use the battery you have"). Night slots (PVW=0) are unaffected —
+// the haircut only ever shaves real generation. Prefer applyPVDownsidePerSlot;
+// this form only runs where the twin has no relative error yet.
 func applyPVDownside(slots []Slot, k, sigmaW float64) {
 	if k <= 0 || sigmaW <= 0 {
 		return

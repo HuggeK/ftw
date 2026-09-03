@@ -145,6 +145,11 @@ type Params struct {
 	SoCMin     float64 // hardware/chemistry floor — DP feasibility check refuses to land below this
 	SoCMax     float64 // e.g. 95
 	InitialSoC float64
+	// InitialSoCUnclamped records the SoC the site actually reported when it
+	// had drifted outside SoCMin…SoCMax and InitialSoC was pulled onto the
+	// band edge so Core could plan at all. Zero when no clamp was needed. It
+	// is a record, not an input: nothing solves from it.
+	InitialSoCUnclamped float64
 
 	// Forecast-risk reserve is handled outside the DP cost now: the planner
 	// optimises against downside PV (forecast − k·σ) via
@@ -166,9 +171,9 @@ type Params struct {
 	// genuine arbitrage (active_arbitrage paths still see spreads
 	// >100 öre/kWh).
 	//
-	// Only applies to ModePassiveArbitrage. 0 disables. The cost
-	// reduction is bounded by the live PV surplus this slot — DP
-	// can never claim a bonus larger than the surplus available, so
+	// Applies in every mode, matching the MILP (#1020). 0 disables.
+	// The cost reduction is bounded by the live PV surplus this slot —
+	// DP can never claim a bonus larger than the surplus available, so
 	// the bias never converts to grid-charge incentive.
 	PVChargeBonusOreKwh float64
 
@@ -233,8 +238,11 @@ type Params struct {
 
 	// PV scenario inputs are consumed by the mathematical optimizer. The Go DP
 	// fallback still receives downside-adjusted slots directly from Service.
-	PVUncertaintyW    float64
-	PVForecastSafetyK float64
+	// PVRelativeUncertainty (0..1) sizes the spread per slot against that
+	// slot's own generation; 0 keeps the flat PVUncertaintyW watt figure.
+	PVUncertaintyW        float64
+	PVRelativeUncertainty float64
+	PVForecastSafetyK     float64
 }
 
 // StorageAssetSpec is one independently constrained home battery in the
@@ -373,9 +381,9 @@ type Plan struct {
 	OptimizerInput json.RawMessage `json:"-"`
 }
 
-// ShadowPlan is a Go-DP candidate calculated alongside an active mathematical
-// plan. It is diagnostic only and is never read by dispatch.
-// ActiveMinusShadowOre is negative when the Python plan has lower raw cost.
+// ShadowPlan is a challenger candidate calculated alongside the active plan.
+// It is diagnostic only and is never read by dispatch. ActiveMinusShadowOre is
+// negative when the challenger has lower raw cost.
 type ShadowPlan struct {
 	TotalCostOre           float64     `json:"total_cost_ore"`
 	ActiveMinusShadowOre   float64     `json:"active_minus_shadow_ore"`
@@ -386,17 +394,48 @@ type ShadowPlan struct {
 	ComparedSlots          int         `json:"compared_slots"`
 	FirstAction            *Action     `json:"first_action,omitempty"`
 	Solver                 *SolverInfo `json:"solver,omitempty"`
+
+	// Terminal-corrected costs net out the terminal-SoC credit both solvers
+	// optimize with but neither reports. Two plans that park the horizon at
+	// different SoC are not comparable on raw cost: the fuller one is storing
+	// value, not overspending, and on a 9.6 kWh pack that artifact is worth up
+	// to ~21 SEK. Filled by the Python field shadow; zero on blocks written
+	// before it existed.
+	ActiveTerminalCorrectedOre            float64 `json:"active_terminal_corrected_ore,omitempty"`
+	TerminalCorrectedOre                  float64 `json:"terminal_corrected_ore,omitempty"`
+	ActiveMinusShadowTerminalCorrectedOre float64 `json:"active_minus_shadow_terminal_corrected_ore,omitempty"`
+}
+
+// terminalCorrectedOre nets the terminal-SoC credit out of a raw grid cost so
+// two plans ending at different SoC compare honestly. Same formula as the DP's
+// terminal value (Optimize) and the stateful shadow's valued cost.
+func terminalCorrectedOre(rawCostOre, endSoC float64, p Params) float64 {
+	return rawCostOre - p.TerminalSoCPrice*(endSoC*p.CapacityWh)/1000.0
+}
+
+// planEndSoC is the SoC the plan parks the horizon at.
+func planEndSoC(plan *Plan) float64 {
+	if plan == nil || len(plan.Actions) == 0 {
+		return 0
+	}
+	return plan.Actions[len(plan.Actions)-1].SoC
 }
 
 // SolverInfo identifies the engine that produced a plan and records enough
-// detail to audit optimizer fallbacks. The Go DP remains available as an
-// emergency fallback when the external mathematical planner is unavailable or
-// returns a plan that fails the Go-side physics validator.
+// detail to audit which planner ran. Engine "core" / Backend "dp" is the
+// in-process Go DP; Fallback separates "core is the configured planner" from
+// "the external planner failed and the DP caught it".
 type SolverInfo struct {
-	Engine                 string   `json:"engine"`
-	Backend                string   `json:"backend,omitempty"`
-	Status                 string   `json:"status"`
-	Formulation            string   `json:"formulation,omitempty"`
+	Engine      string `json:"engine"`
+	Backend     string `json:"backend,omitempty"`
+	Status      string `json:"status"`
+	Formulation string `json:"formulation,omitempty"`
+	// SoCLevels and ActionLevels are the DP's discretization grid — the
+	// dimension that bounds how close it lands to a continuous optimum, and
+	// the one derated when a loadpoint joins the state space. Empty for
+	// solvers that do not discretize.
+	SoCLevels              int      `json:"soc_levels,omitempty"`
+	ActionLevels           int      `json:"action_levels,omitempty"`
 	ObjectiveOre           float64  `json:"objective_ore,omitempty"`
 	ServiceSlack           float64  `json:"service_slack,omitempty"`
 	SolveMs                float64  `json:"solve_ms,omitempty"`
@@ -531,17 +570,16 @@ func Optimize(slots []Slot, p Params) Plan {
 	socStep := (p.SoCMax - p.SoCMin) / float64(S-1)
 	socAt := func(i int) float64 { return p.SoCMin + float64(i)*socStep }
 
-	// Confidence handling: compute the horizon mean (real + forecast)
-	// so we can blend low-confidence prices toward it. Default any
-	// missing confidence to 1.0 (treat caller-unaware slots as "real").
-	var sumPrice float64
+	// Default any missing confidence to 1.0 (treat caller-unaware slots
+	// as "real") before anything reads it.
 	for i := range slots {
 		if slots[i].Confidence <= 0 {
 			slots[i].Confidence = 1.0
 		}
-		sumPrice += slots[i].PriceOre
 	}
-	meanPrice := sumPrice / float64(N)
+	// Confidence handling: blend low-confidence prices toward the
+	// horizon mean (real + forecast).
+	meanPrice, meanExport := horizonMeans(slots, p)
 	// effPrice(slot) = c × raw + (1 − c) × mean. c=1 → raw; c<1 pulls
 	// toward horizon mean, dampening arbitrage the DP sees on shaky
 	// forecasted slots without hiding them entirely.
@@ -550,11 +588,6 @@ func Optimize(slots []Slot, p Params) Plan {
 	}
 	// Export decision lens mirrors import price confidence handling, but
 	// starts from the same raw per-slot export model used everywhere else.
-	var sumExport float64
-	for _, s := range slots {
-		sumExport += SlotExportPriceOre(s, p)
-	}
-	meanExport := sumExport / float64(N)
 	effExportOre := func(s Slot) float64 {
 		raw := SlotExportPriceOre(s, p)
 		return s.Confidence*raw + (1-s.Confidence)*meanExport
@@ -845,7 +878,7 @@ func Optimize(slots []Slot, p Params) Plan {
 							houseGridW := slot.LoadW + slot.PVW + battW
 							if houseGridW > 0 {
 								houseKWh := houseGridW * dtH / 1000.0
-								cost += 2.0 * effPrice(slot) * houseKWh
+								cost += strictSCBiasOre(effPrice(slot), houseKWh)
 							}
 						}
 
@@ -865,7 +898,12 @@ func Optimize(slots []Slot, p Params) Plan {
 						// as economically equivalent. The bonus is
 						// bounded by the live surplus so it never
 						// incentivises grid-charging.
-						if p.Mode == ModePassiveArbitrage && p.PVChargeBonusOreKwh > 0 && battW > 0 {
+						// Applied in every mode, matching the MILP
+						// (parity fix, #1020 — the DP used to gate
+						// this to passive_arbitrage; the bound to
+						// live surplus is what keeps it safe, not
+						// the mode).
+						if p.PVChargeBonusOreKwh > 0 && battW > 0 {
 							pvSurplusW := -slot.PVW - slot.LoadW
 							if pvSurplusW > 0 {
 								chargeFromPVW := battW
@@ -998,7 +1036,18 @@ func Optimize(slots []Slot, p Params) Plan {
 	if si >= S {
 		si = S - 1
 	}
-	soc := socAt(si)
+	// The POLICY is looked up on the grid, but the simulated SoC starts
+	// at the real initial value, clamped to the band — snapping it to
+	// the grid created up to ½ step of phantom or lost energy at t=0
+	// (parity fix, #1020). The rest of the loop already propagates
+	// continuous SoC; only the lookup index rounds.
+	soc := p.InitialSoC
+	if soc < p.SoCMin {
+		soc = p.SoCMin
+	}
+	if soc > p.SoCMax {
+		soc = p.SoCMax
+	}
 	// Initial EV SoC index.
 	ei := 0
 	var evSoc float64
@@ -1011,7 +1060,13 @@ func Optimize(slots []Slot, p Params) Plan {
 		if ei >= EL {
 			ei = EL - 1
 		}
-		evSoc = evSocAt(ei)
+		evSoc = lp.InitialSoC
+		if evSoc < lp.SoCMin {
+			evSoc = lp.SoCMin
+		}
+		if evSoc > lp.SoCMax {
+			evSoc = lp.SoCMax
+		}
 	}
 	var totalCost float64
 	for t := 0; t < N; t++ {
@@ -1095,6 +1150,49 @@ func Optimize(slots []Slot, p Params) Plan {
 	plan.TotalCostOre = totalCost
 	annotateCurtailment(&plan, p)
 	return plan
+}
+
+// horizonMeans returns the horizon's mean import price and mean export
+// price, both LENGTH-WEIGHTED by Slot.LenMin: with mixed 15/60-minute
+// slots an unweighted mean over-counts the short slots, skewing the
+// confidence blend and the EV deadline penalty (parity fix, #1020 —
+// Baselines already weighted by LenMin; the DP did not). Falls back to
+// the unweighted mean when no slot carries a length. Never mutates
+// slots.
+func horizonMeans(slots []Slot, p Params) (meanPriceOre, meanExportOre float64) {
+	if len(slots) == 0 {
+		return 0, 0
+	}
+	var sumPrice, sumExport, sumLenMin float64
+	for _, s := range slots {
+		w := float64(s.LenMin)
+		sumPrice += s.PriceOre * w
+		sumExport += SlotExportPriceOre(s, p) * w
+		sumLenMin += w
+	}
+	if sumLenMin <= 0 {
+		sumPrice, sumExport = 0, 0
+		for _, s := range slots {
+			sumPrice += s.PriceOre
+			sumExport += SlotExportPriceOre(s, p)
+		}
+		sumLenMin = float64(len(slots))
+	}
+	return sumPrice / sumLenMin, sumExport / sumLenMin
+}
+
+// strictSCBiasOre is the strict self-consumption decision bias: house
+// import priced at 2× on top of the real cost, so covering the house
+// from the battery outranks economically-equivalent alternatives. The
+// price is clamped at zero — on a negative retail slot an unclamped
+// bias INVERTS into a house-import bonus. The MILP always clamped
+// (max(eff_import, 0)); the DP now matches (parity fix, #1020).
+// Decision-only: never part of the reported plan cost.
+func strictSCBiasOre(effPriceOre, houseImportKWh float64) float64 {
+	if effPriceOre < 0 {
+		effPriceOre = 0
+	}
+	return 2.0 * effPriceOre * houseImportKWh
 }
 
 // annotateCurtailment walks the plan and flags slots where curtailing

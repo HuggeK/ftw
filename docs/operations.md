@@ -177,6 +177,44 @@ The FTW app and Home Assistant MQTT are unchanged.
 Recovery: `curl` to `127.0.0.1`, or set `api.lan_auth: false` in
 `config.yaml` and restart Core.
 
+### "remote access to protected API routes is disabled"
+
+The full message is `remote access to protected API routes is disabled;
+configure FTW_API_TOKEN or use a local address`. The dashboard still loads —
+the message appears when a protected request (saving settings, starting an
+update, a scan) is refused. It means the request failed the locality rules
+above, and "local" is judged on the request, not on which network the
+browser sits on:
+
+1. **The address in the browser's address bar** must be a private or
+   loopback IP, `localhost`, or a `.local`/`.localhost`/`.home.arpa` name.
+2. **The address the connection arrives from** must be loopback, private, or
+   link-local.
+
+Being on the same LAN as the box satisfies neither by itself. The common
+ways to trip the boundary from the couch next to the Pi:
+
+- **A plain hostname without a dot** — `http://myhost:8080`. Since v2.2.1
+  a no-dot name is deliberately not local (a DNS-rebinding guard), so an
+  address that worked before an update stops working. Use the `.local`
+  name or the IP instead.
+- **A router-issued name with a dot in it** — `pi.lan`, `ftw.fritz.box`,
+  `box.home`. Only the suffixes listed above count as local names.
+- **Tailscale** — both `100.x.y.z` addresses (CGNAT space) and `*.ts.net`
+  names count as remote.
+- **IPv6** — when the name resolves to a global IPv6 address, the browser
+  connects from a global address and fails the second rule, even with a
+  `.local` name in the address bar.
+- **A reverse proxy or Home Assistant ingress reached through a public
+  URL** — the request arrives carrying the public hostname.
+
+The reliable fix for a browser is to open the UI through the box's private
+IPv4 address, for example `http://192.168.1.123:8080`. Setting
+`FTW_API_TOKEN` does not change what the built-in UI sends — the token is
+only for API clients that attach the `Authorization: Bearer` header, as
+described above — and a `?token=...` query parameter in the URL does
+nothing.
+
 ## Logs and health
 
 ```bash
