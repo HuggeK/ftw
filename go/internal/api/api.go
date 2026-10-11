@@ -3679,6 +3679,7 @@ func (s *Server) handleLoadpoints(w http.ResponseWriter, r *http.Request) {
 	if s.deps.Tel != nil {
 		decorateLoadpointsWithVehicle(states, s.deps.Tel)
 	}
+	s.applyPlanningSoC(states, time.Now())
 	s.decorateLoadpointsWithManual(states)
 	s.decorateLoadpointsWithBatteryBoost(states)
 	s.decorateLoadpointsWithPlan(states)
@@ -3687,6 +3688,29 @@ func (s *Server) handleLoadpoints(w http.ResponseWriter, r *http.Request) {
 		"vehicle_limit_goal_supported": true,
 		"loadpoints":                   s.loadpointsWithFeedback(states),
 	})
+}
+
+// applyPlanningSoC records the SoC a new plan starts from. It uses the
+// same picker and timestamp rule as the MPC loadpoint spec, so the
+// charging view's "Planning from" line matches the planner even when the
+// displayed car reading is older than the live-control window.
+func (s *Server) applyPlanningSoC(states []loadpoint.State, now time.Time) {
+	if s.deps == nil || s.deps.Loadpoints == nil {
+		return
+	}
+	for i := range states {
+		if !states[i].PluggedIn {
+			continue
+		}
+		var pick telemetry.VehiclePick
+		if s.deps.Tel != nil {
+			delivering := states[i].CurrentPowerW > loadpoint.DeliveringW
+			pick = telemetry.PlanningVehiclePick(s.deps.Tel, delivering, now)
+		}
+		soc, fromVehicle := s.deps.Loadpoints.PlanningStartSoC(states[i].ID, pick.SoC, pick.UpdatedAt, pick.Driver != "")
+		states[i].PlanningSoC = &soc
+		states[i].PlanningFromVehicle = fromVehicle
+	}
 }
 
 // decorateLoadpointsWithVehicle overlays the best-matching DerVehicle

@@ -1647,26 +1647,28 @@ func main() {
 						break
 					}
 				}
-				// Prefer live DerVehicle SoC over the loadpoint manager's
-				// inferred plugin-anchor + delivered-Wh estimate. The
-				// inference is blind to BMS truth (Easee can't see the
-				// car); when a vehicle driver such as TeslaBLEProxy is
-				// online, its SoC reading is ground truth.
-				//
-				// Picker (rank + freshness + bounds + connection
-				// evidence when delivering power) lives in
-				// telemetry.PickBestVehicleForLoadpoint so api.go's
-				// loadpoint decoration agrees with us on which vehicle
-				// is "the one". Falls back to inferred SoC when nothing
-				// usable online matches.
+				// Prefer a car SoC over the session estimate. A live reading
+				// (five minutes, not driver-stale) is ground truth and may
+				// also supply the charge limit. A cached or driver-stale
+				// reading inside the one-hour anchor window still starts
+				// the plan when it is newer than the manual confirmation,
+				// or when the level was never confirmed. Energy delivered
+				// since that measurement is included. An older manual
+				// correction stays. A stale charge limit does not cap the
+				// plan. The same choice is exposed as planning_soc.
 				initSoC := st.CurrentSoC
-				socSource := "inferred"
+				socSource := "session"
 				var vehicleChargeLimit float64 // 0 = unknown
 				delivering := st.CurrentPowerW > loadpoint.DeliveringW
-				if pick := telemetry.PickBestVehicleForLoadpoint(tel, delivering, time.Now()); pick.Driver != "" {
-					initSoC = pick.SoC
-					socSource = "vehicle:" + pick.Driver
-					vehicleChargeLimit = pick.ChargeLimit
+				if pick := telemetry.PlanningVehiclePick(tel, delivering, time.Now()); pick.Driver != "" {
+					var fromVehicle bool
+					initSoC, fromVehicle = lpMgr.PlanningStartSoC(st.ID, pick.SoC, pick.UpdatedAt, true)
+					if fromVehicle {
+						socSource = "vehicle:" + pick.Driver
+					}
+					if !pick.Stale {
+						vehicleChargeLimit = pick.ChargeLimit
+					}
 				}
 				// Map target time → slot index using the DP's
 				// actual slot length (hour-of-prices vs. 15-min
@@ -2922,27 +2924,28 @@ func main() {
 				lpController.TickWithDispatch(ctx, tickNow, freshness.Allowed())
 			}
 
-			// Anchor each plugged-in loadpoint's inferred SoC to the live
-			// vehicle BMS reading when one is paired. Chargers like Easee
-			// can't read the car, so the manager otherwise drifts on a
-			// plug-in-anchor + delivered-Wh estimate; when a vehicle driver
-			// (TeslaBLEProxy etc.) is online and matched, its SoC is ground
-			// truth. Runs after Tick's Observe so the per-tick re-anchor
-			// wins over that tick's inference. The reading is anchored at
-			// the time it arrived, and energy delivered since then moves
-			// the estimate on, so a cloud SoC up to VehicleAnchorMaxAge old
-			// still helps. Driver-marked stale values and replays of a
-			// cached value never anchor.
+			// Anchor each plugged-in loadpoint to the car reading the plan
+			// would start from. Runs after Tick's Observe so the anchor
+			// wins over that tick's inference. The reading is applied at
+			// the time the car measured it, and energy delivered since
+			// then moves the estimate. A measurement newer than the
+			// manual confirmation replaces it, including a cached or
+			// driver-stale cloud report inside VehicleAnchorMaxAge. A
+			// newer manual confirmation is left alone. When the session
+			// cannot place the measurement in its energy history, the
+			// reading still replaces the older level as the current SoC.
 			for _, st := range lpMgr.States() {
 				if !st.PluggedIn {
 					continue
 				}
 				delivering := st.CurrentPowerW > loadpoint.DeliveringW
 				pick := telemetry.PickVehicleForAnchor(tel, delivering, time.Now())
-				if pick.Driver == "" {
+				if pick.Driver == "" || !lpMgr.VehicleSoCSupersedes(st.ID, pick.UpdatedAt) {
 					continue
 				}
-				lpMgr.AnchorVehicleSoCAt(st.ID, pick.SoC, pick.UpdatedAt)
+				if !lpMgr.AnchorVehicleSoCAt(st.ID, pick.SoC, pick.UpdatedAt) {
+					lpMgr.AnchorVehicleSoC(st.ID, pick.SoC)
+				}
 			}
 
 			if !freshness.Allowed() {
