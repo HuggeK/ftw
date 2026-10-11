@@ -96,10 +96,13 @@ func TestHistoryCancelledWriteWaitsForRollback(t *testing.T) {
 }
 
 type slowHistoryRollbackDriver struct {
-	base    sqlite.Driver
-	armed   atomic.Bool
-	started chan struct{}
-	release chan struct{}
+	queryNeedle string
+	execNeedle  string
+	blocked     chan struct{}
+	base        sqlite.Driver
+	armed       atomic.Bool
+	started     chan struct{}
+	release     chan struct{}
 }
 
 func (d *slowHistoryRollbackDriver) Open(name string) (driver.Conn, error) {
@@ -125,7 +128,14 @@ func (c *slowHistoryRollbackConn) BeginTx(ctx context.Context, opts driver.TxOpt
 
 func (c *slowHistoryRollbackConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	r, err := c.Conn.(driver.ExecerContext).ExecContext(ctx, query, args)
-	if err == nil && ctx.Done() != nil && isHistoryTestWrite(query) && c.d.armed.CompareAndSwap(true, false) {
+	target := c.d.queryNeedle == "" && isHistoryTestWrite(query)
+	if c.d.execNeedle != "" {
+		target = strings.Contains(query, c.d.execNeedle)
+	}
+	if err == nil && ctx.Done() != nil && target && c.d.armed.CompareAndSwap(true, false) {
+		if c.d.blocked != nil {
+			close(c.d.blocked)
+		}
 		<-ctx.Done()
 		// Let database/sql's cancellation goroutine claim the Tx before the
 		// driver returns, while this operation still owns the connection lock.
@@ -136,6 +146,11 @@ func (c *slowHistoryRollbackConn) ExecContext(ctx context.Context, query string,
 }
 
 func (c *slowHistoryRollbackConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	if c.d.queryNeedle != "" && strings.Contains(query, c.d.queryNeedle) && c.d.armed.CompareAndSwap(true, false) {
+		close(c.d.blocked)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	return c.Conn.(driver.QueryerContext).QueryContext(ctx, query, args)
 }
 
