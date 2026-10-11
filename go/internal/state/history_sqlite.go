@@ -137,6 +137,9 @@ func (s *Store) openHistory() error {
 		return err
 	}
 	if RetireRawOnOpen {
+		if err := s.recoverLegacyCharts(context.Background(), generation); err != nil {
+			return err
+		}
 		if err := s.RetireRawHistory(context.Background()); err != nil {
 			return err
 		}

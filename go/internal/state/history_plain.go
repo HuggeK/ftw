@@ -102,6 +102,9 @@ func (s *Store) RetireRawHistory(ctx context.Context) error {
 			return fmt.Errorf("copy %s: %w", table, err)
 		}
 	}
+	if _, err := dest.ExecContext(ctx, `INSERT OR IGNORE INTO history_migrations(name) VALUES(?)`, legacyChartRecovery); err != nil {
+		return err
+	}
 	srcN, srcSum, err := ledgerDigest(ctx, s.history)
 	if err != nil {
 		return err
