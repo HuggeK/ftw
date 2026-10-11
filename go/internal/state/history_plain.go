@@ -28,10 +28,12 @@ const (
 	plainHourKeep                 = 5 * 365 * 24 * time.Hour
 )
 
-// Tables copied into a history file that no longer carries raw polls. Import
-// cursors and Parquet summary receipts travel with the hours they produced:
-// without them a restart repeats an import and adds its samples twice.
+// Tables copied into a history file that no longer carries raw polls. Keep
+// imported chart snapshots: live writes use history_dashboard, but older chart
+// readers still need these frozen tiers. Import cursors and Parquet receipts
+// travel with the hours they produced so restart cannot count samples twice.
 var plainHistoryTables = []string{
+	"history_hot", "history_warm", "history_cold",
 	"ts_drivers", "ts_metrics", "ts_latest",
 	"energy_daily", "energy_ledger_meta", "energy_assets", "energy_ledger_entries", "energy_ledger_cursors",
 	"ts_buckets", "ts_aggregate_hours", "ts_series_hour", "ts_archive_days",
@@ -43,7 +45,7 @@ var plainHistoryTables = []string{
 var replaceHistoryFile = os.Rename
 
 // RetireRawHistory replaces history.db with a copy that omits raw polls and
-// the old hot/warm/cold point log. The previous file stays beside it and is
+// keeps imported chart snapshots. The previous file stays beside it and is
 // not opened again. Ledger rows are counted before the swap.
 func (s *Store) RetireRawHistory(ctx context.Context) error {
 	if s == nil || s.history == nil {

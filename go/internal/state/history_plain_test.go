@@ -79,6 +79,63 @@ func TestRetireRawHistoryKeepsTheLedger(t *testing.T) {
 	}
 }
 
+func TestRetireRawHistoryKeepsImportedChartsAcrossRestarts(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().UTC().Truncate(time.Hour).UnixMilli()
+	points := []HistoryPoint{
+		{TsMs: base - int64(400*24*time.Hour/time.Millisecond), GridW: -13, PVW: 17, JSON: `{"old":"cold"}`},
+		{TsMs: base - int64(35*24*time.Hour/time.Millisecond), GridW: 23, PVW: 29, JSON: `{"old":"warm"}`},
+		{TsMs: base - int64(time.Hour/time.Millisecond), GridW: 31, PVW: 37, JSON: `{"old":"hot"}`},
+	}
+	for i, table := range []string{"history_cold", "history_warm", "history_hot"} {
+		p := points[i]
+		if _, err := s.history.Exec(`INSERT INTO `+table+` VALUES(?,?,?,?,?,?,?)`, p.TsMs, p.GridW, p.PVW, p.BatW, p.LoadW, p.BatSoC, p.JSON); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.RecordSamples([]Sample{{Driver: "meter", Metric: "grid_w", TsMs: base, Value: 5}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	RetireRawOnOpen = true
+	t.Cleanup(func() { RetireRawOnOpen = false })
+	for restart := 0; restart < 2; restart++ {
+		s, err = Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.LoadHistory(points[0].TsMs, base, 0)
+		if err != nil {
+			s.Close()
+			t.Fatal(err)
+		}
+		if len(got) != len(points) {
+			s.Close()
+			t.Fatalf("restart %d: imported chart points=%d, want %d", restart+1, len(got), len(points))
+		}
+		for i, p := range points {
+			if got[i].TsMs != p.TsMs || got[i].GridW != p.GridW || got[i].PVW != p.PVW {
+				s.Close()
+				t.Fatalf("restart %d: changed old point: %+v, want %+v", restart+1, got[i], p)
+			}
+		}
+		var raw int
+		if err := s.history.QueryRow(`SELECT COUNT(*) FROM ts_samples`).Scan(&raw); err != nil || raw != 0 {
+			s.Close()
+			t.Fatalf("restart %d: raw polls=%d, err=%v", restart+1, raw, err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestRetireRawHistoryNeverLeavesHistoryMissing(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
 	s, err := Open(path)
