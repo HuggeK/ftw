@@ -437,10 +437,10 @@ func (s *Store) writeHistoryBatchTx(ctx context.Context, tx *sql.Tx, batchID, pa
 	}
 	if s.aggregateHistory.Load() {
 		if err := s.recordDashboardTx(ctx, tx, p); err != nil {
-			return 0, false, err
+			return 0, false, fmt.Errorf("dashboard: %w", err)
 		}
 		if err := s.insertAggregateSamples(ctx, tx, rs); err != nil {
-			return 0, false, err
+			return 0, false, fmt.Errorf("samples: %w", err)
 		}
 	} else {
 		if p != nil {
@@ -473,8 +473,13 @@ type historyBatchCommit struct {
 	seq       int64
 }
 
-func (s *Store) recordHistoryBatches(ctx context.Context, batches []historyBatch, acknowledgedSequence int64) (historyBatchCommit, error) {
-	var out historyBatchCommit
+func (s *Store) recordHistoryBatches(ctx context.Context, batches []historyBatch, acknowledgedSequence int64) (out historyBatchCommit, err error) {
+	phase := "prepare"
+	defer func() {
+		if err != nil {
+			err = fmt.Errorf("history %s: %w", phase, err)
+		}
+	}()
 	if len(batches) == 0 {
 		return out, nil
 	}
@@ -506,15 +511,27 @@ func (s *Store) recordHistoryBatches(ctx context.Context, batches []historyBatch
 		prep = append(prep, prepared{b: b, p: p, rs: rs})
 	}
 
+	phase = "writer lock"
 	if err := lockContext(ctx, s.historyWriteMu.TryLock); err != nil {
 		return out, err
 	}
 	defer s.historyWriteMu.Unlock()
-	tx, err := s.history.BeginTx(ctx, nil)
+	phase = "connection"
+	conn, err := s.history.Conn(ctx)
+	if err != nil {
+		return out, err
+	}
+	// A cancelled Tx may report ErrTxDone before its automatic rollback
+	// releases SQLite's writer. Conn.Close waits for that rollback, so the
+	// next batch cannot read a snapshot and then fail its upgrade with BUSY.
+	defer conn.Close()
+	phase = "begin"
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return out, err
 	}
 	defer tx.Rollback()
+	phase = "tick"
 	for _, item := range prep {
 		seq, skipped, err := s.writeHistoryBatchTx(ctx, tx, item.b.id, item.b.hash, item.p, item.rs, item.b.payload.Observations)
 		if err != nil {
@@ -529,9 +546,11 @@ func (s *Store) recordHistoryBatches(ctx context.Context, batches []historyBatch
 			}
 		}
 	}
+	phase = "receipts"
 	if err := ackHistoryReceipts(ctx, tx, out.seq, acknowledgedSequence); err != nil {
 		return out, err
 	}
+	phase = "commit"
 	if err := tx.Commit(); err != nil {
 		return out, err
 	}
