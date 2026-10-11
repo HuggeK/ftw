@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.140.8
+
+### Patch Changes
+
+- 1cc469c: Move internal file paths with restored data, including active SQLite settings and old backup formats. Stop a move with unresolved external paths before replacing the destination.
+- 3c2d0f2: Keep absorbed Parquet summaries in stored-resolution history exports after restart, with their recorded count and hourly resolution.
+
 ## 0.140.7
 
 ### Patch Changes
