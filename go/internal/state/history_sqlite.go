@@ -691,5 +691,30 @@ func requireConvertedBeta(path string) error {
 	if err == nil && beta != "" && selected == "" && restore == "" {
 		return errors.New("beta history needs conversion: stop Core and run ftw-history-migrate; original sources remain unchanged")
 	}
+	if err == nil && beta != "" {
+		// An older converter may already have selected SQLite. Check its
+		// summaries before Open can upgrade config or retire raw history.
+		if _, err := os.Stat(historyDatabasePath(path)); err != nil {
+			return fmt.Errorf("converted beta history is unavailable; preserve the originals and restore a full backup: %w", err)
+		}
+		history, err := sql.Open("sqlite", ReadOnlyDatabaseURI(historyDatabasePath(path)))
+		if err != nil {
+			return err
+		}
+		defer history.Close()
+		var summarized int
+		if err := history.QueryRowContext(ctx, `SELECT COUNT(*) FROM history_migrations WHERE name=?`, convertedChartSummaries).Scan(&summarized); err != nil {
+			return fmt.Errorf("check converted chart summaries: %w", err)
+		}
+		if summarized == 0 {
+			var raw int
+			if err := history.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM ts_samples)`).Scan(&raw); err != nil {
+				return fmt.Errorf("check remaining converted raw history: %w", err)
+			}
+			if raw != 0 {
+				return errors.New(incompleteConvertedCharts)
+			}
+		}
+	}
 	return nil
 }

@@ -136,6 +136,12 @@ func (b BucketSummary) validate() error {
 // Retry receipts wrap these updates, so an uncertain commit cannot add the
 // same tick twice. Collapse duplicate source timestamps before aggregation.
 func (s *Store) insertAggregateSamples(ctx context.Context, tx *sql.Tx, rs []resolvedSample) (err error) {
+	return s.aggregateSamples(ctx, tx, rs, true)
+}
+
+// Offline conversion already holds the complete raw dataset. It builds its
+// summaries separately, then keeps any older hours whose raw rows expired.
+func (s *Store) aggregateSamples(ctx context.Context, tx *sql.Tx, rs []resolvedSample, updateSeriesHours bool) (err error) {
 	timing := newHistoryWriteTiming("group_samples")
 	defer func() { err = timing.failure(err) }()
 	unique := make(map[[3]int64]resolvedSample, len(rs))
@@ -188,9 +194,11 @@ func (s *Store) insertAggregateSamples(ctx context.Context, tx *sql.Tx, rs []res
 		addSeriesHourSample(hours, r.dID, r.mID, r.ts, r.v)
 	}
 	// Seed legacy source hours before adding new summaries during migration.
-	timing.next("seed_hours")
-	if err := s.seedSeriesHours(ctx, tx, rs); err != nil {
-		return err
+	if updateSeriesHours {
+		timing.next("seed_hours")
+		if err := s.seedSeriesHours(ctx, tx, rs); err != nil {
+			return err
+		}
 	}
 	for k, b := range groups {
 		if err := b.validate(); err != nil {
@@ -228,8 +236,11 @@ func (s *Store) insertAggregateSamples(ctx context.Context, tx *sql.Tx, rs []res
 	if err := upsertSeriesHoursTableTx(ctx, tx, "ts_aggregate_hours", hours); err != nil {
 		return err
 	}
-	timing.next("write_series_hours")
-	return s.upsertSeriesHoursTx(ctx, tx, hours)
+	if updateSeriesHours {
+		timing.next("write_series_hours")
+		return s.upsertSeriesHoursTx(ctx, tx, hours)
+	}
+	return nil
 }
 
 func nonNilBytes(b []byte) []byte {

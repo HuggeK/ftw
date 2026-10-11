@@ -62,9 +62,16 @@ func ConvertBetaHistory(ctx context.Context, statePath string, source *sql.DB, r
 				err = errors.New("published history failed integrity check")
 			}
 		}
+		var summarized int
+		if err == nil {
+			err = done.QueryRowContext(ctx, `SELECT COUNT(*) FROM history_migrations WHERE name=?`, convertedChartSummaries).Scan(&summarized)
+		}
 		done.Close()
 		if err != nil {
 			return errors.New("history.db already exists without a matching conversion receipt; preserve it and investigate")
+		}
+		if summarized == 0 {
+			return errors.New(incompleteConvertedCharts)
 		}
 		if selected == generation {
 			return nil
@@ -192,6 +199,9 @@ func ConvertBetaHistory(ctx context.Context, statePath string, source *sql.DB, r
 	if _, err := dest.ExecContext(ctx, sampleTimeIndexSQL); err != nil {
 		return err
 	}
+	if err := summarizeConvertedSamples(ctx, dest, report); err != nil {
+		return fmt.Errorf("summarize converted samples: %w", err)
+	}
 	afterHash, err := betaSourceHash(ctx, statePath)
 	if err != nil {
 		return err
@@ -199,8 +209,8 @@ func ConvertBetaHistory(ctx context.Context, statePath string, source *sql.DB, r
 	if afterHash != sourceHash {
 		return errors.New("beta source changed during conversion; stop all writers and preserve the partial copy")
 	}
-	// Hourly aggregates are rebuilt from all samples in Core. This does not
-	// reinterpret counters as energy; the copied ledger retains its provenance.
+	// Core retires raw rows on its first start. All chart summaries must be
+	// durable before publication; the copied ledger keeps its provenance.
 	if _, err := dest.ExecContext(ctx, `INSERT OR IGNORE INTO history_migrations(name) VALUES (?),('sqlite-v1'),(?)`, "generation:"+generation, "beta-converted:"+generation); err != nil {
 		return err
 	}
