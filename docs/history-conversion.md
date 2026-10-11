@@ -4,7 +4,27 @@ Only boxes that selected DuckDB history need this tool. Fresh installations
 and older SQLite + Parquet installations start Core without a manual conversion.
 The normal Core binary, container and release builds do not include DuckDB.
 
-Use the converter from the same commit as the new Core candidate. Build it on
+Use the converter from the same commit as the new Core candidate. Native beta
+releases with converter packages include
+`ftw-history-migrate-VERSION-linux-arm64.tar.gz` and an `amd64` package, each
+with a `.sha256` file. Download the package for the new Linux host and check
+its checksum before unpacking. Inside, `history-converter.json` records the
+source beta, commit, state schema and binary hash. Match these to the native
+release's `ftw-native-release.json`. For stable, use the converter from the
+beta listed in that native receipt's `source_beta` field.
+
+Run conversion on a stopped source or a separate restored copy. A 32-bit source
+or a host with older system libraries can export its backup to a new 64-bit
+Linux host and run the converter there. This does not qualify every old backup
+format; check the migration guide's tested routes before starting Core.
+
+If the selected release has no converter package, do not use a tool from a
+different commit. Maintainers publish the matching packages with
+`history-converter-release.yml`, using the exact `source_beta`. That workflow
+tests the source, checks the published native receipt and adds both packages
+without replacing Core's assets or its receipt.
+
+For development, build the same source on
 the target architecture from `go/tools/history-migrate` with `go build -o
 ftw-history-migrate .`, or use its Dockerfile from the repository root:
 

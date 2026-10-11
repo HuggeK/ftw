@@ -1,0 +1,114 @@
+name: publish offline history converter
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - 'scripts/package-history-converter.py'
+      - 'scripts/test_history_converter_package.py'
+      - '.github/workflows/history-converter-release.yml'
+  workflow_dispatch:
+    inputs:
+      source_beta:
+        description: 'Published native beta with the converter to build'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: history-converter-${{ inputs.source_beta || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: python3 -m unittest discover -s scripts -p test_history_converter_package.py
+
+  publish:
+    if: github.event_name == 'workflow_dispatch'
+    needs: package-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go/tools/history-migrate/go.mod
+      - uses: docker/setup-buildx-action@v4
+      - name: Bind to the published Core source
+        env:
+          SOURCE_BETA: ${{ inputs.source_beta }}
+          GH_TOKEN: ${{ secrets.CI_TOKEN }}
+        run: |
+          set -euo pipefail
+          test "${GITHUB_REF}" = refs/heads/master
+          [[ "${SOURCE_BETA}" =~ ^v0\.[0-9]+\.[0-9]+-beta\.[0-9]+$ ]]
+          test -n "${GH_TOKEN}"
+          cp scripts/package-history-converter.py "${RUNNER_TEMP}/package-history-converter.py"
+          cp scripts/upload-release-assets.sh "${RUNNER_TEMP}/upload-release-assets.sh"
+          gh release view "${SOURCE_BETA}" --repo "${GITHUB_REPOSITORY}" \
+            --json tagName,isDraft,isPrerelease | \
+            jq -e --arg tag "${SOURCE_BETA}" '.tagName == $tag and .isDraft == false and .isPrerelease == true'
+          mkdir -p "${RUNNER_TEMP}/native-receipt"
+          gh release download "${SOURCE_BETA}" --repo "${GITHUB_REPOSITORY}" \
+            --pattern ftw-native-release.json --dir "${RUNNER_TEMP}/native-receipt"
+          git fetch origin "refs/tags/${SOURCE_BETA}:refs/tags/${SOURCE_BETA}"
+          source_commit=$(git rev-list -n 1 "${SOURCE_BETA}")
+          jq -e --arg tag "${SOURCE_BETA}" --arg commit "${source_commit}" \
+            '.schema == 1 and .channel == "beta" and .tag == $tag and .commit == $commit' \
+            "${RUNNER_TEMP}/native-receipt/ftw-native-release.json"
+          git checkout --detach "${source_commit}"
+          test -z "$(git status --porcelain)"
+          printf 'commit=%s\n' "${source_commit}" >> "${GITHUB_OUTPUT}"
+        id: source
+      - name: Test the exact source with DuckDB
+        working-directory: go/tools/history-migrate
+        env:
+          CGO_ENABLED: '1'
+        run: go test -mod=readonly -count=1 -v .
+      - name: Build and bind both Linux packages
+        env:
+          SOURCE_BETA: ${{ inputs.source_beta }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            binaries="${RUNNER_TEMP}/converter-bin-${arch}"
+            docker buildx build --platform "linux/${arch}" \
+              -f go/tools/history-migrate/Dockerfile --target export \
+              --output "type=local,dest=${binaries}" .
+            info=$(go version -m "${binaries}/ftw-history-migrate")
+            grep -F 'CGO_ENABLED=1' <<<"${info}"
+            grep -F 'github.com/duckdb/' <<<"${info}"
+            python3 "${RUNNER_TEMP}/package-history-converter.py" "${arch}" \
+              --root "${GITHUB_WORKSPACE}" --binaries "${binaries}" \
+              --output "${RUNNER_TEMP}/converter-release" \
+              --tag "${SOURCE_BETA}" --commit "${SOURCE_COMMIT}" \
+              --receipt "${RUNNER_TEMP}/native-receipt/ftw-native-release.json"
+          done
+          test -z "$(git status --porcelain)"
+          (cd "${RUNNER_TEMP}/converter-release" && sha256sum -c *.sha256)
+      - name: Add converter assets without replacing Core files
+        env:
+          SOURCE_BETA: ${{ inputs.source_beta }}
+          GH_TOKEN: ${{ secrets.CI_TOKEN }}
+        run: |
+          set -euo pipefail
+          bash "${RUNNER_TEMP}/upload-release-assets.sh" "${SOURCE_BETA}" \
+            "${RUNNER_TEMP}"/converter-release/*.tar.gz \
+            "${RUNNER_TEMP}"/converter-release/*.sha256
+          mkdir -p "${RUNNER_TEMP}/published-converter"
+          gh release download "${SOURCE_BETA}" --repo "${GITHUB_REPOSITORY}" \
+            --pattern 'ftw-history-migrate-*' --dir "${RUNNER_TEMP}/published-converter"
+          (cd "${RUNNER_TEMP}/published-converter" && sha256sum -c *.sha256)
+          for file in "${RUNNER_TEMP}"/converter-release/*; do
+            cmp "${file}" "${RUNNER_TEMP}/published-converter/$(basename "${file}")"
+          done
