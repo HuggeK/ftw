@@ -125,7 +125,7 @@ func (c *slowHistoryRollbackConn) BeginTx(ctx context.Context, opts driver.TxOpt
 
 func (c *slowHistoryRollbackConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	r, err := c.Conn.(driver.ExecerContext).ExecContext(ctx, query, args)
-	if err == nil && ctx.Done() != nil && c.d.armed.CompareAndSwap(true, false) {
+	if err == nil && ctx.Done() != nil && isHistoryTestWrite(query) && c.d.armed.CompareAndSwap(true, false) {
 		<-ctx.Done()
 		// Let database/sql's cancellation goroutine claim the Tx before the
 		// driver returns, while this operation still owns the connection lock.
@@ -160,4 +160,105 @@ func (tx *slowHistoryRollbackTx) Rollback() error {
 		}
 	}
 	return tx.Tx.Rollback()
+}
+
+func isHistoryTestWrite(query string) bool {
+	q := strings.ToUpper(strings.TrimSpace(query))
+	return strings.HasPrefix(q, "INSERT ") || strings.HasPrefix(q, "UPDATE ") || strings.HasPrefix(q, "DELETE ")
+}
+
+func TestHistoryMaintenanceWaitsForCancelledRollback(t *testing.T) {
+	for _, kind := range []string{"archive", "backfill", "completion"} {
+		t.Run(kind, func(t *testing.T) {
+			s := freshStore(t)
+			if kind == "backfill" {
+				if err := s.RecordSamples([]Sample{{Driver: "meter", Metric: "pv_w", TsMs: seriesHourMs, Value: 1200}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, query := range []string{`DELETE FROM ts_series_hour`, `DELETE FROM history_migrations WHERE name='ts-series-hour-v1'`} {
+				if _, err := s.history.Exec(query); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := s.history.Close(); err != nil {
+				t.Fatal(err)
+			}
+			d := &slowHistoryRollbackDriver{started: make(chan struct{}), release: make(chan struct{})}
+			name := fmt.Sprintf("maintenance-rollback-%s-%d", kind, time.Now().UnixNano())
+			sql.Register(name, d)
+			var err error
+			s.history, err = sql.Open(name, s.historyPath+strings.Replace(sqlitePragmas, "synchronous(NORMAL)", "synchronous(FULL)", 1))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var release sync.Once
+			defer release.Do(func() { close(d.release) })
+			run := func(ctx context.Context) error {
+				switch kind {
+				case "archive":
+					return s.tryArchiveBatch(ctx, nil, func(ctx context.Context, tx *sql.Tx) error {
+						_, err := tx.ExecContext(ctx, `INSERT INTO history_site_cursor(key,value) VALUES ('rollback-test',1)`)
+						return err
+					})
+				case "backfill":
+					_, err := s.backfillSeriesHoursSnapshot(ctx, 64)
+					return err
+				default:
+					return s.ensureSeriesHours(ctx)
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			defer cancel()
+			d.armed.Store(true)
+			done := make(chan error, 1)
+			go func() { done <- run(ctx) }()
+			select {
+			case <-d.started:
+			case err := <-done:
+				t.Fatalf("maintenance ended before rollback: %v", err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("maintenance did not start rollback")
+			}
+			waitCtx, stop := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			lockErr := lockContext(waitCtx, s.historyWriteMu.TryLock)
+			stop()
+			if lockErr == nil {
+				s.historyWriteMu.Unlock()
+			}
+			release.Do(func() { close(d.release) })
+			select {
+			case err = <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("maintenance did not finish after rollback")
+			}
+			if lockErr == nil {
+				t.Fatal("maintenance released the writer mutex before SQLite rollback finished")
+			}
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("cancelled maintenance: %v", err)
+			}
+			if err := run(context.Background()); err != nil {
+				t.Fatalf("retry after rollback: %v", err)
+			}
+			// Check every pooled connection: archive must restore its zero busy timeout.
+			var conns []*sql.Conn
+			defer func() {
+				for _, c := range conns {
+					c.Close()
+				}
+			}()
+			for i := 0; i < 4; i++ {
+				c, err := s.history.Conn(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				conns = append(conns, c)
+				var busy int
+				if err := c.QueryRowContext(context.Background(), `PRAGMA busy_timeout`).Scan(&busy); err != nil || busy != 5000 {
+					t.Fatalf("busy timeout leaked: %d %v", busy, err)
+				}
+			}
+		})
+	}
 }
