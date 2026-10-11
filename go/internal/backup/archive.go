@@ -68,6 +68,8 @@ type Manifest struct {
 	CreatedAt     time.Time          `json:"created_at"`
 	DatabaseFile  string             `json:"database_file"`
 	DatabaseEntry string             `json:"database_entry"`
+	SourceDataDir string             `json:"source_data_dir,omitempty"`
+	ConfigFile    string             `json:"config_file,omitempty"`
 	Components    ComponentInventory `json:"components"`
 	Files         []FileEntry        `json:"files"`
 }
@@ -209,19 +211,19 @@ func Create(ctx context.Context, opts CreateOptions) (Info, error) {
 	}
 	databaseFile = filepath.ToSlash(databaseFile)
 	databaseEntry := "data/" + databaseFile + ".gz"
+	configPath := opts.ConfigPath
+	if configPath == "" {
+		configPath = filepath.Join(dataDir, "config.yaml")
+	}
+	configPath, err = filepath.Abs(configPath)
+	if err != nil {
+		return Info{}, err
+	}
+	configFile, err := filepath.Rel(dataDir, configPath)
+	if err != nil || configFile == ".." || strings.HasPrefix(configFile, ".."+string(filepath.Separator)) {
+		return Info{}, errors.New("backup config is outside data directory")
+	}
 	if hasStored {
-		configPath := opts.ConfigPath
-		if configPath == "" {
-			configPath = filepath.Join(dataDir, "config.yaml")
-		}
-		configPath, err = filepath.Abs(configPath)
-		if err != nil {
-			return Info{}, err
-		}
-		configFile, err := filepath.Rel(dataDir, configPath)
-		if err != nil || configFile == ".." || strings.HasPrefix(configFile, ".."+string(filepath.Separator)) {
-			return Info{}, errors.New("backup config is outside data directory")
-		}
 		databaseRef, err := filepath.Rel(filepath.Dir(configPath), filepath.Join(dataDir, databaseFile))
 		if err != nil {
 			return Info{}, err
@@ -290,6 +292,7 @@ func Create(ctx context.Context, opts CreateOptions) (Info, error) {
 	manifest := Manifest{
 		Format: Format, SchemaVersion: SchemaVersion, CreatedAt: created,
 		DatabaseFile: databaseFile, DatabaseEntry: databaseEntry,
+		SourceDataDir: dataDir, ConfigFile: filepath.ToSlash(configFile),
 		Components: opts.Components, Files: files,
 	}
 	if err := validateManifest(manifest); err != nil {
@@ -743,6 +746,12 @@ func validateManifest(manifest Manifest) error {
 	if manifest.CreatedAt.IsZero() || !safeDataPath(manifest.DatabaseEntry) || !safeRelativePath(manifest.DatabaseFile) {
 		return errors.New("backup: invalid manifest identity or database path")
 	}
+	if manifest.ConfigFile != "" && !safeRelativePath(manifest.ConfigFile) {
+		return errors.New("backup: invalid config path")
+	}
+	if manifest.SourceDataDir != "" && !filepath.IsAbs(manifest.SourceDataDir) {
+		return errors.New("backup: source data directory must be absolute")
+	}
 	seen := make(map[string]bool, len(manifest.Files))
 	symlinks := make(map[string]string)
 	databaseFound := false
@@ -858,7 +867,8 @@ func RestoreContents(archivePath, dataDir string, now time.Time) (RestoreResult,
 	if !info.IsDir() {
 		return RestoreResult{}, fmt.Errorf("backup: restore target is not a directory: %s", dataDir)
 	}
-	if _, err := verifyInWorkspace(archivePath, dataDir); err != nil {
+	manifest, err := verifyInWorkspace(archivePath, dataDir)
+	if err != nil {
 		return RestoreResult{}, err
 	}
 	staging, err := os.MkdirTemp(dataDir, ".ftw-restore-stage-")
@@ -868,6 +878,13 @@ func RestoreContents(archivePath, dataDir string, now time.Time) (RestoreResult,
 	defer os.RemoveAll(staging)
 	if err := extractArchive(archivePath, staging); err != nil {
 		return RestoreResult{}, err
+	}
+	seed := manifest.ConfigFile
+	if seed == "" {
+		seed = "config.yaml"
+	}
+	if err := config.RelocateBackup(staging, dataDir, manifest.SourceDataDir, manifest.DatabaseFile, seed); err != nil {
+		return RestoreResult{}, fmt.Errorf("backup: relocate settings: %w", err)
 	}
 	stamp := now.UTC()
 	if stamp.IsZero() {
