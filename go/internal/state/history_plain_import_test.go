@@ -188,6 +188,68 @@ func TestAbsorbColdHistoryKeepsUnsummarizedSampleDays(t *testing.T) {
 	}
 }
 
+func TestStoredResolutionExportKeepsAbsorbedParquetSummaries(t *testing.T) {
+	root := t.TempDir()
+	database := filepath.Join(root, "state.db")
+	cold := filepath.Join(root, "cold")
+	s, err := Open(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.coldDir = cold
+	day := time.Now().UTC().Add(-120 * 24 * time.Hour).Truncate(24 * time.Hour)
+	hour := day.Add(12 * time.Hour).UnixMilli()
+	path := filepath.Join(cold, day.Format("2006/01/02.parquet"))
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeParquetDay(path, []parquetSampleRow{{hour + 1000, "meter", "power", 10}, {hour + 2000, "meter", "power", 30}, {hour + 2*seriesHourMs + 1000, "meter", "power", 50}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ensureSeriesHours(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	before, err := s.LoadSeriesBucketsOrRaw("meter", "power", day.UnixMilli(), day.Add(24*time.Hour).UnixMilli()-1, 0)
+	if err != nil || len(before) != 3 || before[0].N != 1 {
+		t.Fatalf("receipt and retained file counted twice: %v %v", before, err)
+	}
+	if err := s.AbsorbColdHistory(context.Background(), cold); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("summarized source file was not removed", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for start := 0; start < 2; start++ {
+		s, err = Open(database)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.coldDir = cold
+		for _, points := range []int{0, 1000} {
+			got, err := s.LoadSeriesBucketsOrRaw("meter", "power", day.UnixMilli(), day.Add(24*time.Hour).UnixMilli()-1, points)
+			if err != nil || len(got) != 2 {
+				t.Fatalf("start=%d points=%d absorbed history unavailable: %v %v", start, points, got, err)
+			}
+			if got[0].V != 20 || got[0].N != 2 || got[0].Min != 10 || got[0].Max != 30 || got[0].ResolutionMS != HistoryHourResolutionMS || got[0].Last != nil || got[0].FirstMS != 0 {
+				t.Fatalf("summary misrepresented as raw evidence: %+v", got[0])
+			}
+			if got[1].V != 50 || got[1].N != 1 {
+				t.Fatalf("second hour changed: %+v", got[1])
+			}
+		}
+		raw, err := s.LoadSeries("meter", "power", day.UnixMilli(), day.Add(24*time.Hour).UnixMilli()-1, 0)
+		if err != nil || len(raw) != 2 || raw[0].Value != 20 {
+			t.Fatalf("sample reader disagrees with export: %v %v", raw, err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func coldImportFixture(t *testing.T, width int64) (*Store, string, string, int64) {
 	t.Helper()
 	s := freshStore(t)
