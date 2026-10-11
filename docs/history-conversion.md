@@ -52,17 +52,38 @@ volume for a backup if space is tight; do not extract a large backup alongside
 an active control loop on the same SD card. Conversion needs room for both the
 originals and the new SQLite file. It never removes the originals.
 
-Run locally on the box, using the real host path rather than a container path:
+Run from the old Core's working directory, using real host paths. On a stopped
+copy or another mount, name the copied archive directory explicitly:
 
 ```sh
-./ftw-history-migrate -state /path/to/data/state.db
+./ftw-history-migrate -state /path/to/data/state.db -cold /path/to/data/cold
 ```
 
 The tool checks the beta generation, fingerprints the sources, copies and
-reads back each table, merges any remaining legacy SQLite rows and hot history,
+reads back each table, merges any remaining legacy SQLite rows, hot history and
+retained long-format Parquet days,
 and replays energy observations through the existing ledger rules. Hot catalog
 IDs map by name to the selected catalog. Saved device IDs, charging goals,
 SoC estimates and model state stay in state.db.
+
+SQLite settings select the cold directory unless `-cold` names the stopped
+copy. With no saved cold setting, the default is `cold` in Core's working directory.
+Explicit relative settings use the old Core's working directory. An unavailable
+saved path, linked archive, or unsupported Parquet layout stops conversion;
+keep that data and its backup. The tool fingerprints the cold files, joins
+readings by driver, metric and timestamp, and keeps the selected beta/hot value
+on overlap. File receipts become active only after verified publication, so
+Core can retire the duplicate archive without losing its unique or late rows.
+Changed files stop an interrupted conversion from resuming against other data.
+Planner diagnostics and bucket archives stay with their existing readers;
+the sample-day conversion leaves those files unchanged.
+
+An older summary without raw timestamps cannot prove whether an older
+archive-only row already belongs to it. Conversion stops that ambiguous case
+and keeps the sources. A later row can extend the retained hour; the result
+keeps hourly resolution rather than claiming missing raw detail. Older
+conversions with unverified retained cold files require a separate conversion
+from the stopped pre-conversion full backup, including those archives.
 
 The tool builds ten-second, minute and hour summaries before it selects the
 new history file. It keeps older hour summaries whose raw rows have expired.

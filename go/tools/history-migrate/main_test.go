@@ -13,10 +13,103 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
+	"github.com/parquet-go/parquet-go"
 	"github.com/srcfl/ftw/go/internal/state"
 	_ "modernc.org/sqlite"
 )
+
+func TestRealBetaRetainedParquetMergesDistinctReadings(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	cfg, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = cfg.Exec(`CREATE TABLE config(key TEXT PRIMARY KEY,value TEXT NOT NULL);INSERT INTO config VALUES('history_duckdb_generation','cold-days'),('saved_goal','80% by 07:00')`)
+	cfg.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := sql.Open("duckdb", filepath.Join(dir, "history.duckdb")+"?threads=1&memory_limit=128MB&autoload_known_extensions=false&autoinstall_known_extensions=false")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	for _, stmt := range betaSchema {
+		if _, err := source.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := source.Exec(`DROP TABLE ts_series_hour;INSERT INTO history_migrations(name) VALUES('generation:cold-days');INSERT INTO ts_drivers VALUES(7,'meter');INSERT INTO ts_metrics VALUES(9,'power','W');INSERT INTO ts_samples SELECT 7,9,1800000000000+i,i/10.0 FROM range(1,5004) t(i);CHECKPOINT`); err != nil {
+		t.Fatal(err)
+	}
+	type coldRow struct {
+		Ts     int64   `parquet:"ts_ms"`
+		Driver string  `parquet:"driver"`
+		Metric string  `parquet:"metric"`
+		Value  float64 `parquet:"value"`
+	}
+	cold := filepath.Join(dir, "cold")
+	day := time.UnixMilli(1800000000000).UTC().Format("2006/01/02.parquet")
+	archive := filepath.Join(cold, day)
+	if err := os.MkdirAll(filepath.Dir(archive), 0700); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Create(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := parquet.NewGenericWriter[coldRow](f)
+	_, err = w.Write([]coldRow{{1800000000001, "meter", "power", 999}, {1800000006000, "meter", "power", 777}, {1800000002000, "new-meter", "power", 888}})
+	if err = errors.Join(err, w.Close(), f.Close()); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.ConvertBetaHistory(context.Background(), path, source, nil, cold); err != nil {
+		t.Fatal(err)
+	}
+	previous := state.RetireRawOnOpen
+	state.RetireRawOnOpen = true
+	t.Cleanup(func() { state.RetireRawOnOpen = previous })
+	for start := 0; start < 2; start++ {
+		s, err := state.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.AbsorbColdHistory(context.Background(), cold); err != nil {
+			s.Close()
+			t.Fatal(err)
+		}
+		for _, points := range []int{0, 1000} {
+			got, err := s.LoadSeriesBucketsOrRaw("meter", "power", 1800000000000, 1800000010000, points)
+			var n int64
+			var sum float64
+			for _, p := range got {
+				n += p.N
+				sum += p.V * float64(p.N)
+			}
+			want := float64(5003*5004)/20 + 777
+			if err != nil || n != 5004 || math.Abs(sum-want) > 1e-6 {
+				s.Close()
+				t.Fatalf("start=%d points=%d n=%d sum=%v want=%v err=%v", start, points, n, sum, want, err)
+			}
+			newSeries, err := s.LoadSeriesBucketsOrRaw("new-meter", "power", 1800000000000, 1800000010000, points)
+			if err != nil || len(newSeries) != 1 || newSeries[0].N != 1 || newSeries[0].V != 888 {
+				s.Close()
+				t.Fatal("new series lost", newSeries, err)
+			}
+		}
+		if goal, found := s.LoadConfig("saved_goal"); !found || goal != "80% by 07:00" {
+			s.Close()
+			t.Fatal("saved goal changed", goal, found)
+		}
+		s.Close()
+	}
+	if _, err := os.Stat(archive); !os.IsNotExist(err) {
+		t.Fatal("verified duplicate file still active", err)
+	}
+}
 
 func TestRealBetaWithoutHourTableSurvivesRawRetirement(t *testing.T) {
 	dir := t.TempDir()

@@ -98,6 +98,16 @@ func summarizeConvertedSamples(ctx context.Context, db *sql.DB, report func(stri
  n=excluded.n,last_ts_ms=excluded.last_ts_ms WHERE excluded.n>ts_series_hour.n`); err != nil {
 		return err
 	}
+	// A retained hour can include expired source rows. Partial raw buckets
+	// cannot replace that complete record; expose the retained hour with its
+	// real resolution instead of making its older contribution disappear.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM ts_buckets AS b WHERE EXISTS (
+ SELECT 1 FROM ts_series_hour h JOIN ts_aggregate_hours a
+ ON a.driver_id=h.driver_id AND a.metric_id=h.metric_id AND a.hour_ms=h.hour_ms
+ WHERE h.driver_id=b.driver_id AND h.metric_id=b.metric_id
+ AND h.hour_ms=b.start_ms-(b.start_ms%3600000+3600000)%3600000 AND h.n>a.n)`); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO history_migrations(name) VALUES(?)`, seriesHoursMigration); err != nil {
 		return err
 	}
