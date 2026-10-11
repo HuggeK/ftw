@@ -1,0 +1,54 @@
+name: offline history converter
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - 'go/**'
+      - '.github/workflows/history-converter.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'go/**'
+      - '.github/workflows/history-converter.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: history-converter-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  conversion:
+    name: DuckDB conversion and resume
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go/tools/history-migrate/go.mod
+          cache-dependency-path: |
+            go/go.sum
+            go/tools/history-migrate/go.sum
+      - name: Test the separate module without changing dependencies
+        working-directory: go/tools/history-migrate
+        env:
+          CGO_ENABLED: '1'
+        run: go test -mod=readonly -count=1 -v .
+
+  build:
+    name: Linux converter (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, amd64]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Build the documented standalone tool
+        run: >-
+          docker buildx build --platform linux/${{ matrix.arch }}
+          -f go/tools/history-migrate/Dockerfile --target export
+          --output type=local,dest=bin/history-migrate-${{ matrix.arch }} .
