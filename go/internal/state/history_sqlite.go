@@ -24,7 +24,9 @@ var historyTables = []string{
 	"history_hot", "history_warm", "history_cold", "ts_drivers", "ts_metrics", "ts_samples",
 	"energy_daily", "energy_ledger_meta", "energy_assets", "energy_ledger_entries", "energy_ledger_cursors",
 }
-var sqliteHistoryTables = append(append([]string{}, historyTables...), "ts_series_hour", "ts_archive_days", "ts_buckets", "ts_bucket_days", "ts_legacy_bucket_days", "ts_aggregate_hours", "ts_latest", "history_dashboard", "history_site_energy", "history_site_cursor", "history_quality", "history_daily_quality", "history_dashboard_partial", "history_site_energy_partial", "history_partial_cursor", "energy_daily_partial")
+var sqliteHistoryBaseTables = append(append([]string{}, historyTables...), "ts_series_hour", "ts_archive_days", "ts_buckets", "ts_bucket_days", "ts_legacy_bucket_days", "ts_aggregate_hours", "ts_latest", "history_dashboard", "history_site_energy", "history_site_cursor")
+var historyQualityTables = []string{"history_quality", "history_daily_quality", "history_dashboard_partial", "history_site_energy_partial", "history_partial_cursor", "energy_daily_partial"}
+var sqliteHistoryTables = append(append([]string{}, sqliteHistoryBaseTables...), historyQualityTables...)
 
 func ensureHistorySchema(exec func(string) error) error {
 	for _, stmt := range historySchema {
@@ -467,6 +469,30 @@ func (s *Store) exportHistoryToSQLite(ctx context.Context, path string) error {
 	if sqliteComplete == 0 || !s.HistoryMigrationStatus().HistoryComplete {
 		return errors.New("finish historical import before exporting a full backup; keep the verified pre-update backup")
 	}
+	// Published older split-history databases have none of the additive quality
+	// tables. Copy that source without upgrading it. A partial set is unsafe:
+	// exporting its rows without their masks could turn unknown values into zero.
+	qualityTables := 0
+	for _, table := range historyQualityTables {
+		var kind string
+		err := src.QueryRowContext(ctx, `SELECT type FROM sqlite_master WHERE name=?`, table).Scan(&kind)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if kind != "table" {
+			return fmt.Errorf("backup history: %s is not a table", table)
+		}
+		qualityTables++
+	}
+	tables := sqliteHistoryTables
+	if qualityTables == 0 {
+		tables = sqliteHistoryBaseTables
+	} else if qualityTables != len(historyQualityTables) {
+		return errors.New("incomplete history quality tables; keep the source and restore a verified full backup")
+	}
 	// This is an unpublished scratch file. Flush each small commit, then
 	// pause, so the next goal/session sync does not inherit a dirty backlog.
 	dest, err := openBackupDestination(path)
@@ -478,7 +504,7 @@ func (s *Store) exportHistoryToSQLite(ctx context.Context, path string) error {
 	if err := ensureHistorySchema(func(q string) error { _, err := dest.ExecContext(ctx, q); return err }); err != nil {
 		return err
 	}
-	for _, table := range sqliteHistoryTables {
+	for _, table := range tables {
 		if _, err := dest.ExecContext(ctx, `DELETE FROM `+table); err != nil {
 			return err
 		}
