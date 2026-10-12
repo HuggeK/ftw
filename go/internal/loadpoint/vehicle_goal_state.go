@@ -36,7 +36,7 @@ func (m *Manager) retainFinishGoal(id string) {
 	if check {
 		if raw, ok := m.sessionStore.LoadConfig(finishGoalKey(record.DeviceID)); ok {
 			var saved savedFinishGoal
-			if json.Unmarshal([]byte(raw), &saved) == nil && saved.DeviceID == record.DeviceID && (saved.SessionID == record.SessionID || (saved.Completed && !record.Schedule.Recurring)) && saved.Schedule == record.Schedule.withoutClock() && !saved.Deadline.IsZero() {
+			if json.Unmarshal([]byte(raw), &saved) == nil && saved.DeviceID == record.DeviceID && (saved.SessionID == record.SessionID || (saved.Completed && !record.Schedule.Recurring)) && saved.Schedule.withoutClock() == record.Schedule.withoutClock() && !saved.Deadline.IsZero() {
 				m.mu.Lock()
 				if lp.finishGoalExplicit || !lp.finishAtVehicleLimit || lp.schedule != record.Schedule || lp.targetTime != record.Deadline {
 					m.mu.Unlock()

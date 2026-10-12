@@ -1396,9 +1396,12 @@ func (m *Manager) SetScheduleChecked(id string, s Schedule) (bool, error) {
 		return false, nil
 	}
 	s.Normalize()
-	// The owner picked a time on today's clock. Keep that clock time, and
-	// answer clients with its UTC minute today. A cleared goal has none.
-	if !s.Empty() {
+	// Keep the household clock the owner picked: time_of_day_min when the
+	// request has it, else the UTC minute read on today's date. Clients
+	// still read its UTC minute today. A cleared goal has no ready time.
+	if s.Empty() {
+		s = s.withoutClock()
+	} else {
 		s.readClock(now, loc)
 		s.TimeOfDayMinUTC = utcMinuteToday(now, s.clock, loc)
 	}
@@ -1493,9 +1496,10 @@ func (m *Manager) ClearScheduleChecked(id string) (bool, error) {
 // A row saved before Core kept the household clock holds only a UTC
 // minute, which does not say what offset it was saved with. It is read
 // on today's date — the time the owner sees now — and saved back once so
-// the next DST change cannot move it. The first failed save is returned;
-// the goal is used either way and read again at the next boot. Does NOT
-// call RollSchedules; the controller's first tick will handle that.
+// the next DST change cannot move it. A clock out of range is read the
+// same way. The first failed save is returned; the goal is used either
+// way and read again at the next boot. Does NOT call RollSchedules; the
+// controller's first tick will handle that.
 func (m *Manager) HydrateSchedules(loader func(id string) (Schedule, bool)) error {
 	m.intentMu.Lock()
 	defer m.intentMu.Unlock()
@@ -1511,12 +1515,9 @@ func (m *Manager) HydrateSchedules(loader func(id string) (Schedule, bool)) erro
 			continue
 		}
 		s.Normalize()
-		if !s.clockSet {
-			s.readClock(now, loc)
-			if saver != nil {
-				if err := saver(id, s); err != nil && failed == nil {
-					failed = err
-				}
+		if s.readClock(now, loc) && saver != nil {
+			if err := saver(id, s); err != nil && failed == nil {
+				failed = err
 			}
 		}
 		m.mu.Lock()

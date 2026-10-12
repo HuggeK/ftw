@@ -2,6 +2,7 @@ package loadpoint
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -161,11 +162,12 @@ func TestHydrateReadsOldRowOnBootDateAndSavesIt(t *testing.T) {
 			m := dstManager(t, &now)
 			var stored []byte
 			m.SetScheduleSaver(func(_ string, s Schedule) (err error) {
-				stored, err = s.MarshalStored()
+				stored, err = json.Marshal(s)
 				return err
 			})
 			err := m.HydrateSchedules(func(string) (Schedule, bool) {
-				s, err := UnmarshalStored([]byte(row))
+				var s Schedule
+				err := json.Unmarshal([]byte(row), &s)
 				return s, err == nil
 			})
 			if err != nil || stored == nil {
@@ -180,7 +182,8 @@ func TestHydrateReadsOldRowOnBootDateAndSavesIt(t *testing.T) {
 				return nil
 			})
 			if err := again.HydrateSchedules(func(string) (Schedule, bool) {
-				s, err := UnmarshalStored(stored)
+				var s Schedule
+				err := json.Unmarshal(stored, &s)
 				return s, err == nil
 			}); err != nil {
 				t.Fatal(err)
@@ -194,38 +197,74 @@ func TestHydrateReadsOldRowOnBootDateAndSavesIt(t *testing.T) {
 	}
 }
 
-// state.db keeps the household clock. The API answer has the same fields
-// as before, and a rollback to a Core without the clock still finds the
-// UTC minute.
-func TestStoredFormKeepsClockAndAPIFormDoesNot(t *testing.T) {
+// state.db and the API carry the same form: the household clock, and
+// the UTC minute for older clients and for a rollback to a Core
+// without the clock.
+func TestJSONKeepsClockAndUTCMinute(t *testing.T) {
 	s := Schedule{SoC: 0.8, TimeOfDayMinUTC: 300, Recurring: true, Days: 31, clock: 420, clockSet: true}
-	raw, err := s.MarshalStored()
+	raw, err := json.Marshal(s)
 	if err != nil {
 		t.Fatal(err)
 	}
-	back, err := UnmarshalStored(raw)
-	if err != nil || back != s {
-		t.Fatalf("stored round trip: got %+v, %v; want %+v from %s", back, err, s, raw)
+	var back Schedule
+	if err := json.Unmarshal(raw, &back); err != nil || back != s {
+		t.Fatalf("round trip: got %+v, %v; want %+v from %s", back, err, s, raw)
 	}
 	var old struct {
-		TimeOfDayMinUTC int `json:"time_of_day_min_utc"`
+		TimeOfDayMin    *int `json:"time_of_day_min"`
+		TimeOfDayMinUTC int  `json:"time_of_day_min_utc"`
 	}
-	if err := json.Unmarshal(raw, &old); err != nil || old.TimeOfDayMinUTC != 300 {
-		t.Fatalf("a rollback reads time_of_day_min_utc = %d from %s", old.TimeOfDayMinUTC, raw)
+	if err := json.Unmarshal(raw, &old); err != nil || old.TimeOfDayMin == nil || *old.TimeOfDayMin != 420 || old.TimeOfDayMinUTC != 300 {
+		t.Fatalf("want time_of_day_min 420 and time_of_day_min_utc 300 in %s", raw)
 	}
 
-	wire, err := json.Marshal(s)
-	if err != nil {
-		t.Fatal(err)
+	// A schedule without a clock, such as a cleared goal, sends none.
+	raw, err = json.Marshal(Schedule{})
+	if err != nil || strings.Contains(string(raw), `"time_of_day_min"`) {
+		t.Fatalf("empty schedule: %s, %v", raw, err)
 	}
-	var fields map[string]any
-	if err := json.Unmarshal(wire, &fields); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := fields["time_of_day_min"]; ok {
-		t.Fatalf("API form carries the stored clock: %s", wire)
-	}
-	if fields["time_of_day_min_utc"] != 300.0 {
-		t.Fatalf("API form lost time_of_day_min_utc: %s", wire)
+}
+
+// A goal saved with time_of_day_min stays on the household clock across
+// both changes. GET answers the same household minute all year, and the
+// UTC minute older clients read moves with the offset.
+func TestHouseholdMinuteOverDSTChanges(t *testing.T) {
+	loc := stockholm(t)
+	for _, c := range []struct {
+		name  string
+		saved time.Time
+		days  []time.Time // ready times, read the evening before
+		utc   []int       // time_of_day_min_utc on each of those evenings
+	}{
+		{"autumn 2026-10-25", utc(2026, 10, 12, 10, 0),
+			[]time.Time{utc(2026, 10, 24, 5, 0), utc(2026, 10, 25, 6, 0), utc(2026, 10, 26, 6, 0)},
+			[]int{5 * 60, 5 * 60, 6 * 60}},
+		{"spring 2027-03-28", utc(2027, 2, 1, 10, 0),
+			[]time.Time{utc(2027, 3, 27, 6, 0), utc(2027, 3, 28, 5, 0), utc(2027, 3, 29, 5, 0)},
+			[]int{6 * 60, 6 * 60, 5 * 60}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			now := c.saved
+			m := dstManager(t, &now)
+			var s Schedule
+			if err := json.Unmarshal([]byte(`{"soc":0.8,"time_of_day_min":420,"recurring":true}`), &s); err != nil {
+				t.Fatal(err)
+			}
+			m.SetSchedule("garage", s)
+			for i, want := range c.days {
+				now = want.Add(-10 * time.Hour)
+				m.RollSchedules(now)
+				st, _ := m.State("garage")
+				if !st.TargetTime.Equal(want) || st.TargetTime.In(loc).Format("15:04") != "07:00" {
+					t.Fatalf("deadline = %v, want %v at 07:00", st.TargetTime, want)
+				}
+				if min, ok := st.Schedule.TimeOfDayMin(); !ok || min != 420 {
+					t.Fatalf("%s: time_of_day_min = %d (%v), want 420", now.Format("2006-01-02"), min, ok)
+				}
+				if st.Schedule.TimeOfDayMinUTC != c.utc[i] {
+					t.Fatalf("%s: time_of_day_min_utc = %d, want %d", now.Format("2006-01-02"), st.Schedule.TimeOfDayMinUTC, c.utc[i])
+				}
+			}
+		})
 	}
 }

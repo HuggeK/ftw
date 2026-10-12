@@ -176,3 +176,23 @@ test('pending goal write is saving, not failed or confirmed saved', () => {
   ui.root.update({ ...ui.lp, goal_retention: 'session' }, null);
   assert.match(note.textContent, /goal is saved and can be restored/);
 });
+
+const clock = d => String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+
+test('the ready time is on the household clock in any browser zone', async () => {
+  const ui = fixture({ schedule: { soc: .8, time_of_day_min: 420, time_of_day_min_utc: 300, recurring: true } });
+  assert.equal(ui.time.value, '07:00');
+  assert.match(ui.text(), /80 % by 07:00 · repeats/);
+  ui.time.value = '08:15'; ui.time.emit('change'); await ui.flush();
+  assert.equal(ui.requests[0].schedule.time_of_day_min, 8 * 60 + 15);
+  // An older Core reads the UTC minute, worked out in this browser's zone.
+  const d = new Date(); d.setHours(8, 15, 0, 0);
+  assert.equal(ui.requests[0].schedule.time_of_day_min_utc, d.getUTCHours() * 60 + d.getUTCMinutes());
+});
+
+test('a Core without time_of_day_min is read in the browser zone', () => {
+  const ui = fixture({ schedule: { soc: .8, time_of_day_min_utc: 300, recurring: true } });
+  const d = new Date(); d.setUTCHours(5, 0, 0, 0);
+  assert.equal(ui.time.value, clock(d));
+  assert.match(ui.text(), new RegExp('80 % by ' + clock(d)));
+});

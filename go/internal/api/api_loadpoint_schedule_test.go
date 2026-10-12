@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -226,6 +227,8 @@ func TestSchedulePutValidates(t *testing.T) {
 	}{
 		{"time of day too large", "garage", `{"soc_pct":80,"time_of_day_min_utc":1440}`, http.StatusBadRequest},
 		{"negative time of day", "garage", `{"soc_pct":80,"time_of_day_min_utc":-1}`, http.StatusBadRequest},
+		{"household minute too large", "garage", `{"soc_pct":80,"time_of_day_min":1440}`, http.StatusBadRequest},
+		{"negative household minute", "garage", `{"soc_pct":80,"time_of_day_min":-1}`, http.StatusBadRequest},
 		{"days beyond seven bits", "garage", `{"soc_pct":80,"time_of_day_min_utc":360,"days":128}`, http.StatusBadRequest},
 		{"days not a number", "garage", `{"soc_pct":80,"days":"weekdays"}`, http.StatusBadRequest},
 		{"malformed json", "garage", `{`, http.StatusBadRequest},
@@ -324,17 +327,21 @@ func TestVehicleLimitGoalCapabilityAndSchedule(t *testing.T) {
 	}
 }
 
-// sameGoal compares schedules as the API carries them. Core also keeps
-// the household clock, which the API does not send.
+// sameGoal compares schedules as older clients read them. The household
+// clock Core adds as time_of_day_min has its own tests.
 func sameGoal(t *testing.T, a, b loadpoint.Schedule) bool {
 	t.Helper()
-	ja, err := json.Marshal(a)
-	if err != nil {
-		t.Fatal(err)
+	fields := func(s loadpoint.Schedule) map[string]any {
+		raw, err := json.Marshal(s)
+		var m map[string]any
+		if err == nil {
+			err = json.Unmarshal(raw, &m)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		delete(m, "time_of_day_min")
+		return m
 	}
-	jb, err := json.Marshal(b)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return string(ja) == string(jb)
+	return reflect.DeepEqual(fields(a), fields(b))
 }

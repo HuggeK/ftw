@@ -20,10 +20,10 @@ type Schedule struct {
 	IntentID        string  `json:"intent_id,omitempty"`
 	FirstDeadlineMS int64   `json:"first_deadline_ms,omitempty"`
 	SoC             float64 `json:"soc"`
-	// TimeOfDayMinUTC is the ready time as clients send and read it: the
-	// UTC minute of day (0..1439) of that time on today's date. Core keeps
-	// the household clock it stands for, so a DST change does not move
-	// the ready time, and answers with today's UTC minute.
+	// TimeOfDayMinUTC is the ready time as older clients send and read
+	// it: the UTC minute of day (0..1439) of that time on today's date.
+	// Core answers with today's UTC minute. A request that carries
+	// time_of_day_min ignores it.
 	TimeOfDayMinUTC int  `json:"time_of_day_min_utc"`
 	Recurring       bool `json:"recurring"`
 	// Days is an ISO weekday mask, Monday in bit 0. Zero is every day,
@@ -33,9 +33,10 @@ type Schedule struct {
 	SurplusUnlockBatSoC float64 `json:"surplus_unlock_bat_soc,omitempty"`
 
 	// clock is the ready time in minutes after midnight on the household
-	// clock, the box's zone that Days is read in. clockSet is false until
-	// Core has read TimeOfDayMinUTC into it. state.db keeps it as
-	// time_of_day_min; the API does not send it.
+	// clock, the box's zone that Days is read in, so a DST change does not
+	// move it. JSON carries it as time_of_day_min, in state.db and on the
+	// API. clockSet is false for a request or row without it, until Core
+	// reads TimeOfDayMinUTC into it.
 	clock    int
 	clockSet bool
 }
@@ -60,6 +61,7 @@ func (s *Schedule) UnmarshalJSON(b []byte) error {
 	type alias Schedule
 	aux := struct {
 		alias
+		Clock                  *int     `json:"time_of_day_min"`
 		SoCPct                 *float64 `json:"soc_pct"`
 		SurplusUnlockBatSoCPct *float64 `json:"surplus_unlock_bat_soc_pct"`
 	}{}
@@ -67,6 +69,9 @@ func (s *Schedule) UnmarshalJSON(b []byte) error {
 		return err
 	}
 	*s = Schedule(aux.alias)
+	if aux.Clock != nil {
+		s.clock, s.clockSet = *aux.Clock, true
+	}
 	if s.SoC == 0 && aux.SoCPct != nil {
 		s.SoC = *aux.SoCPct
 	}
@@ -77,10 +82,10 @@ func (s *Schedule) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// MarshalStored is the state.db form: the API fields plus the household
-// clock as time_of_day_min. time_of_day_min_utc stays so that a rollback
-// to a Core without the clock still finds a ready time.
-func (s Schedule) MarshalStored() ([]byte, error) {
+// MarshalJSON adds the household clock as time_of_day_min once Core has
+// one. time_of_day_min_utc stays for older clients, and so that a
+// rollback to a Core without the clock still finds a ready time.
+func (s Schedule) MarshalJSON() ([]byte, error) {
 	type fields Schedule
 	row := struct {
 		fields
@@ -92,24 +97,10 @@ func (s Schedule) MarshalStored() ([]byte, error) {
 	return json.Marshal(row)
 }
 
-// UnmarshalStored reads a state.db row. A row without time_of_day_min
-// predates the household clock; HydrateSchedules reads it on load.
-func UnmarshalStored(b []byte) (Schedule, error) {
-	var s Schedule
-	if err := json.Unmarshal(b, &s); err != nil {
-		return Schedule{}, err
-	}
-	var row struct {
-		Clock *int `json:"time_of_day_min"`
-	}
-	if err := json.Unmarshal(b, &row); err != nil {
-		return Schedule{}, err
-	}
-	if row.Clock != nil && *row.Clock >= 0 && *row.Clock < 1440 {
-		s.clock, s.clockSet = *row.Clock, true
-	}
-	return s, nil
-}
+// TimeOfDayMin is the ready time on the household clock, in minutes
+// after midnight, and whether the schedule carries one. A decoded
+// request may carry a value out of range; the API rejects it.
+func (s Schedule) TimeOfDayMin() (int, bool) { return s.clock, s.clockSet }
 
 // HasTarget is true when automatic dispatch must treat the plan as a
 // floor. Surplus may add to it and must not throttle it.
@@ -124,24 +115,25 @@ func (s Schedule) Empty() bool {
 }
 
 // readClock fixes the household clock from TimeOfDayMinUTC on now's
-// date, once, so that later DST changes leave the ready time alone.
-func (s *Schedule) readClock(now time.Time, loc *time.Location) {
-	if !s.clockSet {
-		s.clock, s.clockSet = clockFromUTC(now, s.TimeOfDayMinUTC, zone(loc)), true
+// date, once, so that later DST changes leave the ready time alone. A
+// clock out of range is read again. It reports whether it read one.
+func (s *Schedule) readClock(now time.Time, loc *time.Location) bool {
+	if s.clockSet && s.clock >= 0 && s.clock < 1440 {
+		return false
 	}
+	s.clock, s.clockSet = clockFromUTC(now, s.TimeOfDayMinUTC, zone(loc)), true
+	return true
 }
 
 // clockAt is the household clock of the ready time. A schedule Core has
 // not read yet takes TimeOfDayMinUTC on now's date.
 func (s Schedule) clockAt(now time.Time, loc *time.Location) int {
-	if s.clockSet {
-		return s.clock
-	}
-	return clockFromUTC(now, s.TimeOfDayMinUTC, loc)
+	s.readClock(now, loc)
+	return s.clock
 }
 
-// withoutClock is s as plain JSON carries it, for comparing a copy read
-// back from state.db with the goal in memory.
+// withoutClock is s without the household clock, for comparing a goal
+// with a copy saved before Core kept the clock, and for a cleared goal.
 func (s Schedule) withoutClock() Schedule {
 	s.clock, s.clockSet = 0, false
 	return s

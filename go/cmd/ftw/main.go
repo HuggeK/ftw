@@ -871,7 +871,7 @@ func main() {
 		if s.Empty() {
 			return st.SaveConfig(key, "{}")
 		}
-		b, err := s.MarshalStored()
+		b, err := json.Marshal(s)
 		if err != nil {
 			return err
 		}
@@ -882,8 +882,8 @@ func main() {
 		if !ok || v == "" || v == "{}" {
 			return loadpoint.Schedule{}, false
 		}
-		s, err := loadpoint.UnmarshalStored([]byte(v))
-		if err != nil {
+		var s loadpoint.Schedule
+		if err := json.Unmarshal([]byte(v), &s); err != nil {
 			slog.Warn("failed to parse persisted loadpoint schedule",
 				"lp", id, "err", err)
 			return loadpoint.Schedule{}, false

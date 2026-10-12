@@ -307,7 +307,7 @@ func TestControlWritesVehicleGoalRestoresPastDeadline(t *testing.T) {
 	}
 	m := newManager()
 	m.SetScheduleSaver(func(id string, goal loadpoint.Schedule) error {
-		data, err := goal.MarshalStored()
+		data, err := json.Marshal(goal)
 		if err != nil {
 			return err
 		}
@@ -336,7 +336,8 @@ func TestControlWritesVehicleGoalRestoresPastDeadline(t *testing.T) {
 	m = newManager()
 	m.HydrateSchedules(func(id string) (loadpoint.Schedule, bool) {
 		raw, found := s.LoadConfig("loadpoint_schedule:" + id)
-		goal, err := loadpoint.UnmarshalStored([]byte(raw))
+		var goal loadpoint.Schedule
+		err := json.Unmarshal([]byte(raw), &goal)
 		return goal, found && err == nil
 	})
 	m.RollSchedules(before.Add(2 * time.Hour))

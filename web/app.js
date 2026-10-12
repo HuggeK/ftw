@@ -4104,13 +4104,12 @@
   // threshold (5 pp release hysteresis).
   function buildScheduleSection(lp, hasPV, supportsVehicleLimit) {
     var sched = (lp && lp.schedule) || {};
-    // Convert "minutes-of-day-UTC" to a "HH:MM" string in the browser's
-    // local zone. The UI shows local time everywhere; we marshal back to
-    // UTC minutes on save.
+    // The ready time is on the household clock, the box's zone, wherever
+    // the browser is.
     supportsVehicleLimit = supportsVehicleLimit === true;
     var useVehicleLimit = sched.finish_at_vehicle_limit === true;
     var hasSched = !!(useVehicleLimit || sched.soc || sched.recurring || sched.surplus_unlock_bat_soc);
-    var initLocalHHMM = hasSched ? utcMinsToLocalHHMM(typeof sched.time_of_day_min_utc === "number" ? sched.time_of_day_min_utc : 360) : "07:00";
+    var initHHMM = hasSched ? readyHHMM(sched) : "07:00";
     var initSoC = typeof sched.soc === "number" && sched.soc > 0 ? sched.soc * 100 : 80;
     var percentSoC = useVehicleLimit && typeof sched.soc === "number" ? sched.soc : initSoC / 100;
     var initRec = !!sched.recurring;
@@ -4219,7 +4218,7 @@
 
     var timeInp = document.createElement("input");
     timeInp.type = "time";
-    timeInp.value = initLocalHHMM;
+    timeInp.value = initHHMM;
     timeInp.style.padding = "0.25rem 0.4rem";
     timeInp.style.background = "var(--ink-raised)";
     timeInp.style.color = "var(--fg)";
@@ -4476,8 +4475,7 @@
     }
     function doSave() {
       var seq = saveSeq;
-      var localHHMM = timeInp.value || initLocalHHMM;
-      var minUTC = localHHMMToUtcMins(localHHMM);
+      var hhmm = timeInp.value || initHHMM;
       // Surplus checkbox gates the threshold: when off (or hidden on
       // PV-less sites), the threshold is sent as 0 — the backend
       // interprets 0 as "feature disabled".
@@ -4490,7 +4488,10 @@
       var body = {
         schedule: {
           soc: percentSoC,
-          time_of_day_min_utc: minUTC,
+          // The household clock. A Core without time_of_day_min reads
+          // the UTC minute instead, worked out in this browser's zone.
+          time_of_day_min: hhmmToMins(hhmm),
+          time_of_day_min_utc: localHHMMToUtcMins(hhmm),
           recurring: !!recCb.checked,
           // All seven days is the wire's zero.
           days: days === 0x7f ? 0 : days,
@@ -4626,7 +4627,7 @@
       var hasGoal = !!(s && (s.finish_at_vehicle_limit === true || s.soc > 0));
       summary.textContent = hasGoal
         ? (s.finish_at_vehicle_limit === true ? "Car's charge limit" : Math.round(s.soc * 100) + " %") +
-          " by " + utcMinsToLocalHHMM(s.time_of_day_min_utc) +
+          " by " + readyHHMM(s) +
           (nextLp.goal_complete === true ? " · completed" : s.recurring ? " · repeats" : " · once")
         : "No ready time set.";
       editLabel.textContent = hasGoal ? "Change goal" : "Set a ready time";
@@ -4642,18 +4643,29 @@
     return container;
   }
 
+  // The ready time as "HH:MM" on the household clock. A Core without
+  // time_of_day_min sends only the UTC minute, read in this browser's zone.
+  function readyHHMM(s) {
+    if (typeof s.time_of_day_min === "number") {
+      return String(Math.floor(s.time_of_day_min / 60)).padStart(2, "0") + ":" + String(s.time_of_day_min % 60).padStart(2, "0");
+    }
+    return utcMinsToLocalHHMM(typeof s.time_of_day_min_utc === "number" ? s.time_of_day_min_utc : 360);
+  }
   function utcMinsToLocalHHMM(min) {
     var d = new Date();
     d.setUTCHours(Math.floor(min / 60), min % 60, 0, 0);
     return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
   }
-  function localHHMMToUtcMins(hhmm) {
+  // "HH:MM" as minutes after midnight; 06:00 when it does not parse.
+  function hhmmToMins(hhmm) {
     var parts = String(hhmm).split(":");
-    if (parts.length !== 2) return 360;
     var h = parseInt(parts[0], 10), m = parseInt(parts[1], 10);
-    if (isNaN(h) || isNaN(m)) return 360;
+    return parts.length === 2 && !isNaN(h) && !isNaN(m) ? h * 60 + m : 360;
+  }
+  function localHHMMToUtcMins(hhmm) {
+    var min = hhmmToMins(hhmm);
     var d = new Date();
-    d.setHours(h, m, 0, 0);
+    d.setHours(Math.floor(min / 60), min % 60, 0, 0);
     return d.getUTCHours() * 60 + d.getUTCMinutes();
   }
 
