@@ -141,6 +141,16 @@ func TestRestoreProcessCrashPreservesDataAndRefusesPartialPoints(t *testing.T) {
 				t.Fatalf("missing retained point: %v %v", points, err)
 			}
 			point := points[0]
+			if phase != "reverting" {
+				stages, err := filepath.Glob(filepath.Join(data, ".ftw-restore-stage-*"))
+				if err != nil || len(stages) != 1 {
+					t.Fatalf("stage association missing: %v %v", stages, err)
+				}
+				stage, err := readRestoreStage(stages[0])
+				if err != nil || stage.Phase != "preserving" || stage.Safety != filepath.Base(point) {
+					t.Fatalf("stage not bound to its point: %+v %v", stage, err)
+				}
+			}
 			if phase == "reverting" {
 				active, err := topLevelEntries(data)
 				if err != nil || len(active) != 0 {

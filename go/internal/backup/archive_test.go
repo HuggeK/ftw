@@ -615,3 +615,53 @@ func TestExtractionRetryRetainsOldStageAndAllowsCompleteRevert(t *testing.T) {
 		t.Fatalf("old extraction changed: %q %v", got, err)
 	}
 }
+
+func TestExtractionRetryWithOlderCompleteRestorePoint(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	if err := os.Mkdir(source, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	st, err := state.Open(filepath.Join(source, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.SaveConfig("generation", "backup"); err != nil {
+		t.Fatal(err)
+	}
+	info, err := Create(context.Background(), CreateOptions{State: st, StatePath: filepath.Join(source, "state.db"), DataDir: source, OutputDir: filepath.Join(root, "backup")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "target")
+	writeTestFile(t, filepath.Join(target, "old"), "original data")
+	first, err := RestoreContents(info.Path, target, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage := filepath.Join(target, ".ftw-restore-stage-second")
+	writeTestFile(t, filepath.Join(stage, "partial"), "partial extraction")
+	writeTestFile(t, filepath.Join(stage, restoreStageFile), `{"schema":1,"phase":"extracting"}`)
+	second, err := RestoreContents(info.Path, target, time.Now().Add(time.Second))
+	if err != nil {
+		t.Fatalf("older point blocked extraction-only retry: %v", err)
+	}
+	if err := verifyRestorePoint(first.SafetyDir); err != nil {
+		t.Fatalf("older point changed: %v", err)
+	}
+	back, err := RevertContents(target, second.SafetyDir)
+	if err != nil || !back.SafetyComplete {
+		t.Fatalf("completed retry could not revert: %+v %v", back, err)
+	}
+	if _, err := RevertContents(target, second.SafetyDir); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(target, ".ftw-abandoned-stage-second", "partial"))
+	if err != nil || string(got) != "partial extraction" {
+		t.Fatalf("old extraction bytes changed: %q %v", got, err)
+	}
+}

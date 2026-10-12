@@ -12,6 +12,13 @@ import (
 )
 
 const restorePointFile = ".ftw-restore-point.json"
+const restoreStageFile = ".ftw-restore-stage-record.json"
+
+type restoreStage struct {
+	Schema int    `json:"schema"`
+	Phase  string `json:"phase"`
+	Safety string `json:"safety,omitempty"`
+}
 
 type restorePoint struct {
 	Schema   int      `json:"schema"`
@@ -22,11 +29,20 @@ type restorePoint struct {
 // Record the file list before moving anything. A failed or interrupted write
 // remains unconfirmed; revert must not treat it as a complete previous state.
 func writeRestorePoint(dir string, entries []string, complete bool) error {
-	file, err := os.OpenFile(filepath.Join(dir, restorePointFile), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	return writeRestoreRecord(dir, restorePointFile, restorePoint{Schema: 1, Complete: complete, Entries: entries})
+}
+
+func writeRestoreRecord(dir, name string, record any) error {
+	if info, err := os.Lstat(filepath.Join(dir, name)); err == nil && !info.Mode().IsRegular() {
+		return errors.New("restore record is not a regular file")
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	file, err := os.OpenFile(filepath.Join(dir, name), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}
-	writeErr := json.NewEncoder(file).Encode(restorePoint{Schema: 1, Complete: complete, Entries: entries})
+	writeErr := json.NewEncoder(file).Encode(record)
 	if writeErr == nil {
 		writeErr = file.Sync()
 	}
@@ -85,45 +101,106 @@ func verifyRestorePoint(dir string) error {
 	return nil
 }
 
-func hasRestoreStaging(entries []os.DirEntry) bool {
-	for _, entry := range entries {
-		if strings.HasPrefix(entry.Name(), ".ftw-restore-stage-") {
-			return true
-		}
+// Associate each stage with its own phase before moving active files. Older
+// complete safety points do not imply that a later extraction moved data.
+func writeRestoreStage(dataDir, dir, safety string) error {
+	phase := "extracting"
+	if safety != "" {
+		phase = "preserving"
 	}
-	return false
+	if err := writeRestoreRecord(dir, restoreStageFile, restoreStage{Schema: 1, Phase: phase, Safety: safety}); err != nil {
+		return err
+	}
+	return syncDir(dataDir)
 }
 
-// A retry must not certify a partially moved active directory as a new,
-// complete previous state. Interrupted extraction alone has no safety point
-// and can still be retried. Unrecorded older points require a separate target.
+func readRestoreStage(dir string) (restoreStage, error) {
+	var stage restoreStage
+	name := filepath.Join(dir, restoreStageFile)
+	info, err := os.Lstat(name)
+	if err != nil {
+		return stage, err
+	}
+	if !info.Mode().IsRegular() || info.Size() > 4096 {
+		return stage, errors.New("invalid stage record")
+	}
+	f, err := os.Open(name)
+	if err != nil {
+		return stage, err
+	}
+	defer f.Close()
+	d := json.NewDecoder(io.LimitReader(f, 4096))
+	d.DisallowUnknownFields()
+	if err := d.Decode(&stage); err != nil {
+		return stage, err
+	}
+	if err := d.Decode(new(any)); err != io.EOF {
+		return stage, errors.New("invalid trailing stage record")
+	}
+	if stage.Schema != 1 || (stage.Phase != "extracting" && stage.Phase != "preserving") {
+		return stage, errors.New("unknown stage phase")
+	}
+	if stage.Phase == "extracting" && stage.Safety != "" {
+		return stage, errors.New("extraction already names a safety point")
+	}
+	if stage.Phase == "preserving" && (!strings.HasPrefix(stage.Safety, ".ftw-pre-restore-") || strings.ContainsAny(stage.Safety, `/\`)) {
+		return stage, errors.New("invalid stage safety reference")
+	}
+	return stage, nil
+}
+
+// A retry must not certify a partially moved active directory as complete.
+// Legacy stages without records remain retryable only when no safety point
+// could be associated with them. Unknown or changed records always stop.
 func checkRestorePointsBeforeRestore(dataDir string) error {
 	entries, err := os.ReadDir(dataDir)
 	if err != nil {
 		return err
 	}
-	staging := hasRestoreStaging(entries)
+	points := 0
+	unresolved := func(path string, err error) error {
+		return fmt.Errorf("backup: unresolved restore operation %s; retain all directories and recover a complete point or a full backup on a separate target: %w", path, err)
+	}
 	for _, entry := range entries {
-		if strings.HasPrefix(entry.Name(), ".ftw-rejected-restore-") || (staging && strings.HasPrefix(entry.Name(), ".ftw-pre-restore-")) {
-			return fmt.Errorf("backup: unresolved interrupted restore at %s; retain all directories and recover a complete point or a full backup on a separate target", filepath.Join(dataDir, entry.Name()))
+		path := filepath.Join(dataDir, entry.Name())
+		if strings.HasPrefix(entry.Name(), ".ftw-rejected-restore-") {
+			return unresolved(path, errors.New("revert did not finish"))
 		}
-		if !strings.HasPrefix(entry.Name(), ".ftw-pre-restore-") && !strings.HasPrefix(entry.Name(), ".ftw-rejected-restore-") {
+		if !strings.HasPrefix(entry.Name(), ".ftw-pre-restore-") {
 			continue
 		}
-		point := filepath.Join(dataDir, entry.Name())
+		points++
 		if !entry.IsDir() {
-			return fmt.Errorf("backup: unresolved restore point %s; retain the data and restore a full backup into a separate directory", point)
+			return unresolved(path, errors.New("point is not a directory"))
 		}
-		if err := verifyRestorePoint(point); err != nil {
-			return fmt.Errorf("backup: unresolved restore point %s; retain the data and restore a full backup into a separate directory: %w", point, err)
+		if err := verifyRestorePoint(path); err != nil {
+			return unresolved(path, err)
+		}
+	}
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), ".ftw-restore-stage-") {
+			continue
+		}
+		path := filepath.Join(dataDir, entry.Name())
+		if !entry.IsDir() {
+			return unresolved(path, errors.New("stage is not a directory"))
+		}
+		stage, err := readRestoreStage(path)
+		if errors.Is(err, os.ErrNotExist) && points == 0 {
+			continue
+		}
+		if err != nil {
+			return unresolved(path, err)
+		}
+		if stage.Phase != "extracting" {
+			return unresolved(path, fmt.Errorf("preservation started for %s", stage.Safety))
 		}
 	}
 	return nil
 }
 
 func currentRestoreStateComplete(dataDir string) bool {
-	entries, err := os.ReadDir(dataDir)
-	return err == nil && !hasRestoreStaging(entries) && checkRestorePointsBeforeRestore(dataDir) == nil
+	return checkRestorePointsBeforeRestore(dataDir) == nil
 }
 
 func rollbackRestorePoint(pointDir, dataDir string, moved []string) error {

@@ -24,7 +24,7 @@ func TestRevertRejectsInterruptedPreservationWithoutMovingFiles(t *testing.T) {
 			}
 			// An older unrecorded point is also refused without staging: an
 			// older error path may have cleaned staging after a failed rollback.
-			if _, err := RestoreContents("unused.ftwbak", data, time.Time{}); err == nil || !strings.Contains(err.Error(), "unresolved restore point") {
+			if _, err := RestoreContents("unused.ftwbak", data, time.Time{}); err == nil || !strings.Contains(err.Error(), "unresolved restore") {
 				t.Fatalf("retry did not reject the incomplete root before import: %v", err)
 			}
 			for path, want := range map[string]string{
@@ -211,5 +211,33 @@ func TestRetryImportRejectsInterruptedActivationWithCompletePoint(t *testing.T) 
 	}
 	if _, err := RestoreContents("unused.ftwbak", data, time.Time{}); err == nil || !strings.Contains(err.Error(), "unresolved") {
 		t.Fatalf("import certified partial activation: %v", err)
+	}
+}
+
+func TestRestoreStageRejectsLinkedAndUnknownRecords(t *testing.T) {
+	for _, body := range []string{`{"schema":2,"phase":"extracting"}`, `{"schema":1,"phase":"unknown"}`, `{"schema":1,"phase":"extracting","safety":".ftw-pre-restore-old"}`, `{"schema":1,"phase":"preserving","safety":"../outside"}`, `{"schema":1,"phase":"extracting"} trailing`} {
+		t.Run(body, func(t *testing.T) {
+			dir := t.TempDir()
+			writeTestFile(t, filepath.Join(dir, restoreStageFile), body)
+			if _, err := readRestoreStage(dir); err == nil {
+				t.Fatal("invalid stage accepted")
+			}
+		})
+	}
+	dir := t.TempDir()
+	external := filepath.Join(t.TempDir(), "unchanged")
+	writeTestFile(t, external, "retain these bytes")
+	if err := os.Symlink(external, filepath.Join(dir, restoreStageFile)); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if err := writeRestoreStage(dir, dir, ""); err == nil {
+		t.Fatal("stage write followed a link")
+	}
+	if _, err := readRestoreStage(dir); err == nil {
+		t.Fatal("stage read followed a link")
+	}
+	got, err := os.ReadFile(external)
+	if err != nil || string(got) != "retain these bytes" {
+		t.Fatalf("linked data changed: %q %v", got, err)
 	}
 }

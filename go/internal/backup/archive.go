@@ -882,6 +882,9 @@ func RestoreContents(archivePath, dataDir string, now time.Time) (RestoreResult,
 		return RestoreResult{}, err
 	}
 	defer os.RemoveAll(staging)
+	if err := writeRestoreStage(dataDir, staging, ""); err != nil {
+		return RestoreResult{}, fmt.Errorf("backup: record extraction phase: %w", err)
+	}
 	if err := extractArchive(archivePath, staging); err != nil {
 		return RestoreResult{}, err
 	}
@@ -908,6 +911,9 @@ func RestoreContents(archivePath, dataDir string, now time.Time) (RestoreResult,
 	}
 	if err := writeRestorePoint(safetyDir, current, false); err != nil {
 		return RestoreResult{}, fmt.Errorf("backup: record previous file list: %w", err)
+	}
+	if err := writeRestoreStage(dataDir, staging, filepath.Base(safetyDir)); err != nil {
+		return RestoreResult{}, fmt.Errorf("backup: record preservation phase: %w", err)
 	}
 	movedCurrent := make([]string, 0, len(current))
 	for _, name := range current {
