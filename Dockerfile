@@ -16,6 +16,9 @@ WORKDIR /src
 # Cache the module download as its own layer so source edits don't
 # bust the dep cache.
 COPY go/go.mod go/go.sum ./go/
+# The wire-format module is replaced from ./protocol, so its go.mod must be
+# here before any module command runs.
+COPY go/protocol/go.mod go/protocol/go.sum ./go/protocol/
 RUN cd go && go mod download
 
 COPY go/ ./go/

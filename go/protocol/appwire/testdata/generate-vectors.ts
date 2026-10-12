@@ -13,7 +13,7 @@
  * $lib alias and the app's crypto packages resolve exactly as they do in a
  * browser build:
  *
- *   node go/internal/appwire/testdata/run-generator.mjs ../ftw-webapp
+ *   node go/protocol/appwire/testdata/run-generator.mjs ../ftw-webapp
  */
 
 import { writeFileSync } from 'node:fs'

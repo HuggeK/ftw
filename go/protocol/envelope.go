@@ -1,20 +1,20 @@
-// Package appproto speaks the FTW web app's client protocol.
+// Package protocol is the wire format between an FTW box and its clients: the
+// message names and shapes, the CBOR envelope, the names generated from
+// contract/registry.yaml, the history tile geometry and the push catalogue.
 //
-// It owns message semantics only: what a hello_ok says, which lane a reply
-// belongs on, when a command may be dispatched, what a plan slot means. The
-// bytes underneath — frame header, bucket padding and the Noise session —
-// belong to go/internal/appwire, which this package reaches through the narrow
-// FrameCodec interface below.
-//
-// Two rules run through everything here and are worth stating once:
+// It holds shapes and pure functions, and it imports nothing from the box. A
+// program that only speaks the protocol, such as FTW Cloud, therefore links no
+// control, planner or storage code; CI checks that with go list -deps. What a
+// message means to the box — what a hello_ok says, when a command may be
+// dispatched — stays in the box's go/internal/appproto. The bytes underneath —
+// frame header, bucket padding and the Noise session — belong to package
+// appwire, which this package reaches through the narrow FrameCodec interface
+// below.
 //
 // Every age is measured against the box's uptime, never its wall clock. A Pi
 // has no RTC and reads 1970 until NTP answers, so a wall-clock age would be
 // wrong by decades exactly when a user is looking at it after a power cut.
-//
-// Nothing in this package writes hardware. It validates intent and hands it to
-// control, which is where the safety invariants live.
-package appproto
+package protocol
 
 import (
 	"fmt"
@@ -67,8 +67,8 @@ type Envelope struct {
 	B cbor.RawMessage `cbor:"b,omitempty"`
 }
 
-// Frame is one envelope on one lane. go/internal/appwire owns the byte layout,
-// the padding and the Noise session; this package only decides what goes in a
+// Frame is one envelope on one lane. Package appwire owns the byte layout, the
+// padding and the Noise session; this package only decides what goes in a
 // frame and which lane carries it.
 type Frame struct {
 	Lane  uint8
@@ -78,7 +78,7 @@ type Frame struct {
 	Envelope Envelope
 }
 
-// FrameCodec is the whole of go/internal/appwire that this package needs.
+// FrameCodec is the whole of package appwire that this package needs.
 // It is declared here rather than imported so the message layer builds,
 // tests and reviews on its own.
 type FrameCodec interface {
@@ -112,7 +112,7 @@ func init() {
 func Marshal(v any) (cbor.RawMessage, error) {
 	b, err := encMode.Marshal(v)
 	if err != nil {
-		return nil, fmt.Errorf("appproto: encode body: %w", err)
+		return nil, fmt.Errorf("protocol: encode body: %w", err)
 	}
 	return b, nil
 }
@@ -120,10 +120,10 @@ func Marshal(v any) (cbor.RawMessage, error) {
 // Unmarshal decodes a body. Unknown keys are dropped without complaint.
 func Unmarshal(raw cbor.RawMessage, v any) error {
 	if len(raw) == 0 {
-		return fmt.Errorf("appproto: empty body")
+		return fmt.Errorf("protocol: empty body")
 	}
 	if err := decMode.Unmarshal(raw, v); err != nil {
-		return fmt.Errorf("appproto: decode body: %w", err)
+		return fmt.Errorf("protocol: decode body: %w", err)
 	}
 	return nil
 }
@@ -137,16 +137,16 @@ func EncodeEnvelope(e Envelope) ([]byte, error) {
 func DecodeEnvelope(b []byte) (Envelope, error) {
 	var e Envelope
 	if err := decMode.Unmarshal(b, &e); err != nil {
-		return Envelope{}, fmt.Errorf("appproto: decode envelope: %w", err)
+		return Envelope{}, fmt.Errorf("protocol: decode envelope: %w", err)
 	}
 	if e.T == "" {
-		return Envelope{}, fmt.Errorf("appproto: envelope has no type")
+		return Envelope{}, fmt.Errorf("protocol: envelope has no type")
 	}
 	return e, nil
 }
 
-// newEnvelope builds an outgoing envelope around a body.
-func newEnvelope(t string, id *uint32, body any) (Envelope, error) {
+// NewEnvelope builds an outgoing envelope around a body.
+func NewEnvelope(t string, id *uint32, body any) (Envelope, error) {
 	raw, err := Marshal(body)
 	if err != nil {
 		return Envelope{}, err
@@ -154,10 +154,10 @@ func newEnvelope(t string, id *uint32, body any) (Envelope, error) {
 	return Envelope{T: t, ID: id, B: raw}, nil
 }
 
-// bulkBucketFor is the smallest bulk bucket a payload fits in, or 0 when it
+// BulkBucketFor is the smallest bulk bucket a payload fits in, or 0 when it
 // fits none. Sizing by the encoded body rather than by a guess keeps a large
 // mode catalogue from silently overrunning a bucket.
-func bulkBucketFor(payloadBytes int) int {
+func BulkBucketFor(payloadBytes int) int {
 	// The frame header costs bytes the codec adds; leave room for it rather
 	// than have appwire discover the overrun.
 	const headerBytes = 6

@@ -88,8 +88,8 @@ func mustEncMode() cbor.EncMode {
 
 // Envelope is the CBOR map every frame carries: {t, id?, b?}.
 //
-// Field names match go/internal/appproto's, which is the layer that fills
-// these in. Two spellings of one wire format is how the two drift.
+// Field names match package protocol's, which is the layer that fills these
+// in. Two spellings of one wire format is how the two drift.
 type Envelope struct {
 	// T is the message type. A type this box has never heard of is not an
 	// error — see DecodeFrame.

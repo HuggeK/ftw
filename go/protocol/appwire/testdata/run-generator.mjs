@@ -1,6 +1,6 @@
 /* Runs generate-vectors.ts against a checkout of srcfl/ftw-webapp.
  *
- *   node go/internal/appwire/testdata/run-generator.mjs ../ftw-webapp
+ *   node go/protocol/appwire/testdata/run-generator.mjs ../ftw-webapp
  *
  * It boots the app's own Vite server so the generator sees the same aliases,
  * the same TypeScript settings and the same crypto packages the app ships.

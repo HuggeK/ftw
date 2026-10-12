@@ -16,7 +16,7 @@ import (
 // testCodec is the frame layout from docs/protocol.md, implemented here so the
 // tests drive real bytes rather than passing structs to themselves.
 //
-// go/internal/appwire owns the production one. Keeping a copy in _test.go means
+// go/protocol/appwire owns the production one. Keeping a copy in _test.go means
 // a test passing here says the message layer works against the documented
 // layout, not that a stub agreed with itself — and it cannot be mistaken for
 // the real codec, because it does not ship.

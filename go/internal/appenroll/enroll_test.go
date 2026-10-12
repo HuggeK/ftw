@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/srcfl/ftw/go/internal/apiauth"
-	"github.com/srcfl/ftw/go/internal/appwire"
+	"github.com/srcfl/ftw/go/protocol/appwire"
 )
 
 func newIdentity(t *testing.T) (*Identity, string) {

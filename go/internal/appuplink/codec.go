@@ -2,7 +2,7 @@ package appuplink
 
 import (
 	"github.com/srcfl/ftw/go/internal/appproto"
-	"github.com/srcfl/ftw/go/internal/appwire"
+	"github.com/srcfl/ftw/go/protocol/appwire"
 )
 
 // codec joins the message layer to the wire.

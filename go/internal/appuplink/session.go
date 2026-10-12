@@ -10,7 +10,7 @@ import (
 	"github.com/srcfl/ftw/go/internal/apiauth"
 	"github.com/srcfl/ftw/go/internal/appenroll"
 	"github.com/srcfl/ftw/go/internal/appproto"
-	"github.com/srcfl/ftw/go/internal/appwire"
+	"github.com/srcfl/ftw/go/protocol/appwire"
 )
 
 // MaxSessions is how many phones may watch one house at once.

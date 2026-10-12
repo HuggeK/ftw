@@ -1,6 +1,4 @@
-package appproto
-
-import "github.com/srcfl/ftw/go/internal/control"
+package protocol
 
 // Message type strings. Stable for the life of the protocol.
 const (
@@ -118,7 +116,7 @@ type HelloOK struct {
 	Caps     []string `cbor:"caps"`
 	CapsHash string   `cbor:"capsHash"`
 	// Modes is every mode this box accepts, in its own presentation order,
-	// straight from control.ModeCatalog(). Field 1 in the telemetry stream
+	// straight from the box's mode catalogue. Field 1 in the telemetry stream
 	// carries an index into this list, which is what keeps lane 0 numeric
 	// and its frames a fixed size.
 	Modes []ModeInfo `cbor:"modes"`
@@ -161,7 +159,7 @@ type Clock struct {
 	UptimeMs   int64  `cbor:"uptimeMs"`
 }
 
-// ModeInfo is one mode as the box presents it. The wire shape of
+// ModeInfo is one mode as the box presents it. The wire shape of the box's
 // control.ModeInfo.
 type ModeInfo struct {
 	Key     string `cbor:"key"`
@@ -627,21 +625,3 @@ const (
 	TerminateBoxShutdown  = "box_shutdown"
 	TerminateSuperseded   = "superseded"
 )
-
-// wireModes projects control's catalogue onto the wire.
-//
-// The catalogue is the single source of truth for what modes exist and how
-// they are presented; hand-writing a list here would let the app offer a mode
-// the box does not have, or hide one it does.
-func wireModes(cat []control.ModeInfo) []ModeInfo {
-	out := make([]ModeInfo, 0, len(cat))
-	for _, m := range cat {
-		out = append(out, ModeInfo{
-			Key:     string(m.Key),
-			Label:   m.Label,
-			Tooltip: m.Tooltip,
-			Tier:    string(m.Tier),
-		})
-	}
-	return out
-}

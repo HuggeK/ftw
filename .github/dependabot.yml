@@ -13,14 +13,17 @@ version: 2
 
 updates:
   # ---- Go modules -------------------------------------------------------
-  # The Go module lives in the go/ subdirectory, so `directory` must point
-  # there (not the repo root) or Dependabot finds no go.mod. Indirect
-  # requires move alongside the direct ones that pull them in.
+  # The Go modules live in go/ and go/protocol, so `directories` must point
+  # there (not the repo root) or Dependabot finds no go.mod. The wire-format
+  # module in go/protocol is what FTW Cloud imports. Indirect requires move
+  # alongside the direct ones that pull them in.
   #
   # Go major bumps are import-path changes (/v2), which Dependabot cannot
   # rewrite — expect majors here to surface rarely or not at all.
   - package-ecosystem: "gomod"
-    directory: "/go"
+    directories:
+      - "/go"
+      - "/go/protocol"
     schedule:
       interval: "weekly"
       day: "monday"

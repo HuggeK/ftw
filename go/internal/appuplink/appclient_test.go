@@ -12,7 +12,7 @@ import (
 
 // The app's half of Noise_IK_25519_ChaChaPoly_SHA256, written out here.
 //
-// go/internal/appwire has the responder only, because a box that could
+// go/protocol/appwire has the responder only, because a box that could
 // initiate is a box that could present itself as an app. So the initiator
 // lives in this test file, where it does two jobs: it drives the box end to
 // end, and it is an independent second implementation of the pattern — a

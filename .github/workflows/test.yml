@@ -99,6 +99,16 @@ jobs:
         # tests still check queue latency, cancellation and operation limits.
         run: go test -count=1 -timeout 300s ./...
 
+      # go/protocol is its own module, so ./... above skips it. FTW Cloud
+      # imports it, and it must build without the box.
+      - name: Protocol module
+        working-directory: go/protocol
+        run: |
+          go vet ./...
+          go test -count=1 ./...
+      - name: Protocol module imports nothing from the box
+        run: bash .github/scripts/check-protocol-boundary.sh go/protocol
+
   web:
     name: web
     needs: changes

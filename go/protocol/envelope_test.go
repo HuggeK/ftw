@@ -1,12 +1,18 @@
-package appproto
+package protocol
 
 import (
 	"encoding/hex"
+	"strconv"
 	"testing"
 )
 
+func ptrU32(v uint32) *uint32 { return &v }
+
+// fidKey is how a field id keys the fields map on the wire.
+func fidKey(f Fid) string { return strconv.FormatUint(uint64(f), 10) }
+
 func TestEnvelopeRoundTrips(t *testing.T) {
-	in, err := newEnvelope(MsgTick, ptrU32(17), Tick{Seq: 5, UptimeMs: 60_000})
+	in, err := NewEnvelope(MsgTick, ptrU32(17), Tick{Seq: 5, UptimeMs: 60_000})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +40,7 @@ func TestEnvelopeRoundTrips(t *testing.T) {
 // frame's length never depends on which map order a runtime happened to pick.
 func TestEncodingIsDeterministic(t *testing.T) {
 	build := func() []byte {
-		env, err := newEnvelope(MsgDelta, nil, Delta{
+		env, err := NewEnvelope(MsgDelta, nil, Delta{
 			Seq:      3,
 			UptimeMs: 61_000,
 			Fields: map[string]int64{
@@ -116,8 +122,8 @@ func TestBulkBucketStepsUpRatherThanGrowing(t *testing.T) {
 		{16379, 0},
 	}
 	for _, c := range cases {
-		if got := bulkBucketFor(c.payload); got != c.want {
-			t.Fatalf("bulkBucketFor(%d) = %d, want %d", c.payload, got, c.want)
+		if got := BulkBucketFor(c.payload); got != c.want {
+			t.Fatalf("BulkBucketFor(%d) = %d, want %d", c.payload, got, c.want)
 		}
 	}
 }

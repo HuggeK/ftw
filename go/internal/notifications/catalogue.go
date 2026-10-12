@@ -1,33 +1,33 @@
 package notifications
 
-import (
-	"fmt"
-	"regexp"
-	"strings"
+import "github.com/srcfl/ftw/go/protocol"
+
+// The push catalogue moved to package protocol so that FTW Cloud can import it
+// without the rest of this package. These are the same names under their old
+// spelling here.
+
+// PushCatalogueVersion is the catalogue revision these sentences came from.
+const PushCatalogueVersion = protocol.PushCatalogueVersion
+
+// Push event kinds.
+const (
+	PushChargingConnected       = protocol.PushChargingConnected
+	PushChargingSessionComplete = protocol.PushChargingSessionComplete
+	PushChargingInterrupted     = protocol.PushChargingInterrupted
+	PushUpdateInstalled         = protocol.PushUpdateInstalled
+	PushDriverOffline           = protocol.PushDriverOffline
+	PushFuseOverLimit           = protocol.PushFuseOverLimit
+	PushBoxUnreachable          = protocol.PushBoxUnreachable
 )
 
+// PushSentence is one lock-screen sentence, exactly as the app wrote it.
+type PushSentence = protocol.PushSentence
+
+// PushSentences is every sentence a push may carry, keyed by kind.
+var PushSentences = protocol.PushSentences
+
 // RenderPush fills a catalogue sentence's {arg} placeholders from the event's
-// own facts. It refuses to render a sentence it cannot finish: a lock screen
-// showing a literal "{kwh}" is a promise the catalogue made that the event
-// broke, and silence is better than gibberish.
+// own facts. It refuses to render a sentence it cannot finish.
 func RenderPush(kind string, args map[string]string) (title, body string, err error) {
-	sentence, ok := PushSentences[kind]
-	if !ok {
-		return "", "", fmt.Errorf("notifications: %q is not in the push catalogue", kind)
-	}
-	title = fillPlaceholders(sentence.Title, args)
-	body = fillPlaceholders(sentence.Body, args)
-	if missing := placeholderPattern.FindString(title + " " + body); missing != "" {
-		return "", "", fmt.Errorf("notifications: %s left %s unfilled", kind, missing)
-	}
-	return title, body, nil
-}
-
-var placeholderPattern = regexp.MustCompile(`\{[a-z_]+\}`)
-
-func fillPlaceholders(s string, args map[string]string) string {
-	for k, v := range args {
-		s = strings.ReplaceAll(s, "{"+k+"}", v)
-	}
-	return s
+	return protocol.RenderPush(kind, args)
 }

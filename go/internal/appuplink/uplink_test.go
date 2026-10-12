@@ -19,9 +19,9 @@ import (
 	"github.com/srcfl/ftw/go/internal/apiauth"
 	"github.com/srcfl/ftw/go/internal/appenroll"
 	"github.com/srcfl/ftw/go/internal/appproto"
-	"github.com/srcfl/ftw/go/internal/appwire"
 	"github.com/srcfl/ftw/go/internal/control"
 	"github.com/srcfl/ftw/go/internal/mpc"
+	"github.com/srcfl/ftw/go/protocol/appwire"
 )
 
 // The handle derivation must agree with the app byte for byte, or the box and

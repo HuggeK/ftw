@@ -4,8 +4,8 @@
 // The relay is the only remote path between a box and a phone, and it cannot
 // read a watt: it joins one box uplink to a handful of browser streams under a
 // rendezvous handle and moves opaque bytes between them. Everything that makes
-// those bytes meaningful is in go/internal/appwire (the Noise session) and
-// go/internal/appproto (the messages). See srcfl/ftw-webapp relay/README.md
+// those bytes meaningful is in go/protocol/appwire (the Noise session) and
+// go/protocol (the messages). See srcfl/ftw-webapp relay/README.md
 // for the server's half.
 //
 // One rule shapes the whole file: a dropped connection is this package's
