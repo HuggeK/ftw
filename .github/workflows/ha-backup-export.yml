@@ -1,0 +1,37 @@
+name: Home Assistant backup export
+
+on:
+  pull_request:
+    branches: [master]
+    paths: ['tools/ha-backup-export/**', '.github/workflows/ha-backup-export.yml', '.github/workflows/ha-export-release.yml']
+  push:
+    branches: [master]
+    paths: ['tools/ha-backup-export/**', '.github/workflows/ha-backup-export.yml', '.github/workflows/ha-export-release.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.11', '3.14']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: >-
+          python -m pip install --only-binary=:all: -r tools/ha-backup-export/requirements.txt
+      - working-directory: tools/ha-backup-export
+        run: python -m unittest -v test_export test_release_tag
+      - name: Check the source package and receipt
+        env:
+          TAG: ha-export-v1-beta.999
+          COMMIT: ${{ github.sha }}
+        run: |
+          python tools/ha-backup-export/package.py
+          cd bin/ha-export
+          sha256sum -c checksums.txt
+          tar -tzf "$TAG.tar.gz"
