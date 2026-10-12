@@ -946,6 +946,9 @@ func RestoreContents(archivePath, dataDir string, now time.Time) (RestoreResult,
 		)
 		return RestoreResult{}, errors.Join(fmt.Errorf("backup: sync activated restore: %w", err), rollbackErr)
 	}
+	if err := retireRestoreStaging(dataDir, staging); err != nil {
+		return RestoreResult{}, fmt.Errorf("backup: archive active but old extraction copies could not be retained separately: %w", err)
+	}
 	return RestoreResult{DataDir: dataDir, SafetyDir: safetyDir, SafetyComplete: true}, nil
 }
 
@@ -1070,7 +1073,7 @@ func topLevelEntries(dir string, exclude ...string) ([]string, error) {
 }
 
 func isRestoreInternalName(name string) bool {
-	return name == restorePointFile || strings.HasPrefix(name, ".ftw-restore-stage-") ||
+	return name == restorePointFile || strings.HasPrefix(name, ".ftw-abandoned-stage-") || strings.HasPrefix(name, ".ftw-restore-stage-") ||
 		strings.HasPrefix(name, ".ftw-pre-restore-") ||
 		strings.HasPrefix(name, ".ftw-rejected-restore-")
 }

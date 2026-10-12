@@ -26,6 +26,14 @@ func TestRestoreCrashChild(t *testing.T) {
 	realMove := moveRestoreEntry
 	moved := 0
 	moveRestoreEntry = func(from, to string) error {
+		if phase == "reverting" && filepath.Dir(to) == data && strings.HasPrefix(filepath.Base(filepath.Dir(from)), ".ftw-pre-restore-") {
+			if err := os.WriteFile(marker, []byte(filepath.Dir(from)), 0o600); err != nil {
+				return err
+			}
+			for {
+				time.Sleep(time.Minute)
+			}
+		}
 		if err := realMove(from, to); err != nil {
 			return err
 		}
@@ -46,6 +54,12 @@ func TestRestoreCrashChild(t *testing.T) {
 		}
 		return nil
 	}
+	if phase == "reverting" {
+		if _, err := RevertContents(data, os.Getenv("FTW_RESTORE_CRASH_SAFETY")); err != nil {
+			t.Fatal(err)
+		}
+		t.Fatal("revert completed without reaching the crash window")
+	}
 	if _, err := RestoreContents(os.Getenv("FTW_RESTORE_CRASH_ARCHIVE"), data, time.Now()); err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +67,7 @@ func TestRestoreCrashChild(t *testing.T) {
 }
 
 func TestRestoreProcessCrashPreservesDataAndRefusesPartialPoints(t *testing.T) {
-	for _, phase := range []string{"preserving", "activating"} {
+	for _, phase := range []string{"preserving", "activating", "reverting"} {
 		t.Run(phase, func(t *testing.T) {
 			root := t.TempDir()
 			source := filepath.Join(root, "source")
@@ -82,9 +96,17 @@ func TestRestoreProcessCrashPreservesDataAndRefusesPartialPoints(t *testing.T) {
 			for i := range 128 {
 				writeTestFile(t, filepath.Join(data, fmt.Sprintf("%04d-old", i)), "original data")
 			}
+			safety := ""
+			if phase == "reverting" {
+				result, err := RestoreContents(archive.Path, data, time.Now())
+				if err != nil {
+					t.Fatal(err)
+				}
+				safety = result.SafetyDir
+			}
 			marker := filepath.Join(root, "crash-window")
 			child := exec.Command(os.Args[0], "-test.run=^TestRestoreCrashChild$", "-test.count=1")
-			child.Env = append(os.Environ(), "FTW_RESTORE_CRASH_PHASE="+phase, "FTW_RESTORE_CRASH_DATA="+data, "FTW_RESTORE_CRASH_ARCHIVE="+archive.Path, "FTW_RESTORE_CRASH_MARKER="+marker)
+			child.Env = append(os.Environ(), "FTW_RESTORE_CRASH_PHASE="+phase, "FTW_RESTORE_CRASH_DATA="+data, "FTW_RESTORE_CRASH_ARCHIVE="+archive.Path, "FTW_RESTORE_CRASH_MARKER="+marker, "FTW_RESTORE_CRASH_SAFETY="+safety)
 			log, err := os.Create(filepath.Join(root, "child.log"))
 			if err != nil {
 				t.Fatal(err)
@@ -119,6 +141,22 @@ func TestRestoreProcessCrashPreservesDataAndRefusesPartialPoints(t *testing.T) {
 				t.Fatalf("missing retained point: %v %v", points, err)
 			}
 			point := points[0]
+			if phase == "reverting" {
+				active, err := topLevelEntries(data)
+				if err != nil || len(active) != 0 {
+					t.Fatalf("revert crash did not leave the empty-root window: %v %v", active, err)
+				}
+				if err := verifyRestorePoint(point); err != nil {
+					t.Fatal(err)
+				}
+				rejected, err := filepath.Glob(filepath.Join(data, ".ftw-rejected-restore-*"))
+				if err != nil || len(rejected) != 1 {
+					t.Fatalf("rejected data missing: %v %v", rejected, err)
+				}
+				if err := verifyRestorePoint(rejected[0]); err != nil {
+					t.Fatal(err)
+				}
+			}
 			if phase == "preserving" {
 				if _, err := RevertContents(data, point); err == nil {
 					t.Fatal("partial preservation was accepted")
@@ -139,11 +177,20 @@ func TestRestoreProcessCrashPreservesDataAndRefusesPartialPoints(t *testing.T) {
 				name := fmt.Sprintf("%04d-old", i)
 				atRoot, rootErr := os.ReadFile(filepath.Join(data, name))
 				atPoint, pointErr := os.ReadFile(filepath.Join(point, name))
-				if phase == "activating" && (rootErr != nil || string(atRoot) != "original data") {
+				if phase != "preserving" && (rootErr != nil || string(atRoot) != "original data") {
 					t.Fatalf("original %s not active after recovery", name)
 				}
 				if (rootErr != nil || string(atRoot) != "original data") && (pointErr != nil || string(atPoint) != "original data") {
 					t.Fatalf("original %s lost after %s crash", name, phase)
+				}
+			}
+			if phase == "reverting" {
+				rejected, _ := filepath.Glob(filepath.Join(data, ".ftw-rejected-restore-*"))
+				for i := range 128 {
+					got, err := os.ReadFile(filepath.Join(rejected[0], fmt.Sprintf("%04d-new", i)))
+					if err != nil || string(got) != "new data" {
+						t.Fatalf("revert crash lost new data %d: %q %v", i, got, err)
+					}
 				}
 			}
 			fresh := filepath.Join(root, "fresh-recovery")

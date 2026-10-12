@@ -573,3 +573,45 @@ func TestDescribeSourceRejectsExternalAbsoluteLinkWithoutReadingIt(t *testing.T)
 		t.Fatalf("external link error = %v", err)
 	}
 }
+
+func TestExtractionRetryRetainsOldStageAndAllowsCompleteRevert(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	if err := os.Mkdir(source, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	st, err := state.Open(filepath.Join(source, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.SaveConfig("generation", "backup"); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(source, "config.yaml"), "generation: backup\n")
+	archive, err := Create(context.Background(), CreateOptions{State: st, StatePath: filepath.Join(source, "state.db"), DataDir: source, OutputDir: filepath.Join(root, "backup")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "target")
+	writeTestFile(t, filepath.Join(target, "old"), "original data")
+	writeTestFile(t, filepath.Join(target, ".ftw-restore-stage-interrupted", "partial"), "retained extraction")
+	result, err := RestoreContents(archive.Path, target, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	back, err := RevertContents(target, result.SafetyDir)
+	if err != nil || !back.SafetyComplete {
+		t.Fatalf("retry rejected a completed archive: %+v %v", back, err)
+	}
+	if _, err := RevertContents(target, result.SafetyDir); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(target, ".ftw-abandoned-stage-interrupted", "partial"))
+	if err != nil || string(got) != "retained extraction" {
+		t.Fatalf("old extraction changed: %q %v", got, err)
+	}
+}

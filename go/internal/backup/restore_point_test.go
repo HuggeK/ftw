@@ -172,3 +172,44 @@ func TestRevertRejectsMissingRecordedEntry(t *testing.T) {
 		t.Fatalf("rejected revert moved current data: %q %v", got, err)
 	}
 }
+
+func TestRetryRevertDoesNotCertifyEmptyActiveRoot(t *testing.T) {
+	data := t.TempDir()
+	safety := filepath.Join(data, ".ftw-pre-restore-proof")
+	rejected := filepath.Join(data, ".ftw-rejected-restore-interrupted")
+	writeTestFile(t, filepath.Join(safety, "old"), "original data")
+	writeTestFile(t, filepath.Join(rejected, "new"), "new readings")
+	if err := writeRestorePoint(safety, []string{"old"}, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeRestorePoint(rejected, []string{"new"}, true); err != nil {
+		t.Fatal(err)
+	}
+	result, err := RevertContents(data, safety)
+	if err != nil || result.SafetyComplete {
+		t.Fatalf("retry certified empty root: %+v %v", result, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(data, "old")); err != nil || string(got) != "original data" {
+		t.Fatalf("old data not recovered: %q %v", got, err)
+	}
+	if _, err := RevertContents(data, safety); err == nil {
+		t.Fatal("revert activated empty state")
+	}
+	if got, err := os.ReadFile(filepath.Join(rejected, "new")); err != nil || string(got) != "new readings" {
+		t.Fatalf("new data not retained: %q %v", got, err)
+	}
+}
+
+func TestRetryImportRejectsInterruptedActivationWithCompletePoint(t *testing.T) {
+	data := t.TempDir()
+	safety := filepath.Join(data, ".ftw-pre-restore-proof")
+	writeTestFile(t, filepath.Join(safety, "old"), "complete original")
+	writeTestFile(t, filepath.Join(data, "new"), "partial target")
+	writeTestFile(t, filepath.Join(data, ".ftw-restore-stage-proof", "pending"), "unactivated target")
+	if err := writeRestorePoint(safety, []string{"old"}, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RestoreContents("unused.ftwbak", data, time.Time{}); err == nil || !strings.Contains(err.Error(), "unresolved") {
+		t.Fatalf("import certified partial activation: %v", err)
+	}
+}

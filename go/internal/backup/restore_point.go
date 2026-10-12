@@ -102,7 +102,11 @@ func checkRestorePointsBeforeRestore(dataDir string) error {
 	if err != nil {
 		return err
 	}
+	staging := hasRestoreStaging(entries)
 	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".ftw-rejected-restore-") || (staging && strings.HasPrefix(entry.Name(), ".ftw-pre-restore-")) {
+			return fmt.Errorf("backup: unresolved interrupted restore at %s; retain all directories and recover a complete point or a full backup on a separate target", filepath.Join(dataDir, entry.Name()))
+		}
 		if !strings.HasPrefix(entry.Name(), ".ftw-pre-restore-") && !strings.HasPrefix(entry.Name(), ".ftw-rejected-restore-") {
 			continue
 		}
@@ -139,4 +143,27 @@ func rollbackRestorePoint(pointDir, dataDir string, moved []string) error {
 		return err
 	}
 	return os.Remove(pointDir)
+}
+
+// Retain old extraction copies under a distinct name once a retry has fully
+// activated its verified archive. They no longer describe an active operation.
+func retireRestoreStaging(dataDir, currentStage string) error {
+	entries, err := os.ReadDir(dataDir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), ".ftw-restore-stage-") || entry.Name() == filepath.Base(currentStage) {
+			continue
+		}
+		from := filepath.Join(dataDir, entry.Name())
+		to := filepath.Join(dataDir, ".ftw-abandoned-stage-"+strings.TrimPrefix(entry.Name(), ".ftw-restore-stage-"))
+		if _, err := os.Lstat(to); !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("backup: retained extraction path already exists: %s", to)
+		}
+		if err := os.Rename(from, to); err != nil {
+			return err
+		}
+	}
+	return syncDir(dataDir)
 }
