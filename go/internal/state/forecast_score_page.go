@@ -14,19 +14,28 @@ type ForecastIssueCursor struct {
 	ID         string
 }
 
-func (s *Store) LoadForecastScorePage(ctx context.Context, since, until int64, after ForecastIssueCursor, limit int) ([]forecasting.Issue, ForecastIssueCursor, error) {
+func (s *Store) LoadForecastScorePage(ctx context.Context, since, until int64, after ForecastIssueCursor, limit int) (issues []forecasting.Issue, cursor ForecastIssueCursor, err error) {
 	if limit < 1 || limit > 16 {
 		return nil, after, fmt.Errorf("forecast score page limit must be 1..16")
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT payload FROM forecast_issues
+	timing := newForecastReadTiming(ctx, "score_page")
+	defer timing.finish(&err)
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return nil, after, err
+	}
+	timing.conn = conn
+	timing.next("query")
+	rows, err := conn.QueryContext(ctx, `SELECT payload FROM forecast_issues
  WHERE issued_at_ms>=? AND issued_at_ms<=?
  AND (issued_at_ms>? OR (issued_at_ms=? AND id>?))
  ORDER BY issued_at_ms,id LIMIT ?`, since, until, after.IssuedAtMS, after.IssuedAtMS, after.ID, limit)
 	if err != nil {
 		return nil, after, err
 	}
-	defer rows.Close()
-	issues := make([]forecasting.Issue, 0, limit)
+	timing.rows = rows
+	timing.next("scan")
+	issues = make([]forecasting.Issue, 0, limit)
 	for rows.Next() {
 		if err := ctx.Err(); err != nil {
 			return nil, after, err
@@ -35,11 +44,14 @@ func (s *Store) LoadForecastScorePage(ctx context.Context, since, until int64, a
 		if err := rows.Scan(&data); err != nil {
 			return nil, after, err
 		}
+		timing.rowCount++
+		timing.next("decode")
 		issue, _, err := decodeForecastIssue(data)
 		if err != nil {
 			return nil, after, err
 		}
 		issues = append(issues, issue)
+		timing.next("scan")
 	}
 	if err := rows.Err(); err != nil {
 		return nil, after, err
