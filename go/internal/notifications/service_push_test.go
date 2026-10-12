@@ -36,6 +36,37 @@ func waitForMsgs(t *testing.T, pub *fakePub, n int) []Message {
 	return msgs
 }
 
+// watchDispatched collects the service's notifications.dispatched events.
+//
+// A transport recording a message is not proof that the dispatch is done:
+// deliver counts it as sent only after the last transport has answered. The
+// event comes after the counter, so once it arrives Status() is final for
+// that dispatch. Reading Status() as soon as a fake publisher holds the
+// message races the counter.
+func watchDispatched(bus *events.Bus) <-chan events.NotificationDispatched {
+	ch := make(chan events.NotificationDispatched, 8)
+	bus.Subscribe(events.KindNotificationDispatched, func(e events.Event) {
+		if ev, ok := e.(events.NotificationDispatched); ok {
+			select {
+			case ch <- ev:
+			default:
+			}
+		}
+	})
+	return ch
+}
+
+func waitForDispatched(t *testing.T, ch <-chan events.NotificationDispatched) events.NotificationDispatched {
+	t.Helper()
+	select {
+	case ev := <-ch:
+		return ev
+	case <-time.After(time.Second):
+		t.Fatal("no notifications.dispatched event")
+		return events.NotificationDispatched{}
+	}
+}
+
 // settle waits for any in-flight handleCatalogued goroutines to finish
 // delivering by watching the counters stop moving.
 func settle(svc *Service) {
@@ -148,12 +179,20 @@ func TestDispatchReachesEveryInstalledPublisher(t *testing.T) {
 	svc.AddPublisher(push)
 	bus := events.NewBus()
 	svc.Subscribe(bus)
+	dispatched := watchDispatched(bus)
 
 	bus.Publish(events.ChargingSessionComplete{LoadpointID: "garage", KWh: 3.0, At: time.Now()})
-	waitForMsgs(t, ntfy, 1)
-	waitForMsgs(t, push, 1)
-	if svc.Status().Sent != 1 {
-		t.Fatalf("sent = %d, want 1 (one dispatch, two transports)", svc.Status().Sent)
+	if ev := waitForDispatched(t, dispatched); ev.Status != "sent" {
+		t.Fatalf("dispatch status = %q (%s), want sent", ev.Status, ev.Error)
+	}
+	if n := len(ntfy.Messages()); n != 1 {
+		t.Fatalf("config-selected transport got %d messages, want 1", n)
+	}
+	if n := len(push.Messages()); n != 1 {
+		t.Fatalf("engine-owned transport got %d messages, want 1", n)
+	}
+	if got := svc.Status().Sent; got != 1 {
+		t.Fatalf("sent = %d, want 1 (one dispatch, two transports)", got)
 	}
 }
 
@@ -169,9 +208,13 @@ func TestNothingToSendIsNotAFailure(t *testing.T) {
 	svc.AddPublisher(empty)
 	bus := events.NewBus()
 	svc.Subscribe(bus)
+	dispatched := watchDispatched(bus)
 
 	bus.Publish(events.ChargingSessionComplete{LoadpointID: "garage", KWh: 3.0, At: time.Now()})
-	waitForMsgs(t, ntfy, 1)
+	waitForDispatched(t, dispatched)
+	if n := len(ntfy.Messages()); n != 1 {
+		t.Fatalf("ntfy got %d messages, want 1", n)
+	}
 	st := svc.Status()
 	if st.Sent != 1 || st.Failed != 0 {
 		t.Fatalf("sent=%d failed=%d, want 1/0", st.Sent, st.Failed)
