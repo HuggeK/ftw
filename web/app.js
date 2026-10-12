@@ -95,6 +95,7 @@
     load: [],
     timestamps: [],
     // Energy counters (cumulative Wh, today-scoped)
+    quality: [],
     e_import: [],
     e_export: [],
     e_pv: [],
@@ -155,12 +156,12 @@
   }
 
   // Ensure a battery-driver slot exists. Backfills bat/target arrays
-  // with zeros up to current timestamps length so row indices align
+  // with unknowns up to the preceding timestamp so row indices align
   // with the other chartHistory series.
   function ensureBatteryDriver(name) {
     if (chartBatteries[name]) return chartBatteries[name];
-    var pad = chartHistory.timestamps.length;
-    var slot = { bat: new Array(pad).fill(0), target: new Array(pad).fill(0) };
+    var pad = Math.max(0, chartHistory.timestamps.length - 1);
+    var slot = { bat: new Array(pad).fill(null), target: new Array(pad).fill(null) };
     chartBatteries[name] = slot;
     syncBatteryLegend();
     return slot;
@@ -212,8 +213,8 @@
   }
   function ensureEVDriver(name) {
     if (chartEVs[name]) return chartEVs[name];
-    var pad = chartHistory.timestamps.length;
-    var slot = { ev: new Array(pad).fill(0) };
+    var pad = Math.max(0, chartHistory.timestamps.length - 1);
+    var slot = { ev: new Array(pad).fill(null) };
     chartEVs[name] = slot;
     syncEVLegend();
     return slot;
@@ -374,12 +375,14 @@
   }
 
   function formatKwh(wh) {
-    var kwh = (wh || 0) / 1000;
+    if (wh == null) return "Unknown";
+    var kwh = wh / 1000;
     if (kwh >= 100) return kwh.toFixed(0) + " kWh";
     if (kwh >= 10) return kwh.toFixed(1) + " kWh";
     return kwh.toFixed(2) + " kWh";
   }
   function formatSignedWh(wh) {
+    if (wh == null) return "Unknown";
     var v = Number(wh) || 0;
     var abs = Math.abs(v);
     var sign = v > 0.5 ? "+" : v < -0.5 ? "-" : "±";
@@ -387,6 +390,7 @@
     return sign + Math.round(abs) + " Wh";
   }
   function formatWhMagnitude(wh) {
+    if (wh == null) return "Unknown";
     var abs = Math.abs(Number(wh) || 0);
     if (abs >= 1000) return (abs / 1000).toFixed(2) + " kWh";
     return Math.round(abs) + " Wh";
@@ -472,13 +476,13 @@
       drivers[name] = d;
     });
     out.drivers = drivers;
-    if (have.pv_w) out.pv_w = sums.pv_w;
-    if (have.bat_w) out.bat_w = sums.bat_w;
-    if (have.ev_w) {
+    if (have.pv_w && data.pv_w != null) out.pv_w = sums.pv_w;
+    if (have.bat_w && data.bat_w != null) out.bat_w = sums.bat_w;
+    if (have.ev_w && data.ev_w != null) {
       out.ev_w = sums.ev_w;
       out.ev_charging_w = sums.ev_w;
     }
-    if (out.grid_w != null) {
+    if (out.grid_w != null && data.load_w != null) {
       out.load_w = Math.max(0, (out.grid_w || 0) - (out.bat_w || 0) - (out.pv_w || 0) - (out.ev_w || 0));
     } else {
       // No live meter: do not keep a previous load or treat JSON null as 0 W.
@@ -491,13 +495,14 @@
     if (!windowMs || windowMs <= 0 || values.length < 3) return values;
     var out = new Array(values.length);
     for (var i = 0; i < values.length; i++) {
+      if (values[i] == null) { out[i] = null; continue; }
       var t = timestamps[i];
       var sum = 0;
       var n = 0;
       for (var j = i; j >= 0; j--) {
         if (t - timestamps[j] > windowMs) break;
         var v = values[j];
-        if (v == null || !isFinite(v)) continue;
+        if (v == null || !isFinite(v)) break;
         sum += v;
         n++;
       }
@@ -682,8 +687,8 @@
         // SEPARATELY within the slot — the bill is import × import_price
         // plus export × export_price, never their net. Render both
         // directions so the operator sees the slot's true exposure.
-        var impWh = Number(slot.import_wh) || 0;
-        var expWh = Number(slot.export_wh) || 0;
+        var impWh = slot.import_wh;
+        var expWh = slot.export_wh;
         slotBadge.textContent = "15m ↑" + formatWhMagnitude(impWh) + " ↓" + formatWhMagnitude(expWh);
         slotBadge.className = "grid-slot-badge" +
           (impWh > expWh + 5 ? " slot-import" : expWh > impWh + 5 ? " slot-export" : "");
@@ -706,7 +711,7 @@
       return online && d.pv_w != null;
     });
     var pvConfigured = Object.keys(data.drivers || {}).some(function (name) {
-      return (data.drivers[name] || {}).pv_w != null;
+      return Object.prototype.hasOwnProperty.call(data.drivers[name] || {}, "pv_w");
     });
     var pvDir = document.getElementById("pv-dir");
     if (pvConfigured && !pvLive) {
@@ -733,10 +738,10 @@
     var cardEvWEl   = document.getElementById("card-ev-w");
     var cardEvSubEl = document.getElementById("card-ev-sub");
     if (cardEvWEl) {
-      var evWNow = data.ev_charging_w || 0;
+      var evWNow = data.ev_charging_w;
       cardEvWEl.textContent = formatW(evWNow);
       cardEvWEl.className = evWNow > 1 ? "card-value val-load" : "card-value val-neutral";
-      if (cardEvSubEl) cardEvSubEl.textContent = evWNow > 1 ? "charging" : "charger";
+      if (cardEvSubEl) cardEvSubEl.textContent = evWNow == null ? "no data" : evWNow > 1 ? "charging" : "charger";
     }
 
     // Battery — positive=charge, negative=discharge. Same honesty as solar:
@@ -749,7 +754,7 @@
       return online && d.bat_w != null;
     });
     var batConfigured = Object.keys(data.drivers || {}).some(function (name) {
-      return (data.drivers[name] || {}).bat_w != null;
+      return Object.prototype.hasOwnProperty.call(data.drivers[name] || {}, "bat_w");
     });
     if (batConfigured && !batLive) {
       batW.textContent = "—";
@@ -1045,12 +1050,13 @@
     chartHistory.pv.push(data.pv_w);
     chartHistory.load.push(data.load_w);
     chartHistory.timestamps.push(now);
-    chartHistory.e_import.push(t.import_wh || 0);
-    chartHistory.e_export.push(t.export_wh || 0);
-    chartHistory.e_pv.push(t.pv_wh || 0);
-    chartHistory.e_charged.push(t.bat_charged_wh || 0);
-    chartHistory.e_discharged.push(t.bat_discharged_wh || 0);
-    chartHistory.e_load.push(t.load_wh || 0);
+    chartHistory.quality.push(data.history_quality || "complete");
+    chartHistory.e_import.push(t.import_wh == null ? null : t.import_wh);
+    chartHistory.e_export.push(t.export_wh == null ? null : t.export_wh);
+    chartHistory.e_pv.push(t.pv_wh == null ? null : t.pv_wh);
+    chartHistory.e_charged.push(t.bat_charged_wh == null ? null : t.bat_charged_wh);
+    chartHistory.e_discharged.push(t.bat_discharged_wh == null ? null : t.bat_discharged_wh);
+    chartHistory.e_load.push(t.load_wh == null ? null : t.load_wh);
 
     // Per-battery-driver push. Any driver in data.drivers that exposes
     // bat_w is considered battery-capable and gets its own chart series.
@@ -1059,31 +1065,28 @@
     var seenEVs = {};
     Object.keys(drivers).forEach(function (name) {
       var d = drivers[name] || {};
-      if (d.bat_w != null) {
+      if (Object.prototype.hasOwnProperty.call(d, "bat_w")) {
         seenBatteries[name] = true;
         var bslot = ensureBatteryDriver(name);
-        bslot.bat.push(d.bat_w || 0);
+        bslot.bat.push(d.status === "offline" || d.bat_w == null ? null : d.bat_w);
         bslot.target.push((targetsByDriver && targetsByDriver[name]) || 0);
       }
-      if (d.ev_w != null) {
+      if (Object.prototype.hasOwnProperty.call(d, "ev_w")) {
         seenEVs[name] = true;
         var eslot = ensureEVDriver(name);
-        eslot.ev.push(d.ev_w || 0);
+        eslot.ev.push(d.status === "offline" || d.ev_w == null ? null : d.ev_w);
       }
     });
-    // Drivers that have history but didn't report this cycle: push a
-    // 0 so index alignment with chartHistory.timestamps stays intact.
-    // (Keeps the line continuous; the driver offline/gap is already
-    // visible through the driver card's status indicator.)
+    // Preserve alignment while leaving a gap for an unavailable device.
     Object.keys(chartBatteries).forEach(function (name) {
       if (seenBatteries[name]) return;
       var slot = chartBatteries[name];
-      slot.bat.push(0);
-      slot.target.push(0);
+      slot.bat.push(null);
+      slot.target.push(null);
     });
     Object.keys(chartEVs).forEach(function (name) {
       if (seenEVs[name]) return;
-      chartEVs[name].ev.push(0);
+      chartEVs[name].ev.push(null);
     });
 
     if (chartHistory.grid.length > CHART_POINTS) {
@@ -1139,6 +1142,14 @@
     var windowMs = CHART_RANGE_MS[chartRange] || CHART_RANGE_MS["5m"];
     var now = Date.now();
     var windowStart = now - windowMs;
+    var qualityNote = document.getElementById("chart-history-quality");
+    if (qualityNote) {
+      var qualities = chartHistory.quality.filter(function (_,i) { return chartHistory.timestamps[i] >= windowStart; });
+      var mismatch = qualities.indexOf("balance_mismatch") >= 0;
+      var partial = mismatch || qualities.indexOf("incomplete") >= 0;
+      qualityNote.hidden = !partial;
+      qualityNote.textContent = mismatch ? "Measurements do not balance. Home use is unknown for those samples." : "Some measurements are missing. Working devices keep recording; gaps are unknown.";
+    }
     // Forward-looking forecast: at least 15 minutes so the transition
     // from actual→predicted is smooth. For longer ranges, use half the
     // past window. Keeps the live trace dominant on wide views while
@@ -1153,7 +1164,7 @@
     var smoothedPVSeries = null;
     var smoothedLoadSeries = null;
     if (chartView === "energy") {
-      function toKwh(arr) { return arr.map(function(x){ return x / 1000; }); }
+      function toKwh(arr) { return arr.map(function(x){ return x == null ? null : x / 1000; }); }
       series = [
         { data: toKwh(chartHistory.e_import),     color: "#ef4444", width: 2, dash: [], name: "Import",     fill: true },
         { data: toKwh(chartHistory.e_export),     color: "#22c55e", width: 2, dash: [], name: "Export",     fill: true },
@@ -1302,12 +1313,14 @@
     series.forEach(function (sr) {
       if (sr.data.length < 2 || chartHistory.timestamps.length < 2) return;
 
-      var pts = [];
+      var segments = [], pts = [];
       for (var j = 0; j < sr.data.length; j++) {
         var ts = chartHistory.timestamps[j];
-        if (sr.data[j] == null) continue;
+        if (sr.data[j] == null) { if (pts.length) segments.push(pts); pts = []; continue; }
         pts.push({ x: tsToX(ts), y: valToY(sr.data[j]) });
       }
+      if (pts.length) segments.push(pts);
+      segments.forEach(function (pts) {
       if (pts.length < 2) return;
 
       if (sr.fill) {
@@ -1340,6 +1353,7 @@
       if (sr.width >= 2) {
         liveTips.push({ x: pts[pts.length - 1].x, y: pts[pts.length - 1].y, color: sr.color });
       }
+      });
     });
 
     // ---- Forward-looking forecast (dashed lines from plan) ----
@@ -4909,16 +4923,17 @@
         chartEVs = {};
         data.items.forEach(function (it) {
           var et = it.energy_today || {};
-          chartHistory.grid.push(it.grid_w || 0);
-          chartHistory.pv.push(it.pv_w || 0);
-          chartHistory.load.push(it.load_w || 0);
+          chartHistory.grid.push(it.grid_w == null ? null : it.grid_w);
+          chartHistory.pv.push(it.pv_w == null ? null : it.pv_w);
+          chartHistory.load.push(it.load_w == null ? null : it.load_w);
           chartHistory.timestamps.push(it.ts || 0);
-          chartHistory.e_import.push(et.import_wh || 0);
-          chartHistory.e_export.push(et.export_wh || 0);
-          chartHistory.e_pv.push(et.pv_wh || 0);
-          chartHistory.e_charged.push(et.bat_charged_wh || 0);
-          chartHistory.e_discharged.push(et.bat_discharged_wh || 0);
-          chartHistory.e_load.push(et.load_wh || 0);
+          chartHistory.quality.push(it.history_quality || "complete");
+          chartHistory.e_import.push(et.import_wh == null ? null : et.import_wh);
+          chartHistory.e_export.push(et.export_wh == null ? null : et.export_wh);
+          chartHistory.e_pv.push(et.pv_wh == null ? null : et.pv_wh);
+          chartHistory.e_charged.push(et.bat_charged_wh == null ? null : et.bat_charged_wh);
+          chartHistory.e_discharged.push(et.bat_discharged_wh == null ? null : et.bat_discharged_wh);
+          chartHistory.e_load.push(et.load_wh == null ? null : et.load_wh);
 
           // Per-driver discovery from this item's drivers + targets maps.
           // A driver can expose bat_w, ev_w, or both.
@@ -4927,26 +4942,26 @@
           var seenBat = {}, seenEV = {};
           Object.keys(itDrivers).forEach(function (name) {
             var d = itDrivers[name] || {};
-            if (d.bat_w != null) {
+            if (Object.prototype.hasOwnProperty.call(d, "bat_w")) {
               seenBat[name] = true;
               var bslot = ensureBatteryDriver(name);
-              bslot.bat.push(d.bat_w || 0);
-              bslot.target.push(itTargets[name] || 0);
+              bslot.bat.push(d.status === "offline" || d.bat_w == null ? null : d.bat_w);
+              bslot.target.push(itTargets[name] == null ? null : itTargets[name]);
             }
-            if (d.ev_w != null) {
+            if (Object.prototype.hasOwnProperty.call(d, "ev_w")) {
               seenEV[name] = true;
-              ensureEVDriver(name).ev.push(d.ev_w || 0);
+              ensureEVDriver(name).ev.push(d.ev_w == null ? null : d.ev_w);
             }
           });
           Object.keys(chartBatteries).forEach(function (name) {
             if (seenBat[name]) return;
             var slot = chartBatteries[name];
-            slot.bat.push(0);
-            slot.target.push(0);
+            slot.bat.push(null);
+            slot.target.push(null);
           });
           Object.keys(chartEVs).forEach(function (name) {
             if (seenEV[name]) return;
-            chartEVs[name].ev.push(0);
+            chartEVs[name].ev.push(null);
           });
         });
         syncBatteryLegend();
@@ -5029,6 +5044,7 @@
           totals.export_wh += arr[i].export_wh || 0;
           totals.pv_wh     += arr[i].pv_wh     || 0;
         }
+        if (arr.some(function (day) { return ["import_wh", "load_wh", "export_wh", "pv_wh"].some(function (key) { return day[key] == null; }); })) { totals.incomplete = true; }
         historyCakeEl.setTotals(totals);
       })
       .catch(function () { /* network blip — leave the previous render */ })
@@ -5091,11 +5107,10 @@
     // the row blob. Skip rows with no battery sample so the chart
     // doesn't draw spurious zero bars.
     var points = items
-      .filter(function (it) { return it.bat_w != null || it.bat_soc != null; })
       .map(function (it) {
         return {
           ts_ms: it.ts || it.ts_ms,
-          bat_w: it.bat_w || 0,
+          bat_w: it.bat_w == null ? null : it.bat_w,
           soc_pct: (it.bat_soc != null) ? it.bat_soc * 100 : null,
         };
       });
@@ -5114,6 +5129,7 @@
     ctx.clearRect(0, 0, cssW, cssH);
 
     var C = chartColors();
+    if (!points.some(function(p) { return p.bat_w != null || p.soc_pct != null; })) { ctx.fillStyle = C.muted; ctx.font = "13px system-ui"; ctx.fillText("Battery measurements unknown", 16, 28); return; }
     var pad = { left: 36, right: 36, top: 8, bottom: 18 };
     var plotW = cssW - pad.left - pad.right;
     var plotH = cssH - pad.top - pad.bottom;
@@ -5176,7 +5192,7 @@
     var started = false;
     for (var k = 0; k < points.length; k++) {
       var sp = points[k];
-      if (sp.soc_pct == null) continue;
+      if (sp.soc_pct == null) { started = false; continue; }
       var sx = xOf(sp.ts_ms);
       var sy = socOf(sp.soc_pct);
       if (!started) { ctx.moveTo(sx, sy); started = true; }

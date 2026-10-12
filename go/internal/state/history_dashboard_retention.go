@@ -19,13 +19,38 @@ func (s *Store) maintainDashboard(ctx context.Context, now time.Time) error {
 	if err := s.rollSiteEnergy(ctx, now.Add(-AggregateRetention).UnixMilli()); err != nil {
 		return err
 	}
+	for _, partial := range []bool{false, true} {
+		if err := s.pruneDashboard(ctx, now, partial); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func dashboardStorage(partial bool) (string, string) {
+	if partial {
+		return "history_dashboard_partial", "partial_dashboard"
+	}
+	return "history_dashboard", "dashboard"
+}
+func energyStorage(partial bool) (string, string) {
+	if partial {
+		return "history_site_energy_partial", "partial_energy"
+	}
+	return "history_site_energy", "energy"
+}
+func (s *Store) pruneDashboard(ctx context.Context, now time.Time, partial bool) error {
+	table, kind := dashboardStorage(partial)
 	for {
 		var n int64
 		err := s.writeArchiveBatch(ctx, func(ctx context.Context, tx *sql.Tx) error {
-			result, err := tx.ExecContext(ctx, `DELETE FROM history_dashboard WHERE (start_ms,resolution_ms) IN (SELECT start_ms,resolution_ms FROM history_dashboard WHERE last_ms<? ORDER BY last_ms LIMIT 128)`, now.Add(-AggregateRetention).UnixMilli())
+			if _, err := tx.ExecContext(ctx, `DELETE FROM history_quality WHERE kind='`+kind+`' AND (start_ms,resolution_ms) IN (SELECT start_ms,resolution_ms FROM `+table+` WHERE last_ms<? ORDER BY last_ms LIMIT 128)`, now.Add(-AggregateRetention).UnixMilli()); err != nil {
+				return err
+			}
+			result, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE (start_ms,resolution_ms) IN (SELECT start_ms,resolution_ms FROM `+table+` WHERE last_ms<? ORDER BY last_ms LIMIT 128)`, now.Add(-AggregateRetention).UnixMilli())
 			if err != nil {
 				return err
 			}
+
 			n, err = result.RowsAffected()
 			return err
 		})
@@ -42,11 +67,20 @@ func (s *Store) maintainDashboard(ctx context.Context, now time.Time) error {
 }
 
 func (s *Store) rollDashboard(ctx context.Context, source, width, cutoff int64) error {
+	for _, partial := range []bool{false, true} {
+		if err := s.rollDashboardTable(ctx, source, width, cutoff, partial); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func (s *Store) rollDashboardTable(ctx context.Context, source, width, cutoff int64, partial bool) error {
+	table, kind := dashboardStorage(partial)
 	cutoff = bucketStart(cutoff, width)
 	limit := int64(128)
 	for {
 		var first sql.NullInt64
-		if err := s.history.QueryRowContext(ctx, `SELECT MIN(start_ms) FROM history_dashboard WHERE resolution_ms=? AND start_ms<?`, source, cutoff).Scan(&first); err != nil {
+		if err := s.history.QueryRowContext(ctx, `SELECT MIN(start_ms) FROM `+table+` WHERE resolution_ms=? AND start_ms<?`, source, cutoff).Scan(&first); err != nil {
 			return err
 		}
 		if !first.Valid {
@@ -60,17 +94,23 @@ func (s *Store) rollDashboard(ctx context.Context, source, width, cutoff int64) 
 		var points []dashboardRollup
 		err := s.rollupTransaction(ctx, func(ctx context.Context, tx *sql.Tx) error {
 			var err error
-			points, err = readDashboardRollup(ctx, tx, source, width, from, to)
+			points, err = readDashboardRollup(ctx, tx, source, width, from, to, partial)
 			return err
 		}, func(ctx context.Context, tx *sql.Tx) error {
 			for _, p := range points {
 				n := float64(p.n)
-				if _, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO history_dashboard VALUES(?,?,?,?,?,?,?,?,?,?,?,X'')`,
+				if _, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO `+table+` VALUES(?,?,?,?,?,?,?,?,?,?,?,X'')`,
 					p.start, width, p.first, p.last, p.n, p.grid/n, p.pv/n, p.bat/n, p.load/n, p.soc/n, p.json); err != nil {
 					return err
 				}
+				if err := putHistoryQuality(ctx, tx, kind, p.start, width, p.missing); err != nil {
+					return err
+				}
 			}
-			_, err := tx.ExecContext(ctx, `DELETE FROM history_dashboard WHERE resolution_ms=? AND start_ms>=? AND start_ms<?`, source, from, to)
+			if _, err := tx.ExecContext(ctx, `DELETE FROM history_quality WHERE kind='`+kind+`' AND resolution_ms=? AND start_ms>=? AND start_ms<?`, source, from, to); err != nil {
+				return err
+			}
+			_, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE resolution_ms=? AND start_ms>=? AND start_ms<?`, source, from, to)
 			return err
 		})
 		if err != nil && ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
@@ -88,14 +128,16 @@ func (s *Store) rollDashboard(ctx context.Context, source, width, cutoff int64) 
 }
 
 type dashboardRollup struct {
+	missing                  HistoryMissing
 	start, first, last, n    int64
 	grid, pv, bat, load, soc float64
 	json                     string
 }
 
-func readDashboardRollup(ctx context.Context, tx *sql.Tx, source, width, from, to int64) ([]dashboardRollup, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT start_ms,first_ms,last_ms,n,grid_w,pv_w,bat_w,load_w,bat_soc,json
- FROM history_dashboard WHERE resolution_ms=? AND start_ms>=? AND start_ms<? ORDER BY start_ms`, source, from, to)
+func readDashboardRollup(ctx context.Context, tx *sql.Tx, source, width, from, to int64, partial ...bool) ([]dashboardRollup, error) {
+	table, kind := dashboardStorage(len(partial) > 0 && partial[0])
+	rows, err := tx.QueryContext(ctx, `SELECT d.start_ms,first_ms,last_ms,n,grid_w,pv_w,bat_w,load_w,bat_soc,json,COALESCE(q.missing,0)
+ FROM `+table+` d LEFT JOIN history_quality q ON q.kind='`+kind+`' AND q.start_ms=d.start_ms AND q.resolution_ms=d.resolution_ms WHERE d.resolution_ms=? AND d.start_ms>=? AND d.start_ms<? ORDER BY d.start_ms`, source, from, to)
 	if err != nil {
 		return nil, err
 	}
@@ -103,7 +145,7 @@ func readDashboardRollup(ctx context.Context, tx *sql.Tx, source, width, from, t
 	var points []dashboardRollup
 	for rows.Next() {
 		var p dashboardRollup
-		if err := rows.Scan(&p.start, &p.first, &p.last, &p.n, &p.grid, &p.pv, &p.bat, &p.load, &p.soc, &p.json); err != nil {
+		if err := rows.Scan(&p.start, &p.first, &p.last, &p.n, &p.grid, &p.pv, &p.bat, &p.load, &p.soc, &p.json, &p.missing); err != nil {
 			return nil, err
 		}
 		if p.n <= 0 {
@@ -122,6 +164,7 @@ func readDashboardRollup(ctx context.Context, tx *sql.Tx, source, width, from, t
 			a.last, a.json = p.last, p.json
 		}
 		a.n += p.n
+		a.missing |= p.missing
 		a.grid += p.grid
 		a.pv += p.pv
 		a.bat += p.bat
@@ -135,11 +178,20 @@ func readDashboardRollup(ctx context.Context, tx *sql.Tx, source, width, from, t
 // Unlike UTC daily buckets, quarters preserve local midnight boundaries and
 // normal tariff periods without spreading energy across a missing interval.
 func (s *Store) rollSiteEnergy(ctx context.Context, cutoff int64) error {
+	for _, partial := range []bool{false, true} {
+		if err := s.rollSiteEnergyTable(ctx, cutoff, partial); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func (s *Store) rollSiteEnergyTable(ctx context.Context, cutoff int64, partial bool) error {
+	table, kind := energyStorage(partial)
 	width := int64((15 * time.Minute).Milliseconds())
 	cutoff = bucketStart(cutoff, width)
 	for {
 		var first sql.NullInt64
-		if err := s.history.QueryRowContext(ctx, `SELECT MIN(start_ms) FROM history_site_energy WHERE resolution_ms=? AND start_ms<?`, ArchiveResolutionMS, cutoff).Scan(&first); err != nil {
+		if err := s.history.QueryRowContext(ctx, `SELECT MIN(start_ms) FROM `+table+` WHERE resolution_ms=? AND start_ms<?`, ArchiveResolutionMS, cutoff).Scan(&first); err != nil {
 			return err
 		}
 		if !first.Valid {
@@ -151,13 +203,22 @@ func (s *Store) rollSiteEnergy(ctx context.Context, cutoff int64) error {
 		// live writer while it computes its small additive result.
 		var r siteEnergyRow
 		err := s.rollupTransaction(ctx, func(ctx context.Context, tx *sql.Tx) error {
-			return tx.QueryRowContext(ctx, `SELECT MIN(first_ms),MAX(last_ms),SUM(covered_ms),SUM(n),SUM(import_wh),SUM(export_wh),SUM(pv_wh),SUM(bat_charge_wh),SUM(bat_discharge_wh),SUM(load_wh),SUM(ev_wh) FROM history_site_energy WHERE resolution_ms=? AND start_ms>=? AND start_ms<?`, ArchiveResolutionMS, from, to).Scan(&r.first, &r.last, &r.covered, &r.n, &r.imp, &r.exp, &r.pv, &r.charge, &r.discharge, &r.load, &r.ev)
+			if err := tx.QueryRowContext(ctx, `SELECT COALESCE(`+historyMissingAggregate+`,0) FROM history_quality WHERE kind='`+kind+`' AND resolution_ms=? AND start_ms>=? AND start_ms<?`, ArchiveResolutionMS, from, to).Scan(&r.missing); err != nil {
+				return err
+			}
+			return tx.QueryRowContext(ctx, `SELECT MIN(first_ms),MAX(last_ms),SUM(covered_ms),SUM(n),SUM(import_wh),SUM(export_wh),SUM(pv_wh),SUM(bat_charge_wh),SUM(bat_discharge_wh),SUM(load_wh),SUM(ev_wh) FROM `+table+` WHERE resolution_ms=? AND start_ms>=? AND start_ms<?`, ArchiveResolutionMS, from, to).Scan(&r.first, &r.last, &r.covered, &r.n, &r.imp, &r.exp, &r.pv, &r.charge, &r.discharge, &r.load, &r.ev)
 		}, func(ctx context.Context, tx *sql.Tx) error {
-			_, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO history_site_energy VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, from, width, r.first, r.last, r.covered, r.n, r.imp, r.exp, r.pv, r.charge, r.discharge, r.load, r.ev)
+			_, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO `+table+` VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, from, width, r.first, r.last, r.covered, r.n, r.imp, r.exp, r.pv, r.charge, r.discharge, r.load, r.ev)
 			if err != nil {
 				return err
 			}
-			_, err = tx.ExecContext(ctx, `DELETE FROM history_site_energy WHERE resolution_ms=? AND start_ms>=? AND start_ms<?`, ArchiveResolutionMS, from, to)
+			if err := putHistoryQuality(ctx, tx, kind, from, width, r.missing); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `DELETE FROM history_quality WHERE kind='`+kind+`' AND resolution_ms=? AND start_ms>=? AND start_ms<?`, ArchiveResolutionMS, from, to); err != nil {
+				return err
+			}
+			_, err = tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE resolution_ms=? AND start_ms>=? AND start_ms<?`, ArchiveResolutionMS, from, to)
 			return err
 		})
 		if err != nil {

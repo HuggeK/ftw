@@ -54,20 +54,19 @@ func TestHistoryKeepsRunningWithOptionalPVAndUnconfirmedIdentity(t *testing.T) {
 		t.Fatalf("history stopped: point=%+v available=%v", point, ok)
 	}
 
-	// A known source that goes silent still stops history; only optional,
-	// never-reported PV is treated as absent.
+	// Missing flows remain unknown while independent live history continues.
 	tel.DriverHealthMut("pixii").SetOffline()
-	if _, ok := buildHistoryPoint(tel, tickPersistControl{SiteMeterDriver: "sourceful-zap"},
-		time.Now().UnixMilli(), time.Minute, snap.HistoryOptions); ok {
-		t.Fatal("offline battery treated as zero in history")
+	if p, ok := buildHistoryPoint(tel, tickPersistControl{SiteMeterDriver: "sourceful-zap"},
+		time.Now().UnixMilli(), time.Minute, snap.HistoryOptions); !ok || p.Missing&(state.MissingBattery|state.MissingLoad) == 0 {
+		t.Fatal("offline battery lost independent history or became known")
 	}
 	tel.Update("pixii", telemetry.DerBattery, 500, nil, nil)
 	tel.RecordDriverSuccess("pixii")
 	// Once the Zap does report PV, a stale PV reading stops history again.
 	tel.Update("sourceful-zap", telemetry.DerPV, -100, nil, nil)
 	tel.Get("sourceful-zap", telemetry.DerPV).UpdatedAt = time.Now().Add(-2 * time.Minute)
-	if _, ok := buildHistoryPoint(tel, tickPersistControl{SiteMeterDriver: "sourceful-zap"},
-		time.Now().UnixMilli(), time.Minute, snap.HistoryOptions); ok {
-		t.Fatal("stale reported PV treated as zero in history")
+	if p, ok := buildHistoryPoint(tel, tickPersistControl{SiteMeterDriver: "sourceful-zap"},
+		time.Now().UnixMilli(), time.Minute, snap.HistoryOptions); !ok || p.Missing&state.MissingPV == 0 {
+		t.Fatal("stale PV lost independent history or became known")
 	}
 }

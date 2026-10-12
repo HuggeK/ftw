@@ -150,6 +150,9 @@ func (s *Store) EnqueueTelemetryTick(p *HistoryPoint, samples []Sample, observat
 	if w == nil {
 		return errors.New("history writer is unavailable")
 	}
+	if p != nil && p.Missing != 0 && !s.aggregateHistory.Load() {
+		return w.reject("partial history requires aggregate storage")
+	}
 	if err := validateHistorySamples(samples); err != nil {
 		return w.reject(err.Error())
 	}

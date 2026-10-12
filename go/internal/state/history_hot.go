@@ -63,5 +63,6 @@ func addDayEnergy(a, b DayEnergy) DayEnergy {
 	a.BatDischargedWh += b.BatDischargedWh
 	a.LoadWh += b.LoadWh
 	a.Intervals += b.Intervals
+	a.Missing |= b.Missing
 	return a
 }

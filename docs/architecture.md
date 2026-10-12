@@ -58,6 +58,17 @@ a reading after the observed connection and no measured charging. An ambiguous
 match cannot finish the goal. A charger declining current is reported as a refusal, never
 as an invented battery level or proof that the target was reached.
 
+### History measurement quality
+
+An offline flow leaves working devices recording. Missing inputs make their
+values and the derived household balance unknown. Separate additive schema-7
+tables preserve partial chart and energy rows, including missing-value evidence,
+through retention, downsampling and full backup. A recovered sample cannot fill
+an earlier gap. Older Cores see only complete rows in the original tables;
+their integration cursor cannot bridge a partial interval after rollback.
+Partial rows remain stored and become visible again on the newer Core.
+
+
 ### Control state and disk writes
 
 Core loads EV restart records before starting control. During operation, a

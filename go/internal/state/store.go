@@ -1376,6 +1376,7 @@ func (s *Store) batteryModelKey(driverName string) string {
 
 // HistoryPoint is one row of the history table.
 type HistoryPoint struct {
+	Missing      HistoryMissing
 	N            int64 `json:"n,omitempty"`
 	ResolutionMS int64 `json:"resolution_ms,omitempty"`
 	FirstMS      int64 `json:"first_ms,omitempty"`
@@ -1390,6 +1391,9 @@ type HistoryPoint struct {
 
 // RecordHistory inserts a live hot-tier entry into SQLite.
 func (s *Store) RecordHistory(p HistoryPoint) error {
+	if p.Missing != 0 {
+		return errors.New("partial history must use the aggregate tick writer")
+	}
 	var normalizeErr error
 	p, normalizeErr = normalizeHistoryPoint(p)
 	if normalizeErr != nil {
@@ -1412,6 +1416,9 @@ func (s *Store) RecordHistory(p HistoryPoint) error {
 // A retry is safe: the last history point for each timestamp wins.
 func (s *Store) BulkRecordHistory(pts []HistoryPoint) error {
 	for _, p := range pts {
+		if p.Missing != 0 {
+			return errors.New("partial history must use the aggregate tick writer")
+		}
 		if _, err := normalizeHistoryPoint(p); err != nil {
 			return err
 		}
@@ -1477,15 +1484,16 @@ func (s *Store) loadArchiveHistory(ctx context.Context, sinceMs, untilMs int64, 
 	// COALESCE to 0 so NULL columns (from partial aggregations) scan cleanly.
 	const tierUnion = `
 		WITH all_rows AS (
-			SELECT ts_ms, grid_w, pv_w, bat_w, load_w, bat_soc, 0 AS tier,1 AS n,1 AS resolution_ms,ts_ms AS first_ms FROM history_hot
+			SELECT ts_ms, grid_w, pv_w, bat_w, load_w, bat_soc, 0 AS tier,1 AS n,1 AS resolution_ms,ts_ms AS first_ms,0 AS missing FROM history_hot
 			WHERE ts_ms BETWEEN ? AND ?
 			UNION ALL
-			SELECT ts_ms, grid_w, pv_w, bat_w, load_w, bat_soc, 1,1,900000,ts_ms FROM history_warm
+			SELECT ts_ms, grid_w, pv_w, bat_w, load_w, bat_soc, 1,1,900000,ts_ms,0 FROM history_warm
 			WHERE ts_ms BETWEEN ? AND ?
 			UNION ALL
-			SELECT ts_ms, grid_w, pv_w, bat_w, load_w, bat_soc, 2,1,86400000,ts_ms FROM history_cold
+			SELECT ts_ms, grid_w, pv_w, bat_w, load_w, bat_soc, 2,1,86400000,ts_ms,0 FROM history_cold
 			WHERE ts_ms BETWEEN ? AND ?
-		UNION ALL SELECT last_ms,grid_w,pv_w,bat_w,load_w,bat_soc,-1,n,resolution_ms,first_ms FROM history_dashboard WHERE last_ms BETWEEN ? AND ?
+		UNION ALL SELECT last_ms,grid_w,pv_w,bat_w,load_w,bat_soc,-1,n,d.resolution_ms,first_ms,COALESCE(q.missing,0) FROM history_dashboard d LEFT JOIN history_quality q ON q.kind='dashboard' AND q.start_ms=d.start_ms AND q.resolution_ms=d.resolution_ms WHERE last_ms BETWEEN ? AND ?
+		UNION ALL SELECT last_ms,grid_w,pv_w,bat_w,load_w,bat_soc,-2,n,d.resolution_ms,first_ms,COALESCE(q.missing,0) FROM history_dashboard_partial d LEFT JOIN history_quality q ON q.kind='partial_dashboard' AND q.start_ms=d.start_ms AND q.resolution_ms=d.resolution_ms WHERE last_ms BETWEEN ? AND ?
  ),
 		deduped AS (
 			SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY ts_ms ORDER BY tier) AS rn FROM all_rows) WHERE rn=1
@@ -1505,23 +1513,23 @@ func (s *Store) loadArchiveHistory(ctx context.Context, sinceMs, untilMs int64, 
 			SELECT MAX(ts_ms) AS ts_ms,
 			       SUM(COALESCE(grid_w, 0)*n)/SUM(n) AS grid_w, SUM(COALESCE(pv_w, 0)*n)/SUM(n) AS pv_w,
 			       SUM(COALESCE(bat_w, 0)*n)/SUM(n) AS bat_w, SUM(COALESCE(load_w, 0)*n)/SUM(n) AS load_w,
-			       SUM(COALESCE(bat_soc, 0)*n)/SUM(n) AS bat_soc,SUM(n) AS n,MAX(resolution_ms) AS resolution_ms,MIN(first_ms) AS first_ms
+			       SUM(COALESCE(bat_soc, 0)*n)/SUM(n) AS bat_soc,SUM(n) AS n,MAX(resolution_ms) AS resolution_ms,MIN(first_ms) AS first_ms,`+historyMissingAggregate+` AS missing
 			FROM deduped GROUP BY (ts_ms - ?) / ?
 		)
 		SELECT ts_ms,grid_w,pv_w,bat_w,load_w,bat_soc,
-		COALESCE((SELECT json FROM history_dashboard WHERE last_ms=b.ts_ms),
+		COALESCE((SELECT json FROM history_dashboard_partial WHERE last_ms=b.ts_ms),(SELECT json FROM history_dashboard WHERE last_ms=b.ts_ms),
  (SELECT json FROM history_hot WHERE ts_ms=b.ts_ms),
 		         (SELECT json FROM history_warm WHERE ts_ms=b.ts_ms),
-		         (SELECT json FROM history_cold WHERE ts_ms=b.ts_ms),'{}'),n,resolution_ms,first_ms
-		FROM bucketed b ORDER BY ts_ms`, sinceMs, untilMs, sinceMs, untilMs, sinceMs, untilMs, sinceMs, untilMs, sinceMs, bucketMs)
+		         (SELECT json FROM history_cold WHERE ts_ms=b.ts_ms),'{}'),n,resolution_ms,first_ms,missing
+		FROM bucketed b ORDER BY ts_ms`, sinceMs, untilMs, sinceMs, untilMs, sinceMs, untilMs, sinceMs, untilMs, sinceMs, untilMs, sinceMs, bucketMs)
 	} else {
 		rows, err = s.history.QueryContext(ctx, tierUnion+`
 			SELECT ts_ms,COALESCE(grid_w,0),COALESCE(pv_w,0),COALESCE(bat_w,0),COALESCE(load_w,0),COALESCE(bat_soc,0),
-			COALESCE((SELECT json FROM history_dashboard WHERE last_ms=b.ts_ms),
+			COALESCE((SELECT json FROM history_dashboard_partial WHERE last_ms=b.ts_ms),(SELECT json FROM history_dashboard WHERE last_ms=b.ts_ms),
  (SELECT json FROM history_hot WHERE ts_ms=b.ts_ms),
 			         (SELECT json FROM history_warm WHERE ts_ms=b.ts_ms),
-			         (SELECT json FROM history_cold WHERE ts_ms=b.ts_ms),'{}'),n,resolution_ms,first_ms
-			FROM deduped b ORDER BY ts_ms LIMIT ?`, sinceMs, untilMs, sinceMs, untilMs, sinceMs, untilMs, sinceMs, untilMs, maxRawSeriesPoints+1)
+			         (SELECT json FROM history_cold WHERE ts_ms=b.ts_ms),'{}'),n,resolution_ms,first_ms,missing
+			FROM deduped b ORDER BY ts_ms LIMIT ?`, sinceMs, untilMs, sinceMs, untilMs, sinceMs, untilMs, sinceMs, untilMs, sinceMs, untilMs, maxRawSeriesPoints+1)
 	}
 	if err != nil {
 		return nil, err
@@ -1532,7 +1540,7 @@ func (s *Store) loadArchiveHistory(ctx context.Context, sinceMs, untilMs int64, 
 	var bytes int
 	for rows.Next() {
 		var p HistoryPoint
-		if err := rows.Scan(&p.TsMs, &p.GridW, &p.PVW, &p.BatW, &p.LoadW, &p.BatSoC, &p.JSON, &p.N, &p.ResolutionMS, &p.FirstMS); err != nil {
+		if err := rows.Scan(&p.TsMs, &p.GridW, &p.PVW, &p.BatW, &p.LoadW, &p.BatSoC, &p.JSON, &p.N, &p.ResolutionMS, &p.FirstMS, &p.Missing); err != nil {
 			return all, err
 		}
 		if p.ResolutionMS > 1 {
@@ -1558,6 +1566,7 @@ func (s *Store) loadArchiveHistory(ctx context.Context, sinceMs, untilMs int64, 
 // Import/Export are grid-boundary W split on sign; PV and LoadWh are always
 // positive accumulations; BatCharged/BatDischarged split bat_w on sign.
 type DayEnergy struct {
+	Missing         HistoryMissing
 	ImportWh        float64
 	ExportWh        float64
 	PVWh            float64
@@ -1713,13 +1722,13 @@ func (s *Store) dailyEnergyFromArchive(sinceMs, untilMs int64) (DayEnergy, error
 // authoritative — no TTL, no staleness check needed.
 func (s *Store) LoadDailyEnergy(day string) (DayEnergy, bool, error) {
 	const q = `
-		SELECT import_wh, export_wh, pv_wh, bat_charged_wh, bat_discharged_wh, load_wh
-		FROM energy_daily WHERE day = ?
+		SELECT import_wh, export_wh, pv_wh, bat_charged_wh, bat_discharged_wh, load_wh,q.missing,q.n
+		FROM energy_daily_partial d JOIN history_daily_quality q ON q.day=d.day WHERE d.day = ?
 	`
 	var d DayEnergy
 	err := s.history.QueryRow(q, day).Scan(
 		&d.ImportWh, &d.ExportWh, &d.PVWh,
-		&d.BatChargedWh, &d.BatDischargedWh, &d.LoadWh,
+		&d.BatChargedWh, &d.BatDischargedWh, &d.LoadWh, &d.Missing, &d.Intervals,
 	)
 	if err == sql.ErrNoRows {
 		return DayEnergy{}, false, nil
@@ -1738,7 +1747,7 @@ func (s *Store) SaveDailyEnergy(day string, de DayEnergy) error {
 	s.historyWriteMu.Lock()
 	defer s.historyWriteMu.Unlock()
 	const q = `
-		INSERT INTO energy_daily(
+		INSERT INTO energy_daily_partial(
 			day, import_wh, export_wh, pv_wh, bat_charged_wh, bat_discharged_wh, load_wh, computed_at_ms
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(day) DO UPDATE SET
@@ -1750,12 +1759,23 @@ func (s *Store) SaveDailyEnergy(day string, de DayEnergy) error {
 			load_wh           = excluded.load_wh,
 			computed_at_ms    = excluded.computed_at_ms
 	`
-	_, err := s.history.Exec(q, day,
+	tx, err := s.history.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.Exec(q, day,
 		de.ImportWh, de.ExportWh, de.PVWh,
 		de.BatChargedWh, de.BatDischargedWh, de.LoadWh,
 		time.Now().UnixMilli(),
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO history_daily_quality VALUES(?,?,?) ON CONFLICT(day) DO UPDATE SET missing=excluded.missing,n=excluded.n`, day, de.Missing, de.Intervals); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // CountHistoryWithoutMarker returns the number of history rows across all

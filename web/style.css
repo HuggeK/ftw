@@ -2344,3 +2344,5 @@ body.ftw-app .forecast-card .twin-profile-toggle button { min-height: 40px; font
 .cs-row[data-tone="warning"] { border-color: var(--amber); }
 .cs-row[data-tone="alarm"] { border-color: var(--red-e); }
 .cs-device { color: var(--fg-dim); }
+
+.history-data-warning { color: var(--accent-e, #f5b942); font-size: 13px; margin: 8px 0; }

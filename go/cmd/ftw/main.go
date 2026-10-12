@@ -2505,6 +2505,7 @@ func main() {
 		SiteDispatchBlocked: func() string {
 			return siteDispatchNow(tel, cfg, cfgMu, ctrl, ctrlMu, time.Now()).Reason
 		},
+		HistoryMeasurementSources: func() telemetry.ForecastOptions { return forecastSettings.Snapshot().HistoryOptions },
 		SiteMeasurementSources: func() telemetry.ForecastOptions {
 			return forecastSettings.Snapshot().Options
 		},
@@ -3894,7 +3895,7 @@ func persistTelemetryTick(st *state.Store, tel *telemetry.Store, ctrl tickPersis
 	energyObservations := buildEnergyObservations(st, tel, ctrl, hp, identity)
 	filtered := energyObservations[:0]
 	for _, observation := range energyObservations {
-		if !historyAvailable && observation.AssetKind == state.AssetObservedConsumer {
+		if (!historyAvailable || hp.Missing&state.MissingLoad != 0) && observation.AssetKind == state.AssetObservedConsumer {
 			continue
 		}
 		if observation.AssetKind != state.AssetObservedConsumer {
@@ -3921,102 +3922,81 @@ func persistTelemetryTick(st *state.Store, tel *telemetry.Store, ctrl tickPersis
 }
 
 func buildHistoryPoint(tel *telemetry.Store, ctrl tickPersistControl, nowMs int64, historyMaxAge time.Duration, options ...telemetry.ForecastOptions) (state.HistoryPoint, bool) {
-	unavailable := state.HistoryPoint{TsMs: nowMs}
-	if tel == nil || ctrl.SiteMeterDriver == "" {
-		return unavailable, false
+	if tel == nil {
+		return state.HistoryPoint{TsMs: nowMs}, false
 	}
 	opts := telemetry.ForecastOptions{MaxAge: historyMaxAge}
 	if len(options) > 0 {
 		opts = options[0]
 		opts.MaxAge = historyMaxAge
 	}
-	// Polls can update telemetry while dispatch runs. Keep the tick's history
-	// timestamp, but judge reading freshness when this snapshot is captured.
+	opts.UseWatchdogTimeout = true
 	balance := tel.ForecastMeasurementNow(ctrl.SiteMeterDriver, opts)
+	p := state.HistoryPoint{TsMs: nowMs, GridW: balance.GridW, PVW: balance.PVW, BatW: balance.BatteryW, LoadW: balance.HouseholdW}
+	for kind, flag := range map[telemetry.DerType]state.HistoryMissing{telemetry.DerMeter: state.MissingGrid, telemetry.DerPV: state.MissingPV, telemetry.DerBattery: state.MissingBattery, telemetry.DerEV: state.MissingEV, telemetry.DerV2X: state.MissingV2X} {
+		if !balance.Known[kind] {
+			p.Missing |= flag
+		}
+	}
+	if opts.PVInvalidReason != "" {
+		p.Missing |= state.MissingPV
+	}
 	if !balance.Valid {
-		return unavailable, false
+		p.Missing |= state.MissingLoad
 	}
-	now := balance.At
-	gridW, pvW, batW := balance.GridW, balance.PVW, balance.BatteryW
-	evW, v2xW, loadW := balance.EVW, balance.V2XW, balance.HouseholdW
-	readingUsable := func(driver string, updatedAt time.Time) bool {
-		h := tel.DriverHealth(driver)
-		if !h.TelemetryLive() || updatedAt.After(now) {
-			return false
+	if balance.Reason == "invalid_balance" || strings.HasPrefix(balance.Reason, "duplicate_") || strings.HasPrefix(balance.Reason, "invalid_sign:") || balance.Reason == "time_skew" {
+		p.Missing |= state.BalanceMismatch
+	}
+	perDriver := map[string]map[string]any{}
+	var socSum float64
+	var batteries, socCount int
+	var hasPower bool
+	for _, source := range balance.Sources {
+		hasPower = hasPower || source.PowerW != nil
+		name := source.Flow.Driver
+		if name == "" {
+			continue
 		}
-		maxAge := historyMaxAge
-		if h.WatchdogTimeoutOverride > 0 {
-			maxAge = h.WatchdogTimeoutOverride
+		row := perDriver[name]
+		if row == nil {
+			row = map[string]any{}
+			perDriver[name] = row
 		}
-		return maxAge <= 0 || now.Sub(updatedAt) <= maxAge
-	}
-	var avgSoC, sumSoC float64
-	var socCount int
-	for _, r := range tel.ReadingsByType(telemetry.DerBattery) {
-		if readingUsable(r.Driver, r.UpdatedAt) && r.SoC != nil {
-			sumSoC += *r.SoC
-			socCount++
+		field := map[telemetry.DerType]string{telemetry.DerMeter: "meter_w", telemetry.DerPV: "pv_w", telemetry.DerBattery: "bat_w", telemetry.DerEV: "ev_w", telemetry.DerV2X: "v2x_w"}[source.Flow.DerType]
+		if field != "" {
+			row[field] = source.PowerW
 		}
-	}
-	if socCount > 0 {
-		avgSoC = sumSoC / float64(socCount)
-	}
-
-	// Per-driver detail packed into the JSON column. The schema is
-	// schema-less by design — UI code reads what it understands and
-	// ignores the rest, so drivers can add fields without a migration.
-	perDriver := make(map[string]map[string]float64)
-	for name := range tel.AllHealth() {
-		row := map[string]float64{}
-		if r := tel.Get(name, telemetry.DerBattery); r != nil &&
-			readingUsable(name, r.UpdatedAt) {
-			row["bat_w"] = r.SmoothedW
-			if r.SoC != nil {
-				row["soc"] = *r.SoC
+		if source.Flow.DerType == telemetry.DerBattery {
+			batteries++
+			row["soc"] = source.SoC
+			if source.SoC != nil {
+				socSum += *source.SoC
+				socCount++
 			}
 		}
-		if r := tel.Get(name, telemetry.DerPV); r != nil &&
-			readingUsable(name, r.UpdatedAt) {
-			row["pv_w"] = r.SmoothedW
+		if source.Flow.DerType == telemetry.DerV2X {
+			row["v2x_vehicle_soc"] = source.SoC
 		}
-		if r := tel.Get(name, telemetry.DerMeter); r != nil &&
-			readingUsable(name, r.UpdatedAt) {
-			row["meter_w"] = r.SmoothedW
-		}
-		// EV charge power: required for the live chart's EV series
-		// (web/app.js reads `d.ev_w` per driver from /api/history).
-		// Without it the chart's EV trace is always zero — the in-memory
-		// /api/status DOES carry ev_w, but history rows never did until
-		// this row was added.
-		if r := tel.Get(name, telemetry.DerEV); r != nil &&
-			readingUsable(name, r.UpdatedAt) {
-			row["ev_w"] = r.SmoothedW
-		}
-		if r := tel.Get(name, telemetry.DerV2X); r != nil &&
-			readingUsable(name, r.UpdatedAt) {
-			row["v2x_w"] = r.SmoothedW
-			if r.SoC != nil {
-				row["v2x_vehicle_soc"] = *r.SoC
-			}
-		}
-		perDriver[name] = row
 	}
-	targets := make(map[string]float64)
+	if socCount > 0 && socCount == batteries {
+		p.BatSoC = socSum / float64(socCount)
+	} else {
+		p.Missing |= state.MissingSoC
+	}
+	// Numeric storage remains finite. The durable mask, never these placeholders,
+	// decides whether a chart or energy total is known.
+	p.ClearMissingValues()
+	targets := map[string]float64{}
 	for _, t := range ctrl.LastTargets {
 		targets[t.Driver] = t.TargetW
 	}
-	jsonBlob, _ := json.Marshal(map[string]any{
-		"drivers":                      perDriver,
-		"targets":                      targets,
-		"ev_w":                         evW,
-		"v2x_w":                        v2xW,
-		"load_house_w":                 loadW,
-		"forecast_measurement_quality": "complete_instantaneous_balance_v1",
-	})
-	return state.HistoryPoint{
-		TsMs: nowMs, GridW: gridW, PVW: pvW, BatW: batW, LoadW: loadW, BatSoC: avgSoC,
-		JSON: string(jsonBlob),
-	}, true
+	quality := "incomplete_measurement"
+	if balance.Valid {
+		quality = "complete_instantaneous_balance_v1"
+	}
+	blob, _ := json.Marshal(map[string]any{"drivers": perDriver, "targets": targets, "ev_w": p.Missing.Value(state.MissingEV, balance.EVW), "v2x_w": p.Missing.Value(state.MissingV2X, balance.V2XW), "load_house_w": p.LoadW, "forecast_measurement_quality": quality, "history_reason": balance.Reason})
+	p.JSON = string(blob)
+	return p, hasPower
 }
 
 func restoreLatestMPCDiagnostic(st *state.Store, svc *mpc.Service, now time.Time) {

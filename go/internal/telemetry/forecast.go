@@ -33,12 +33,21 @@ type ForecastOptions struct {
 	ExpectedFlows          []ForecastFlow
 	MaxAge                 time.Duration
 	MaxSkew                time.Duration
+	UseWatchdogTimeout     bool `json:",omitempty"`
 }
 
 // ForecastReading is one coherent snapshot, in site signs and raw watts.
 // Valid describes the household balance. PVValid only describes the PV sources.
 // Neither flag claims that the instantaneous sample covers a time interval.
+type ForecastSource struct {
+	Flow   ForecastFlow
+	PowerW *float64
+	SoC    *float64
+}
+
 type ForecastReading struct {
+	Known                                       map[DerType]bool
+	Sources                                     map[string]ForecastSource
 	At, Earliest, Latest, PVEarliest, PVLatest  time.Time
 	GridW, PVW, BatteryW, EVW, V2XW, HouseholdW float64
 	Valid, PVValid                              bool
@@ -68,8 +77,11 @@ func (s *Store) ForecastMeasurementNow(siteMeter string, opts ForecastOptions) F
 }
 
 func (s *Store) forecastMeasurementLocked(now time.Time, siteMeter string, opts ForecastOptions) ForecastReading {
-	out := ForecastReading{At: now, Valid: true, PVValid: true}
+	out := ForecastReading{At: now, Valid: true, PVValid: true, Known: map[DerType]bool{DerMeter: true, DerPV: true, DerBattery: true, DerEV: true, DerV2X: true}, Sources: map[string]ForecastSource{}}
 	if s == nil {
+		for kind := range out.Known {
+			out.Known[kind] = false
+		}
 		out.Valid = false
 		out.PVValid = false
 		out.Reason = "no_telemetry"
@@ -98,6 +110,9 @@ func (s *Store) forecastMeasurementLocked(now time.Time, siteMeter string, opts 
 		out.PVValid = false
 		out.PVReason = opts.PVInvalidReason
 	}
+	if opts.PVInvalidReason != "" || opts.HouseholdInvalidReason == "configured_pv_without_measurement_source" {
+		out.Known[DerPV] = false
+	}
 	if opts.HouseholdInvalidReason != "" {
 		fail(opts.HouseholdInvalidReason, false)
 	}
@@ -116,6 +131,7 @@ func (s *Store) forecastMeasurementLocked(now time.Time, siteMeter string, opts 
 		if f.FlowID != "" {
 			if old, ok := ids[f.FlowID]; ok {
 				fail("duplicate_flow:"+f.FlowID, f.DerType == DerPV || old.DerType == DerPV)
+				out.Known[f.DerType], out.Known[old.DerType] = false, false
 			}
 			ids[f.FlowID] = f
 		}
@@ -126,6 +142,7 @@ func (s *Store) forecastMeasurementLocked(now time.Time, siteMeter string, opts 
 		if f.DerType == DerEV {
 			if _, ok := flows[f.Driver+":"+DerV2X.String()]; ok {
 				fail("duplicate_charger:"+f.Driver, false)
+				out.Known[DerEV], out.Known[DerV2X] = false, false
 			}
 		}
 	}
@@ -143,6 +160,12 @@ func (s *Store) forecastMeasurementLocked(now time.Time, siteMeter string, opts 
 			pvCount++
 		}
 		r := s.readings[k]
+		source := ForecastSource{Flow: f}
+		out.Sources[k] = source
+		maxAge := opts.MaxAge
+		if opts.UseWatchdogTimeout && s.health[f.Driver] != nil && s.health[f.Driver].WatchdogTimeoutOverride > 0 {
+			maxAge = s.health[f.Driver].WatchdogTimeoutOverride
+		}
 		reason := ""
 		var powerW float64
 		var powerAt time.Time
@@ -167,7 +190,7 @@ func (s *Store) forecastMeasurementLocked(now time.Time, siteMeter string, opts 
 			reason = "unknown_power:"
 		case math.IsNaN(powerW) || math.IsInf(powerW, 0):
 			reason = "nonfinite:"
-		case powerAt.IsZero() || now.Sub(powerAt) > opts.MaxAge:
+		case powerAt.IsZero() || now.Sub(powerAt) > maxAge:
 			reason = "stale:"
 		case powerAt.After(now):
 			reason = "future:"
@@ -176,8 +199,15 @@ func (s *Store) forecastMeasurementLocked(now time.Time, siteMeter string, opts 
 		}
 		if reason != "" {
 			fail(reason+k, pv)
+			out.Known[f.DerType] = false
 			continue
 		}
+		source.PowerW = &powerW
+		if r.SoC != nil && !math.IsNaN(*r.SoC) && !math.IsInf(*r.SoC, 0) && *r.SoC >= 0 && *r.SoC <= 1 {
+			soc := *r.SoC
+			source.SoC = &soc
+		}
+		out.Sources[k] = source
 		if out.Earliest.IsZero() || powerAt.Before(out.Earliest) {
 			out.Earliest = powerAt
 		}
@@ -218,6 +248,11 @@ func (s *Store) forecastMeasurementLocked(now time.Time, siteMeter string, opts 
 	}
 	if math.IsNaN(out.PVW) || math.IsInf(out.PVW, 0) {
 		fail("nonfinite_pv_sum", true)
+	}
+	for kind, w := range map[DerType]float64{DerMeter: out.GridW, DerPV: out.PVW, DerBattery: out.BatteryW, DerEV: out.EVW, DerV2X: out.V2XW} {
+		if math.IsNaN(w) || math.IsInf(w, 0) {
+			out.Known[kind] = false
+		}
 	}
 	out.HouseholdW = out.GridW - out.PVW - out.BatteryW - out.EVW - out.V2XW
 	if math.IsNaN(out.HouseholdW) || math.IsInf(out.HouseholdW, 0) || out.HouseholdW < 0 {

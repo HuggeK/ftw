@@ -370,6 +370,9 @@ func (s *Store) RecordTickWithOptionalHistory(p *HistoryPoint, samples []Sample,
 // commit succeed and will never retry it again. Its current, possibly uncertain
 // commit retains its receipt until a later batch succeeds.
 func (s *Store) recordHistoryBatch(ctx context.Context, batchID, payloadHash string, p *HistoryPoint, samples []Sample, observations []EnergyObservation, acknowledgedSequence int64) (int64, error) {
+	if p != nil && p.Missing != 0 && !s.aggregateHistory.Load() {
+		return 0, errors.New("partial history requires aggregate storage")
+	}
 	if err := validateHistorySamples(samples); err != nil {
 		return 0, err
 	}

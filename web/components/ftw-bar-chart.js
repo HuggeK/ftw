@@ -255,6 +255,7 @@ class FtwBarChart extends FtwElement {
 
     let max = 0, sum = 0, count = 0;
     for (const d of this._data) {
+      if (d.value == null) continue;
       const v = Number(d.value) || 0;
       if (v > max) max = v;
       sum += v;
@@ -263,6 +264,7 @@ class FtwBarChart extends FtwElement {
     const avg = count > 0 ? sum / count : 0;
 
     const colsSvg = this._data.map((d) => {
+      if (d.value == null) return `<div class="col" title="${escapeHtml(d.title || "Unknown")}"><span class="val" style="bottom:0">?</span></div>`;
       const v = Number(d.value) || 0;
       // 2% floor keeps tiny-but-nonzero values visible; gate on v>0 so
       // truly-zero buckets render as empty columns, not 2% slivers.
