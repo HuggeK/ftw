@@ -58,7 +58,7 @@ assert_paths 'scripts/upgrade-paired-release.sh' \
 assert_paths 'scripts/test-upgrade-paired-release.sh' \
   'core=false' 'optimizer=false' 'web=false' 'drivers=false' 'compose=true'
 
-for path in deploy/docker/.dockerignore docs/native-beta.md docs/setup-guide/update-sv.md scripts/test_install_docs.py scripts/test-release-docker-context.sh; do
+for path in deploy/docker/.dockerignore docs/native-beta.md docs/setup-guide/update-sv.md scripts/test_install_docs.py scripts/test-release-docker-context.sh scripts/ftwctl.py scripts/test_ftwctl.py; do
   assert_paths "$path" \
     'core=false' 'optimizer=false' 'web=false' 'drivers=false' 'compose=true'
 done
