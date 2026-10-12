@@ -5,7 +5,9 @@ import (
 	"time"
 )
 
-func TestNextDailyUTC(t *testing.T) {
+// In UTC the household clock is the UTC minute, so a zero mask rolls
+// the stored minute to its next occurrence.
+func TestNextDeadlineUTC_InUTC(t *testing.T) {
 	base := time.Date(2026, 5, 10, 8, 0, 0, 0, time.UTC)
 	cases := []struct {
 		name  string
@@ -22,13 +24,13 @@ func TestNextDailyUTC(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := NextDailyUTC(c.now, c.min)
+			got := Schedule{SoC: 0.5, TimeOfDayMinUTC: c.min}.NextDeadlineUTC(c.now, time.UTC)
 			if got.Hour() != c.wantH || got.Day() != c.wantD {
-				t.Errorf("NextDailyUTC(%v,%d) = %v, want H=%d D=%d",
+				t.Errorf("NextDeadlineUTC(%v,%d) = %v, want H=%d D=%d",
 					c.now, c.min, got, c.wantH, c.wantD)
 			}
 			if !got.After(c.now) {
-				t.Errorf("NextDailyUTC must return time strictly after now; got %v <= %v",
+				t.Errorf("NextDeadlineUTC must return time strictly after now; got %v <= %v",
 					got, c.now)
 			}
 		})
@@ -63,7 +65,7 @@ func TestManager_SetGetClearSchedule(t *testing.T) {
 		t.Fatal("SetSchedule should succeed for known ID")
 	}
 	got, ok := m.GetSchedule("garage")
-	if !ok || got != s {
+	if !ok || got.withoutClock() != s {
 		t.Errorf("GetSchedule roundtrip mismatch: got %+v, want %+v", got, s)
 	}
 	if m.SetSchedule("nope", s) {
@@ -166,7 +168,7 @@ func TestManager_HydrateSchedules(t *testing.T) {
 		return Schedule{}, false
 	})
 	got, ok := m.GetSchedule("garage")
-	if !ok || got != want {
+	if !ok || got.withoutClock() != want {
 		t.Errorf("HydrateSchedules: got=%+v ok=%v want=%+v", got, ok, want)
 	}
 	if _, ok := m.GetSchedule("street"); ok {
@@ -225,7 +227,7 @@ func TestManager_LoadPreservesSchedule(t *testing.T) {
 	// Re-load (config hot reload): same id should keep its schedule.
 	m.Load([]Config{{ID: "garage", DriverName: "easee", MaxChargeW: 11000}})
 	got, ok := m.GetSchedule("garage")
-	if !ok || got != s {
+	if !ok || got.withoutClock() != s {
 		t.Errorf("Load should preserve schedule across reload; got=%+v ok=%v", got, ok)
 	}
 }

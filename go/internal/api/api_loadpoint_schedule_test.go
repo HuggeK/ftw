@@ -61,7 +61,7 @@ func TestScheduleStorageFailureKeepsGoalAndRetrySaves(t *testing.T) {
 				t.Fatalf("failed storage returned %d: %s", rr.Code, rr.Body.String())
 			}
 			after, _ := mgr.State("garage")
-			if after.Schedule != old || after.TargetSoC != before.TargetSoC || after.TargetTime != before.TargetTime {
+			if !sameGoal(t, after.Schedule, old) || after.TargetSoC != before.TargetSoC || after.TargetTime != before.TargetTime {
 				t.Fatalf("failed request changed the running goal: %+v", after)
 			}
 			if _, reason := svc.LastReplanInfo(); reason != "" {
@@ -84,7 +84,7 @@ func TestScheduleStorageFailureKeepsGoalAndRetrySaves(t *testing.T) {
 				if !saved.Empty() || !after.Schedule.Empty() || after.TargetSoC != 0 || !after.TargetTime.IsZero() {
 					t.Fatalf("retry failed to remove goal: saved=%+v state=%+v", saved, after)
 				}
-			} else if saved.SoC != .9 || after.Schedule != saved || after.TargetSoC != .9 || after.TargetTime.IsZero() {
+			} else if saved.SoC != .9 || !sameGoal(t, after.Schedule, saved) || after.TargetSoC != .9 || after.TargetTime.IsZero() {
 				t.Fatalf("retry did not apply the saved goal: saved=%+v state=%+v", saved, after)
 			}
 		})
@@ -154,7 +154,7 @@ func TestSchedulePutStoresRollsAndReplans(t *testing.T) {
 		t.Fatal("PUT did not store the schedule")
 	}
 	want := loadpoint.Schedule{SoC: 0.8, TimeOfDayMinUTC: 360, Recurring: true, Days: 31}
-	if got != want {
+	if !sameGoal(t, got, want) {
 		t.Fatalf("stored schedule = %+v, want %+v", got, want)
 	}
 
@@ -322,4 +322,19 @@ func TestVehicleLimitGoalCapabilityAndSchedule(t *testing.T) {
 	if rr.Code != 200 || st.FinishAtVehicleLimit || st.TargetSoC != .8 {
 		t.Fatal(rr.Code, st)
 	}
+}
+
+// sameGoal compares schedules as the API carries them. Core also keeps
+// the household clock, which the API does not send.
+func sameGoal(t *testing.T, a, b loadpoint.Schedule) bool {
+	t.Helper()
+	ja, err := json.Marshal(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jb, err := json.Marshal(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(ja) == string(jb)
 }

@@ -23,16 +23,20 @@ func stockholm(t *testing.T) *time.Location {
 	return loc
 }
 
-// A zero mask is exactly the pre-mask behaviour: NextDeadlineUTC and
-// NextDailyUTC agree on every case the old function was tested on,
-// and a stored schedule without the field decodes to that zero.
+// A zero mask is every day: within one offset the deadline is the
+// stored UTC minute's next occurrence, and a stored schedule without
+// the field decodes to that zero.
 func TestNextDeadlineUTC_ZeroMaskIsEveryDay(t *testing.T) {
 	loc := stockholm(t)
 	base := time.Date(2026, 5, 10, 8, 0, 0, 0, time.UTC)
 	for _, min := range []int{0, 360, 480, 600, 1439} {
 		s := Schedule{SoC: 0.8, TimeOfDayMinUTC: min}
-		if got, want := s.NextDeadlineUTC(base, loc), NextDailyUTC(base, min); !got.Equal(want) {
-			t.Errorf("zero mask, min=%d: got %v, want NextDailyUTC's %v", min, got, want)
+		want := time.Date(2026, 5, 10, min/60, min%60, 0, 0, time.UTC)
+		if !want.After(base) {
+			want = want.Add(24 * time.Hour)
+		}
+		if got := s.NextDeadlineUTC(base, loc); !got.Equal(want) {
+			t.Errorf("zero mask, min=%d: got %v, want %v", min, got, want)
 		}
 	}
 
@@ -101,12 +105,12 @@ func TestManager_RollSchedules_WeekdayMaskSkipsWeekend(t *testing.T) {
 	m := NewManager()
 	m.Load([]Config{{ID: "garage", DriverName: "easee"}})
 	m.SetLocation(stockholm(t))
+	// Friday 2026-05-15 19:00 UTC, past today's 06:00 slot.
+	now := time.Date(2026, 5, 15, 19, 0, 0, 0, time.UTC)
+	m.SetNowFn(func() time.Time { return now })
 	m.SetSchedule("garage", Schedule{
 		SoC: 0.8, TimeOfDayMinUTC: 360, Recurring: true, Days: maskMonToFri,
 	})
-
-	// Friday 2026-05-15 19:00 UTC, past today's 06:00 slot.
-	now := time.Date(2026, 5, 15, 19, 0, 0, 0, time.UTC)
 	m.RollSchedules(now)
 
 	st, _ := m.State("garage")
@@ -125,9 +129,9 @@ func TestManager_RollSchedules_ZeroMaskStillRollsDaily(t *testing.T) {
 	m := NewManager()
 	m.Load([]Config{{ID: "garage", DriverName: "easee"}})
 	m.SetLocation(stockholm(t))
-	m.SetSchedule("garage", Schedule{SoC: 0.8, TimeOfDayMinUTC: 360, Recurring: true})
-
 	now := time.Date(2026, 5, 15, 19, 0, 0, 0, time.UTC) // Friday evening
+	m.SetNowFn(func() time.Time { return now })
+	m.SetSchedule("garage", Schedule{SoC: 0.8, TimeOfDayMinUTC: 360, Recurring: true})
 	m.RollSchedules(now)
 
 	st, _ := m.State("garage")

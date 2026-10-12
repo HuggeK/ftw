@@ -20,13 +20,24 @@ type Schedule struct {
 	IntentID        string  `json:"intent_id,omitempty"`
 	FirstDeadlineMS int64   `json:"first_deadline_ms,omitempty"`
 	SoC             float64 `json:"soc"`
-	TimeOfDayMinUTC int     `json:"time_of_day_min_utc"` // 0..1439
-	Recurring       bool    `json:"recurring"`
+	// TimeOfDayMinUTC is the ready time as clients send and read it: the
+	// UTC minute of day (0..1439) of that time on today's date. Core keeps
+	// the household clock it stands for, so a DST change does not move
+	// the ready time, and answers with today's UTC minute.
+	TimeOfDayMinUTC int  `json:"time_of_day_min_utc"`
+	Recurring       bool `json:"recurring"`
 	// Days is an ISO weekday mask, Monday in bit 0. Zero is every day,
 	// which is what rows written before the field decode as. The bit
 	// is read in the box's zone, not UTC.
 	Days                uint8   `json:"days,omitempty"`
 	SurplusUnlockBatSoC float64 `json:"surplus_unlock_bat_soc,omitempty"`
+
+	// clock is the ready time in minutes after midnight on the household
+	// clock, the box's zone that Days is read in. clockSet is false until
+	// Core has read TimeOfDayMinUTC into it. state.db keeps it as
+	// time_of_day_min; the API does not send it.
+	clock    int
+	clockSet bool
 }
 
 // BatSoCUnlockHyst is the fraction gap between arm and release for the
@@ -66,6 +77,40 @@ func (s *Schedule) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+// MarshalStored is the state.db form: the API fields plus the household
+// clock as time_of_day_min. time_of_day_min_utc stays so that a rollback
+// to a Core without the clock still finds a ready time.
+func (s Schedule) MarshalStored() ([]byte, error) {
+	type fields Schedule
+	row := struct {
+		fields
+		Clock *int `json:"time_of_day_min,omitempty"`
+	}{fields: fields(s)}
+	if s.clockSet {
+		row.Clock = &s.clock
+	}
+	return json.Marshal(row)
+}
+
+// UnmarshalStored reads a state.db row. A row without time_of_day_min
+// predates the household clock; HydrateSchedules reads it on load.
+func UnmarshalStored(b []byte) (Schedule, error) {
+	var s Schedule
+	if err := json.Unmarshal(b, &s); err != nil {
+		return Schedule{}, err
+	}
+	var row struct {
+		Clock *int `json:"time_of_day_min"`
+	}
+	if err := json.Unmarshal(b, &row); err != nil {
+		return Schedule{}, err
+	}
+	if row.Clock != nil && *row.Clock >= 0 && *row.Clock < 1440 {
+		s.clock, s.clockSet = *row.Clock, true
+	}
+	return s, nil
+}
+
 // HasTarget is true when automatic dispatch must treat the plan as a
 // floor. Surplus may add to it and must not throttle it.
 func (s Schedule) HasTarget() bool { return s.SoC > 0 || s.FinishAtVehicleLimit }
@@ -75,43 +120,103 @@ func (s Schedule) HasTarget() bool { return s.SoC > 0 || s.FinishAtVehicleLimit 
 // schedule on disk is naturally GC'd when the operator clears it via
 // the API.
 func (s Schedule) Empty() bool {
-	return !s.FinishAtVehicleLimit && s.SoC == 0 && s.TimeOfDayMinUTC == 0 && !s.Recurring && s.SurplusUnlockBatSoC == 0
+	return !s.FinishAtVehicleLimit && s.SoC == 0 && s.TimeOfDayMinUTC == 0 && s.clock == 0 && !s.Recurring && s.SurplusUnlockBatSoC == 0
 }
 
-// NextDailyUTC is the next UTC time-of-day strictly after now.
-// minUTC is taken mod 1440.
-func NextDailyUTC(now time.Time, minUTC int) time.Time {
-	minUTC = ((minUTC % 1440) + 1440) % 1440
-	now = now.UTC()
-	today := time.Date(now.Year(), now.Month(), now.Day(),
-		minUTC/60, minUTC%60, 0, 0, time.UTC)
-	if !today.After(now) {
-		today = today.Add(24 * time.Hour)
+// readClock fixes the household clock from TimeOfDayMinUTC on now's
+// date, once, so that later DST changes leave the ready time alone.
+func (s *Schedule) readClock(now time.Time, loc *time.Location) {
+	if !s.clockSet {
+		s.clock, s.clockSet = clockFromUTC(now, s.TimeOfDayMinUTC, zone(loc)), true
 	}
-	return today
 }
 
-// NextDeadlineUTC is the next stored time-of-day on a day Days allows.
-// The weekday is the household's: a 00:30 Saturday in Stockholm is still
-// Friday in UTC. A zero mask is every day. nil loc is time.Local.
-// The clock stays in UTC minutes, so a DST change moves the wall time
-// by an hour until the operator saves again.
+// clockAt is the household clock of the ready time. A schedule Core has
+// not read yet takes TimeOfDayMinUTC on now's date.
+func (s Schedule) clockAt(now time.Time, loc *time.Location) int {
+	if s.clockSet {
+		return s.clock
+	}
+	return clockFromUTC(now, s.TimeOfDayMinUTC, loc)
+}
+
+// withoutClock is s as plain JSON carries it, for comparing a copy read
+// back from state.db with the goal in memory.
+func (s Schedule) withoutClock() Schedule {
+	s.clock, s.clockSet = 0, false
+	return s
+}
+
+// NextDeadlineUTC is the next time the household clock shows the ready
+// time, on a day Days allows, strictly after now. The clock and the
+// weekday are read in loc; nil is time.Local. A zero mask is every day.
 func (s Schedule) NextDeadlineUTC(now time.Time, loc *time.Location) time.Time {
-	next := NextDailyUTC(now, s.TimeOfDayMinUTC)
+	loc = zone(loc)
+	clock := s.clockAt(now, loc)
 	days := s.Days & 0x7F
-	if days == 0 {
-		return next
-	}
-	if loc == nil {
-		loc = time.Local
-	}
-	for range 7 {
+	y, mo, d := now.In(loc).Date()
+	// A non-zero mask allows one of any seven dates, so this ends.
+	for i := 0; ; i++ {
 		// time.Weekday counts Sunday=0; the mask counts Monday=0 (ISO).
-		iso := (int(next.In(loc).Weekday()) + 6) % 7
-		if days&(1<<iso) != 0 {
-			break
+		iso := (int(time.Date(y, mo, d+i, 12, 0, 0, 0, time.UTC).Weekday()) + 6) % 7
+		if days != 0 && days&(1<<iso) == 0 {
+			continue
 		}
-		next = next.Add(24 * time.Hour)
+		if t := wallClock(y, mo, d+i, clock, loc); t.After(now) {
+			return t.UTC()
+		}
 	}
-	return next
+}
+
+// wallClock is the first instant on the date y-mo-d at which the clock
+// in loc shows clock minutes or later. A time a DST change skips gives
+// the end of the skipped hour; a time it repeats gives the first one.
+// Either way the car is ready no later than the owner asked.
+func wallClock(y int, mo time.Month, d, clock int, loc *time.Location) time.Time {
+	t := time.Date(y, mo, d, clock/60, clock%60, 0, 0, loc)
+	start, end := t.ZoneBounds()
+	if got := t.Hour()*60 + t.Minute(); got != clock {
+		if got > clock {
+			return start
+		}
+		return end
+	}
+	_, offset := t.Zone()
+	_, before := start.Add(-time.Second).Zone()
+	if earlier := t.Add(-time.Duration(before-offset) * time.Second); before > offset && earlier.Before(start) {
+		return earlier
+	}
+	return t
+}
+
+// utcMinuteToday is the household clock as clients read it: the UTC
+// minute of day of that time on now's date in loc.
+func utcMinuteToday(now time.Time, clock int, loc *time.Location) int {
+	loc = zone(loc)
+	y, mo, d := now.In(loc).Date()
+	u := wallClock(y, mo, d, clock, loc).UTC()
+	return u.Hour()*60 + u.Minute()
+}
+
+// clockFromUTC reads a UTC minute of day the way clients make it: as the
+// time on now's date in loc that has that UTC minute. On the day a
+// repeated hour gives two such times, the first wins.
+func clockFromUTC(now time.Time, minUTC int, loc *time.Location) int {
+	minUTC = ((minUTC % 1440) + 1440) % 1440
+	y, mo, d := now.In(loc).Date()
+	start := wallClock(y, mo, d, 0, loc)
+	su := start.UTC()
+	t := time.Date(su.Year(), su.Month(), su.Day(), minUTC/60, minUTC%60, 0, 0, time.UTC)
+	if t.Before(start) {
+		t = t.Add(24 * time.Hour)
+	}
+	l := t.In(loc)
+	return l.Hour()*60 + l.Minute()
+}
+
+func zone(loc *time.Location) *time.Location {
+	if loc == nil {
+		return time.Local
+	}
+	return loc
 }

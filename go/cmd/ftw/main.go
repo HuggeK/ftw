@@ -870,25 +870,27 @@ func main() {
 		if s.Empty() {
 			return st.SaveConfig(key, "{}")
 		}
-		b, err := json.Marshal(s)
+		b, err := s.MarshalStored()
 		if err != nil {
 			return err
 		}
 		return st.SaveConfig(key, string(b))
 	})
-	lpMgr.HydrateSchedules(func(id string) (loadpoint.Schedule, bool) {
+	if err := lpMgr.HydrateSchedules(func(id string) (loadpoint.Schedule, bool) {
 		v, ok := st.LoadConfig(lpSchedKeyPrefix + id)
 		if !ok || v == "" || v == "{}" {
 			return loadpoint.Schedule{}, false
 		}
-		var s loadpoint.Schedule
-		if err := json.Unmarshal([]byte(v), &s); err != nil {
+		s, err := loadpoint.UnmarshalStored([]byte(v))
+		if err != nil {
 			slog.Warn("failed to parse persisted loadpoint schedule",
 				"lp", id, "err", err)
 			return loadpoint.Schedule{}, false
 		}
 		return s, !s.Empty()
-	})
+	}); err != nil {
+		slog.Warn("could not save ready time on the household clock; it is read again at next start", "err", err)
+	}
 	// Persist surplus_only toggles the same way schedules persist —
 	// state.config key `loadpoint_surplus_only:<id>` stores "true" or
 	// "false". Operators toggle this from the dashboard EV modal, not
