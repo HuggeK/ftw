@@ -34,6 +34,8 @@ const (
 
 var ensureBackupDiskSpace = state.EnsureDiskSpace
 
+var moveRestoreEntry = os.Rename
+
 // ComponentInventory records the independently versioned runtime that created
 // the backup. Driver artifacts themselves are also captured under data/.
 type ComponentInventory struct {
@@ -96,8 +98,9 @@ type Info struct {
 }
 
 type RestoreResult struct {
-	DataDir   string `json:"data_dir"`
-	SafetyDir string `json:"safety_dir,omitempty"`
+	DataDir        string `json:"data_dir"`
+	SafetyDir      string `json:"safety_dir,omitempty"`
+	SafetyComplete bool   `json:"safety_complete"`
 }
 
 // Inspect performs a full verification and returns stable archive metadata.
@@ -867,6 +870,9 @@ func RestoreContents(archivePath, dataDir string, now time.Time) (RestoreResult,
 	if !info.IsDir() {
 		return RestoreResult{}, fmt.Errorf("backup: restore target is not a directory: %s", dataDir)
 	}
+	if err := checkRestorePointsBeforeRestore(dataDir); err != nil {
+		return RestoreResult{}, err
+	}
 	manifest, err := verifyInWorkspace(archivePath, dataDir)
 	if err != nil {
 		return RestoreResult{}, err
@@ -900,27 +906,33 @@ func RestoreContents(archivePath, dataDir string, now time.Time) (RestoreResult,
 		_ = os.Remove(safetyDir)
 		return RestoreResult{}, err
 	}
+	if err := writeRestorePoint(safetyDir, current, false); err != nil {
+		return RestoreResult{}, fmt.Errorf("backup: record previous file list: %w", err)
+	}
 	movedCurrent := make([]string, 0, len(current))
 	for _, name := range current {
-		if err := os.Rename(filepath.Join(dataDir, name), filepath.Join(safetyDir, name)); err != nil {
-			rollbackErr := restoreMoveSet(safetyDir, dataDir, movedCurrent)
-			_ = os.Remove(safetyDir)
+		if err := moveRestoreEntry(filepath.Join(dataDir, name), filepath.Join(safetyDir, name)); err != nil {
+			rollbackErr := rollbackRestorePoint(safetyDir, dataDir, movedCurrent)
 			return RestoreResult{}, errors.Join(fmt.Errorf("backup: preserve current %s: %w", name, err), rollbackErr)
 		}
 		movedCurrent = append(movedCurrent, name)
 	}
+	if err := completeRestorePoint(dataDir, safetyDir, current); err != nil {
+		rollbackErr := rollbackRestorePoint(safetyDir, dataDir, movedCurrent)
+		return RestoreResult{}, errors.Join(fmt.Errorf("backup: confirm previous files: %w", err), rollbackErr)
+	}
 
 	restored, err := topLevelEntries(staging)
 	if err != nil {
-		rollbackErr := restoreMoveSet(safetyDir, dataDir, movedCurrent)
+		rollbackErr := rollbackRestorePoint(safetyDir, dataDir, movedCurrent)
 		return RestoreResult{}, errors.Join(err, rollbackErr)
 	}
 	activated := make([]string, 0, len(restored))
 	for _, name := range restored {
-		if err := os.Rename(filepath.Join(staging, name), filepath.Join(dataDir, name)); err != nil {
+		if err := moveRestoreEntry(filepath.Join(staging, name), filepath.Join(dataDir, name)); err != nil {
 			rollbackErr := errors.Join(
 				restoreMoveSet(dataDir, staging, activated),
-				restoreMoveSet(safetyDir, dataDir, movedCurrent),
+				rollbackRestorePoint(safetyDir, dataDir, movedCurrent),
 			)
 			return RestoreResult{}, errors.Join(fmt.Errorf("backup: activate restored %s: %w", name, err), rollbackErr)
 		}
@@ -929,12 +941,12 @@ func RestoreContents(archivePath, dataDir string, now time.Time) (RestoreResult,
 	if err := syncDir(dataDir); err != nil {
 		rollbackErr := errors.Join(
 			restoreMoveSet(dataDir, staging, activated),
-			restoreMoveSet(safetyDir, dataDir, movedCurrent),
+			rollbackRestorePoint(safetyDir, dataDir, movedCurrent),
 			syncDir(dataDir),
 		)
 		return RestoreResult{}, errors.Join(fmt.Errorf("backup: sync activated restore: %w", err), rollbackErr)
 	}
-	return RestoreResult{DataDir: dataDir, SafetyDir: safetyDir}, nil
+	return RestoreResult{DataDir: dataDir, SafetyDir: safetyDir, SafetyComplete: true}, nil
 }
 
 // RevertContents puts a RestoreContents safety directory back into service.
@@ -953,12 +965,16 @@ func RevertContents(dataDir, safetyDir string) (RestoreResult, error) {
 	if filepath.Dir(safetyDir) != dataDir || !strings.HasPrefix(filepath.Base(safetyDir), ".ftw-pre-restore-") {
 		return RestoreResult{}, errors.New("backup: safety directory is not a direct FTW restore point")
 	}
-	if info, statErr := os.Stat(safetyDir); statErr != nil || !info.IsDir() {
+	if info, statErr := os.Lstat(safetyDir); statErr != nil || !info.IsDir() {
 		if statErr != nil {
 			return RestoreResult{}, statErr
 		}
 		return RestoreResult{}, errors.New("backup: safety path is not a directory")
 	}
+	if err := verifyRestorePoint(safetyDir); err != nil {
+		return RestoreResult{}, err
+	}
+	currentComplete := currentRestoreStateComplete(dataDir)
 	rejected, err := os.MkdirTemp(dataDir, ".ftw-rejected-restore-")
 	if err != nil {
 		return RestoreResult{}, err
@@ -973,29 +989,48 @@ func RevertContents(dataDir, safetyDir string) (RestoreResult, error) {
 	if err != nil {
 		return RestoreResult{}, err
 	}
+	if err := writeRestorePoint(rejected, current, false); err != nil {
+		return RestoreResult{}, fmt.Errorf("backup: record rejected file list: %w", err)
+	}
+	// Retain moved data even if an error prevents rollback. A failed revert
+	// must never delete readings that are absent from the source archive.
+	keepRejected = true
 	movedCurrent := make([]string, 0, len(current))
 	for _, name := range current {
-		if err := os.Rename(filepath.Join(dataDir, name), filepath.Join(rejected, name)); err != nil {
-			rollbackErr := restoreMoveSet(rejected, dataDir, movedCurrent)
+		if err := moveRestoreEntry(filepath.Join(dataDir, name), filepath.Join(rejected, name)); err != nil {
+			rollbackErr := rollbackRestorePoint(rejected, dataDir, movedCurrent)
 			return RestoreResult{}, errors.Join(fmt.Errorf("backup: stage rejected %s: %w", name, err), rollbackErr)
 		}
 		movedCurrent = append(movedCurrent, name)
 	}
+	if err := errors.Join(syncDir(dataDir), syncDir(rejected)); err != nil {
+		rollbackErr := rollbackRestorePoint(rejected, dataDir, movedCurrent)
+		return RestoreResult{}, errors.Join(fmt.Errorf("backup: confirm rejected files: %w", err), rollbackErr)
+	}
+	if currentComplete {
+		if err := writeRestorePoint(rejected, current, true); err != nil {
+			rollbackErr := rollbackRestorePoint(rejected, dataDir, movedCurrent)
+			return RestoreResult{}, errors.Join(fmt.Errorf("backup: confirm rejected file list: %w", err), rollbackErr)
+		}
+	}
 	previous, err := topLevelEntries(safetyDir)
 	if err != nil {
-		rollbackErr := restoreMoveSet(rejected, dataDir, movedCurrent)
+		rollbackErr := rollbackRestorePoint(rejected, dataDir, movedCurrent)
 		return RestoreResult{}, errors.Join(err, rollbackErr)
 	}
 	restored := make([]string, 0, len(previous))
 	for _, name := range previous {
-		if err := os.Rename(filepath.Join(safetyDir, name), filepath.Join(dataDir, name)); err != nil {
-			rollbackErr := errors.Join(
-				restoreMoveSet(dataDir, safetyDir, restored),
-				restoreMoveSet(rejected, dataDir, movedCurrent),
-			)
+		if err := moveRestoreEntry(filepath.Join(safetyDir, name), filepath.Join(dataDir, name)); err != nil {
+			rollbackErr := restoreMoveSet(dataDir, safetyDir, restored)
+			if rollbackErr == nil {
+				rollbackErr = rollbackRestorePoint(rejected, dataDir, movedCurrent)
+			}
 			return RestoreResult{}, errors.Join(fmt.Errorf("backup: reactivate previous %s: %w", name, err), rollbackErr)
 		}
 		restored = append(restored, name)
+	}
+	if err := os.Remove(filepath.Join(safetyDir, restorePointFile)); err != nil {
+		return RestoreResult{DataDir: dataDir, SafetyDir: rejected}, fmt.Errorf("backup: previous data is active but rejected restore remains at %s: %w", rejected, err)
 	}
 	if err := os.Remove(safetyDir); err != nil {
 		keepRejected = true
@@ -1009,7 +1044,7 @@ func RevertContents(dataDir, safetyDir string) (RestoreResult, error) {
 	if err := syncDir(dataDir); err != nil {
 		return RestoreResult{}, err
 	}
-	return RestoreResult{DataDir: dataDir, SafetyDir: safetyDir}, nil
+	return RestoreResult{DataDir: dataDir, SafetyDir: safetyDir, SafetyComplete: currentComplete}, nil
 }
 
 func topLevelEntries(dir string, exclude ...string) ([]string, error) {
@@ -1035,7 +1070,7 @@ func topLevelEntries(dir string, exclude ...string) ([]string, error) {
 }
 
 func isRestoreInternalName(name string) bool {
-	return strings.HasPrefix(name, ".ftw-restore-stage-") ||
+	return name == restorePointFile || strings.HasPrefix(name, ".ftw-restore-stage-") ||
 		strings.HasPrefix(name, ".ftw-pre-restore-") ||
 		strings.HasPrefix(name, ".ftw-rejected-restore-")
 }
@@ -1043,7 +1078,7 @@ func isRestoreInternalName(name string) bool {
 func restoreMoveSet(fromDir, toDir string, names []string) error {
 	var result error
 	for i := len(names) - 1; i >= 0; i-- {
-		if err := os.Rename(filepath.Join(fromDir, names[i]), filepath.Join(toDir, names[i])); err != nil {
+		if err := moveRestoreEntry(filepath.Join(fromDir, names[i]), filepath.Join(toDir, names[i])); err != nil {
 			result = errors.Join(result, fmt.Errorf("backup: roll back move for %s: %w", names[i], err))
 		}
 	}

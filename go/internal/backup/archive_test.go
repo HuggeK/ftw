@@ -440,6 +440,15 @@ func TestRestoreContentsAndRevertPreserveBothStates(t *testing.T) {
 	if err != nil || string(got) != "generation: backup\n" {
 		t.Fatalf("rejected restore not retained = %q err=%v", got, err)
 	}
+	// The rejected state is itself a complete point, so another revert can
+	// switch back without accepting a stale list from the previous state.
+	if _, err := RevertContents(dataDir, reverted.SafetyDir); err != nil {
+		t.Fatal(err)
+	}
+	got, err = os.ReadFile(filepath.Join(dataDir, "config.yaml"))
+	if err != nil || string(got) != "generation: backup\n" {
+		t.Fatalf("second revert config = %q err=%v", got, err)
+	}
 }
 
 func writeTestFile(t *testing.T, filename, body string) {
