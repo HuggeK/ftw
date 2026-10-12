@@ -1349,11 +1349,11 @@
       ctx.stroke();
       ctx.setLineDash([]);
 
-      // Cache the right-most point for un-clipped pulse drawing
-      if (sr.width >= 2) {
+      });
+      // Only the current sample may pulse. Earlier segments remain still.
+      if (sr.width >= 2 && pts.length && sr.data.length === chartHistory.timestamps.length) {
         liveTips.push({ x: pts[pts.length - 1].x, y: pts[pts.length - 1].y, color: sr.color });
       }
-      });
     });
 
     // ---- Forward-looking forecast (dashed lines from plan) ----

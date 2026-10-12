@@ -31,3 +31,25 @@ test('daily view renders unknown home use and a measured grid total',()=>{
  assert.match(els['energy-history-insight'].innerHTML,/Incomplete measurements/);
  assert.doesNotMatch(els['energy-history-insight'].innerHTML,/%/);
 });
+
+function liveTipsFor(data, timestamps=data.map((_,i)=>i)) {
+ const noop=()=>{};
+ const ctx={createLinearGradient:()=>({addColorStop:noop}),beginPath:noop,moveTo:noop,lineTo:noop,closePath:noop,fill:noop,stroke:noop,setLineDash:noop};
+ const c={ctx,series:[{data,color:'#ef4444',width:2}],chartHistory:{timestamps},tsToX:x=>x,valToY:y=>y,pad:{top:0},plotH:100,hexAlpha:()=>''};
+ vm.createContext(c);
+ const start=app.indexOf('    var liveTips = [];');
+ const end=app.indexOf('    // ---- Forward-looking forecast',start);
+ assert.ok(start>=0 && end>start);
+ vm.runInContext(app.slice(start,end),c);
+ return Array.from(c.liveTips,tip=>({x:tip.x,y:tip.y}));
+}
+
+test('live chart pulses only the current segment after a measurement gap',()=>{
+ assert.deepEqual(liveTipsFor([100,200,null,300,400]),[{x:4,y:400}]);
+ assert.deepEqual(liveTipsFor([100,200,null,300]),[{x:3,y:300}]);
+});
+
+test('live chart leaves old endpoints quiet when the latest measurement is unknown',()=>{
+ assert.deepEqual(liveTipsFor([100,200,null,300,400,null]),[]);
+ assert.deepEqual(liveTipsFor([100,200],[0,1,2]),[]);
+});
