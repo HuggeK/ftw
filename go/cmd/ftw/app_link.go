@@ -17,6 +17,7 @@ import (
 	"github.com/srcfl/ftw/go/internal/config"
 	"github.com/srcfl/ftw/go/internal/control"
 	"github.com/srcfl/ftw/go/internal/loadpoint"
+	"github.com/srcfl/ftw/go/internal/localzone"
 	"github.com/srcfl/ftw/go/internal/mpc"
 	"github.com/srcfl/ftw/go/internal/notifications"
 	"github.com/srcfl/ftw/go/internal/prices"
@@ -170,6 +171,13 @@ type appBoxInfo struct {
 	id    string
 	build string
 	tz    string
+}
+
+// newAppBoxInfo names the box's own zone as the host sets it. The app renders
+// plan slot times in it, so a box in Stockholm and a phone abroad still agree
+// on when tonight's cheap hours are.
+func newAppBoxInfo(id, build string) appBoxInfo {
+	return appBoxInfo{id: id, build: build, tz: localzone.Name()}
 }
 
 func (a appBoxInfo) Identity() appproto.Identity {
@@ -522,16 +530,11 @@ func startAppLink(
 		return enroll, nil, false, nil
 	}
 
-	// The box's own zone, read from the host. The app renders plan slot times
-	// in it, so a box in Stockholm and a phone abroad still agree on when
-	// tonight's cheap hours are.
-	tz := time.Now().Location().String()
-
 	site := &appSite{
 		tel: tel, ctrl: ctrl, ctrlMu: ctrlMu, revision: revision,
 		started: processStarted, siteMeterStale: siteMeterStale,
 	}
-	info := appBoxInfo{id: boxID, build: build, tz: tz}
+	info := newAppBoxInfo(boxID, build)
 	modes := &appModes{ctrl: ctrl, ctrlMu: ctrlMu, state: st, mpc: planner, prefs: prefs}
 	plans := &appPlans{planner: planner, ctrl: ctrl, ctrlMu: ctrlMu}
 

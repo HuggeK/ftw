@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/srcfl/ftw/go/internal/localzone"
 	"github.com/srcfl/ftw/go/internal/state"
 )
 
@@ -121,7 +122,7 @@ func (s *Server) handleLoadResearchDump(w http.ResponseWriter, r *http.Request) 
 		"bucket_min":                      loadResearchBucketMin,
 		"excluded_dashboard_summary_rows": excluded,
 		"observation_policy":              "original site observations only; dashboard summaries are excluded",
-		"timezone":                        time.Local.String(),
+		"timezone":                        localzone.Name(),
 		"privacy":                         "no logs, no raw config, no hostnames, no driver names, no device identifiers",
 		"load_semantics":                  "house_load_w = max(grid_w - pv_w - bat_w - ev_w - v2x_w, 0); site convention: import/charge positive, PV/battery discharge/V2X discharge negative",
 		"contents": []string{

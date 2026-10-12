@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/srcfl/ftw/go/internal/config"
+	"github.com/srcfl/ftw/go/internal/localzone"
 	"github.com/srcfl/ftw/go/internal/savings"
 	"github.com/srcfl/ftw/go/internal/state"
 )
@@ -115,7 +116,7 @@ type savingsCacheT struct {
 //	              "actual_cost_ore": ..., "baseline_cost_ore": ..., "saved_ore": ...,
 //	              "expected_ms": ..., "history_covered_ms": ..., "priced_covered_ms": ...,
 //	              "history_coverage_pct": ..., "priced_coverage_pct": ... },
-//	  "tz": "Local", "value_scope": "site_total",
+//	  "tz": "Europe/Stockholm", "value_scope": "site_total",
 //	  "baseline": "no_pv_no_battery_vehicle_energy_at_daily_average"
 //	}
 //
@@ -162,7 +163,7 @@ func (s *Server) handleSavingsDaily(w http.ResponseWriter, r *http.Request) {
 	if zone == "" {
 		// No price provider configured → nothing to compare against.
 		writeJSON(w, 200, map[string]any{
-			"days": []any{}, "tz": time.Now().Location().String(),
+			"days": []any{}, "tz": localzone.Name(),
 			"value_scope": savingsValueScope, "baseline": savingsBaseline,
 		})
 		return
@@ -275,7 +276,7 @@ func (s *Server) handleSavingsDaily(w http.ResponseWriter, r *http.Request) {
 			"history_coverage_pct": boundedCoveragePct(tHistoryCoveredMs, tExpectedMs),
 			"priced_coverage_pct":  boundedCoveragePct(tPricedCoveredMs, tExpectedMs),
 		},
-		"tz":          loc.String(),
+		"tz":          localzone.Name(),
 		"value_scope": savingsValueScope,
 		"baseline":    savingsBaseline,
 	})
@@ -412,7 +413,7 @@ func (s *Server) writeLedgerSavings(w http.ResponseWriter, r *http.Request, days
 			"history_coverage_pct": boundedCoveragePct(tHist, tExpected),
 			"priced_coverage_pct":  boundedCoveragePct(tPrice, tExpected),
 		},
-		"tz": loc.String(), "value_scope": savingsValueScope, "baseline": savingsBaseline,
+		"tz": localzone.Name(), "value_scope": savingsValueScope, "baseline": savingsBaseline,
 		"baselines": []string{"no_pv_no_battery", "self_consumption"},
 	})
 	return true, nil

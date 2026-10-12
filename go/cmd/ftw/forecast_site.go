@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -16,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/srcfl/ftw/go/internal/config"
 	"github.com/srcfl/ftw/go/internal/drivers"
+	"github.com/srcfl/ftw/go/internal/localzone"
 	"github.com/srcfl/ftw/go/internal/state"
 	"github.com/srcfl/ftw/go/internal/telemetry"
 )
@@ -86,7 +85,7 @@ func (s *forecastSiteConfig) Snapshot() forecastSite {
 }
 
 func (s *forecastSiteConfig) Configure(cfg *config.Config, catalog []drivers.CatalogEntry) bool {
-	v := forecastSite{Meter: cfg.SiteMeterDriver(), Timezone: forecastTimezone(), Options: forecastMeasurementOptions(cfg, catalog), HistoryOptions: historyMeasurementOptions(cfg, catalog)}
+	v := forecastSite{Meter: cfg.SiteMeterDriver(), Timezone: localzone.Name(), Options: forecastMeasurementOptions(cfg, catalog), HistoryOptions: historyMeasurementOptions(cfg, catalog)}
 	if cfg.Weather != nil && cfg.Weather.Provider != "" && cfg.Weather.Provider != "none" {
 		v.Latitude, v.Longitude = cfg.Weather.Latitude, cfg.Weather.Longitude
 		v.HasLocation = !math.IsNaN(v.Latitude) && !math.IsNaN(v.Longitude) && math.Abs(v.Latitude) <= 90 && math.Abs(v.Longitude) <= 180
@@ -385,29 +384,6 @@ func forecastRatedPVW(w *config.Weather) float64 {
 		return w.PVRatedW
 	}
 	return 0
-}
-
-// Prefer the host's IANA name so persisted clock buckets retain DST rules.
-// UTC is valid when that is the box's configured timezone; never guess a country.
-func forecastTimezone() string {
-	candidates := []string{strings.TrimPrefix(os.Getenv("TZ"), ":"), time.Local.String()}
-	if target, err := filepath.EvalSymlinks("/etc/localtime"); err == nil {
-		if _, zone, ok := strings.Cut(target, "/zoneinfo/"); ok {
-			candidates = append(candidates, zone)
-		}
-	}
-	if data, err := os.ReadFile("/etc/timezone"); err == nil {
-		candidates = append(candidates, strings.TrimSpace(string(data)))
-	}
-	for _, zone := range candidates {
-		if zone == "" || zone == "Local" {
-			continue
-		}
-		if _, err := time.LoadLocation(zone); err == nil {
-			return zone
-		}
-	}
-	return "UTC"
 }
 
 func usableTrainingWeather(row state.ForecastPoint, now time.Time) bool {

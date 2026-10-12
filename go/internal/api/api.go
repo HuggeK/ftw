@@ -46,6 +46,7 @@ import (
 	"github.com/srcfl/ftw/go/internal/ha"
 	"github.com/srcfl/ftw/go/internal/loadmodel"
 	"github.com/srcfl/ftw/go/internal/loadpoint"
+	"github.com/srcfl/ftw/go/internal/localzone"
 	"github.com/srcfl/ftw/go/internal/mpc"
 	"github.com/srcfl/ftw/go/internal/notifications"
 	"github.com/srcfl/ftw/go/internal/ocpp"
@@ -2342,7 +2343,7 @@ func parseRange(s string) int64 {
 // Response: {"days": [{"day":"YYYY-MM-DD","import_wh":..., "export_wh":...,
 //
 //	"pv_wh":..., "bat_charged_wh":..., "bat_discharged_wh":...,
-//	"load_wh":...}], "tz": "Local"}
+//	"load_wh":...}], "tz": "Europe/Stockholm"}
 //
 // Buckets are local-day. Today is the last entry. Mirrors the integration
 // loop in handleStatus's energy-today block — same site convention, same
@@ -2435,7 +2436,7 @@ func (s *Server) handleEnergyDaily(w http.ResponseWriter, r *http.Request) {
 			"load_wh":           de.LoadWh,
 		})
 	}
-	writeJSON(w, 200, map[string]any{"days": out, "tz": loc.String()})
+	writeJSON(w, 200, map[string]any{"days": out, "tz": localzone.Name()})
 }
 
 // ---- /api/prices ----
