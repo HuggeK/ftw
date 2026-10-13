@@ -235,6 +235,20 @@ authorized cloud agent is an endpoint that can read the data the user grants
 it; do not describe that access as blind. The box keeps operating when the
 agent, MCP service or network is unavailable.
 
+FTW Cloud is such an endpoint. It is proposed in
+[ADR 0008](docs/adr/0008-ftw-cloud.md) and has not shipped. The iPhone app is
+the way into it, and it may become a paid service. When an owner turns it on,
+the box sends Sourceful a signed, readable copy of what the owner enabled, so
+the app starts fast and its alerts, widgets and Live Activities work while it
+is closed. FTW Cloud never sends control and never chooses which actions a
+user is offered; commands still go from the app to the box over the encrypted
+session. Statistics need their own consent, off by default. This turns away
+from [#1323](https://github.com/srcfl/ftw/issues/1323), which asks that no
+feature need a Sourceful service: the iPhone app needs FTW Cloud, while the
+box does not. A household that does not want FTW Cloud runs the box itself,
+updates included, and uses the box's own page, the webapp over the blind
+relay and ntfy.
+
 This document adds no new protocol operation, credential or access grant.
 New shared names belong in the contract registry and must ship with their
 validation and matching clients.

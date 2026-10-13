@@ -407,6 +407,12 @@ The properties that matter:
   and dispatch. An unavailable relay leaves local control and local recovery
   intact.
 
+Proposed, not shipped: [ADR 0008](adr/0008-ftw-cloud.md) adds FTW Cloud, a
+second outbound connection for homes whose owner turns it on. It carries to
+`cloud.ftw.energy` a signed, readable copy of what the owner enabled, and it
+never carries control. Commands and long history stay on the relay path above.
+[protocol-cloud.md](protocol-cloud.md) specifies its wire format.
+
 ### Who is let in, and as what
 
 An enrolment carries a role from `contract/registry.yaml`: `owner`, which may
