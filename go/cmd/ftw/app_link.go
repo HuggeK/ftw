@@ -519,6 +519,7 @@ func startAppLink(
 	siteMeterStale time.Duration,
 	gateway *lateAPI,
 	webPush *notifications.WebPush,
+	cloud *cloudSession,
 ) (*appenroll.Identity, *appuplink.Uplink, bool, error) {
 	enabled := cfg != nil && cfg.AppLink.On()
 
@@ -610,9 +611,12 @@ func startAppLink(
 				API:          gateway,
 				Caller:       caller,
 				Grants:       grants,
-				Caps:         caps,
-				Codec:        appuplink.Codec(),
-				Sender:       sender,
+				// FTW Cloud is asked per session: its link is bound after
+				// this returns, and its grant moves while the box runs.
+				Caps:   cloud.caps(caps),
+				Cloud:  cloud.info,
+				Codec:  appuplink.Codec(),
+				Sender: sender,
 				// The three frozen power fields point at the source whose
 				// freshness governs them. The site meter is the only one the
 				// box can name without knowing the site's hardware.

@@ -192,6 +192,9 @@ type Identity struct {
 	// randRead is the entropy source. Injectable so a test can prove the
 	// failure path instead of only the happy one.
 	randRead func([]byte) (int, error)
+	// onChange hears about every change to who is paired and what they
+	// may do, after it is saved. Not about lastSeen stamps.
+	onChange []func()
 }
 
 // appMeta is what the box remembers about one paired phone.
@@ -587,7 +590,9 @@ func (i *Identity) Authorise(appStatic, payload []byte) (Grant, error) {
 	i.pairing = nil
 	i.mu.Unlock()
 
-	return Grant{DeviceID: deviceID(key), Role: role, Epoch: firstEpoch}, i.save()
+	err := i.save()
+	i.changed()
+	return Grant{DeviceID: deviceID(key), Role: role, Epoch: firstEpoch}, err
 }
 
 // hasOwnerLocked reports whether any enrolment can still administer this box.
@@ -694,7 +699,9 @@ func (i *Identity) SetRole(id, role string) error {
 	meta.epoch++
 	i.mu.Unlock()
 
-	return i.save()
+	err := i.save()
+	i.changed()
+	return err
 }
 
 // Devices lists every paired phone, most recently seen first.
@@ -773,7 +780,9 @@ func (i *Identity) Revoke(id string, from Presence) ([]byte, error) {
 	delete(i.authorised, fullKey)
 	i.mu.Unlock()
 
-	if err := i.save(); err != nil {
+	err := i.save()
+	i.changed()
+	if err != nil {
 		return nil, err
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(fullKey)
@@ -783,6 +792,49 @@ func (i *Identity) Revoke(id string, from Presence) ([]byte, error) {
 		return nil, nil
 	}
 	return raw, nil
+}
+
+// RosterEntry is one paired phone with its whole key, for the roster the box
+// signs for FTW Cloud. The service learns devices from nothing else, and it
+// needs the key to recognise the phone's Noise handshake.
+type RosterEntry struct {
+	ID    string
+	Key   []byte
+	Role  string
+	Epoch uint64
+}
+
+// Roster lists every paired phone, sorted by id.
+func (i *Identity) Roster() []RosterEntry {
+	i.mu.Lock()
+	out := make([]RosterEntry, 0, len(i.authorised))
+	for key, meta := range i.authorised {
+		raw, err := base64.RawURLEncoding.DecodeString(key)
+		if err != nil {
+			continue
+		}
+		out = append(out, RosterEntry{ID: deviceID(key), Key: raw, Role: meta.role, Epoch: meta.epoch})
+	}
+	i.mu.Unlock()
+	sort.Slice(out, func(a, b int) bool { return out[a].ID < out[b].ID })
+	return out
+}
+
+// OnChange registers fn to run after a pairing, a role change or a revoke has
+// been saved. A reconnect's lastSeen stamp is not a change.
+func (i *Identity) OnChange(fn func()) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.onChange = append(i.onChange, fn)
+}
+
+func (i *Identity) changed() {
+	i.mu.Lock()
+	fns := append([]func(){}, i.onChange...)
+	i.mu.Unlock()
+	for _, fn := range fns {
+		fn()
+	}
 }
 
 // AuthorisedCount is for the API and for tests. The keys themselves stay here.

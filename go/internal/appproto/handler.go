@@ -68,6 +68,12 @@ type Config struct {
 	// silently hiding a feature in the app.
 	Caps []string
 
+	// Cloud answers hello_ok's FTW Cloud session information, or nil while
+	// FTW Cloud is off. Asked once per hello, for every role: a viewer reads
+	// FTW Cloud too and checks the box's signatures the same way. Nil on a
+	// box without the uplink.
+	Cloud func() *CloudSession
+
 	// Source ids for the three frozen power fields. The dictionary points
 	// each reading at one of these, which is how the app turns a number
 	// into a freshness claim.
@@ -373,11 +379,14 @@ func (h *Handler) onHello(env Envelope) error {
 
 	caps := h.cfg.Caps
 	hint := ""
+	var cloud *CloudSession
 	if proto == ProtoFloor {
 		// Floor mode speaks the frozen subset and nothing else. Advertising
 		// more would invite an app that cannot use it to try.
 		caps = []string{CapStatusCore}
 		hint = HintAppUpdate
+	} else if h.cfg.Cloud != nil {
+		cloud = h.cfg.Cloud()
 	}
 
 	source, syncedAtMs := h.cfg.Clock.Sync()
@@ -401,6 +410,7 @@ func (h *Handler) onHello(env Envelope) error {
 		Role:       h.cfg.Caller.Role,
 		Scopes:     h.cfg.Caller.Scopes.Names(),
 		Subscribed: fastSub,
+		Cloud:      cloud,
 	}
 
 	h.mu.Lock()

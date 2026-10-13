@@ -4,6 +4,7 @@ import (
 	"math"
 	"strconv"
 
+	"github.com/srcfl/ftw/go/internal/control"
 	"github.com/srcfl/ftw/go/internal/units"
 )
 
@@ -66,6 +67,13 @@ func wireSources(snap Snapshot, uptimeMs int64) map[string]SourceWire {
 		}
 	}
 	return out
+}
+
+// LiveView is the frozen fields and the graded source table exactly as a
+// session renders them. The FTW Cloud uplink sends the same numbers, so it
+// reads them here rather than computing a second set.
+func LiveView(snap Snapshot, uptimeMs int64) (map[string]int64, map[string]SourceWire) {
+	return fieldValues(snap, wireModes(control.ModeCatalog())), wireSources(snap, uptimeMs)
 }
 
 // modeIndex is field 1's value: the mode's position in the catalogue that

@@ -106,6 +106,7 @@ type (
 	ErrorBody        = protocol.ErrorBody
 	Event            = protocol.Event
 	SessionTerminate = protocol.SessionTerminate
+	CloudSession     = protocol.CloudSession
 )
 
 const (
@@ -213,6 +214,7 @@ const (
 	CapNetWebrtc          = protocol.CapNetWebrtc
 	CapPriceSpot          = protocol.CapPriceSpot
 	CapApiPassthrough     = protocol.CapApiPassthrough
+	CapCloudLink          = protocol.CapCloudLink
 	ScopeLiveRead         = protocol.ScopeLiveRead
 	ScopeHistoryRead      = protocol.ScopeHistoryRead
 	ScopePlanRead         = protocol.ScopePlanRead

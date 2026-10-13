@@ -347,6 +347,7 @@ func backupExtraBytes(sources []sourceEntry) (int64, error) {
 func collectSources(dataDir, statePath, outputDir string) ([]sourceEntry, error) {
 	stateRel, _ := filepath.Rel(dataDir, statePath)
 	cacheRel, _ := filepath.Rel(dataDir, filepath.Join(filepath.Dir(statePath), "cache.db"))
+	cloudKeyRel, _ := filepath.Rel(dataDir, filepath.Join(filepath.Dir(statePath), "cloud.key"))
 	outputRel, outputInside := filepath.Rel(dataDir, outputDir)
 	if outputInside != nil || outputRel == ".." || strings.HasPrefix(outputRel, ".."+string(filepath.Separator)) {
 		outputRel = ""
@@ -405,6 +406,12 @@ func collectSources(dataDir, statePath, outputDir string) ([]sourceEntry, error)
 		// The live cache.db is never copied; Create archives a consistent
 		// copy instead. Restore moves all of them aside anyway.
 		if strings.HasPrefix(rel, stateRel+".snapshot") || rel == cacheRel || strings.HasPrefix(rel, cacheRel+"-") {
+			return nil
+		}
+		// FTW Cloud's key never goes into a backup. A box restored elsewhere
+		// must not speak for the old box's home: its grant reads as off until
+		// an owner turns FTW Cloud on again, under a new home id.
+		if rel == cloudKeyRel || rel == cloudKeyRel+".tmp" {
 			return nil
 		}
 		info, err := d.Info()

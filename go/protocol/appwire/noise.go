@@ -496,6 +496,19 @@ func (h *HandshakeState) WriteMessage(payload []byte) ([]byte, error) {
 	return append(epub, encrypted...), nil
 }
 
+// RemoteStatic is the initiator's static key once ReadMessage has
+// authenticated it, and nil before. A responder that admits initiators by key,
+// as FTW Cloud admits phones by the box's roster, decides here, before
+// message 2 carries anything.
+func (h *HandshakeState) RemoteStatic() []byte {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.step == stepRead1 {
+		return nil
+	}
+	return append([]byte{}, h.rs...)
+}
+
 // Complete reports whether the pattern has run to its end.
 func (h *HandshakeState) Complete() bool {
 	h.mu.Lock()

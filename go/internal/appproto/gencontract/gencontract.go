@@ -53,6 +53,10 @@ type Registry struct {
 		Desc      string `yaml:"desc"`
 	} `yaml:"errors"`
 	SourceStates []string `yaml:"source_states"`
+	// CloudScopes and CloudPurposes bound what an owner can let the box share
+	// with FTW Cloud, and what for.
+	CloudScopes   []string `yaml:"cloud_scopes"`
+	CloudPurposes []string `yaml:"cloud_purposes"`
 	Resolutions  map[string]struct {
 		TileSpanMs    int64  `yaml:"tile_span_ms"`
 		RetentionDays int    `yaml:"retention_days"`
@@ -78,6 +82,7 @@ func Generate(raw []byte) ([]byte, error) {
 	writeFields(&b, reg)
 	writeCaps(&b, reg)
 	writeScopes(&b, reg)
+	writeCloud(&b, reg)
 	writeOps(&b, reg)
 	writeErrors(&b, reg)
 	writeSourceStates(&b, reg)
@@ -181,6 +186,32 @@ func writeScopes(b *bytes.Buffer, reg Registry) {
 			continue
 		}
 		fmt.Fprintf(b, "\tScope%s,\n", goName(strings.TrimPrefix(s.Name, "ftw.")))
+	}
+	b.WriteString("}\n\n")
+}
+
+// writeCloud emits what an FTW Cloud grant may name. The scopes are listed
+// by their constants, so a cloud scope the registry does not declare as a
+// scope fails to compile rather than being shared under a misspelled name.
+func writeCloud(b *bytes.Buffer, reg Registry) {
+	b.WriteString("// CloudScopes are the scopes an FTW Cloud grant may name.\n")
+	b.WriteString("var CloudScopes = []string{\n")
+	for _, s := range reg.CloudScopes {
+		fmt.Fprintf(b, "\tScope%s,\n", goName(strings.TrimPrefix(s, "ftw.")))
+	}
+	b.WriteString("}\n\n")
+
+	b.WriteString("// What an FTW Cloud grant lets the service use the data for.\n")
+	b.WriteString("const (\n")
+	for _, p := range reg.CloudPurposes {
+		fmt.Fprintf(b, "\tCloudPurpose%s = %q\n", goName(p), p)
+	}
+	b.WriteString(")\n\n")
+
+	b.WriteString("// CloudPurposes is every purpose an FTW Cloud grant may name.\n")
+	b.WriteString("var CloudPurposes = []string{\n")
+	for _, p := range reg.CloudPurposes {
+		fmt.Fprintf(b, "\tCloudPurpose%s,\n", goName(p))
 	}
 	b.WriteString("}\n\n")
 }

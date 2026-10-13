@@ -363,6 +363,13 @@ type loadpointRuntime struct {
 	sessionID                string
 	socRetention             string
 	completionNotified       bool
+	// goalRiskNotified latches charging.goal_at_risk once per plug-in.
+	// vehicleAnchored is true once the car itself reported a level this
+	// session; chargedSinceStart once it drew power in this process, so a
+	// restart beside a car that is already done says nothing.
+	goalRiskNotified  bool
+	vehicleAnchored   bool
+	chargedSinceStart bool
 	Config
 
 	pluggedIn            bool
@@ -771,6 +778,9 @@ func (m *Manager) observe(id string, pluggedIn bool, powerW, deliveredWh float64
 		lp.sessionPluginSoC = anchor
 		lp.socConfirmed = false
 		lp.completionNotified = false
+		lp.goalRiskNotified = false
+		lp.vehicleAnchored = false
+		lp.chargedSinceStart = false
 		lp.deliveredHistory = nil
 		lp.notRequestingSince = time.Time{}
 		lp.chargingDeclined = false
@@ -878,6 +888,17 @@ func (m *Manager) observe(id string, pluggedIn bool, powerW, deliveredWh float64
 	if pluggedIn {
 		lp.currentSoC = estimateSoC(lp.sessionPluginSoC,
 			deliveredWh, lp.VehicleCapacityWh)
+		if powerW >= DeliveringW {
+			lp.chargedSinceStart = true
+		}
+		// A car that reports nothing itself is done when the box's own
+		// estimate, from a level someone set, reaches the target. Said in
+		// kWh, which the box measured; the level is an estimate.
+		if !lp.completionNotified && !lp.vehicleAnchored && lp.socConfirmed && lp.chargedSinceStart &&
+			lp.targetSoC > 0 && lp.currentSoC >= lp.targetSoC && deliveredWh >= minCompletionWh {
+			lp.completionNotified = true
+			fired = append(fired, events.ChargingSessionComplete{LoadpointID: id, KWh: deliveredWh / 1000, At: now})
+		}
 	} else {
 		lp.currentSoC = 0
 	}
@@ -1140,6 +1161,7 @@ func (m *Manager) AnchorVehicleSoCAt(id string, socPct float64, observedAt time.
 		}
 	}
 	reanchorSoCAtLocked(lp, socPct, deliveredAt, m.now())
+	lp.vehicleAnchored = true
 	if lp.targetSoC > 0 && lp.currentSoC >= lp.targetSoC && !lp.completionNotified {
 		lp.completionNotified = true
 		completion = &events.ChargingSessionComplete{LoadpointID: id, KWh: lp.deliveredWhSession / 1000, At: m.now()}

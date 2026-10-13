@@ -68,6 +68,7 @@ import (
 	"github.com/srcfl/ftw/go/internal/selfupdate"
 	"github.com/srcfl/ftw/go/internal/state"
 	"github.com/srcfl/ftw/go/internal/telemetry"
+	"github.com/srcfl/ftw/go/protocol/cloudwire"
 )
 
 // Version gets injected at build time via -ldflags. Defaults to "dev" for
@@ -2423,10 +2424,12 @@ func main() {
 	// The app's window onto this box's own HTTP API. Handed to the uplink
 	// now and filled in below, once the API server exists.
 	appAPI := &lateAPI{}
+	// FTW Cloud as app sessions see it, bound below once the link exists.
+	appCloud := &cloudSession{}
 	appEnroll, appUplink, appLinkEnabled, appLinkErr := startAppLink(
 		ctx, cfg, identityKeyPath, boxID, Version,
 		st, tel, mpcSvc, lpMgr, lpController, priceSvc, ctrl, ctrlMu, plannerPrefs,
-		controlRev, appLinkWatchdog, appAPI, webPush,
+		controlRev, appLinkWatchdog, appAPI, webPush, appCloud,
 	)
 	switch {
 	case appLinkErr != nil:
@@ -2437,6 +2440,13 @@ func main() {
 	default:
 		slog.Info("app link disabled — set app_link.enabled to turn it on")
 	}
+
+	// FTW Cloud: a signed, readable copy of the house for the owner's phones,
+	// off until an owner turns it on. It reads; it never controls.
+	cloudNotify := &cloudNotices{}
+	cloudLink := startCloudLink(ctx, statePath, Version, st, appEnroll,
+		tel, ctrl, ctrlMu, controlRev, appLinkWatchdog, priceSvc, appAPI, cloudNotify)
+	appCloud.bind(cloudLink)
 
 	// The anonymous fleet ping: how many boxes, which versions, which drivers.
 	// Its separate relay HTTP door keeps daily totals; the encrypted app path
@@ -2471,6 +2481,7 @@ func main() {
 		BatteryIdentity: batteryIdentity,
 		AppEnroll:       appEnrollForAPI(appEnroll, appUplink, st, appLinkEnabled),
 		FleetPing:       fleetPinger,
+		Cloud:           cloudForAPI(cloudLink),
 		CfgMu:           cfgMu, Cfg: cfg, ConfigPath: *configPath,
 		ConfigApplier:       applyConfigChange,
 		DriverDir:           resolveDriverDir(),
@@ -2621,6 +2632,7 @@ func main() {
 		return amps, limitA, true
 	})
 	notifSvc.Subscribe(bus)
+	cloudNotify.svc.Store(notifSvc)
 	// Persist every dispatch to state.notification_log via a bus
 	// subscriber so the notifications package stays free of storage
 	// logic. The UI reads this table through /api/notifications/history.
@@ -2649,6 +2661,20 @@ func main() {
 		notifSvc.AddPublisher(webPush)
 		deps.WebPush = webPush
 	}
+	// FTW Cloud carries the catalogue's events to the owners' phones,
+	// signed, when the grant includes them. The publisher only queues.
+	if cloudLink != nil {
+		notifSvc.AddPublisher(notifications.CloudPublisher{Queue: cloudEventQueue(cloudLink)})
+	}
+	notifSvc.SetChargingFacts(func(id string) (notifications.ChargingFacts, bool) {
+		lp, ok := lpMgr.State(id)
+		if !ok {
+			return notifications.ChargingFacts{}, false
+		}
+		return notifications.ChargingFacts{
+			Plugged: lp.PluggedIn, LevelKnown: lp.PluggedIn && lp.SoCSource != "assumed", HasGoal: lp.TargetSoC > 0,
+		}, true
+	})
 	if appUplink != nil {
 		deps.PushResync = appUplink.ResyncDeadman
 	}
@@ -2765,6 +2791,7 @@ func main() {
 		select {
 		case <-sigc:
 			slog.Info("shutting down")
+			cloudLink.Bye(cloudwire.ByeShutdown, cloudByeWait)
 			markNativeCleanExit(nativeRoot)
 			flushHistoryOnStop(st)
 			if err := st.RecordEvent("shutdown"); err != nil {
@@ -2777,6 +2804,9 @@ func main() {
 			} else {
 				slog.Info("restart requested via API — exiting cleanly so the supervisor brings us back")
 			}
+			// A restart the box chose, an update among them: FTW Cloud holds
+			// back "box out of reach" until the box is back.
+			cloudLink.Bye(cloudwire.ByeUpdate, cloudByeWait)
 			markNativeCleanExit(nativeRoot)
 			flushHistoryOnStop(st)
 			if err := st.RecordEvent("restart"); err != nil {
@@ -3184,6 +3214,15 @@ func main() {
 							"lp", lp.ID, "prev_w", prev, "curr_w", curr)
 					}
 					evDrawPrev[lp.ID] = curr
+				}
+			}
+
+			// A car whose plan cannot make its goal: the loadpoint manager
+			// tells the household once per plug-in, from a plan that is
+			// neither being remade nor out of date.
+			if mpcSvc != nil {
+				if snap := mpcSvc.PlanSnapshot(); snap.Plan != nil && !snap.Pending && !snap.Outdated {
+					lpMgr.ObservePlanShortfall(snap.Plan.LoadpointShortfallWh, tickNow)
 				}
 			}
 

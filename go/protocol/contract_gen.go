@@ -79,6 +79,7 @@ const (
 	CapNetWebrtc       = "net.webrtc"
 	CapPriceSpot       = "price.spot"
 	CapApiPassthrough  = "api.passthrough"
+	CapCloudLink       = "cloud.link"
 )
 
 // AllCapabilities is every capability name the registry defines.
@@ -99,6 +100,7 @@ var AllCapabilities = []string{
 	CapNetWebrtc,
 	CapPriceSpot,
 	CapApiPassthrough,
+	CapCloudLink,
 }
 
 // Scopes are one object axis and two verb axes. Roles are a projection over
@@ -114,6 +116,8 @@ const (
 	ScopeHealthRead = "ftw.health.read"
 	// ScopeAssetsRead — Devices and their capabilities.
 	ScopeAssetsRead = "ftw.assets.read"
+	// ScopeEventsRead — Events behind notifications.
+	ScopeEventsRead = "ftw.events.read"
 	// ScopeDispatchWrite — Control energy assets.
 	ScopeDispatchWrite = "ftw.dispatch.write"
 	// ScopeModeWrite — Change site operating mode.
@@ -129,6 +133,27 @@ var WriteScopes = []string{
 	ScopeDispatchWrite,
 	ScopeModeWrite,
 	ScopeMembersWrite,
+}
+
+// CloudScopes are the scopes an FTW Cloud grant may name.
+var CloudScopes = []string{
+	ScopeLiveRead,
+	ScopeHistoryRead,
+	ScopePlanRead,
+	ScopeHealthRead,
+	ScopeEventsRead,
+}
+
+// What an FTW Cloud grant lets the service use the data for.
+const (
+	CloudPurposeServe = "serve"
+	CloudPurposeStats = "stats"
+)
+
+// CloudPurposes is every purpose an FTW Cloud grant may name.
+var CloudPurposes = []string{
+	CloudPurposeServe,
+	CloudPurposeStats,
 }
 
 // RegistryOps is the app's copy of the operations a cmd frame may name,

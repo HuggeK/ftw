@@ -657,3 +657,60 @@ func TestABoxCodeExpiresSoonerThanAScannedOne(t *testing.T) {
 		t.Fatalf("an expired box code was redeemed: %v", err)
 	}
 }
+
+// --------------------------------------------------------------------------
+// The roster FTW Cloud learns devices from
+// --------------------------------------------------------------------------
+
+// Every change to who is paired, and as what, is heard about after it is
+// saved; a reconnect's lastSeen stamp is not. The roster carries whole keys,
+// roles and epochs, because the service has nothing else to go on.
+func TestRosterChangesAreHeardAndStampsAreNot(t *testing.T) {
+	id, _ := newIdentity(t)
+	changes := 0
+	id.OnChange(func() { changes++ })
+
+	owner := pair(t, id, apiauth.RoleOwner)
+	viewerKey := appKey(t)
+	code, _, _ := id.MintPairingCode(apiauth.RoleViewer, InviteTTL)
+	viewer, err := id.Authorise(viewerKey, code)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changes != 2 {
+		t.Fatalf("two pairings made %d changes", changes)
+	}
+
+	if _, err := id.Authorise(viewerKey, nil); err != nil {
+		t.Fatal(err)
+	}
+	if changes != 2 {
+		t.Fatal("a reconnect counted as a roster change")
+	}
+
+	roster := id.Roster()
+	if len(roster) != 2 {
+		t.Fatalf("roster %+v", roster)
+	}
+	for _, r := range roster {
+		if r.ID == viewer.DeviceID && (r.Role != apiauth.RoleViewer || string(r.Key) != string(viewerKey) || r.Epoch != 1) {
+			t.Fatalf("viewer entry %+v", r)
+		}
+	}
+
+	if err := id.SetRole(viewer.DeviceID, apiauth.RoleOwner); err != nil {
+		t.Fatal(err)
+	}
+	if err := id.SetRole(viewer.DeviceID, apiauth.RoleOwner); err != nil {
+		t.Fatal(err)
+	}
+	if changes != 3 {
+		t.Fatalf("one real role change made %d changes in all", changes)
+	}
+	if _, err := id.Revoke(owner.DeviceID, AtTheBox); err != nil {
+		t.Fatal(err)
+	}
+	if changes != 4 || len(id.Roster()) != 1 {
+		t.Fatalf("revoke: %d changes, roster %+v", changes, id.Roster())
+	}
+}

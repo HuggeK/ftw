@@ -136,6 +136,30 @@ type HelloOK struct {
 	// Subscribed says the optional subscription carried by Hello was accepted.
 	// False also covers an older box, where this additive field is absent.
 	Subscribed bool `cbor:"subscribed,omitempty"`
+	// Cloud is what the phone needs to read this home from FTW Cloud. Every
+	// role gets it, and only while an owner has FTW Cloud on. Absent means
+	// off, or an older box.
+	Cloud *CloudSession `cbor:"cloud,omitempty"`
+}
+
+// CloudSession lets a phone check and read what FTW Cloud serves it. It comes
+// from the box over Noise and never from the service, so the service cannot
+// sign for the box, swap its key or rename a source.
+type CloudSession struct {
+	// PK is the box's FTW Cloud public key, the 65-byte uncompressed P-256
+	// point. Every box envelope from the service verifies with it.
+	PK []byte `cbor:"pk"`
+	// Home is the home id at the service, cut from PK.
+	Home string `cbor:"home"`
+	// Boot is the uplink's current 16-byte boot id. With hello_ok's
+	// clock.uptimeMs it anchors the times in box envelopes: both count from
+	// the same process start.
+	Boot []byte `cbor:"boot"`
+	// Sources maps each opaque source id to its source id in this protocol,
+	// the driver name.
+	Sources map[string]string `cbor:"sources"`
+	// Loadpoints maps each opaque loadpoint id to the loadpoint id.
+	Loadpoints map[string]string `cbor:"loadpoints"`
 }
 
 // HintAppUpdate tells the app it is behind. It is a hint, not an error: the

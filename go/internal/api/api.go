@@ -108,6 +108,10 @@ type Deps struct {
 	// embeddings; GET /api/fleet-ping then says so.
 	FleetPing *fleetping.Pinger
 
+	// Cloud is the box's FTW Cloud grant and uplink. Nil in tests and
+	// minimal embeddings; the /api/cloud routes then say it is unavailable.
+	Cloud CloudGrant
+
 	CfgMu         *sync.RWMutex
 	Cfg           *config.Config
 	ConfigPath    string
@@ -424,6 +428,7 @@ func (s *Server) routes() {
 	s.handle("DELETE /api/app-link/devices/{id}", Configure, s.handleAppLinkDeviceRevoke)
 	s.handle("PATCH  /api/app-link/devices/{id}", Configure, s.handleAppLinkDeviceRole)
 	s.handle("GET  /api/fleet-ping", Read, s.handleFleetPing)
+	s.cloudRoutes()
 	s.handle("POST /api/mode", Actuate, s.handleSetMode, Via(appproto.OpSetMode))
 	s.handle("GET  /api/planner/prefs", Read, s.handleGetPlannerPrefs)
 	s.handle("POST /api/planner/prefs", Actuate, s.handleSetPlannerPrefs, Via(appproto.OpPlannerPrefsSet))

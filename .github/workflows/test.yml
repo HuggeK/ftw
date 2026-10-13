@@ -108,6 +108,10 @@ jobs:
           go test -count=1 ./...
       - name: Protocol module imports nothing from the box
         run: bash .github/scripts/check-protocol-boundary.sh go/protocol
+      # FTW Cloud reads and never controls. The uplink's build graph says so:
+      # it reaches no control, API or loadpoint code.
+      - name: FTW Cloud uplink imports nothing that controls
+        run: bash .github/scripts/check-cloudlink-imports.sh go
 
   web:
     name: web

@@ -10,11 +10,14 @@ const PushCatalogueVersion = 1
 const (
 	PushChargingConnected       = "charging.connected"
 	PushChargingSessionComplete = "charging.session_complete"
+	PushChargingGoalAtRisk      = "charging.goal_at_risk"
 	PushChargingInterrupted     = "charging.interrupted"
 	PushUpdateInstalled         = "update.installed"
 	PushDriverOffline           = "driver.offline"
 	PushFuseOverLimit           = "fuse.over_limit"
 	PushBoxUnreachable          = "box.unreachable"
+	PushCloudGranted            = "cloud.granted"
+	PushCloudRevoked            = "cloud.revoked"
 )
 
 // PushSentence is one lock-screen sentence, exactly as the app wrote it.
@@ -28,9 +31,12 @@ type PushSentence struct {
 var PushSentences = map[string]PushSentence{
 	PushChargingConnected:       {Title: "Car plugged in", Body: "Open to see charging status, check the battery level and set a ready time."},
 	PushChargingSessionComplete: {Title: "Car charged", Body: "{kwh} kWh delivered — ready to go."},
+	PushChargingGoalAtRisk:      {Title: "The car may not be ready", Body: "It will not reach {target} % by {by} at this pace."},
 	PushChargingInterrupted:     {Title: "Charging stopped early", Body: "The car stopped charging before it was done."},
 	PushUpdateInstalled:         {Title: "Your box updated itself", Body: "Now running {version}. Everything came back on its own."},
 	PushDriverOffline:           {Title: "A device went quiet", Body: "{name} stopped answering."},
 	PushFuseOverLimit:           {Title: "The house is drawing too much", Body: "{phase} is over the fuse rating."},
 	PushBoxUnreachable:          {Title: "Your box is out of reach", Body: "It stopped answering. Power cut, or the internet at home is down."},
+	PushCloudGranted:            {Title: "FTW Cloud is on", Body: "Your box now shares a copy of its readings with FTW Cloud. You can turn it off in the app or on the box."},
+	PushCloudRevoked:            {Title: "FTW Cloud is off", Body: "Your box stopped sharing with FTW Cloud and asked it to delete its copy."},
 }

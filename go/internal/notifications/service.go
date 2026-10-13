@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -97,12 +98,21 @@ func DefaultRules() []config.NotificationRule {
 		{Type: PushChargingConnected, Enabled: false, Priority: 3, CooldownS: 60},
 		{Type: PushChargingSessionComplete, Enabled: false, Priority: 3},
 		{Type: PushChargingInterrupted, Enabled: false, Priority: 4, CooldownS: 3600},
+		// Once per plug-in, only when the box knows the car's level and the
+		// plan cannot make the goal: rare, and the moment to act.
+		{Type: PushChargingGoalAtRisk, Enabled: false, Priority: 4},
 		{Type: PushUpdateInstalled, Enabled: false, Priority: 2},
 		// Phone lock-screen counterparts of the operator rules above.
 		// Same thresholds so a blip or a kettle is not a notification;
 		// the sentences come from the catalogue, never from templates.
 		{Type: PushDriverOffline, Enabled: false, ThresholdS: DefaultThresholdS, Priority: 4, CooldownS: DefaultCooldownS},
 		{Type: PushFuseOverLimit, Enabled: false, ThresholdS: 30, Priority: 5, CooldownS: 900},
+		// FTW Cloud on or off. The only rules on by default: each says the
+		// house has started or stopped sending a readable copy of itself to
+		// a Sourceful service, and every owner should hear that without
+		// having opted in first. An owner may still turn them off.
+		{Type: PushCloudGranted, Enabled: true, Priority: 3},
+		{Type: PushCloudRevoked, Enabled: true, Priority: 3},
 	}
 }
 
@@ -116,7 +126,8 @@ func KnownRuleTypes() []string {
 		EventDriverOffline, EventDriverRecovered, EventUpdateAvailable,
 		EventFuseOverLimit, EventConcurrentDriversOffline,
 		PushChargingConnected, PushChargingSessionComplete, PushChargingInterrupted,
-		PushUpdateInstalled, PushDriverOffline, PushFuseOverLimit,
+		PushChargingGoalAtRisk, PushUpdateInstalled, PushDriverOffline, PushFuseOverLimit,
+		PushCloudGranted, PushCloudRevoked,
 	}
 }
 
@@ -138,6 +149,14 @@ type Message struct {
 	Body        string
 	Priority    int
 	Tags        []string
+	// Args are the catalogue's placeholders, for a transport whose phones
+	// write their own words, as FTW Cloud's do. Nil for template rules.
+	Args map[string]string
+	// Device is the driver the event concerns, for a transport that names
+	// it some other way than by its name.
+	Device string
+	// At is when the event happened.
+	At time.Time
 }
 
 // Publisher dispatches a rendered Message to its transport.
@@ -254,6 +273,10 @@ type Service struct {
 	sent            uint64
 	failed          uint64
 	now             func() time.Time
+	// charging answers what the plug-in rule needs to know about a
+	// loadpoint; connectedSettle is how long it waits before asking.
+	charging        func(loadpointID string) (ChargingFacts, bool)
+	connectedSettle time.Duration
 }
 
 // New constructs a Service. cfg may be nil (no-op until Reload is called).
@@ -267,6 +290,7 @@ func New(cfg *config.Notifications, pub Publisher, lookup DeviceLookup) *Service
 		activeAlert:     map[string]bool{},
 		fuseFirstOverAt: map[string]time.Time{},
 		now:             time.Now,
+		connectedSettle: ConnectedSettle,
 	}
 }
 
@@ -391,7 +415,15 @@ func (s *Service) Subscribe(bus *events.Bus) {
 	// cooldown. Words come from the catalogue and nowhere else.
 	bus.Subscribe(events.KindChargingConnected, func(e events.Event) {
 		if ev, ok := e.(events.ChargingConnected); ok {
-			go s.handleCatalogued(PushChargingConnected, ev.LoadpointID, nil)
+			go s.handleConnected(ev.LoadpointID)
+		}
+	})
+	bus.Subscribe(events.KindChargingGoalAtRisk, func(e events.Event) {
+		if ev, ok := e.(events.ChargingGoalAtRisk); ok {
+			go s.handleCatalogued(PushChargingGoalAtRisk, ev.LoadpointID, map[string]string{
+				"target": strconv.Itoa(int(math.Round(ev.TargetSoC * 100))),
+				"by":     ev.ByClock,
+			})
 		}
 	})
 	bus.Subscribe(events.KindChargingSessionComplete, func(e events.Event) {
@@ -470,6 +502,8 @@ func (s *Service) handleCatalogued(kind, device string, args map[string]string) 
 		Body:     body,
 		Priority: prio,
 		Tags:     splitTags(rule.Tags),
+		Args:     args,
+		At:       now,
 	})
 }
 
@@ -867,19 +901,7 @@ func (s *Service) SendTest() error {
 		Body:     fmt.Sprintf("Test notification sent at %s.", time.Now().UTC().Format(time.RFC3339)),
 		Priority: prio,
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	var sent int
-	var errs []error
-	for _, pub := range pubs {
-		switch err := pub.Publish(ctx, msg); {
-		case err == nil:
-			sent++
-		case errors.Is(err, ErrNothingToSend):
-		default:
-			errs = append(errs, err)
-		}
-	}
+	sent, errs := publishAll(pubs, msg)
 	var err error
 	if sent == 0 {
 		if len(errs) > 0 {
@@ -946,7 +968,8 @@ func (s *Service) buildData(driver, eventType string, since time.Duration, now t
 }
 
 func (s *Service) dispatchCatalogue(cfg *config.Notifications, rule config.NotificationRule, data templateData) {
-	title, body, err := RenderPush(rule.Type, catalogueArgs(rule.Type, data))
+	args := catalogueArgs(rule.Type, data)
+	title, body, err := RenderPush(rule.Type, args)
 	if err != nil {
 		slog.Warn("notifications: catalogue render failed", "event", rule.Type, "err", err)
 		s.bumpFailed()
@@ -958,10 +981,14 @@ func (s *Service) dispatchCatalogue(cfg *config.Notifications, rule config.Notif
 		prio = cfg.DefaultPriority
 	}
 	s.deliver(rule.Type, data.Device, Message{
+		Kind:     rule.Type,
 		Title:    title,
 		Body:     body,
 		Priority: prio,
 		Tags:     splitTags(rule.Tags),
+		Args:     args,
+		Device:   data.Device,
+		At:       s.now(),
 	})
 }
 
@@ -1033,22 +1060,7 @@ func (s *Service) dispatch(cfg *config.Notifications, rule config.NotificationRu
 // enabled with no provider installed — and stays a truthful failure in the
 // history rather than a panic or a silence.
 func (s *Service) deliver(eventType, device string, msg Message) {
-	pubs := s.publishers()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	var sent int
-	var errs []error
-	for _, pub := range pubs {
-		switch err := pub.Publish(ctx, msg); {
-		case err == nil:
-			sent++
-		case errors.Is(err, ErrNothingToSend):
-			// Absence, not failure.
-		default:
-			errs = append(errs, err)
-		}
-	}
+	sent, errs := publishAll(s.publishers(), msg)
 	switch {
 	case sent > 0:
 		if len(errs) > 0 {
@@ -1067,6 +1079,35 @@ func (s *Service) deliver(eventType, device string, msg Message) {
 		s.bumpFailed()
 		s.emitDispatched(eventType, device, msg, "failed", "no publisher installed")
 	}
+}
+
+// PublishTimeout bounds one transport's Publish. Each transport has its own,
+// and they run side by side, so a gateway that hangs costs only itself.
+const PublishTimeout = 10 * time.Second
+
+// publishAll hands msg to every transport at once, each under its own
+// timeout, and counts the outcome. ErrNothingToSend is absence, not failure.
+func publishAll(pubs []Publisher, msg Message) (sent int, errs []error) {
+	results := make([]error, len(pubs))
+	var wg sync.WaitGroup
+	for i, pub := range pubs {
+		wg.Go(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), PublishTimeout)
+			defer cancel()
+			results[i] = pub.Publish(ctx, msg)
+		})
+	}
+	wg.Wait()
+	for _, err := range results {
+		switch {
+		case err == nil:
+			sent++
+		case errors.Is(err, ErrNothingToSend):
+		default:
+			errs = append(errs, err)
+		}
+	}
+	return sent, errs
 }
 
 // emitDispatched publishes a NotificationDispatched event for history

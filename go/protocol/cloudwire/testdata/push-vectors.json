@@ -1,0 +1,257 @@
+{
+  "keys": [
+    {
+      "home": "fjzyr67buzpyncqmjliwgezvde",
+      "pk": "04cd7a7c09b7c1fed854fcba642c1da25b48df5bf3208c67bcc2158374011e8c84bf6490130896243c527842441c170a64252874fdf719aa61444e329fe6bc02b8"
+    },
+    {
+      "home": "t3w5bfotxeygcjxjdhjaeo6pvq",
+      "pk": "04003ed3e19bde3ad2abbe687ce92a9d63cfacd49cb4bace9903c3ee95093700804081439d960c07e29171ab20fdaf94c603d87e4669f961d7a227e8d8616111f9"
+    }
+  ],
+  "cases": [
+    {
+      "name": "connected, fresh",
+      "payload": "{\"aps\":{\"alert\":{\"title-loc-key\":\"push.title\",\"loc-key\":\"push.generic\"},\"mutable-content\":1,\"sound\":\"default\"},\"ftw\":{\"v\":1,\"home\":\"fjzyr67buzpyncqmjliwgezvde\",\"event\":\"o2FiWKarYmxwa2ozSFpPUk5DV0hzYnRzGwAAAaEw18loY3NlcQljc3Jja0RVWVdXUW1uLVhnZGFyZ3OgZGJvb3RQsLCwsLCwsLCwsLCwsLCwsGRraW5kcmNoYXJnaW5nLmNvbm5lY3RlZGZ3YWxsTXMbAAABoTDXyvhnZXZlbnRJZGxRMlpyTWpSMGR6Vmhoc2V2ZXJpdHlkaW5mb2h1cHRpbWVNcxoAARVYYXRlZXZlbnRjc2lnWEABMIFtaHgkzfeMrtApu30UgdXtawe2kzcX4lBlhZ9yVOdjZkXlCSoSUrd2nHXDYI4pClpW4ReFKP/H9mqucV2H\"}}",
+      "sig": "0130816d687824cdf78caed029bb7d1481d5ed6b07b6933717e25065859f7254e7636645e5092a1252b7769c75c3608e290a5a56e1178528ffc7f66aae715d87",
+      "nowMs": 1791820812200,
+      "want": {
+        "verdict": "event",
+        "home": "fjzyr67buzpyncqmjliwgezvde",
+        "kind": "charging.connected",
+        "src": "DUYWWQmn-Xg",
+        "lp": "j3HZORNCWHs",
+        "boot": "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
+        "seq": 9,
+        "atMs": 1791820810600
+      }
+    },
+    {
+      "name": "interrupted, fresh",
+      "payload": "{\"aps\":{\"alert\":{\"title-loc-key\":\"push.title\",\"loc-key\":\"push.generic\"},\"mutable-content\":1,\"sound\":\"default\"},\"ftw\":{\"v\":1,\"home\":\"fjzyr67buzpyncqmjliwgezvde\",\"event\":\"o2FiWKurYmxwa2ozSFpPUk5DV0hzYnRzGwAAAaEw1820Y3NlcQpjc3Jja0RVWVdXUW1uLVhnZGFyZ3OgZGJvb3RQsLCwsLCwsLCwsLCwsLCwsGRraW5kdGNoYXJnaW5nLmludGVycnVwdGVkZndhbGxNcxsAAAGhMNfO4GdldmVudElkbGFXNTBjbkIwWkRBeGhzZXZlcml0eWd3YXJuaW5naHVwdGltZU1zGgABGUBhdGVldmVudGNzaWdYQKJwjC0k3f6XPDpapuR7NTwgus1FBgURGLD5DSpoTIsFWtfQ2iow7T1MWUHBPcWxPna0WQUCzpdkh5EcsZQULTs=\"}}",
+      "sig": "a2708c2d24ddfe973c3a5aa6e47b353c20bacd4506051118b0f90d2a684c8b055ad7d0da2a30ed3d4c5941c13dc5b13e76b4590502ce976487911cb194142d3b",
+      "nowMs": 1791820813200,
+      "want": {
+        "verdict": "event",
+        "home": "fjzyr67buzpyncqmjliwgezvde",
+        "kind": "charging.interrupted",
+        "src": "DUYWWQmn-Xg",
+        "lp": "j3HZORNCWHs",
+        "boot": "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
+        "seq": 10,
+        "atMs": 1791820811700
+      }
+    },
+    {
+      "name": "goal at risk, fresh",
+      "payload": "{\"aps\":{\"alert\":{\"title-loc-key\":\"push.title\",\"loc-key\":\"push.generic\"},\"mutable-content\":1,\"sound\":\"default\"},\"ftw\":{\"v\":1,\"home\":\"fjzyr67buzpyncqmjliwgezvde\",\"event\":\"o2FiWK+qYmxwa2ozSFpPUk5DV0hzYnRzGwAAAaEw19ZMY3NlcQ9kYXJnc6JiYnllMDc6MDBmdGFyZ2V0YjgwZGJvb3RQsLCwsLCwsLCwsLCwsLCwsGRraW5kdWNoYXJnaW5nLmdvYWxfYXRfcmlza2Z3YWxsTXMbAAABoTDX1rBnZXZlbnRJZGxaMjloYkhKcGMyc3hoc2V2ZXJpdHlnd2FybmluZ2h1cHRpbWVNcxoAASEQYXRlZXZlbnRjc2lnWEDAGlZS76Snuq3dzP6oBe1buyz2kzW/N79ukTRxpHgali+4Bqh7Um61zOsv4QTfS6Ss6vENXdDC6biX122t3pJg\"}}",
+      "sig": "c01a5652efa4a7baadddccfea805ed5bbb2cf69335bf37bf6e913471a4781a962fb806a87b526eb5cceb2fe104df4ba4aceaf10d5dd0c2e9b897d76dadde9260",
+      "nowMs": 1791820815200,
+      "want": {
+        "verdict": "event",
+        "home": "fjzyr67buzpyncqmjliwgezvde",
+        "kind": "charging.goal_at_risk",
+        "args": {
+          "by": "07:00",
+          "target": "80"
+        },
+        "lp": "j3HZORNCWHs",
+        "boot": "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
+        "seq": 15,
+        "atMs": 1791820813900
+      }
+    },
+    {
+      "name": "one byte of the body changed",
+      "payload": "{\"aps\":{\"alert\":{\"title-loc-key\":\"push.title\",\"loc-key\":\"push.generic\"},\"mutable-content\":1,\"sound\":\"default\"},\"ftw\":{\"v\":1,\"home\":\"fjzyr67buzpyncqmjliwgezvde\",\"event\":\"o2FiWKarYmxwa2ozSFpPUk5DV0hzYnRzGwAAAaEw18loY3NlcQljc3Jja0RVWVdXUW1uLVhnZGFyZ3OgZGJvb3RQsLCwsLCwsLCwsLCwsLCwsGRraW5kcmNoYXJnaW5nLmJvbm5lY3RlZGZ3YWxsTXMbAAABoTDXyvhnZXZlbnRJZGxRMlpyTWpSMGR6Vmhoc2V2ZXJpdHlkaW5mb2h1cHRpbWVNcxoAARVYYXRlZXZlbnRjc2lnWECNIbMUmau1F9d1HqNW3rNdV0jlDVXEjK/Q3/b8bBjF7yCpDjUzd9n2FfuL0zIv0aJUJkc3BbScu+pvpr8piwGb\"}}",
+      "sig": "8d21b31499abb517d7751ea356deb35d5748e50d55c48cafd0dff6fc6c18c5ef20a90e353377d9f615fb8bd3322fd1a25426473705b49cbbea6fa6bf298b019b",
+      "nowMs": 1791820812200,
+      "want": {
+        "verdict": "generic",
+        "home": "fjzyr67buzpyncqmjliwgezvde"
+      }
+    },
+    {
+      "name": "named for another home the phone holds",
+      "payload": "{\"aps\":{\"alert\":{\"title-loc-key\":\"push.title\",\"loc-key\":\"push.generic\"},\"mutable-content\":1,\"sound\":\"default\"},\"ftw\":{\"v\":1,\"home\":\"t3w5bfotxeygcjxjdhjaeo6pvq\",\"event\":\"o2FiWKarYmxwa2ozSFpPUk5DV0hzYnRzGwAAAaEw18loY3NlcQljc3Jja0RVWVdXUW1uLVhnZGFyZ3OgZGJvb3RQsLCwsLCwsLCwsLCwsLCwsGRraW5kcmNoYXJnaW5nLmNvbm5lY3RlZGZ3YWxsTXMbAAABoTDXyvhnZXZlbnRJZGxRMlpyTWpSMGR6Vmhoc2V2ZXJpdHlkaW5mb2h1cHRpbWVNcxoAARVYYXRlZXZlbnRjc2lnWEBH6wZnxbr20B6MN8GTyLZcR25rSVN1bugYCsIleoMmLRG5mELw/q7JcRUOiucK7LLM3ka46TK2T7FnZh3mxuIl\"}}",
+      "sig": "47eb0667c5baf6d01e8c37c193c8b65c476e6b4953756ee8180ac2257a83262d11b99842f0feaec971150e8ae70aecb2ccde46b8e932b64fb167661de6c6e225",
+      "nowMs": 1791820812200,
+      "want": {
+        "verdict": "generic",
+        "home": "t3w5bfotxeygcjxjdhjaeo6pvq"
+      }
+    },
+    {
+      "name": "signed by another box for this home",
+      "payload": "{\"aps\":{\"alert\":{\"title-loc-key\":\"push.title\",\"loc-key\":\"push.generic\"},\"mutable-content\":1,\"sound\":\"default\"},\"ftw\":{\"v\":1,\"home\":\"fjzyr67buzpyncqmjliwgezvde\",\"event\":\"o2FiWKarYmxwa2ozSFpPUk5DV0hzYnRzGwAAAaEw18loY3NlcRBjc3Jja0RVWVdXUW1uLVhnZGFyZ3OgZGJvb3RQsLCwsLCwsLCwsLCwsLCwsGRraW5kcmNoYXJnaW5nLmNvbm5lY3RlZGZ3YWxsTXMbAAABoTDXyvhnZXZlbnRJZGxRMlpyTWpSMGR6Vmhoc2V2ZXJpdHlkaW5mb2h1cHRpbWVNcxoAARVYYXRlZXZlbnRjc2lnWEBJ68gFtSwOcqFpSXiK6MHVsHr2RiTTMxIm9h1lNwn/IroE4rs65mYQCkTY+xLXrenrOasV/suwp6HzhwgoHk8z\"}}",
+      "sig": "49ebc805b52c0e72a16949788ae8c1d5b07af64624d3331226f61d653709ff22ba04e2bb3ae666100a44d8fb12d7ade9eb39ab15fecbb0a7a1f38708281e4f33",
+      "nowMs": 1791820812200,
+      "want": {
+        "verdict": "generic",
+        "home": "fjzyr67buzpyncqmjliwgezvde"
+      }
+    },
+    {
+      "name": "two hours old",
+      "payload": "{\"aps\":{\"alert\":{\"title-loc-key\":\"push.title\",\"loc-key\":\"push.generic\"},\"mutable-content\":1,\"sound\":\"default\"},\"ftw\":{\"v\":1,\"home\":\"fjzyr67buzpyncqmjliwgezvde\",\"event\":\"o2FiWKarYmxwa2ozSFpPUk5DV0hzYnRzGwAAAaEw18loY3NlcQljc3Jja0RVWVdXUW1uLVhnZGFyZ3OgZGJvb3RQsLCwsLCwsLCwsLCwsLCwsGRraW5kcmNoYXJnaW5nLmNvbm5lY3RlZGZ3YWxsTXMbAAABoTDXyvhnZXZlbnRJZGxRMlpyTWpSMGR6Vmhoc2V2ZXJpdHlkaW5mb2h1cHRpbWVNcxoAARVYYXRlZXZlbnRjc2lnWEAg1t+OvFYf9y9gpMPg21Q7dzGvrJ5V8CrBNIr2EWpgLZl1QZgbSA8ELs8nrATH2p+tUjDAmJSyG1m8YlsgYEap\"}}",
+      "sig": "20d6df8ebc561ff72f60a4c3e0db543b7731afac9e55f02ac1348af6116a602d997541981b480f042ecf27ac04c7da9fad5230c09894b21b59bc625b206046a9",
+      "nowMs": 1791828011000,
+      "want": {
+        "verdict": "generic",
+        "home": "fjzyr67buzpyncqmjliwgezvde"
+      }
+    },
+    {
+      "name": "ten minutes old is still fresh",
+      "payload": "{\"aps\":{\"alert\":{\"title-loc-key\":\"push.title\",\"loc-key\":\"push.generic\"},\"mutable-content\":1,\"sound\":\"default\"},\"ftw\":{\"v\":1,\"home\":\"fjzyr67buzpyncqmjliwgezvde\",\"event\":\"o2FiWKurYmxwa2ozSFpPUk5DV0hzYnRzGwAAAaEw1820Y3NlcQpjc3Jja0RVWVdXUW1uLVhnZGFyZ3OgZGJvb3RQsLCwsLCwsLCwsLCwsLCwsGRraW5kdGNoYXJnaW5nLmludGVycnVwdGVkZndhbGxNcxsAAAGhMNfO4GdldmVudElkbGFXNTBjbkIwWkRBeGhzZXZlcml0eWd3YXJuaW5naHVwdGltZU1zGgABGUBhdGVldmVudGNzaWdYQB7Mfxasg5x9bJLORP3yYOgcto/sS+Y/Z2SgGKkgJucoOlYH2mg5ex6sShXDjDHRYZ4RHhRgC3ENSJ+FxFIryMI=\"}}",
+      "sig": "1ecc7f16ac839c7d6c92ce44fdf260e81cb68fec4be63f6764a018a92026e7283a5607da68397b1eac4a15c38c31d1619e111e14600b710d489f85c4522bc8c2",
+      "nowMs": 1791821411700,
+      "want": {
+        "verdict": "event",
+        "home": "fjzyr67buzpyncqmjliwgezvde",
+        "kind": "charging.interrupted",
+        "src": "DUYWWQmn-Xg",
+        "lp": "j3HZORNCWHs",
+        "boot": "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
+        "seq": 10,
+        "atMs": 1791820811700
+      }
+    },
+    {
+      "name": "box clock not synced",
+      "payload": "{\"aps\":{\"alert\":{\"title-loc-key\":\"push.title\",\"loc-key\":\"push.generic\"},\"mutable-content\":1,\"sound\":\"default\"},\"ftw\":{\"v\":1,\"home\":\"fjzyr67buzpyncqmjliwgezvde\",\"event\":\"o2FiWIqpYmxwa2ozSFpPUk5DV0hzY3NlcQxjc3Jja0RVWVdXUW1uLVhnZGFyZ3OgZGJvb3RQsLCwsLCwsLCwsLCwsLCwsGRraW5kcmNoYXJnaW5nLmNvbm5lY3RlZGdldmVudElkbFEyWnJNalIwZHpWaGhzZXZlcml0eWRpbmZvaHVwdGltZU1zGgABFVhhdGVldmVudGNzaWdYQA4D7BC9hbsDGWWnl69+YzZWkvCG2DyNVfPtNFNW4O27uftmRBxY0ewGRUt+ilCSn+mRKmIIqpbBh0wAgJxCVaI=\"}}",
+      "sig": "0e03ec10bd85bb031965a797af7e63365692f086d83c8d55f3ed345356e0edbbb9fb66441c58d1ec06454b7e8a50929fe9912a6208aa96c1874c00809c4255a2",
+      "nowMs": 1791820812200,
+      "want": {
+        "verdict": "generic",
+        "home": "fjzyr67buzpyncqmjliwgezvde"
+      }
+    },
+    {
+      "name": "box clock ahead of the phone",
+      "payload": "{\"aps\":{\"alert\":{\"title-loc-key\":\"push.title\",\"loc-key\":\"push.generic\"},\"mutable-content\":1,\"sound\":\"default\"},\"ftw\":{\"v\":1,\"home\":\"fjzyr67buzpyncqmjliwgezvde\",\"event\":\"o2FiWJqqYmxwa2ozSFpPUk5DV0hzY3NlcQ1jc3Jja0RVWVdXUW1uLVhnZGFyZ3OgZGJvb3RQsLCwsLCwsLCwsLCwsLCwsGRraW5kcmNoYXJnaW5nLmNvbm5lY3RlZGZ3YWxsTXMbAAABoTDX7iBnZXZlbnRJZGxRMlpyTWpSMGR6Vmhoc2V2ZXJpdHlkaW5mb2h1cHRpbWVNcxoAARVYYXRlZXZlbnRjc2lnWEDNcUjPNmeqdosZjUen9w+4n17dD+hThNnqvSLF0A89nUqTWpscn7BRZybd7FyfIHQ8We5wyuZLHQYmf4s2Ggd5\"}}",
+      "sig": "cd7148cf3667aa768b198d47a7f70fb89f5edd0fe85384d9eabd22c5d00f3d9d4a935a9b1c9fb0516726ddec5c9f20743c59ee70cae64b1d06267f8b361a0779",
+      "nowMs": 1791820817999,
+      "want": {
+        "verdict": "generic",
+        "home": "fjzyr67buzpyncqmjliwgezvde"
+      }
+    },
+    {
+      "name": "a kind the phone does not know",
+      "payload": "{\"aps\":{\"alert\":{\"title-loc-key\":\"push.title\",\"loc-key\":\"push.generic\"},\"mutable-content\":1,\"sound\":\"default\"},\"ftw\":{\"v\":1,\"home\":\"fjzyr67buzpyncqmjliwgezvde\",\"event\":\"o2FiWKSrYmxwa2ozSFpPUk5DV0hzYnRzGwAAAaEw18loY3NlcQ5jc3Jja0RVWVdXUW1uLVhnZGFyZ3OgZGJvb3RQsLCwsLCwsLCwsLCwsLCwsGRraW5kcGNoYXJnaW5nLnNvbWVkYXlmd2FsbE1zGwAAAaEw18r4Z2V2ZW50SWRsUTJack1qUjBkelZoaHNldmVyaXR5ZGluZm9odXB0aW1lTXMaAAEVWGF0ZWV2ZW50Y3NpZ1hAuiASso5HdVyi4+dXlmi5PKDjO5DBTXiaChzNJqz5l/nXU7o++4oPDzfzx3k0Ra0tM3vXtZ2GoHJafIP+dypV6g==\"}}",
+      "sig": "ba2012b28e47755ca2e3e7579668b93ca0e33b90c14d789a0a1ccd26acf997f9d753ba3efb8a0f0f37f3c7793445ad2d337bd7b59d86a0725a7c83fe772a55ea",
+      "nowMs": 1791820812200,
+      "want": {
+        "verdict": "generic",
+        "home": "fjzyr67buzpyncqmjliwgezvde"
+      }
+    },
+    {
+      "name": "unreachable, from the service",
+      "payload": "{\"aps\":{\"alert\":{\"title-loc-key\":\"push.title\",\"loc-key\":\"push.generic\"},\"mutable-content\":1,\"sound\":\"default\"},\"ftw\":{\"v\":1,\"home\":\"fjzyr67buzpyncqmjliwgezvde\",\"kind\":\"box.unreachable\"}}",
+      "sig": "",
+      "nowMs": 1791820800000,
+      "want": {
+        "verdict": "unreachable",
+        "home": "fjzyr67buzpyncqmjliwgezvde"
+      }
+    },
+    {
+      "name": "another kind from the service",
+      "payload": "{\"aps\":{\"alert\":{\"title-loc-key\":\"push.title\",\"loc-key\":\"push.generic\"},\"mutable-content\":1,\"sound\":\"default\"},\"ftw\":{\"v\":1,\"home\":\"fjzyr67buzpyncqmjliwgezvde\",\"kind\":\"charging.connected\"}}",
+      "sig": "",
+      "nowMs": 1791820800000,
+      "want": {
+        "verdict": "generic",
+        "home": "fjzyr67buzpyncqmjliwgezvde"
+      }
+    },
+    {
+      "name": "a home the phone does not hold",
+      "payload": "{\"aps\":{\"alert\":{\"title-loc-key\":\"push.title\",\"loc-key\":\"push.generic\"},\"mutable-content\":1,\"sound\":\"default\"},\"ftw\":{\"v\":1,\"home\":\"aaaaaaaaaaaaaaaaaaaaaaaaaa\",\"event\":\"o2FiWKarYmxwa2ozSFpPUk5DV0hzYnRzGwAAAaEw18loY3NlcQljc3Jja0RVWVdXUW1uLVhnZGFyZ3OgZGJvb3RQsLCwsLCwsLCwsLCwsLCwsGRraW5kcmNoYXJnaW5nLmNvbm5lY3RlZGZ3YWxsTXMbAAABoTDXyvhnZXZlbnRJZGxRMlpyTWpSMGR6Vmhoc2V2ZXJpdHlkaW5mb2h1cHRpbWVNcxoAARVYYXRlZXZlbnRjc2lnWECFrKOjjhGZn6O0MCWuzT1paANIFK44ZLUd7mRqIzBcRgdME/ZjLp6jHx96zZY87aqltd41D9CG4Fn1IrGtzuNz\"}}",
+      "sig": "85aca3a38e11999fa3b43025aecd3d6968034814ae3864b51dee646a23305c46074c13f6632e9ea31f1f7acd963cedaaa5b5de350fd086e059f522b1adcee373",
+      "nowMs": 1791820812200,
+      "want": {
+        "verdict": "generic",
+        "home": "aaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    {
+      "name": "box clock not synced, anchored by rule U",
+      "payload": "{\"aps\":{\"alert\":{\"title-loc-key\":\"push.title\",\"loc-key\":\"push.generic\"},\"mutable-content\":1,\"sound\":\"default\"},\"ftw\":{\"v\":1,\"home\":\"fjzyr67buzpyncqmjliwgezvde\",\"event\":\"o2FiWIqpYmxwa2ozSFpPUk5DV0hzY3NlcQxjc3Jja0RVWVdXUW1uLVhnZGFyZ3OgZGJvb3RQsLCwsLCwsLCwsLCwsLCwsGRraW5kcmNoYXJnaW5nLmNvbm5lY3RlZGdldmVudElkbFEyWnJNalIwZHpWaGhzZXZlcml0eWRpbmZvaHVwdGltZU1zGgABFVhhdGVldmVudGNzaWdYQFNotNXPkQUfb07DO7RwspScyA+HtdtuE/R6EAOdZFzmMBTAeJfa+x5KFmmfsdQNg7Q3ffV+WLE0KNonhgL6OXY=\"}}",
+      "sig": "5368b4d5cf91051f6f4ec33bb470b2949cc80f87b5db6e13f47a10039d645ce63014c07897dafb1e4a16699fb1d40d83b4377df57e58b13428da278602fa3976",
+      "offset": {
+        "home": "fjzyr67buzpyncqmjliwgezvde",
+        "boot": "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
+        "offsetMs": 1791820740000,
+        "learnedAtMs": 1791817211000
+      },
+      "nowMs": 1791820812200,
+      "want": {
+        "verdict": "event",
+        "home": "fjzyr67buzpyncqmjliwgezvde",
+        "kind": "charging.connected",
+        "src": "DUYWWQmn-Xg",
+        "lp": "j3HZORNCWHs",
+        "boot": "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
+        "seq": 12,
+        "atMs": 1791820810640
+      }
+    },
+    {
+      "name": "box clock ahead, anchored by rule U",
+      "payload": "{\"aps\":{\"alert\":{\"title-loc-key\":\"push.title\",\"loc-key\":\"push.generic\"},\"mutable-content\":1,\"sound\":\"default\"},\"ftw\":{\"v\":1,\"home\":\"fjzyr67buzpyncqmjliwgezvde\",\"event\":\"o2FiWJqqYmxwa2ozSFpPUk5DV0hzY3NlcQ1jc3Jja0RVWVdXUW1uLVhnZGFyZ3OgZGJvb3RQsLCwsLCwsLCwsLCwsLCwsGRraW5kcmNoYXJnaW5nLmNvbm5lY3RlZGZ3YWxsTXMbAAABoTDX7iBnZXZlbnRJZGxRMlpyTWpSMGR6Vmhoc2V2ZXJpdHlkaW5mb2h1cHRpbWVNcxoAARVYYXRlZXZlbnRjc2lnWEAT0WQabV0OknG7SmU38U/KFBl7E6LdxOZZMNh9lOK/hi2WqRrVsSfQKUrKe8k65zfTUYHCQjuGSyi03B3vwg4W\"}}",
+      "sig": "13d1641a6d5d0e9271bb4a6537f14fca14197b13a2ddc4e65930d87d94e2bf862d96a91ad5b127d0294aca7bc93ae737d35181c2423b864b28b4dc1defc20e16",
+      "offset": {
+        "home": "fjzyr67buzpyncqmjliwgezvde",
+        "boot": "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
+        "offsetMs": 1791820740000,
+        "learnedAtMs": 1791817211000
+      },
+      "nowMs": 1791820812200,
+      "want": {
+        "verdict": "event",
+        "home": "fjzyr67buzpyncqmjliwgezvde",
+        "kind": "charging.connected",
+        "src": "DUYWWQmn-Xg",
+        "lp": "j3HZORNCWHs",
+        "boot": "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
+        "seq": 13,
+        "atMs": 1791820810640
+      }
+    },
+    {
+      "name": "rule U from another boot",
+      "payload": "{\"aps\":{\"alert\":{\"title-loc-key\":\"push.title\",\"loc-key\":\"push.generic\"},\"mutable-content\":1,\"sound\":\"default\"},\"ftw\":{\"v\":1,\"home\":\"fjzyr67buzpyncqmjliwgezvde\",\"event\":\"o2FiWIqpYmxwa2ozSFpPUk5DV0hzY3NlcQxjc3Jja0RVWVdXUW1uLVhnZGFyZ3OgZGJvb3RQsLCwsLCwsLCwsLCwsLCwsGRraW5kcmNoYXJnaW5nLmNvbm5lY3RlZGdldmVudElkbFEyWnJNalIwZHpWaGhzZXZlcml0eWRpbmZvaHVwdGltZU1zGgABFVhhdGVldmVudGNzaWdYQGk/DH/IlyDThxxoaZe5v0fNthUnu8QnNIlvDjReA36nwi4S1d0vPiDfNV2JwE4iyT57heDhaU27bERXLSNGRnc=\"}}",
+      "sig": "693f0c7fc89720d3871c686997b9bf47cdb61527bbc42734896f0e345e037ea7c22e12d5dd2f3e20df355d89c04e22c93e7b85e0e1694dbb6c44572d23464677",
+      "offset": {
+        "home": "fjzyr67buzpyncqmjliwgezvde",
+        "boot": "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+        "offsetMs": 1791820740000,
+        "learnedAtMs": 1791817211000
+      },
+      "nowMs": 1791820812200,
+      "want": {
+        "verdict": "generic",
+        "home": "fjzyr67buzpyncqmjliwgezvde"
+      }
+    },
+    {
+      "name": "rule U learned over a day ago",
+      "payload": "{\"aps\":{\"alert\":{\"title-loc-key\":\"push.title\",\"loc-key\":\"push.generic\"},\"mutable-content\":1,\"sound\":\"default\"},\"ftw\":{\"v\":1,\"home\":\"fjzyr67buzpyncqmjliwgezvde\",\"event\":\"o2FiWIqpYmxwa2ozSFpPUk5DV0hzY3NlcQxjc3Jja0RVWVdXUW1uLVhnZGFyZ3OgZGJvb3RQsLCwsLCwsLCwsLCwsLCwsGRraW5kcmNoYXJnaW5nLmNvbm5lY3RlZGdldmVudElkbFEyWnJNalIwZHpWaGhzZXZlcml0eWRpbmZvaHVwdGltZU1zGgABFVhhdGVldmVudGNzaWdYQJYY1B25q3N9kJEsHpndMcA9zIZD70klDsFbQdtklHF3eIWxYd1qbRN1eQaszxJWNQc8zatRazb3KwxDyiFMj/0=\"}}",
+      "sig": "9618d41db9ab737d90912c1e99dd31c03dcc8643ef49250ec15b41db649471777885b161dd6a6d13757906accf125635073ccdab516b36f72b0c43ca214c8ffd",
+      "offset": {
+        "home": "fjzyr67buzpyncqmjliwgezvde",
+        "boot": "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
+        "offsetMs": 1791820740000,
+        "learnedAtMs": 1791734412199
+      },
+      "nowMs": 1791820812200,
+      "want": {
+        "verdict": "generic",
+        "home": "fjzyr67buzpyncqmjliwgezvde"
+      }
+    }
+  ]
+}

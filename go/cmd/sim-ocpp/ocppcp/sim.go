@@ -169,6 +169,13 @@ func (s *Sim) Unplug() error {
 	return s.statusPlugged(false)
 }
 
+// Stall stops delivery with the car still asking, or lets it go on.
+func (s *Sim) Stall(stalled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.physics.Stalled = stalled
+}
+
 // Tick advances physics. Tests call this with a positive dt and TauS=0 to settle.
 func (s *Sim) Tick(dt time.Duration) {
 	s.mu.Lock()

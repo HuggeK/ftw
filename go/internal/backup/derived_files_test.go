@@ -39,3 +39,21 @@ func TestCollectSourcesSkipsDerivedStateFiles(t *testing.T) {
 		t.Fatalf("collected %v, want %v", got, want)
 	}
 }
+
+// cloud.key stays on the box that made it. A backup carries the grant record
+// in state.db, which then reads as off on whatever box restores it.
+func TestCollectSourcesNeverTakesTheCloudKey(t *testing.T) {
+	dataDir := t.TempDir()
+	for _, name := range []string{"config.yaml", "cloud.key", "cloud.key.tmp"} {
+		if err := os.WriteFile(filepath.Join(dataDir, name), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sources, err := collectSources(dataDir, filepath.Join(dataDir, "state.db"), filepath.Join(dataDir, "backups"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sources) != 1 || sources[0].archivePath != "data/config.yaml" {
+		t.Fatalf("collected %+v", sources)
+	}
+}
