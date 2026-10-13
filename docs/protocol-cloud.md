@@ -344,6 +344,7 @@ The grid ceiling the plan defends is not sent.
 | Field | Type | Meaning |
 |---|---|---|
 | `eventId` | text | Unique per event |
+| `ts` | int, optional | The box's wall time of the event, in ms. Present only while NTP has synced the box clock. It can be earlier than `wallMs` when the event waited for the uplink. The phone dates the alert by the earlier of this and the send time |
 | `kind` | text | A kind from `contract/push-catalogue.yaml` |
 | `severity` | text | As on the box |
 | `args` | map text→(text or int) | The catalogue's placeholders, except names |
