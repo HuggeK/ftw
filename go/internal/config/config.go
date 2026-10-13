@@ -49,7 +49,8 @@ type Config struct {
 	// still boot, or the operator loses the UI they would fix it with. The
 	// write path (Settings save, bootstrap) never populates this — it calls
 	// Validate directly and stays strict. Never serialized.
-	LoadWarnings []string `yaml:"-" json:"-"`
+	LoadWarnings      []string `yaml:"-" json:"-"`
+	LoadpointWarnings []string `yaml:"-" json:"-"`
 	// Retired names settings of removed features that loading dropped so
 	// they cannot steer the site. Startup warns once for each;
 	// DropRetiredSettings deletes them from stored settings.
@@ -1915,6 +1916,9 @@ func isLegacyDefaultDriverRepository(repo DriverRepositorySource) bool {
 // Validate ensures the config is internally consistent and safe to run with.
 func (c *Config) Validate() error {
 	c.NormalizeUnits()
+	if err := c.normalizeLoadpointSteps(); err != nil {
+		return err
+	}
 	if c.State != nil && c.State.ColdRetentionDays < 0 {
 		return fmt.Errorf("state.cold_retention_days must be >= 0, got %d", c.State.ColdRetentionDays)
 	}
@@ -2306,6 +2310,9 @@ func SaveAtomic(path string, c *Config) error {
 }
 
 func saveAtomic(w durableWriter, path string, c *Config) error {
+	if err := c.normalizeLoadpointSteps(); err != nil {
+		return err
+	}
 	// Driver paths are resolved to absolute-ish paths at Load() time.
 	// Convert them back to config-relative before writing so that
 	// repeated save cycles don't accumulate extra "../" prefixes.

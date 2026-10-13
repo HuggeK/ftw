@@ -245,3 +245,60 @@ describe("first charger connection", () => {
     assert.match(render(config), /value="easee" selected/);
   });
 });
+
+describe("charger save corrections", () => {
+  it("shows the server warning and keeps the corrected steps for later saves", async () => {
+    const handlers = new Map();
+    const input = {
+      dataset: { path: 'loadpoints.0.allowed_steps_w__str' },
+      value: '0, 4800, 11100',
+      addEventListener(name, fn) {
+        handlers.set(name, [...(handlers.get(name) || []), fn]);
+      },
+    };
+    const status = { textContent: '', setAttribute() {} };
+    const inline = { textContent: '' };
+    const nodes = { 'settings-status': status, 'charger-save-status': inline };
+    const config = { loadpoints: [{ id: 'Easee', max_charge_w: 11000, allowed_steps_w: [0, 4800, 11000] }] };
+    const corrected = [{ ...config.loadpoints[0], allowed_steps_w: [0, 4800, 11000] }];
+    const warning = 'Charger "Easee": charging steps above the 11000 W limit were reduced to 11000 W.';
+    const previousDocument = globalThis.document;
+    const previousFetch = globalThis.fetch;
+    const saves = [];
+    const response = body => ({ ok: true, json: async () => body });
+    try {
+      globalThis.document = {
+        getElementById: id => nodes[id] || null,
+        querySelector: () => input,
+      };
+      globalThis.fetch = async () => ({ ok: false });
+      window.FTWSettings.catalogByLua = {};
+      window.FTWSettings.tabs.loadpoints.after({
+        config,
+        bodyEl: { querySelectorAll: selector => selector.includes('data-path') ? [input] : [] },
+        captureCurrentTab() {},
+        apiFetch: async (path, opts) => {
+          if (opts && opts.method === 'POST') {
+            saves.push(JSON.parse(opts.body));
+            return response({ warnings: [warning], loadpoints: corrected });
+          }
+          return response({ loadpoints: [] });
+        },
+      });
+      for (const fn of handlers.get('change')) fn();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.deepEqual(saves[0].loadpoints[0].allowed_steps_w, [0, 4800, 11100]);
+      assert.deepEqual(config.loadpoints[0].allowed_steps_w, [0, 4800, 11000]);
+      assert.equal(input.value, '0, 4800, 11000');
+      assert.equal(status.className, 'settings-status warning');
+      assert.ok(status.textContent.includes(warning));
+      assert.ok(inline.textContent.includes(warning));
+      for (const fn of handlers.get('change')) fn();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.deepEqual(saves[1].loadpoints[0].allowed_steps_w, [0, 4800, 11000]);
+    } finally {
+      globalThis.document = previousDocument;
+      globalThis.fetch = previousFetch;
+    }
+  });
+});

@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1681,6 +1682,8 @@ func (s *Server) handlePostConfig(w http.ResponseWriter, r *http.Request) {
 		"status":           "ok",
 		"restart_required": len(restartReasons) > 0,
 		"restart_reasons":  restartReasons,
+		"warnings":         newCfg.LoadpointWarnings,
+		"loadpoints":       newCfg.Loadpoints,
 	})
 }
 
@@ -2606,6 +2609,19 @@ func (s *Server) handleMPCPlan(w http.ResponseWriter, r *http.Request) {
 		"last_replan_reason": snapshot.Reason,
 		"replanning":         snapshot.Pending,
 		"outdated":           snapshot.Outdated,
+		"error":              snapshot.Error,
+		"warnings":           snapshot.Warnings,
+	}
+	if s.deps.Cfg != nil && s.deps.CfgMu != nil {
+		s.deps.CfgMu.RLock()
+		warnings := append([]string(nil), s.deps.Cfg.LoadpointWarnings...)
+		s.deps.CfgMu.RUnlock()
+		for _, warning := range snapshot.Warnings {
+			if !slices.Contains(warnings, warning) {
+				warnings = append(warnings, warning)
+			}
+		}
+		meta["warnings"] = warnings
 	}
 	if plan == nil {
 		writeJSON(w, 200, map[string]any{"enabled": true, "plan": nil, "meta": meta})

@@ -15,6 +15,31 @@ const slot = (offsetMinutes, overrides = {}) => ({
 });
 
 describe("plan brief normalization", () => {
+  it("shows the actual planning failure before a first plan exists", () => {
+    const error = 'loadpoints[0].capacity_wh must be finite and greater than zero';
+    const brief = derivePlanBrief({ enabled: true, planning: { error },
+      status: { mode: 'planner_arbitrage', bat_soc: 0.84 }, now });
+    assert.equal(brief.state.label, 'Cannot plan');
+    assert.equal(brief.reason, error);
+    assert.equal(brief.planner.detail, error);
+    assert.doesNotMatch(brief.next.action, /Preparing/);
+  });
+
+  it("keeps a capped charger warning beside an active plan", () => {
+    const warning = 'Charger "Easee": charging steps above the 11000 W limit were reduced to 11000 W.';
+    const brief = derivePlanBrief({ enabled: true, plan: { actions: [slot(-7)] },
+      planning: { warnings: [warning] }, status: { mode: 'planner_arbitrage' }, now });
+    assert.equal(brief.state.key, 'active');
+    assert.match(brief.constraint, /Easee.*11000 W/);
+    assert.doesNotMatch(brief.constraint, /schedule is old/);
+  });
+
+  it("does not label a new pending attempt as a previous failure", () => {
+    const brief = derivePlanBrief({ enabled: true, planning: { error: 'old error', replanning: true }, now });
+    assert.equal(brief.state.key, 'preparing');
+    assert.doesNotMatch(brief.reason, /old error/);
+  });
+
   it("describes planner-off operation as manual and omits battery copy when absent", () => {
     const brief = derivePlanBrief({
       enabled: false,

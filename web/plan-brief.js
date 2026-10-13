@@ -236,6 +236,18 @@ function preparingBrief(status, hasBattery) {
   };
 }
 
+function failedBrief(status, hasBattery, error) {
+  return {
+    state: { key: 'blocked', label: 'Cannot plan', tone: 'warn' },
+    next: { action: 'Planning could not finish', time: 'Fix the cause below, then try Replan' },
+    reason: error,
+    constraint: 'No new schedule is being dispatched; FTW safety limits still apply',
+    forecast: { label: 'No accepted plan', detail: 'Planning stopped before a usable schedule was produced' },
+    soc: batterySocNow(status, hasBattery, 'No planned charge path yet'),
+    planner: { label: 'Cannot plan', detail: error },
+  };
+}
+
 export function derivePlanBrief({
   enabled = false,
   unavailableReason = "",
@@ -243,6 +255,7 @@ export function derivePlanBrief({
   status = {},
   now = Date.now(),
   socOpts = {},
+  planning = {},
 } = {}) {
   fillPlanSoC(plan, socOpts);
   const actions = plan && Array.isArray(plan.actions) ? plan.actions : [];
@@ -253,7 +266,13 @@ export function derivePlanBrief({
     if (plannerMode) return blockedBrief(status, hasBattery, unavailableReason);
     return manualBrief(status, hasBattery);
   }
-  if (!actions.length) return preparingBrief(status, hasBattery);
+  if (planning.error && !planning.replanning) return failedBrief(status, hasBattery, planning.error);
+  const warnings = Array.isArray(planning.warnings) ? planning.warnings.join(' ') : '';
+  if (!actions.length) {
+    const brief = preparingBrief(status, hasBattery);
+    if (warnings) brief.constraint = warnings;
+    return brief;
+  }
 
   const solver = plan.solver || {};
   const stale = Boolean(status.plan_stale);
@@ -297,6 +316,7 @@ export function derivePlanBrief({
   } else if (stale) {
     constraint = "The schedule is old, so FTW is using safe live balancing";
   }
+  if (warnings) constraint = warnings + ' ' + constraint;
 
   const finalAction = actions[actions.length - 1];
   // The plan reaches as far as the published prices, and says how far.
