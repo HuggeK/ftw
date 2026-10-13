@@ -357,7 +357,7 @@ func (c *cloudSession) load() *cloudlink.Link {
 }
 
 // caps adds cloud.link to an app session's capabilities when this build can
-// run the uplink. A release build names no service and says nothing.
+// run the uplink. A build that names no service says nothing.
 func (c *cloudSession) caps(caps []string) []string {
 	if link := c.load(); link != nil && link.Available() {
 		return append(slices.Clip(caps), appproto.CapCloudLink)

@@ -125,6 +125,30 @@ Envelope = { t: text, b: bstr, sig: bstr }
 A home id comes only from the key that signed `hello` on this connection,
 never from a body field.
 
+### Rotating the service keys
+
+The service key signs every `hello_ok` and every downlink message. A box
+trusts only the public halves its build carries (`cloudlink.ServiceKeys`).
+Release builds carry one: the key `cloud.ftw.energy` holds in Secrets
+Manager as `ftw-cloud/service-key`. To rotate it:
+
+1. Make the new key where only the service can read it, beside the old one.
+   Put its public half into Core next to the old one, so a release carries
+   both.
+2. Ship that release and wait for boxes to update. Until the switch, every
+   box checks the service against the old key.
+3. Switch the service to the new key. Boxes on the new release accept it.
+   A box on an older release refuses the service and keeps running on its
+   own until it updates.
+4. Drop the old public half in a later release.
+
+If the key leaks, ship a release with only the new key at once. To stand in
+for the service, an attacker would also need the TLS certificate for
+`cloud.ftw.energy`.
+
+The service's Noise key rotates the same way through the app, which carries
+up to two and tries the next when the service refuses message 1.
+
 ## Common body fields
 
 Every body the box sends carries these four fields. The class tables below do

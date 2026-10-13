@@ -42,9 +42,14 @@ var (
 	Endpoint = "wss://cloud.ftw.energy/v1/box"
 	// ServiceKeys are the service's P-256 public keys, base64url of the
 	// 65-byte point, comma separated. Up to two, so the key can rotate
-	// across a release. Empty means no service exists for this build: the
-	// box refuses a grant and never dials.
-	ServiceKeys = ""
+	// across a release (docs/protocol-cloud.md, "Keys and ids"). Empty
+	// means no service exists for this build: the box refuses a grant and
+	// never dials.
+	//
+	// The one key is cloud.ftw.energy's, in Secrets Manager as
+	// ftw-cloud/service-key since srcfl/ftw-cloud#3. Only its public half is
+	// here; a box checks every hello_ok and downlink message against it.
+	ServiceKeys = "BG6EvBxFzSHPVsQOES6PYaKFo5vHQmte9lJ6D5OBIT9JgcBrJAOxAucdqKXxS76pToQ7orI1Ivsno0OtxbMuliQ"
 	// DevRootCA is a PEM file of extra roots, for a local service with its
 	// own certificate. Empty in every release build.
 	DevRootCA = ""

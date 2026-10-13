@@ -296,13 +296,20 @@ type harness struct {
 
 func newHarness(t *testing.T, svc *fakeService) *harness {
 	t.Helper()
+	return newHarnessKeys(t, svc, []*ecdsa.PublicKey{&svc.key.PublicKey})
+}
+
+// newHarnessKeys is a box that trusts keys; nil means the keys this build
+// carries.
+func newHarnessKeys(t *testing.T, svc *fakeService, keys []*ecdsa.PublicKey) *harness {
+	t.Helper()
 	h := &harness{svc: svc, site: &fakeSite{grid: 1200, state: protocol.SourceLive}, kv: &memKV{},
 		keyPath: filepath.Join(t.TempDir(), "cloud.key"), pushed: make(chan string, 8)}
 	link, err := New(Options{
 		Site: h.site, Roster: fakeRoster{}, KV: h.kv, KeyPath: h.keyPath, Build: "test",
 		Started: time.Now().Add(-time.Minute), ClockSynced: func() bool { return true },
 		Notify:   func(kind string) { h.pushed <- kind },
-		Endpoint: svc.endpoint(), ServiceKeys: []*ecdsa.PublicKey{&svc.key.PublicKey},
+		Endpoint: svc.endpoint(), ServiceKeys: keys,
 		RootCAs: svc.roots(), Tick: 20 * time.Millisecond,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
@@ -466,6 +473,39 @@ func TestAServiceThatFailsTheBindingGetsOnlyHello(t *testing.T) {
 				t.Fatal("the link reports connected")
 			}
 		})
+	}
+}
+
+// A release build knows FTW Cloud at cloud.ftw.energy by one key. A
+// service that answers with any other key hears the box's hello and
+// nothing after it, and the box does not call itself connected.
+func TestAReleaseBuildTrustsOnlyTheServicesKey(t *testing.T) {
+	if Endpoint != "wss://cloud.ftw.energy/v1/box" {
+		t.Fatalf("release endpoint %q", Endpoint)
+	}
+	keys, err := parseServiceKeys(ServiceKeys)
+	if err != nil || len(keys) != 1 {
+		t.Fatalf("release keys: %d, %v", len(keys), err)
+	}
+
+	svc := newFakeService(t) // its own key, not the release key
+	h := newHarnessKeys(t, svc, nil)
+	if !h.link.Available() {
+		t.Fatal("a release build says FTW Cloud is unavailable")
+	}
+	h.grant(t)
+	time.Sleep(time.Second)
+	svc.mu.Lock()
+	dialled := svc.hello != nil
+	svc.mu.Unlock()
+	if !dialled {
+		t.Fatal("the box never said hello, so the key was not what refused it")
+	}
+	if got := svc.received(); len(got) != 0 {
+		t.Fatalf("the box sent %d messages to a service with another key", len(got))
+	}
+	if h.link.Status().Connected {
+		t.Fatal("the link reports connected to a service with another key")
 	}
 }
 
