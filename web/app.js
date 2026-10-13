@@ -7,6 +7,7 @@
   const evPlanUI = import("/ev-plan.js").catch(function () { return null; });
   const POLL_INTERVAL = 2000;        // status poll cadence — snappier cards
   const historyMigrationUI = import("/history-migration.js").catch(function () { return null; });
+  const energyTodayUI = import("/energy-today.js").catch(function () { return null; });
   function updateHistoryMigration(health) {
     historyMigrationUI.then(function (ui) { if (ui) ui.updateMigrationBanner(health); }).catch(function () {});
     if (updateBadge && typeof updateBadge.setBootHealth === "function") updateBadge.setBootHealth(health);
@@ -887,6 +888,9 @@
       if (peakLimitSend) peakLimitSend.disabled = true; // pristine
     }
     // Energy today
+    energyTodayUI.then(function (ui) {
+      if (ui) ui.updateEnergyToday(data.energy && data.energy.today);
+    });
     if (data.energy && data.energy.today) {
       var t = data.energy.today;
       if (eImport) eImport.textContent = formatKwh(t.import_wh);

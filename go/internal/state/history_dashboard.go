@@ -226,6 +226,9 @@ func (s *Store) aggregateDayEnergy(ctx context.Context, from, to int64) (DayEner
 		out.LoadWh += r.load
 		out.Intervals += r.n
 		out.Missing |= r.missing
+		if r.covered > 0 {
+			out.observed |= MissingPower &^ r.missing
+		}
 		return nil
 	})
 	return out, err

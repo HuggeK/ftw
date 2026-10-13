@@ -26,6 +26,23 @@ const LIVE = {
 };
 
 describe("flowReadingsFromStatus", () => {
+  it("keeps a missing solar day total unknown instead of inventing zero", () => {
+    const status = structuredClone(LIVE);
+    status.energy.today.pv_wh = null;
+    const solar = flowReadingsFromStatus(status).planets.find(p => p.role === "pv");
+    assert.equal(solar.dailyKwh, "Unknown");
+  });
+
+  it("marks measured day energy after a gap without inferring a daily share", () => {
+    const status = structuredClone(LIVE);
+    status.energy.today.pv_wh = null;
+    status.energy.today.load_wh = null;
+    status.energy.today.measured = {pv_wh: 600, load_wh: 1200};
+    const result = flowReadingsFromStatus(status);
+    assert.equal(result.planets.find(p => p.role === "pv").dailyKwh, "≥ 0.60 kWh");
+    assert.equal(result.selfPoweredPctToday, null);
+  });
+
   it("draws one planet per live driver and hides a spare offline inverter", () => {
     const r = flowReadingsFromStatus(LIVE);
     assert.deepEqual(

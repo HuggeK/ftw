@@ -1566,7 +1566,11 @@ func (s *Store) loadArchiveHistory(ctx context.Context, sinceMs, untilMs int64, 
 // Import/Export are grid-boundary W split on sign; PV and LoadWh are always
 // positive accumulations; BatCharged/BatDischarged split bat_w on sign.
 type DayEnergy struct {
-	Missing         HistoryMissing
+	Missing HistoryMissing
+	// observed records flows with a known integration interval, including
+	// measured zero. It is derived from history rows, not persisted in the
+	// closed-day cache, whose totals retain their full-range quality mask.
+	observed        HistoryMissing
 	ImportWh        float64
 	ExportWh        float64
 	PVWh            float64
@@ -1580,6 +1584,23 @@ type DayEnergy struct {
 	// real measurement. Callers use this to tell "no data yet" apart from a
 	// genuine zero (mirrors the old `len(pts) > 1` guard).
 	Intervals int64
+}
+
+// MeasuredValue returns the recorded subtotal without claiming a complete
+// range. Positive energy proves a contribution even when a minute bucket
+// combines known and missing intervals; zero needs a known interval.
+func (d DayEnergy) MeasuredValue(flag HistoryMissing, value float64) any {
+	if d.Intervals > 0 && (d.Missing&flag == 0 || d.observed&flag != 0 || value > 0) {
+		return value
+	}
+	return nil
+}
+
+func (d DayEnergy) observedFlows() HistoryMissing {
+	if d.Intervals > 0 {
+		return d.observed | (MissingPower &^ d.Missing)
+	}
+	return d.observed
 }
 
 // DailyEnergy integrates history W columns over [sinceMs, untilMs] and returns

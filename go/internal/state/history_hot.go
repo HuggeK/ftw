@@ -56,6 +56,7 @@ func (s *Store) dailyEnergyFromHot(ctx context.Context, sinceMs, untilMs int64) 
 }
 
 func addDayEnergy(a, b DayEnergy) DayEnergy {
+	a.observed = a.observedFlows() | b.observedFlows()
 	a.ImportWh += b.ImportWh
 	a.ExportWh += b.ExportWh
 	a.PVWh += b.PVWh

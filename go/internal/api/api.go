@@ -1146,14 +1146,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			// 0; rendering that as a hard "0 Wh" looks like a real reading
 			// instead of "no data yet". Mirror the old `len(pts) > 1` guard.
 			if d.Intervals > 0 {
-				energyToday = map[string]any{
-					"import_wh":         d.Missing.Value(state.MissingGrid, d.ImportWh),
-					"export_wh":         d.Missing.Value(state.MissingGrid, d.ExportWh),
-					"pv_wh":             d.Missing.Value(state.MissingPV, d.PVWh),
-					"bat_charged_wh":    d.Missing.Value(state.MissingBattery, d.BatChargedWh),
-					"bat_discharged_wh": d.Missing.Value(state.MissingBattery, d.BatDischargedWh),
-					"load_wh":           d.Missing.Value(state.MissingLoad, d.LoadWh),
-				}
+				energyToday = energyTodayFields(d)
 			}
 		} else {
 			slog.Warn("failed to integrate today's energy", "err", err)
