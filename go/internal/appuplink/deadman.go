@@ -161,11 +161,16 @@ func (u *Uplink) ResyncDeadman() {
 	u.deadmanPosted = posted
 	u.deadmanMu.Unlock()
 
-	// Claim what was posted, if there is a socket to claim on. The claim
-	// is per-connection state on the relay, so serve() runs this again on
-	// every reconnect.
+	// Claim what was posted on the newest socket, if there is one. The
+	// claim is per-connection state on the relay, so serve() runs this again
+	// on every connect. In the overlap after the hour the older socket keeps
+	// the claims it made on its own connect, and the relay counts claims, so
+	// closing one socket does not release the other's.
 	u.liveMu.Lock()
-	text := u.liveText
+	var text func(string) error
+	if n := len(u.live); n > 0 {
+		text = u.live[n-1].text
+	}
 	u.liveMu.Unlock()
 	if text == nil {
 		return
