@@ -471,6 +471,10 @@ type PlanSlot struct {
 	// slot's price is not known.
 	PriceMinor *int64     `cbor:"priceMinor"`
 	Reason     PlanReason `cbor:"reason"`
+	// SocPermille is the battery's planned level at the end of the slot, in
+	// thousandths, absent when the planner gave none. The same name and unit
+	// as the FTW Cloud plan class. An older app ignores it.
+	SocPermille *int64 `cbor:"socPermille,omitempty"`
 }
 
 // Plan is what the box intends to do.

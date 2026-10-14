@@ -1,6 +1,7 @@
 package appproto
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -52,6 +53,30 @@ func TestPlanGetAnswersOnTheBulkLaneAndEchoesTheRequestId(t *testing.T) {
 	}
 	if p.Stale {
 		t.Fatal("a plan generated a moment ago was reported stale")
+	}
+}
+
+// Each slot carries the battery's planned level at its end, in thousandths,
+// so a phone can say where the plan leads and not only what it does. A
+// number that is not a level is left out, never sent as a guess.
+func TestPlanCarriesTheBatteryLevelAtEachSlotsEnd(t *testing.T) {
+	h, box, rec, clock := newRig(t)
+	subscribe(t, h, rec)
+	plan := samplePlan(clock.now)
+	plan.Actions[3].SoC = math.NaN()
+	box.plan = plan
+
+	deliver(t, h, MsgPlanGet, ptrU32(5), nil)
+
+	p := body[Plan](t, rec.only(t, MsgPlan))
+	want := []int64{400, 600, 450}
+	for i, w := range want {
+		if p.Slots[i].SocPermille == nil || *p.Slots[i].SocPermille != w {
+			t.Fatalf("slot %d socPermille = %v, want %d", i, p.Slots[i].SocPermille, w)
+		}
+	}
+	if p.Slots[3].SocPermille != nil {
+		t.Fatalf("a level that is not a number was sent: %d", *p.Slots[3].SocPermille)
 	}
 }
 
