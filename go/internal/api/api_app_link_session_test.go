@@ -20,6 +20,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -448,6 +449,72 @@ func TestTheAppCannotMakeAnotherOwner(t *testing.T) {
 	}
 	if owners != 1 {
 		t.Fatalf("%d owners, want the one who was there before", owners)
+	}
+}
+
+// No door hands out a watch yet.
+//
+// The registry names the role, so the box's own enrolment would accept it. A
+// watch belongs to the owner phone that adds it (ADR 0009), and until the box
+// can bind one to its phone the API refuses the role at both doors. This runs
+// against the real enrolment because a stub that knows only owner and viewer
+// would refuse for its own reasons.
+func TestNoDoorHandsOutAWatchYet(t *testing.T) {
+	enrol := newEnrolment(t)
+
+	code, _, err := enrol.id.MintPairingCode(apiauth.RoleViewer, appenroll.InviteTTL)
+	if err != nil {
+		t.Fatalf("minting the guest's code: %v", err)
+	}
+	guest, err := enrol.id.Authorise(appKey(2), code)
+	if err != nil {
+		t.Fatalf("enrolling the guest: %v", err)
+	}
+
+	lan := func(method, path, body string) *http.Request {
+		r := httptest.NewRequest(method, path, strings.NewReader(body))
+		r.Header.Set("Content-Type", "application/json")
+		r.Host = "192.168.1.1"
+		r.RemoteAddr = "192.168.1.5:1234"
+		return r
+	}
+	s := New(&Deps{AppEnroll: enrol})
+
+	for _, c := range []struct {
+		name  string
+		serve func(http.ResponseWriter)
+	}{
+		{"a scanned watch code from the LAN", func(w http.ResponseWriter) {
+			s.handleAppLinkPairing(w, lan(http.MethodPost, "/api/app-link/pairing", `{"role":"watch"}`))
+		}},
+		{"a spoken watch code from the LAN", func(w http.ResponseWriter) {
+			s.handleAppLinkPairing(w, lan(http.MethodPost, "/api/app-link/pairing", `{"role":"watch","kind":"spoken"}`))
+		}},
+		{"the guest changed into a watch from the LAN", func(w http.ResponseWriter) {
+			r := lan(http.MethodPatch, "/api/app-link/devices/"+guest.DeviceID, `{"role":"watch"}`)
+			r.SetPathValue("id", guest.DeviceID)
+			s.handleAppLinkDeviceRole(w, r)
+		}},
+	} {
+		w := httptest.NewRecorder()
+		c.serve(w)
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("%s answered %d %s, want 403", c.name, w.Code, w.Body.String())
+		}
+	}
+
+	rig := newAppSession(t, apiauth.RoleOwner, withEnrolment(enrol))
+	status, refusal, body := rig.call(t, 1, appproto.APIReq{
+		Method: appproto.APIPost, Path: "/api/app-link/pairing",
+		Body: []byte(`{"role":"watch"}`), StepUp: true})
+	if status != http.StatusForbidden {
+		t.Fatalf("a watch code over the session answered %d %q %s, want 403", status, refusal, body)
+	}
+
+	for _, d := range enrol.Devices() {
+		if d.Role == apiauth.RoleWatch {
+			t.Fatalf("%s is now a watch", d.ID)
+		}
 	}
 }
 

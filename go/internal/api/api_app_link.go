@@ -447,6 +447,15 @@ func (s *Server) appLinkRoleAllowed(w http.ResponseWriter, r *http.Request, aske
 			"say which kind of access this is for")
 		return false
 	}
+	// A watch belongs to the owner phone that adds it (ADR 0009). This box
+	// cannot bind a watch to a phone yet, so neither door hands one out: a
+	// watch code from the LAN, or a phone changed into a watch, would be a
+	// watch with no phone above it.
+	if asked == apiauth.RoleWatch {
+		writeAppLinkError(w, http.StatusForbidden,
+			"a watch is added from its owner's phone, and this box cannot do that yet")
+		return false
+	}
 	if appLinkOverSession(r) && asked != apiauth.RoleViewer {
 		writeAppLinkError(w, http.StatusForbidden,
 			"from the app you can let someone view this home. "+

@@ -80,6 +80,7 @@ const (
 	CapPriceSpot       = "price.spot"
 	CapApiPassthrough  = "api.passthrough"
 	CapCloudLink       = "cloud.link"
+	CapCmdExchange     = "cmd.exchange"
 )
 
 // AllCapabilities is every capability name the registry defines.
@@ -101,6 +102,7 @@ var AllCapabilities = []string{
 	CapPriceSpot,
 	CapApiPassthrough,
 	CapCloudLink,
+	CapCmdExchange,
 }
 
 // Scopes are one object axis and two verb axes. Roles are a projection over
