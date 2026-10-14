@@ -73,7 +73,8 @@ func (c *cloudSite) Live() cloudlink.Live {
 	}
 
 	// Each field follows the drivers that produce it. Load is what is left
-	// of the grid after every other flow, so it follows all of them.
+	// of the grid after every other flow, so it follows all of them. The
+	// fuse is config and follows none.
 	meter := siteMeterName(c.site.ctrl, c.site.ctrlMu)
 	byType := func(t telemetry.DerType) []string {
 		var names []string
@@ -95,6 +96,9 @@ func (c *cloudSite) Live() cloudlink.Live {
 		meterOnly = []string{meter}
 	}
 	set(appproto.FidGridW, meterOnly)
+	set(appproto.FidGridL1Da, meterOnly)
+	set(appproto.FidGridL2Da, meterOnly)
+	set(appproto.FidGridL3Da, meterOnly)
 	set(appproto.FidPvW, pv)
 	set(appproto.FidBatteryW, battery)
 	set(appproto.FidBatterySoc, battery)

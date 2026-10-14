@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"math"
 	"path/filepath"
 	"sync"
@@ -342,5 +343,129 @@ func TestAppLoadpointsFlipSurplusOnlyThroughTheManager(t *testing.T) {
 
 	if _, ok := lp.SetSurplusOnly("street", true); ok {
 		t.Fatal("a loadpoint the box does not have took a flag")
+	}
+}
+
+// The home box's Sungrow, read on 14 October 2026: it gives each phase's
+// current as a size and each phase's power with the site's sign. One phase
+// imported while the other two exported, so the wire must say which is
+// which, and the fuse travels with them as their scale.
+func TestAppSnapshotSignsEachPhaseByItsPower(t *testing.T) {
+	tel, ctrl := seedSite(t)
+	tel.Update("meter", telemetry.DerMeter, 160, nil, json.RawMessage(
+		`{"w":160,"l1_w":-367,"l2_w":908,"l3_w":-381,"l1_a":2.13,"l2_a":4.76,"l3_a":1.61}`))
+	ctrl.SiteFuseAmps, ctrl.SiteFusePhases = 20, 3
+	site := &appSite{
+		tel: tel, ctrl: ctrl, ctrlMu: &sync.Mutex{},
+		revision: &control.Revision{}, started: time.Now(),
+		siteMeterStale: time.Minute,
+	}
+
+	snap := site.Snapshot()
+
+	want := [3]float64{-2.13, 4.76, -1.61}
+	for i, w := range want {
+		if snap.GridPhaseA[i] == nil || *snap.GridPhaseA[i] != w {
+			t.Fatalf("L%d = %v, want %v", i+1, snap.GridPhaseA[i], w)
+		}
+	}
+	if snap.FuseA != 20 {
+		t.Fatalf("fuse = %v, want 20", snap.FuseA)
+	}
+}
+
+func TestGridPhaseAmps(t *testing.T) {
+	reading := func(data string) *telemetry.DerReading {
+		return &telemetry.DerReading{Data: json.RawMessage(data)}
+	}
+	show := func(p [3]*float64) []any {
+		out := make([]any, 3)
+		for i, v := range p {
+			if v != nil {
+				out[i] = *v
+			}
+		}
+		return out
+	}
+	cases := []struct {
+		name   string
+		data   string
+		phases int
+		want   []any
+	}{
+		{
+			// A meter that signs its currents and gives no power keeps them.
+			name: "signed by the driver", phases: 3,
+			data: `{"l1_a":-17,"l2_a":3,"l3_a":0}`,
+			want: []any{-17.0, 3.0, 0.0},
+		},
+		{
+			// A P1 meter: sizes only. Positive is all it can say.
+			name: "sizes only", phases: 3,
+			data: `{"l1_a":4.2,"l2_a":0.4,"l3_a":1.1}`,
+			want: []any{4.2, 0.4, 1.1},
+		},
+		{
+			// The power is the site's sign, set by the driver. Copying it
+			// onto a current already signed the same way changes nothing.
+			name: "power agrees with a signed current", phases: 3,
+			data: `{"l1_a":-6,"l1_w":-1380,"l2_a":2,"l2_w":460,"l3_a":1,"l3_w":0}`,
+			want: []any{-6.0, 2.0, 1.0},
+		},
+		{
+			// A one-phase site owns no L2, whatever the payload holds.
+			name: "one phase", phases: 1,
+			data: `{"l1_a":9.5,"l1_w":2185,"l2_a":3,"l3_a":3}`,
+			want: []any{9.5, nil, nil},
+		},
+		{
+			name: "a phase the meter does not report", phases: 3,
+			data: `{"l1_a":1,"l3_a":2}`,
+			want: []any{1.0, nil, 2.0},
+		},
+		{
+			// Harnesses that leave fuse.phases unset read three, as the
+			// fuse guard does.
+			name: "phases unset", phases: 0,
+			data: `{"l1_a":1,"l2_a":2,"l3_a":3}`,
+			want: []any{1.0, 2.0, 3.0},
+		},
+		{
+			name: "no phases at all", phases: 3,
+			data: `{"w":1200}`,
+			want: []any{nil, nil, nil},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := show(gridPhaseAmps(reading(c.data), c.phases))
+			for i := range c.want {
+				if got[i] != c.want[i] {
+					t.Fatalf("L%d = %v, want %v (all: %v)", i+1, got[i], c.want[i], got)
+				}
+			}
+		})
+	}
+	if got := gridPhaseAmps(nil, 3); got != [3]*float64{} {
+		t.Fatalf("no reading gave %v", show(got))
+	}
+}
+
+// An offline meter's phases are as old as its power. The power already goes
+// unsent; the phases go with it, so the app is never handed a phase it would
+// have to age by itself.
+func TestAnOfflineSiteMeterSendsNoPhases(t *testing.T) {
+	tel, ctrl := seedSite(t)
+	tel.Update("meter", telemetry.DerMeter, 160, nil, json.RawMessage(`{"l1_a":2.13,"l2_a":4.76,"l3_a":1.61}`))
+	tel.DriverHealthMut("meter").SetOffline()
+	ctrl.SiteFuseAmps, ctrl.SiteFusePhases = 20, 3
+	site := &appSite{
+		tel: tel, ctrl: ctrl, ctrlMu: &sync.Mutex{},
+		revision: &control.Revision{}, started: time.Now(),
+		siteMeterStale: time.Minute,
+	}
+
+	if got := site.Snapshot().GridPhaseA; got != [3]*float64{} {
+		t.Fatalf("an offline meter sent phases %v", got)
 	}
 }

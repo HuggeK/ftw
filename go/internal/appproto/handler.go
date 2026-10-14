@@ -626,8 +626,14 @@ func (h *Handler) Tick() error {
 	// command will be refused for a conflict it cannot see. Only the snapshot
 	// carries the number, so a change in it costs one bulk frame — which is
 	// also how the client resyncs mid-session rather than on reconnect.
+	//
+	// A field that stopped coming is the same kind of news. A delta carries
+	// values, not absences, so a phase the meter no longer reports would stay
+	// on the client at its last value; the snapshot replaces the client's
+	// whole set instead.
+	fields := fieldValues(snap, h.modes)
 	h.mu.Lock()
-	stale := snap.ControlRev != h.lastRev
+	stale := snap.ControlRev != h.lastRev || anyGone(h.lastSent, fields)
 	h.mu.Unlock()
 	if stale {
 		if err := h.sendSnapshot(); err != nil {
@@ -635,7 +641,6 @@ func (h *Handler) Tick() error {
 		}
 	}
 
-	fields := fieldValues(snap, h.modes)
 	sources := wireSources(snap, uptimeMs)
 	blocked := snap.DispatchBlockedBy
 	if blocked == nil {
@@ -757,6 +762,16 @@ func (h *Handler) fitDelta(body *Delta, bucket int) (map[string]int64, uint8, er
 	}
 
 	return nil, 0, fmt.Errorf("appproto: an empty delta does not fit a %d-byte bucket", bucket)
+}
+
+// anyGone reports whether a field the client was sent is missing now.
+func anyGone(sent, now map[string]int64) bool {
+	for k := range sent {
+		if _, ok := now[k]; !ok {
+			return true
+		}
+	}
+	return false
 }
 
 func fidOf(key string) uint64 {

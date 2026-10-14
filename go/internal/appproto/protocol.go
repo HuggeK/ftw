@@ -203,6 +203,10 @@ const (
 	FidSrcPv              = protocol.FidSrcPv
 	FidSrcBattery         = protocol.FidSrcBattery
 	FidEvW                = protocol.FidEvW
+	FidGridL1Da           = protocol.FidGridL1Da
+	FidGridL2Da           = protocol.FidGridL2Da
+	FidGridL3Da           = protocol.FidGridL3Da
+	FidGridFuseDa         = protocol.FidGridFuseDa
 	CapStatusCore         = protocol.CapStatusCore
 	CapStatusPhases       = protocol.CapStatusPhases
 	CapStatusDrivers      = protocol.CapStatusDrivers
@@ -257,6 +261,8 @@ const (
 var (
 	FrozenFieldNames        = protocol.FrozenFieldNames
 	FrozenFieldUnits        = protocol.FrozenFieldUnits
+	FieldNames              = protocol.FieldNames
+	FieldUnits              = protocol.FieldUnits
 	AllCapabilities         = protocol.AllCapabilities
 	WriteScopes             = protocol.WriteScopes
 	RegistryOps             = protocol.RegistryOps

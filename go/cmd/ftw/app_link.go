@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
+	"math"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -59,9 +61,10 @@ func (a *appSite) Snapshot() appproto.Snapshot {
 	mode := a.ctrl.Mode
 	siteMeterDriver := a.ctrl.SiteMeterDriver
 	rev := a.revision.Observe(a.ctrl)
+	fuseA, fusePhases := a.ctrl.SiteFuseAmps, a.ctrl.SiteFusePhases
 	a.ctrlMu.Unlock()
 
-	snap := appproto.Snapshot{Mode: mode, ControlRev: rev}
+	snap := appproto.Snapshot{Mode: mode, ControlRev: rev, FuseA: fuseA}
 
 	uptimeMs := time.Since(a.started).Milliseconds()
 	seen := map[string]bool{}
@@ -97,6 +100,7 @@ func (a *appSite) Snapshot() appproto.Snapshot {
 		if health := a.tel.DriverHealth(siteMeterDriver); health != nil && health.IsOnline() {
 			if reading := a.tel.Get(siteMeterDriver, telemetry.DerMeter); reading != nil {
 				snap.GridW = reading.SmoothedW
+				snap.GridPhaseA = gridPhaseAmps(reading, fusePhases)
 			}
 		} else {
 			// The invariant is that stale site-meter data stops dispatch.
@@ -164,6 +168,53 @@ func (a *appSite) Snapshot() appproto.Snapshot {
 	}
 
 	return snap
+}
+
+// gridPhaseAmps reads the site meter's current on each of the site's phases
+// and gives it the site convention's sign.
+//
+// Meters differ here. Some sign the current; many, Sungrow among them, give
+// only its size. The power on the same phase already carries the site's
+// sign, because the driver converted it, so where the meter reports that
+// power its sign is the phase's direction. Otherwise the driver's own sign
+// stands. This converts no vendor sign: it copies a site sign onto a size,
+// and a current the driver already signed keeps its sign.
+//
+// Only the site's phases are read, in L1 to L3 order, as the fuse guard
+// reads them: a one-phase site owns no L2, whatever the payload holds.
+func gridPhaseAmps(r *telemetry.DerReading, phases int) [3]*float64 {
+	var out [3]*float64
+	if r == nil || len(r.Data) == 0 {
+		return out
+	}
+	var d struct {
+		L1A *float64 `json:"l1_a"`
+		L2A *float64 `json:"l2_a"`
+		L3A *float64 `json:"l3_a"`
+		L1W *float64 `json:"l1_w"`
+		L2W *float64 `json:"l2_w"`
+		L3W *float64 `json:"l3_w"`
+	}
+	if err := json.Unmarshal(r.Data, &d); err != nil {
+		return out
+	}
+	if phases <= 0 || phases > len(out) {
+		phases = len(out)
+	}
+	amps := [3]*float64{d.L1A, d.L2A, d.L3A}
+	watts := [3]*float64{d.L1W, d.L2W, d.L3W}
+	finite := func(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
+	for i := 0; i < phases; i++ {
+		if amps[i] == nil || !finite(*amps[i]) {
+			continue
+		}
+		a := *amps[i]
+		if w := watts[i]; w != nil && finite(*w) && *w != 0 {
+			a = math.Copysign(math.Abs(a), *w)
+		}
+		out[i] = &a
+	}
+	return out
 }
 
 // appBoxInfo is what the box calls itself.

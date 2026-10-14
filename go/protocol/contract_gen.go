@@ -6,7 +6,8 @@ package protocol
 const ContractVersion = 1
 
 // Fid is a telemetry field id. 1-9 are frozen permanently as of v1, so an
-// app of any age can draw the core view from them alone.
+// app of any age can draw the core view from them alone. Ids after the
+// frozen set are depth for a node's own view.
 type Fid uint32
 
 const (
@@ -30,6 +31,14 @@ const (
 	FidSrcBattery Fid = 9
 	// FidEvW — power, unit W.
 	FidEvW Fid = 10
+	// FidGridL1Da — current, unit dA.
+	FidGridL1Da Fid = 11
+	// FidGridL2Da — current, unit dA.
+	FidGridL2Da Fid = 12
+	// FidGridL3Da — current, unit dA.
+	FidGridL3Da Fid = 13
+	// FidGridFuseDa — current, unit dA.
+	FidGridFuseDa Fid = 14
 )
 
 // FrozenFieldNames maps a frozen field id to its registry name.
@@ -58,6 +67,42 @@ var FrozenFieldUnits = map[Fid]string{
 	FidSrcPv:      "",
 	FidSrcBattery: "",
 	FidEvW:        "W",
+}
+
+// FieldNames maps every field id, frozen or extra, to its registry name.
+var FieldNames = map[Fid]string{
+	FidMode:       "mode",
+	FidGridW:      "grid_w",
+	FidPvW:        "pv_w",
+	FidBatteryW:   "battery_w",
+	FidBatterySoc: "battery_soc",
+	FidLoadW:      "load_w",
+	FidSrcGrid:    "src_grid",
+	FidSrcPv:      "src_pv",
+	FidSrcBattery: "src_battery",
+	FidEvW:        "ev_w",
+	FidGridL1Da:   "grid_l1_da",
+	FidGridL2Da:   "grid_l2_da",
+	FidGridL3Da:   "grid_l3_da",
+	FidGridFuseDa: "grid_fuse_da",
+}
+
+// FieldUnits maps every field id, frozen or extra, to its unit, empty when it has none.
+var FieldUnits = map[Fid]string{
+	FidMode:       "",
+	FidGridW:      "W",
+	FidPvW:        "W",
+	FidBatteryW:   "W",
+	FidBatterySoc: "permille",
+	FidLoadW:      "W",
+	FidSrcGrid:    "",
+	FidSrcPv:      "",
+	FidSrcBattery: "",
+	FidEvW:        "W",
+	FidGridL1Da:   "dA",
+	FidGridL2Da:   "dA",
+	FidGridL3Da:   "dA",
+	FidGridFuseDa: "dA",
 }
 
 // Capabilities are presence, not levels. An app hides what is absent and

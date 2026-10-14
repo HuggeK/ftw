@@ -23,13 +23,12 @@ import (
 // (carrier states) are deliberately absent: generating a constant the box
 // never uses only invites someone to use it.
 type Registry struct {
-	Version      int `yaml:"version"`
-	FrozenFields map[int]struct {
-		Name string `yaml:"name"`
-		Kind string `yaml:"kind"`
-		Unit string `yaml:"unit"`
-	} `yaml:"frozen_fields"`
-	Capabilities []string `yaml:"capabilities"`
+	Version      int           `yaml:"version"`
+	FrozenFields map[int]field `yaml:"frozen_fields"`
+	// ExtraFields share the frozen set's ids on the wire but are not part of
+	// the core view: depth a node's own view draws when the box sends it.
+	ExtraFields  map[int]field `yaml:"extra_fields"`
+	Capabilities []string      `yaml:"capabilities"`
 	Scopes       []struct {
 		Name string `yaml:"name"`
 		Desc string `yaml:"desc"`
@@ -57,11 +56,18 @@ type Registry struct {
 	// with FTW Cloud, and what for.
 	CloudScopes   []string `yaml:"cloud_scopes"`
 	CloudPurposes []string `yaml:"cloud_purposes"`
-	Resolutions  map[string]struct {
+	Resolutions   map[string]struct {
 		TileSpanMs    int64  `yaml:"tile_span_ms"`
 		RetentionDays int    `yaml:"retention_days"`
 		Source        string `yaml:"source"`
 	} `yaml:"resolutions"`
+}
+
+// field is one entry of frozen_fields or extra_fields.
+type field struct {
+	Name string `yaml:"name"`
+	Kind string `yaml:"kind"`
+	Unit string `yaml:"unit"`
 }
 
 // Generate renders the constant file for package protocol. Exported and byte-deterministic so the
@@ -70,6 +76,10 @@ func Generate(raw []byte) ([]byte, error) {
 	var reg Registry
 	if err := yaml.Unmarshal(raw, &reg); err != nil {
 		return nil, fmt.Errorf("parse registry: %w", err)
+	}
+
+	if err := checkFields(reg); err != nil {
+		return nil, err
 	}
 
 	var b bytes.Buffer
@@ -112,19 +122,58 @@ func GenerateRoles(raw []byte) ([]byte, error) {
 	return format.Source(b.Bytes())
 }
 
-func writeFields(b *bytes.Buffer, reg Registry) {
-	ids := make([]int, 0, len(reg.FrozenFields))
-	for id := range reg.FrozenFields {
+// checkFields refuses a registry where one id or one name means two things.
+// A delta and FTW Cloud's live body key fields by id alone, so the frozen
+// set and the extra fields are one space on the wire. Extra fields sit above
+// the frozen set too: lane 0 drops the highest id first when a delta does not
+// fit, and the core view must be the last thing to go.
+func checkFields(reg Registry) error {
+	highestFrozen := 0
+	names := map[string]int{}
+	for id, f := range reg.FrozenFields {
+		highestFrozen = max(highestFrozen, id)
+		names[f.Name] = id
+	}
+	for id, f := range reg.ExtraFields {
+		if _, ok := reg.FrozenFields[id]; ok {
+			return fmt.Errorf("field id %d is both frozen and extra", id)
+		}
+		if id <= highestFrozen {
+			return fmt.Errorf("extra field %d (%s) sits among the frozen ids", id, f.Name)
+		}
+		if other, ok := names[f.Name]; ok {
+			return fmt.Errorf("field name %s is both %d and %d", f.Name, other, id)
+		}
+		names[f.Name] = id
+	}
+	return nil
+}
+
+func sortedIDs(fields map[int]field) []int {
+	ids := make([]int, 0, len(fields))
+	for id := range fields {
 		ids = append(ids, id)
 	}
 	sort.Ints(ids)
+	return ids
+}
+
+func writeFields(b *bytes.Buffer, reg Registry) {
+	all := make(map[int]field, len(reg.FrozenFields)+len(reg.ExtraFields))
+	for id, f := range reg.FrozenFields {
+		all[id] = f
+	}
+	for id, f := range reg.ExtraFields {
+		all[id] = f
+	}
 
 	b.WriteString("// Fid is a telemetry field id. 1-9 are frozen permanently as of v1, so an\n")
-	b.WriteString("// app of any age can draw the core view from them alone.\n")
+	b.WriteString("// app of any age can draw the core view from them alone. Ids after the\n")
+	b.WriteString("// frozen set are depth for a node's own view.\n")
 	b.WriteString("type Fid uint32\n\n")
 	b.WriteString("const (\n")
-	for _, id := range ids {
-		f := reg.FrozenFields[id]
+	for _, id := range sortedIDs(all) {
+		f := all[id]
 		unit := f.Unit
 		if unit == "" {
 			unit = "none"
@@ -134,17 +183,23 @@ func writeFields(b *bytes.Buffer, reg Registry) {
 	}
 	b.WriteString(")\n\n")
 
-	b.WriteString("// FrozenFieldNames maps a frozen field id to its registry name.\n")
-	b.WriteString("var FrozenFieldNames = map[Fid]string{\n")
+	writeFieldMaps(b, "FrozenFieldNames", "FrozenFieldUnits", "a frozen field id", reg.FrozenFields)
+	writeFieldMaps(b, "FieldNames", "FieldUnits", "every field id, frozen or extra,", all)
+}
+
+func writeFieldMaps(b *bytes.Buffer, names, units, what string, fields map[int]field) {
+	ids := sortedIDs(fields)
+	fmt.Fprintf(b, "// %s maps %s to its registry name.\n", names, what)
+	fmt.Fprintf(b, "var %s = map[Fid]string{\n", names)
 	for _, id := range ids {
-		fmt.Fprintf(b, "\tFid%s: %q,\n", goName(reg.FrozenFields[id].Name), reg.FrozenFields[id].Name)
+		fmt.Fprintf(b, "\tFid%s: %q,\n", goName(fields[id].Name), fields[id].Name)
 	}
 	b.WriteString("}\n\n")
 
-	b.WriteString("// FrozenFieldUnits maps a frozen field id to its unit, empty when it has none.\n")
-	b.WriteString("var FrozenFieldUnits = map[Fid]string{\n")
+	fmt.Fprintf(b, "// %s maps %s to its unit, empty when it has none.\n", units, what)
+	fmt.Fprintf(b, "var %s = map[Fid]string{\n", units)
 	for _, id := range ids {
-		fmt.Fprintf(b, "\tFid%s: %q,\n", goName(reg.FrozenFields[id].Name), reg.FrozenFields[id].Unit)
+		fmt.Fprintf(b, "\tFid%s: %q,\n", goName(fields[id].Name), fields[id].Unit)
 	}
 	b.WriteString("}\n\n")
 }

@@ -153,8 +153,9 @@ type Hello struct {
 // Live is the site's flows and the freshness of every source behind them.
 type Live struct {
 	Header
-	// Fields uses the app protocol's frozen ids 1–6 and 10, keyed and
-	// encoded as its delta does.
+	// Fields uses the app protocol's frozen ids 1–6 and 10, and its extra
+	// fields 11–14 when the site meter gives phases, keyed and encoded as its
+	// delta does.
 	Fields map[string]int64 `cbor:"fields"`
 	// FieldSources and Sources travel only when the source table changed and
 	// in every full message.

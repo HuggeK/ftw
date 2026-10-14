@@ -5,17 +5,22 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"path/filepath"
 	"slices"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/srcfl/ftw/go/internal/appproto"
 	"github.com/srcfl/ftw/go/internal/cloudlink"
+	"github.com/srcfl/ftw/go/internal/control"
 	"github.com/srcfl/ftw/go/internal/loadpoint"
 	"github.com/srcfl/ftw/go/internal/state"
+	"github.com/srcfl/ftw/go/internal/telemetry"
 	"github.com/srcfl/ftw/go/protocol/cloudwire"
 )
 
@@ -156,5 +161,41 @@ func TestAppSessionsHearOfFTWCloudOnlyWhenItCanRun(t *testing.T) {
 		if name != "p1" || len(id) != 11 {
 			t.Fatalf("source %q named %q", id, name)
 		}
+	}
+}
+
+// FTW Cloud's live body is the same field set the app session streams, and
+// each phase follows the site meter's freshness there too. The fuse is
+// config, so it names no driver.
+func TestCloudLiveCarriesThePhasesUnderTheMeter(t *testing.T) {
+	tel, ctrl := seedSite(t)
+	tel.Update("meter", telemetry.DerMeter, 160, nil, json.RawMessage(
+		`{"l1_w":-367,"l2_w":908,"l3_w":-381,"l1_a":2.13,"l2_a":4.76,"l3_a":1.61}`))
+	ctrl.SiteFuseAmps, ctrl.SiteFusePhases = 20, 3
+	c := &cloudSite{site: &appSite{
+		tel: tel, ctrl: ctrl, ctrlMu: &sync.Mutex{},
+		revision: &control.Revision{}, started: time.Now(),
+		siteMeterStale: time.Minute,
+	}}
+
+	live := c.Live()
+
+	want := map[appproto.Fid]int64{
+		appproto.FidGridL1Da: -21, appproto.FidGridL2Da: 48, appproto.FidGridL3Da: -16, appproto.FidGridFuseDa: 200,
+	}
+	for fid, v := range want {
+		key := strconv.Itoa(int(fid))
+		if got, ok := live.Fields[key]; !ok || got != v {
+			t.Fatalf("field %s = %d (present %v), want %d", key, got, ok, v)
+		}
+	}
+	for _, fid := range []appproto.Fid{appproto.FidGridL1Da, appproto.FidGridL2Da, appproto.FidGridL3Da} {
+		key := strconv.Itoa(int(fid))
+		if got := live.FieldSources[key]; !slices.Equal(got, []string{"meter"}) {
+			t.Fatalf("field %s follows %v, want the meter", key, got)
+		}
+	}
+	if got, ok := live.FieldSources[strconv.Itoa(int(appproto.FidGridFuseDa))]; ok {
+		t.Fatalf("the fuse follows %v; it is config", got)
 	}
 }

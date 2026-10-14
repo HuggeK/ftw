@@ -232,7 +232,7 @@ list still show what kinds of equipment a site has.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `fields` | map text→int | Frozen field ids 1–6 and 10, keyed and encoded as the app protocol's `delta` does: field 1 is the mode index, power in W |
+| `fields` | map text→int | Frozen field ids 1–6 and 10, and the extra fields 11–14 when the site meter gives phases, keyed and encoded as the app protocol's `delta` does: field 1 is the mode index, power in W, phase currents and the main fuse in tenths of an ampere |
 | `fieldSources` | map text→[text] | The sources each field's freshness follows. Sent only with `sources` |
 | `sources` | map text→Source | The source table. Sent whenever `srcRev` changes, and in every full message |
 | `srcRev` | uint | Rises by 1, per boot, each time the source table changes |

@@ -93,6 +93,16 @@ type Snapshot struct {
 	EVW      float64
 	EVWKnown bool
 
+	// GridPhaseA is the site meter's current on L1, L2 and L3 in amps, signed
+	// by the site convention: positive while the phase draws from the grid.
+	// Nil for a phase the site does not have or the meter does not report,
+	// and all nil while the meter is offline. The wire carries tenths of an
+	// ampere, converted at the edge of this package.
+	GridPhaseA [3]*float64
+	// FuseA is the main fuse per phase, the scale the phases are read
+	// against. Sent only with at least one phase.
+	FuseA float64
+
 	Sources []Source
 
 	// DispatchBlockedBy names the source ids currently stopping dispatch.
