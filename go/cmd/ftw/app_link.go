@@ -422,6 +422,22 @@ func (a *appLoadpoints) SetSoC(id string, soc float64) bool {
 	return true
 }
 
+// Readings is every charger as the manager holds it. The car's level counts
+// only while it is plugged in: unplugged, the manager's number is the last
+// session's, and a watch would draw it as now.
+func (a *appLoadpoints) Readings() []appproto.LoadpointReading {
+	states := a.mgr.States()
+	out := make([]appproto.LoadpointReading, 0, len(states))
+	for _, st := range states {
+		out = append(out, appproto.LoadpointReading{
+			ID: st.ID, Plugged: st.PluggedIn,
+			SoC: st.CurrentSoC, SoCKnown: st.PluggedIn,
+			PowerW: st.CurrentPowerW,
+		})
+	}
+	return out
+}
+
 func (a *appLoadpoints) ObservedSoC(id string) (float64, bool) {
 	st, ok := a.mgr.State(id)
 	return st.CurrentSoC, ok
@@ -591,17 +607,20 @@ func startAppLink(
 	// and a retry in the next session must meet the id the last one took.
 	cmds := appproto.NewCmdLog()
 
-	uplink, err := appuplink.New(appuplink.Options{
-		Enroll:  enroll,
-		Deadman: deadman,
-		Handler: func(
+	// The box takes a watch through the relay's exchange (ADR 0009), and
+	// says so, so a phone offers "Add watch".
+	caps = append(caps, appproto.CapCmdExchange)
+
+	// handlerFor builds one handler for one session: a phone's stream, or a
+	// watch's exchange. They share the ports above, which are read-only
+	// apart from the mode and the command log, and the mode goes through
+	// control's own validation.
+	handlerFor := func(exchange bool) appuplink.HandlerBuilder {
+		return func(
 			sender appproto.Sender,
 			caller apiauth.Caller,
 			grants appproto.GrantReader,
 		) (*appproto.Handler, error) {
-			// One handler per app session. They share the ports above, which
-			// are read-only apart from the mode and the command log, and the
-			// mode goes through control's own validation.
 			return appproto.New(appproto.Config{
 				Clock:        appproto.SystemClock{StartedAt: site.started, Source: "ntp"},
 				Site:         site,
@@ -616,6 +635,7 @@ func startAppLink(
 				Caller:       caller,
 				Grants:       grants,
 				Commands:     cmds,
+				Exchange:     exchange,
 				// FTW Cloud is asked per session: its link is bound after
 				// this returns, and its grant moves while the box runs.
 				Caps:   cloud.caps(caps),
@@ -629,7 +649,14 @@ func startAppLink(
 				SrcPV:      siteMeterName(ctrl, ctrlMu),
 				SrcBattery: siteMeterName(ctrl, ctrlMu),
 			})
-		},
+		}
+	}
+
+	uplink, err := appuplink.New(appuplink.Options{
+		Enroll:          enroll,
+		Deadman:         deadman,
+		Handler:         handlerFor(false),
+		ExchangeHandler: handlerFor(true),
 	})
 	if err != nil {
 		return enroll, nil, enabled, err

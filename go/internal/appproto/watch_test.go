@@ -159,6 +159,6 @@ func TestAWatchsHelloNamesItsRoleAndScopes(t *testing.T) {
 		t.Fatalf("hello_ok scopes = %v, want %v", ok.Scopes, want)
 	}
 	if slices.Contains(ok.Caps, CapCmdExchange) {
-		t.Fatal("hello_ok says cmd.exchange before the box opens the exchange")
+		t.Fatal("hello_ok says cmd.exchange for a box that was not given it")
 	}
 }

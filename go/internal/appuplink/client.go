@@ -128,6 +128,11 @@ type Options struct {
 	// control or the planner.
 	Handler HandlerBuilder
 
+	// ExchangeHandler builds one handler per watch session, with
+	// appproto.Config.Exchange set (ADR 0009). Nil leaves the exchange
+	// socket closed: the box takes no watch, and nothing else changes.
+	ExchangeHandler HandlerBuilder
+
 	Logger *slog.Logger
 
 	// Deadman, when set, arms the dead man's switch: rows posted to the
@@ -179,6 +184,11 @@ type Uplink struct {
 	liveMu sync.Mutex
 	live   []*liveLink
 
+	// exchanges is the box's table of watch sessions, nil without an
+	// ExchangeHandler. One for the box rather than one per connection, so a
+	// watch's session survives the hour turning under it.
+	exchanges *exchanges
+
 	// The dead man's switch bookkeeping: which row ids the relay holds,
 	// so a removed subscription's row is deleted rather than left armed.
 	deadmanMu      sync.Mutex
@@ -207,6 +217,9 @@ func (u *Uplink) DropSessionsByAppKey(pub []byte) int {
 	dropped := 0
 	for _, l := range live {
 		dropped += l.sessions.dropByAppKey(pub)
+	}
+	if u.exchanges != nil {
+		dropped += u.exchanges.dropByAppKey(pub)
 	}
 	return dropped
 }
@@ -265,6 +278,16 @@ func New(opts Options) (*Uplink, error) {
 	}
 	if u.deadmanRefresh <= 0 {
 		u.deadmanRefresh = deadmanRefreshInterval
+	}
+	if opts.ExchangeHandler != nil {
+		u.exchanges = &exchanges{
+			build:    opts.ExchangeHandler,
+			enroll:   opts.Enroll,
+			static:   opts.Enroll.StaticKey(),
+			log:      u.log,
+			now:      time.Now,
+			cmdFloor: ExchangeCmdFloor,
+		}
 	}
 	return u, nil
 }
@@ -326,7 +349,7 @@ func (u *Uplink) once(ctx context.Context) (time.Duration, error) {
 	// this, an hourly rotation would compound the backoff until a box that
 	// works perfectly waits a minute after every rotation.
 	connectedAt := u.now()
-	end := u.ride(ctx, u.start(ctx, conn, epoch))
+	end := u.ride(ctx, u.start(ctx, conn, epoch, handle))
 	if u.now().Sub(connectedAt) >= backoffCap {
 		u.attempt = 0
 	}
@@ -388,11 +411,16 @@ type linkEnd struct {
 	err    error
 }
 
-func (u *Uplink) start(ctx context.Context, conn *websocket.Conn, epoch int64) *link {
+func (u *Uplink) start(ctx context.Context, conn *websocket.Conn, epoch int64, handle string) *link {
 	ctx, stop := context.WithCancel(ctx)
 	l := &link{epoch: epoch, stop: stop, done: make(chan linkEnd, 1)}
 	go func() {
 		defer stop()
+		// The exchange socket rides beside this connection, under the same
+		// epoch and handle, and ends with it.
+		if u.exchanges != nil {
+			go u.keepExchange(ctx, epoch, handle)
+		}
 		code, reason, err := u.serve(ctx, conn)
 		l.done <- linkEnd{code: code, reason: reason, err: err}
 	}()
@@ -505,7 +533,7 @@ func (u *Uplink) join(ctx context.Context, epoch int64) *link {
 		u.log.Debug("could not join the new hour's handle yet", "err", err)
 		return nil
 	}
-	return u.start(ctx, conn, epoch)
+	return u.start(ctx, conn, epoch, handle)
 }
 
 // serve runs one connection. It returns the close code and reason when the

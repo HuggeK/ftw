@@ -107,6 +107,10 @@ type (
 	Event            = protocol.Event
 	SessionTerminate = protocol.SessionTerminate
 	CloudSession     = protocol.CloudSession
+	ExchangeHelloOK  = protocol.ExchangeHelloOK
+	Now              = protocol.Now
+	NowSource        = protocol.NowSource
+	NowLoadpoint     = protocol.NowLoadpoint
 )
 
 const (
@@ -133,6 +137,7 @@ const (
 	MsgAPIHead                = protocol.MsgAPIHead
 	MsgAPIChunk               = protocol.MsgAPIChunk
 	MsgAPIEnd                 = protocol.MsgAPIEnd
+	MsgNow                    = protocol.MsgNow
 	OpSetMode                 = protocol.OpSetMode
 	OpPlannerPrefsSet         = protocol.OpPlannerPrefsSet
 	OpLoadpointHold           = protocol.OpLoadpointHold

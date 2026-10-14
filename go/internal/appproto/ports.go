@@ -179,6 +179,21 @@ type Loadpoints interface {
 	SetSurplusOnly(id string, v bool) (prev bool, ok bool)
 	// ObservedSurplusOnly is the flag as the box holds it now.
 	ObservedSurplusOnly(id string) (v bool, ok bool)
+	// Readings is every charger as the box holds it now, in its configured
+	// order: what a watch's now draws.
+	Readings() []LoadpointReading
+}
+
+// LoadpointReading is one charger as the box holds it now.
+type LoadpointReading struct {
+	ID      string
+	Plugged bool
+	// SoC is the car's level as a fraction in [0,1], meaningful only while
+	// SoCKnown.
+	SoC      float64
+	SoCKnown bool
+	// PowerW is the charger's draw, positive while charging.
+	PowerW float64
 }
 
 // PlannerPrefsSnapshot is the household planner preference as the box holds

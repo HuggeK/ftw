@@ -68,6 +68,12 @@ type Config struct {
 	// next session act a second time.
 	Commands *CmdLog
 
+	// Exchange makes this a watch's exchange session (ADR 0009, decision 2).
+	// It takes hello, cmd and now, and answers every other request
+	// E_UNKNOWN_OP. It never streams and pushes no plan after a command.
+	// Every frame it sends is lane 0 apart from hello_ok.
+	Exchange bool
+
 	// Caps is what this box advertises. Names must come from the generated
 	// contract constants; a typo is refused at construction rather than
 	// silently hiding a feature in the app.
@@ -346,6 +352,9 @@ func (h *Handler) Handle(ctx context.Context, frame []byte) error {
 }
 
 func (h *Handler) dispatch(ctx context.Context, env Envelope) error {
+	if h.cfg.Exchange {
+		return h.dispatchExchange(ctx, env)
+	}
 	switch env.T {
 	case MsgHello:
 		return h.onHello(env)
@@ -973,7 +982,9 @@ func (h *Handler) settleAndReport(cmdID string, res CmdResult) error {
 	if err := h.sendCmdResult(res); err != nil {
 		return err
 	}
-	if res.State == CmdApplied {
+	// An exchange answers with two frames of one size and nothing after
+	// them, so a watch reads the new plan from FTW Cloud instead.
+	if res.State == CmdApplied && !h.cfg.Exchange {
 		return h.sendPlan(nil)
 	}
 	return nil

@@ -25,6 +25,9 @@ const (
 	MsgAPIHead          = "api.head"
 	MsgAPIChunk         = "api.chunk"
 	MsgAPIEnd           = "api.end"
+	// MsgNow is a watch's read of the home over the exchange, and the box's
+	// answer to it (ADR 0009). The same type both ways, as tick is.
+	MsgNow = "now"
 )
 
 // Operations a client may ask for, from contract/registry.yaml `ops` — the
@@ -86,6 +89,10 @@ type Hello struct {
 	// ignore this additive field; subscribed in hello_ok tells a newer app whether
 	// it still needs to send the ordinary sub message.
 	Sub *Sub `cbor:"sub,omitempty"`
+	// Code is a watch's pairing code, sent once, in the hello that rides in
+	// the exchange's handshake message 1. A phone's code travels as the
+	// whole of its message 1 payload instead, and a paired watch sends none.
+	Code []byte `cbor:"code,omitempty"`
 }
 
 type ProtoRange struct {
@@ -139,6 +146,27 @@ type HelloOK struct {
 	// Cloud is what the phone needs to read this home from FTW Cloud. Every
 	// role gets it, and only while an owner has FTW Cloud on. Absent means
 	// off, or an older box.
+	Cloud *CloudSession `cbor:"cloud,omitempty"`
+}
+
+// ExchangeHelloOK answers a watch's hello on the exchange, in handshake
+// message 2 (ADR 0009, decision 2).
+//
+// It carries what a watch needs and nothing more. The capability list and the
+// mode catalogue stay on the stream: a watch sends cmd and now, and nothing it
+// shows needs them. The smallest bulk bucket it fits, normally 1 KiB; its size
+// follows the house's equipment, never what happens in the house.
+type ExchangeHelloOK struct {
+	Proto  int      `cbor:"proto"`
+	Mode   BoxMode  `cbor:"mode"`
+	Clock  Clock    `cbor:"clock"`
+	Role   string   `cbor:"role"`
+	Scopes []string `cbor:"scopes"`
+	// Rev is the site's controlRev. A command carries the rev it expects, and
+	// the exchange has no snapshot to learn it from.
+	Rev uint64 `cbor:"rev"`
+	// Cloud is what the watch needs to read FTW Cloud on its own, while an
+	// owner has FTW Cloud on. Absent means off.
 	Cloud *CloudSession `cbor:"cloud,omitempty"`
 }
 
@@ -288,6 +316,45 @@ type Delta struct {
 type Tick struct {
 	Seq      uint64 `cbor:"seq"`
 	UptimeMs int64  `cbor:"uptimeMs"`
+}
+
+// Now is the home as the Now screen shows it, answered on the exchange in one
+// lane 0 frame (ADR 0009, decision 2). A watch reads it when FTW Cloud is off.
+//
+// The request is a now with an empty body. What does not fit the frame is
+// left out and the frame flagged TRUNC, as a delta is.
+type Now struct {
+	UptimeMs int64 `cbor:"uptimeMs"`
+	// ControlRev is the site's controlRev, which a command expects.
+	ControlRev uint64 `cbor:"controlRev"`
+	// Fields are the frozen fields, as a snapshot carries them.
+	Fields map[string]int64 `cbor:"fields"`
+	// Sources are keyed by the frozen source fields, 7 for the grid, 8 for
+	// PV and 9 for the battery, so a watch with no field dictionary can still
+	// age each reading.
+	Sources map[string]NowSource `cbor:"sources"`
+	// DispatchBlockedBy names the sources stopping dispatch, as a snapshot
+	// does. A watch that sees it knows a charge will be refused.
+	DispatchBlockedBy []string `cbor:"dispatchBlockedBy"`
+	// Loadpoints are the box's chargers, in its configured order.
+	Loadpoints []NowLoadpoint `cbor:"loadpoints"`
+}
+
+// NowSource is one source's freshness, without its name.
+type NowSource struct {
+	State SourceState `cbor:"state"`
+	// AgeMs is box uptime since the last good reading, or -1 for none.
+	AgeMs int64 `cbor:"ageMs"`
+}
+
+// NowLoadpoint is one charger as a watch draws it.
+type NowLoadpoint struct {
+	ID      string `cbor:"id"`
+	Plugged bool   `cbor:"plugged"`
+	// SocPermille is the car's level, absent when the box does not know it.
+	SocPermille *int64 `cbor:"socPermille,omitempty"`
+	// PowerW is the charger's draw, positive while charging.
+	PowerW int64 `cbor:"powerW"`
 }
 
 // --------------------------------------------------------------------------
