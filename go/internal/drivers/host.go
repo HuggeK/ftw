@@ -145,9 +145,13 @@ type HostEnv struct {
 	BatteryTelemetryOnly bool
 
 	mu sync.Mutex
-	// Desired poll interval — driver can set via host.set_poll_interval OR
-	// return it from driver_poll. We persist the last hint here.
-	PollIntervalMS int32
+	// Standing poll interval, 5 s until the driver calls
+	// host.set_poll_interval. Once it has, that interval wins over anything
+	// driver_poll returns.
+	PollIntervalMS  int32
+	pollIntervalSet bool
+	// scheduledPoll is the wait the run loop armed last, standing or returned.
+	scheduledPoll time.Duration
 	// Identity set by driver / capability layer.
 	// Make + SN are reported via host.set_make / host.set_sn.
 	// Endpoint is the protocol+host+port string set by the registry when
@@ -546,6 +550,7 @@ func (h *HostEnv) log(level int32, msg string) {
 func (h *HostEnv) setPollInterval(ms int32) {
 	h.mu.Lock()
 	h.PollIntervalMS = ms
+	h.pollIntervalSet = true
 	h.mu.Unlock()
 }
 
@@ -798,14 +803,64 @@ func (h *HostEnv) stampIdentity(raw []byte) []byte {
 	return out
 }
 
-// PollInterval returns the driver's current requested poll cadence.
+// PollInterval returns the driver's standing poll cadence.
 func (h *HostEnv) PollInterval() time.Duration {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	return h.standingPollIntervalLocked()
+}
+
+func (h *HostEnv) standingPollIntervalLocked() time.Duration {
 	if h.PollIntervalMS <= 0 {
 		return 5 * time.Second
 	}
 	return time.Duration(h.PollIntervalMS) * time.Millisecond
+}
+
+// Bounds for an interval a driver returns from driver_poll. Lane 0 frames
+// leave once a second and the control loop ticks every two seconds by
+// default, so a faster read reaches nothing but the device's bus; some
+// catalog drivers return 200 ms or 50 ms. The ceiling is half the default
+// 60 s watchdog window, so a returned wait cannot make a driver stale by
+// itself: myuplink returns 60 s after a good read. A driver that needs longer
+// sets it with host.set_poll_interval, as the vehicle drivers do.
+const (
+	minReturnedPollInterval = time.Second
+	maxReturnedPollInterval = 30 * time.Second
+)
+
+// returnedPollInterval converts milliseconds returned by driver_poll. It caps
+// before converting: a Lua number can exceed the range of time.Duration.
+func returnedPollInterval(ms float64) time.Duration {
+	ms = math.Min(ms, float64(maxReturnedPollInterval/time.Millisecond))
+	return time.Duration(ms) * time.Millisecond
+}
+
+// nextPollInterval picks the wait before the next driver_poll. An interval
+// set with host.set_poll_interval wins, unbounded, as it always has. A driver
+// that never set one gets the positive interval its last poll returned,
+// within bounds, or the 5 s default.
+func (h *HostEnv) nextPollInterval(returned time.Duration) time.Duration {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	next := h.standingPollIntervalLocked()
+	if !h.pollIntervalSet && returned > 0 {
+		next = min(max(returned, minReturnedPollInterval), maxReturnedPollInterval)
+	}
+	h.scheduledPoll = next
+	return next
+}
+
+// ScheduledPollInterval returns the wait the run loop armed last, or the
+// standing interval before the first poll has run.
+func (h *HostEnv) ScheduledPollInterval() time.Duration {
+	h.mu.Lock()
+	scheduled := h.scheduledPoll
+	h.mu.Unlock()
+	if scheduled > 0 {
+		return scheduled
+	}
+	return h.PollInterval()
 }
 
 // Identity returns (make, serial) set by the driver.

@@ -1055,7 +1055,7 @@ func (r *Registry) runLoop(rd *runningDriver) {
 			// Register the poll as the active Lua call so SendDefault can
 			// cancel it the same way it cancels an in-flight command.
 			pollCtx, finishPoll := rd.beginCommand(ctx)
-			_, err := rd.driver.Poll(pollCtx)
+			returned, err := rd.driver.Poll(pollCtx)
 			finishPoll()
 			if err != nil {
 				slog.Warn("driver poll failed", "name", rd.cfg.Name, "err", err)
@@ -1073,8 +1073,8 @@ func (r *Registry) runLoop(rd *runningDriver) {
 				// re-stamps LastSuccess every tick from cached values.
 				r.tel.RecordDriverTick(rd.cfg.Name)
 			}
-			// Re-arm timer at driver's requested interval
-			interval = rd.env.PollInterval()
+			// Re-arm at the interval the poll returned, or the standing one.
+			interval = rd.env.nextPollInterval(returned)
 			timer.Reset(interval)
 		case <-recoveryC:
 			if err := attemptDefault(); err != nil {
@@ -1468,7 +1468,7 @@ func replacementContext(ctx context.Context) context.Context {
 	return context.WithoutCancel(ctx)
 }
 
-// PollInterval returns the currently requested cadence for a running driver.
+// PollInterval returns the cadence a running driver is polled at now.
 // Repository activation uses it to wait for two fresh cycles before declaring
 // a new artifact healthy.
 func (r *Registry) PollInterval(name string) (time.Duration, bool) {
@@ -1478,7 +1478,7 @@ func (r *Registry) PollInterval(name string) (time.Duration, bool) {
 	if !ok {
 		return 0, false
 	}
-	return rd.env.PollInterval(), true
+	return rd.env.ScheduledPollInterval(), true
 }
 
 // tcpAllowedHostsFor builds the effective allowlist for a TCP-capable
