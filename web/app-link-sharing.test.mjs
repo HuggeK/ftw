@@ -259,6 +259,48 @@ describe("the device list", () => {
     assert.doesNotMatch(said, /last phone/i, "two phones are paired and one was called the last");
   });
 
+  // A watch sits under the phone that added it. Its reach follows that
+  // phone, so it gets Remove and nothing else.
+  it("lists a watch under its phone, with no role button", async () => {
+    const { el } = load({
+      devices: [
+        { id: "aaaa1111", role: "owner" },
+        { id: "wwww3333", role: "watch", parent: "aaaa1111" },
+        { id: "bbbb2222", role: "viewer" },
+      ],
+    });
+    await settle();
+
+    const rows = el("app-link-devices").children;
+    assert.equal(rows.length, 3);
+    assert.match(rows[1].words(), /Watch wwww3333/);
+    assert.match(rows[1].words(), /Can look and charge/);
+    assert.match(rows[1].className, /app-device-watch/, "the watch is not set in under its phone");
+    assert.doesNotMatch(rows[0].className, /app-device-watch/);
+    assert.deepEqual(rows[1].buttons().map((b) => b.textContent), ["Remove"]);
+  });
+
+  it("says a phone's watches go with it, and a watch goes alone", async () => {
+    const { el, confirmed } = load({
+      devices: [
+        { id: "aaaa1111", role: "owner", last_owner: true },
+        { id: "wwww3333", role: "watch", parent: "aaaa1111" },
+      ],
+    });
+    await settle();
+
+    const rows = el("app-link-devices").children;
+    rows[1].buttons().find((b) => b.textContent === "Remove").click();
+    await settle();
+    assert.match(confirmed[0], /Remove this watch\?/);
+    assert.doesNotMatch(confirmed[0], /last phone/i, "removing a watch was called removing the last phone");
+
+    rows[0].buttons().find((b) => b.textContent === "Remove").click();
+    await settle();
+    assert.match(confirmed[1], /last phone/i, "a phone with a watch was not called the last phone");
+    assert.match(confirmed[1], /Its watch goes with it/, "the warning hides that the watch goes too");
+  });
+
   it("hides sharing until there is somebody to share from", async () => {
     // The first phone on a box is its owner whatever code it used, so an
     // invite offered before then would silently make an owner.

@@ -1764,6 +1764,10 @@ footer {
 .app-device-row button {
   flex: 0 0 auto;
 }
+/* A watch sits under the phone that added it. */
+.app-device-watch {
+  padding-left: 16px;
+}
 /* Who the next code is for, on one line and wrapping on a narrow screen.
    Only one code is ever live, so these belong together rather than scattered
    down the panel as if they were independent settings. How the code travels —

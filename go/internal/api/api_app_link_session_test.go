@@ -56,6 +56,11 @@ func (e *realEnroller) MintSpokenCode(role string) (string, time.Time, error) {
 	return code, expires, enrollError(err)
 }
 
+func (e *realEnroller) MintWatchCode(parentID string) ([]byte, time.Time, error) {
+	code, expires, err := e.id.MintWatchCode(parentID, appenroll.WatchTTL)
+	return code, expires, enrollError(err)
+}
+
 func (e *realEnroller) EnrollmentURL(code []byte, lanHint string) (string, error) {
 	return e.id.EnrollmentURL(code, lanHint)
 }
@@ -67,7 +72,7 @@ func (e *realEnroller) Devices() []AppDevice {
 	for _, d := range e.id.Devices() {
 		out = append(out, AppDevice{
 			ID: d.ID, AddedAtMs: d.AddedAtMs, LastSeenMs: d.LastSeenMs,
-			Role: d.Role, LastOwner: d.LastOwner,
+			Role: d.Role, LastOwner: d.LastOwner, Parent: d.Parent,
 		})
 	}
 	return out
@@ -92,6 +97,10 @@ func enrollError(err error) error {
 		return ErrLastAppOwnerProtected
 	case errors.Is(err, appenroll.ErrUnknownRole):
 		return ErrUnknownAppRole
+	case errors.Is(err, appenroll.ErrWatchRole):
+		return ErrWatchAppRole
+	case errors.Is(err, appenroll.ErrWatchNeedsOwner):
+		return ErrWatchNeedsOwner
 	default:
 		return err
 	}
@@ -452,14 +461,16 @@ func TestTheAppCannotMakeAnotherOwner(t *testing.T) {
 	}
 }
 
-// No door hands out a watch yet.
+// A watch comes only from its owner phone, over that phone's session.
 //
-// The registry names the role, so the box's own enrolment would accept it. A
-// watch belongs to the owner phone that adds it (ADR 0009), and until the box
-// can bind one to its phone the API refuses the role at both doors. This runs
-// against the real enrolment because a stub that knows only owner and viewer
-// would refuse for its own reasons.
-func TestNoDoorHandsOutAWatchYet(t *testing.T) {
+// The registry names the role, so the box's own enrolment knows it. A watch
+// belongs to the owner phone that adds it (ADR 0009): the box's page has no
+// phone to bind one to, and changing a phone into a watch would leave a watch
+// with no phone above it. A session that is not the enrolled owner's phone
+// gets nothing either. The rule's success path is in
+// api_app_link_watch_test.go. This runs against the real enrolment because a
+// stub that knows only owner and viewer would refuse for its own reasons.
+func TestNoDoorButItsPhoneHandsOutAWatch(t *testing.T) {
 	enrol := newEnrolment(t)
 
 	code, _, err := enrol.id.MintPairingCode(apiauth.RoleViewer, appenroll.InviteTTL)

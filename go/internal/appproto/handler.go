@@ -265,6 +265,32 @@ func ScopesForRole(role string) apiauth.ScopeSet {
 	return apiauth.NewScopeSet(apiauth.RoleScopes[role]...)
 }
 
+// GrantScopes lists what an enrolment carries now, in the registry's order.
+//
+// A phone carries its role's scopes. A watch carries those of its role's
+// scopes that its parent's role carries too, so a watch never does more than
+// its phone can do this second (ADR 0009, decision 4). A watch with no parent
+// carries nothing.
+func GrantScopes(role, parentRole string) []string {
+	own := apiauth.RoleScopes[role]
+	if role != apiauth.RoleWatch {
+		return own
+	}
+	parent := ScopesForRole(parentRole)
+	out := make([]string, 0, len(own))
+	for _, scope := range own {
+		if parent.Has(scope) {
+			out = append(out, scope)
+		}
+	}
+	return out
+}
+
+// ScopesForGrant is GrantScopes as a set.
+func ScopesForGrant(role, parentRole string) apiauth.ScopeSet {
+	return apiauth.NewScopeSet(GrantScopes(role, parentRole)...)
+}
+
 // liveCaller is whose session this is, as the box's records stand this second.
 //
 // Not the snapshot the handshake took. A socket outlives a revoke, and it
@@ -280,14 +306,14 @@ func ScopesForRole(role string) apiauth.ScopeSet {
 // that is the right way round — the app drawing a button is presentation, and
 // the box refusing it is the enforcement.
 func (h *Handler) liveCaller() (apiauth.Caller, bool) {
-	role, epoch, ok := h.cfg.Grants.Grant()
+	grant, ok := h.cfg.Grants.Grant()
 	if !ok {
 		return apiauth.Caller{}, false
 	}
 	caller := h.cfg.Caller
-	caller.Role = role
-	caller.Epoch = epoch
-	caller.Scopes = ScopesForRole(role)
+	caller.Role = grant.Role
+	caller.Epoch = grant.Epoch
+	caller.Scopes = ScopesForGrant(grant.Role, grant.ParentRole)
 	return caller, true
 }
 
@@ -898,8 +924,12 @@ func (h *Handler) onCmd(ctx context.Context, env Envelope) error {
 }
 
 // cmdRoot is the device whose command ids this session spends: the enrolled
-// device itself. Its subject is stable across sessions and names nobody else.
+// device itself, or for a watch the phone that added it. A subject is stable
+// across sessions and names nobody else.
 func (h *Handler) cmdRoot() string {
+	if grant, ok := h.cfg.Grants.Grant(); ok && grant.Root != "" {
+		return grant.Root
+	}
 	return h.cfg.Caller.Subject
 }
 

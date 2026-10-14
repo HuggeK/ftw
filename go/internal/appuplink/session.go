@@ -171,10 +171,10 @@ func (s *sessions) open(message []byte) error {
 	// commands it may send, which routes it may reach — is decided from this
 	// value, and nothing the phone sends can add to it.
 	caller := apiauth.Caller{
-		Subject: apiauth.KindApp + ":" + grant.DeviceID,
+		Subject: subjectOf(grant.DeviceID),
 		Kind:    apiauth.KindApp,
 		Role:    grant.Role,
-		Scopes:  appproto.ScopesForRole(grant.Role),
+		Scopes:  appproto.ScopesForGrant(grant.Role, grant.ParentRole),
 		Epoch:   grant.Epoch,
 	}
 
@@ -280,12 +280,28 @@ type liveGrant struct {
 	deviceID string
 }
 
-func (g liveGrant) Grant() (string, uint64, bool) {
+func (g liveGrant) Grant() (appproto.Enrolment, bool) {
 	grant, ok := g.enroll.GrantFor(g.deviceID)
 	if !ok {
-		return "", 0, false
+		return appproto.Enrolment{}, false
 	}
-	return grant.Role, grant.Epoch, true
+	return enrolmentOf(grant), true
+}
+
+// enrolmentOf is a grant as the message layer reads it. A watch spends its
+// parent phone's command ids, so one intent sent by both acts once.
+func enrolmentOf(grant appenroll.Grant) appproto.Enrolment {
+	e := appproto.Enrolment{Role: grant.Role, Epoch: grant.Epoch, ParentRole: grant.ParentRole}
+	if grant.Parent != "" {
+		e.Root = subjectOf(grant.Parent)
+	}
+	return e
+}
+
+// subjectOf is the caller subject for a device id. Built here and nowhere
+// else, so the command log and the audit line name a device the same way.
+func subjectOf(deviceID string) string {
+	return apiauth.KindApp + ":" + deviceID
 }
 
 func (s *sessions) count() int {

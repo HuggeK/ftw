@@ -245,16 +245,20 @@ type fakeGrants struct {
 	role  string
 	epoch uint64
 	gone  bool
+	// parentRole and root make the grant a watch's: the role its phone holds
+	// now, and that phone's subject.
+	parentRole string
+	root       string
 }
 
 func newGrants() *fakeGrants { return &fakeGrants{role: apiauth.RoleOwner, epoch: 1} }
 
 func newViewerGrants() *fakeGrants { return &fakeGrants{role: apiauth.RoleViewer, epoch: 1} }
 
-func (g *fakeGrants) Grant() (string, uint64, bool) {
+func (g *fakeGrants) Grant() (Enrolment, bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.role, g.epoch, !g.gone
+	return Enrolment{Role: g.role, Epoch: g.epoch, ParentRole: g.parentRole, Root: g.root}, !g.gone
 }
 
 // revoke is what appenroll.Revoke does to a row: it stops existing.

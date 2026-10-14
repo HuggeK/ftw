@@ -783,11 +783,11 @@ func TestARevokedShareStopsACallAlreadyInFlight(t *testing.T) {
 
 	// What the settings page does: forget the key, then tear down whatever
 	// it is running right now.
-	key, err := r.enroll.Revoke(deviceIDOf(app.staticPublic()), appenroll.AtTheBox)
+	removed, err := r.enroll.Revoke(deviceIDOf(app.staticPublic()), appenroll.AtTheBox)
 	if err != nil {
 		t.Fatalf("Revoke: %v", err)
 	}
-	if dropped := r.uplink.DropSessionsByAppKey(key); dropped != 1 {
+	if dropped := r.uplink.DropSessionsByAppKey(removed[0].Key); dropped != 1 {
 		t.Fatalf("dropped %d sessions, want 1", dropped)
 	}
 

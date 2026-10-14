@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/srcfl/ftw/go/internal/api"
-	"github.com/srcfl/ftw/go/internal/apiauth"
 	"github.com/srcfl/ftw/go/internal/appenroll"
 	"github.com/srcfl/ftw/go/internal/appproto"
 	"github.com/srcfl/ftw/go/internal/cloudlink"
@@ -270,7 +269,8 @@ func roundW(v float64) int64 {
 
 func ptr[T any](v T) *T { return &v }
 
-// cloudRoster lists paired phones with the scopes their roles carry.
+// cloudRoster lists paired devices with the scopes the box derives for each:
+// a phone's role, or for a watch what its role and its phone's role share.
 type cloudRoster struct {
 	enroll *appenroll.Identity
 }
@@ -279,7 +279,7 @@ func (r cloudRoster) Devices() []cloudlink.RosterDevice {
 	var out []cloudlink.RosterDevice
 	for _, e := range r.enroll.Roster() {
 		out = append(out, cloudlink.RosterDevice{ID: e.ID, Key: e.Key, Role: e.Role, Epoch: e.Epoch,
-			Scopes: apiauth.RoleScopes[e.Role]})
+			Scopes: appproto.GrantScopes(e.Role, e.ParentRole)})
 	}
 	return out
 }

@@ -95,6 +95,14 @@ var (
 	// ErrLastOwnerProtected is an attempt to demote the only owner, or to
 	// remove it from somewhere other than the box itself.
 	ErrLastOwnerProtected = errors.New("appenroll: that is the only owner")
+	// ErrWatchRole is the watch role asked for where it cannot be given: on
+	// a phone's code, or as a role change to or from watch. A watch comes
+	// only from an owner phone's watch code and stays a watch until removed.
+	ErrWatchRole = errors.New("appenroll: a watch comes only from an owner phone's watch code")
+	// ErrWatchNeedsOwner is a watch code asked for by a phone that is not an
+	// owner. A watch never holds more than its phone, and only an owner may
+	// add a device.
+	ErrWatchNeedsOwner = errors.New("appenroll: only an owner phone can add a watch")
 )
 
 // stored is the on-disk shape. Base64 rather than hex only because the app's
@@ -127,6 +135,9 @@ type storedApp struct {
 	// GrantFor, which every privileged request calls. Absent, or zero, reads
 	// as the first epoch.
 	Epoch uint64 `json:"epoch,omitempty"`
+	// Parent is the full key of the phone that added this watch. Empty for a
+	// phone. A watch without its phone is removed with it, never left behind.
+	Parent string `json:"parent,omitempty"`
 }
 
 // UnmarshalJSON accepts the legacy bare-string form beside the current one.
@@ -162,6 +173,9 @@ type DeviceInfo struct {
 	// session — so a screen can say what it is before somebody presses a
 	// button rather than after.
 	LastOwner bool
+	// Parent is the device id of the phone that added this watch, and empty
+	// for a phone. The list puts each watch right after its phone.
+	Parent string
 }
 
 // deviceID is the row name: the first eight characters of the base64 key.
@@ -188,6 +202,9 @@ type Identity struct {
 	rendezvous   []byte
 	authorised   map[string]*appMeta
 	pairing      *pairingCode
+	// watchPairing is the watch code, in a slot of its own so that adding a
+	// watch never cancels a phone's pending code. See MintWatchCode.
+	watchPairing *pairingCode
 	now          func() time.Time
 	// randRead is the entropy source. Injectable so a test can prove the
 	// failure path instead of only the happy one.
@@ -203,6 +220,9 @@ type appMeta struct {
 	lastSeenMs int64
 	role       string
 	epoch      uint64
+	// parent is the full key of the phone that added a watch, and empty for
+	// a phone.
+	parent string
 }
 
 // firstEpoch is where a fresh enrolment starts.
@@ -217,6 +237,12 @@ type Grant struct {
 	DeviceID string
 	Role     string
 	Epoch    uint64
+	// Parent and ParentRole name the phone that added a watch and the role
+	// that phone holds now. Both are empty for a phone. A watch holds only
+	// the scopes its parent's role also carries, so a parent demoted to
+	// viewer narrows its watch at once.
+	Parent     string
+	ParentRole string
 }
 
 type pairingCode struct {
@@ -233,6 +259,9 @@ type pairingCode struct {
 	kind string
 	// attempts counts wrong guesses against this code. See Authorise.
 	attempts int
+	// parent is the full key of the phone a watch code was minted for, and
+	// empty on a phone's code.
+	parent string
 }
 
 // Kinds of pairing code.
@@ -319,6 +348,15 @@ func (i *Identity) load(raw []byte) error {
 			lastSeenMs: app.LastSeenMs,
 			role:       role,
 			epoch:      epoch,
+			parent:     app.Parent,
+		}
+	}
+	// A watch whose phone is missing from the file was left behind by a
+	// write that never finished. It holds nothing its phone could vouch for,
+	// so it goes rather than lingering as a device nobody can narrow.
+	for key, meta := range i.authorised {
+		if meta.role == apiauth.RoleWatch && i.authorised[meta.parent] == nil {
+			delete(i.authorised, key)
 		}
 	}
 	return nil
@@ -360,7 +398,7 @@ func (i *Identity) save() error {
 	for key, meta := range i.authorised {
 		s.AuthorisedApps = append(s.AuthorisedApps, storedApp{
 			Key: key, AddedAtMs: meta.addedAtMs, LastSeenMs: meta.lastSeenMs,
-			Role: meta.role, Epoch: meta.epoch,
+			Role: meta.role, Epoch: meta.epoch, Parent: meta.parent,
 		})
 	}
 	// Deterministic on disk, so two saves of the same state are the same
@@ -446,7 +484,7 @@ func (i *Identity) RotateRendezvousSecret() ([]byte, error) {
 //     the initiator's ephemeral nor its static private key and so cannot
 //     derive the session keys the box answers with.
 func (i *Identity) MintPairingCode(role string, ttl time.Duration) ([]byte, time.Time, error) {
-	if err := knownRole(role); err != nil {
+	if err := phoneRole(role); err != nil {
 		return nil, time.Time{}, err
 	}
 	code := make([]byte, PairingCodeBytes)
@@ -472,7 +510,7 @@ func (i *Identity) MintPairingCode(role string, ttl time.Duration) ([]byte, time
 // Returned grouped as XXXX-XXXX, ready to be shown and read. The bytes are
 // what travels; the characters are for the person.
 func (i *Identity) MintSpokenCode(role string) (string, time.Time, error) {
-	if err := knownRole(role); err != nil {
+	if err := phoneRole(role); err != nil {
 		return "", time.Time{}, err
 	}
 	code := make([]byte, SpokenCodeBytes)
@@ -501,6 +539,18 @@ func knownRole(role string) error {
 	return nil
 }
 
+// phoneRole refuses a role a phone cannot hold: one the registry does not
+// define, and watch, which only MintWatchCode hands out.
+func phoneRole(role string) error {
+	if err := knownRole(role); err != nil {
+		return err
+	}
+	if role == apiauth.RoleWatch {
+		return ErrWatchRole
+	}
+	return nil
+}
+
 // Authorise decides whether a finished handshake may become a session, and
 // says what the session may do.
 //
@@ -520,11 +570,18 @@ func (i *Identity) Authorise(appStatic, payload []byte) (Grant, error) {
 
 	i.mu.Lock()
 	if meta := i.authorised[key]; meta != nil {
+		if meta.role == apiauth.RoleWatch {
+			// A watch has no stream. It reaches the box through the
+			// exchange, which never takes one of a phone's four places, and
+			// it answers here as a stranger would.
+			i.mu.Unlock()
+			return Grant{}, ErrNoPairing
+		}
 		// A reconnect. The stamp is what lets the settings page tell a
 		// phone in daily use from a key that paired once and vanished —
 		// which is exactly the row someone wants to revoke.
 		meta.lastSeenMs = i.now().UnixMilli()
-		grant := Grant{DeviceID: deviceID(key), Role: meta.role, Epoch: meta.epoch}
+		grant := i.grantLocked(key, meta)
 		i.mu.Unlock()
 		// A stamp that could not be persisted must not block a session.
 		_ = i.save()
@@ -653,7 +710,22 @@ func (i *Identity) GrantFor(id string) (Grant, bool) {
 	if meta == nil {
 		return Grant{}, false
 	}
-	return Grant{DeviceID: deviceID(key), Role: meta.role, Epoch: meta.epoch}, true
+	if meta.role == apiauth.RoleWatch && i.authorised[meta.parent] == nil {
+		// Revoke removes a phone's watches with it, so this is only a
+		// guard: a watch never outlives the phone that vouches for it.
+		return Grant{}, false
+	}
+	return i.grantLocked(key, meta), true
+}
+
+// grantLocked is one enrolment as a Grant. The caller holds the mutex.
+func (i *Identity) grantLocked(key string, meta *appMeta) Grant {
+	grant := Grant{DeviceID: deviceID(key), Role: meta.role, Epoch: meta.epoch}
+	if parent := i.authorised[meta.parent]; meta.parent != "" && parent != nil {
+		grant.Parent = deviceID(meta.parent)
+		grant.ParentRole = parent.role
+	}
+	return grant
 }
 
 // SetRole changes what one paired phone may do.
@@ -674,15 +746,21 @@ func (i *Identity) GrantFor(id string) (Grant, bool) {
 // leaves that same box carrying a list of phones that can only look, which is
 // the shape of the problem rather than a way out of it.
 func (i *Identity) SetRole(id, role string) error {
-	if err := knownRole(role); err != nil {
+	if err := phoneRole(role); err != nil {
 		return err
 	}
 
 	i.mu.Lock()
-	_, meta := i.findLocked(id)
+	key, meta := i.findLocked(id)
 	if meta == nil {
 		i.mu.Unlock()
 		return ErrUnknownDevice
+	}
+	if meta.role == apiauth.RoleWatch {
+		// A watch is a watch until it is removed. Its reach follows its
+		// phone's role, not a role of its own.
+		i.mu.Unlock()
+		return ErrWatchRole
 	}
 	if meta.role == role {
 		// Nothing changed, so nothing is bumped. An epoch that moved for a
@@ -697,6 +775,14 @@ func (i *Identity) SetRole(id, role string) error {
 	}
 	meta.role = role
 	meta.epoch++
+	// The phone's watches hold what it holds, so their grants changed too.
+	// Their epochs move with it, and the next roster carries the narrower
+	// scopes.
+	for _, watch := range i.authorised {
+		if watch.parent == key {
+			watch.epoch++
+		}
+	}
 	i.mu.Unlock()
 
 	err := i.save()
@@ -704,26 +790,43 @@ func (i *Identity) SetRole(id, role string) error {
 	return err
 }
 
-// Devices lists every paired phone, most recently seen first.
+// Devices lists every paired phone, most recently seen first, each followed by
+// its watches.
 func (i *Identity) Devices() []DeviceInfo {
 	i.mu.Lock()
 	lastOwner := i.ownerCountLocked() == 1
-	out := make([]DeviceInfo, 0, len(i.authorised))
+	var phones []DeviceInfo
+	watches := map[string][]DeviceInfo{}
 	for key, meta := range i.authorised {
-		out = append(out, DeviceInfo{
+		d := DeviceInfo{
 			ID: deviceID(key), AddedAtMs: meta.addedAtMs, LastSeenMs: meta.lastSeenMs,
 			Role:      meta.role,
 			LastOwner: lastOwner && meta.role == apiauth.RoleOwner,
-		})
+		}
+		if meta.parent != "" {
+			d.Parent = deviceID(meta.parent)
+			watches[d.Parent] = append(watches[d.Parent], d)
+			continue
+		}
+		phones = append(phones, d)
 	}
 	i.mu.Unlock()
 
-	sort.Slice(out, func(a, b int) bool {
-		if out[a].LastSeenMs != out[b].LastSeenMs {
-			return out[a].LastSeenMs > out[b].LastSeenMs
-		}
-		return out[a].ID < out[b].ID
-	})
+	recentFirst := func(rows []DeviceInfo) {
+		sort.Slice(rows, func(a, b int) bool {
+			if rows[a].LastSeenMs != rows[b].LastSeenMs {
+				return rows[a].LastSeenMs > rows[b].LastSeenMs
+			}
+			return rows[a].ID < rows[b].ID
+		})
+	}
+	recentFirst(phones)
+	out := make([]DeviceInfo, 0, len(phones))
+	for _, phone := range phones {
+		out = append(out, phone)
+		recentFirst(watches[phone.ID])
+		out = append(out, watches[phone.ID]...)
+	}
 	return out
 }
 
@@ -745,9 +848,22 @@ const (
 	OverASession Presence = false
 )
 
-// Revoke forgets a phone by its device id and returns the full key, so the
-// caller can also tear down any session that key is running right now. The
-// next handshake from it meets ErrNoPairing like any stranger's.
+// Removed is one enrolment a revoke took away: its device id and its full key,
+// so the caller can end the sessions the key is running and sweep what the
+// device left behind.
+type Removed struct {
+	ID  string
+	Key []byte
+}
+
+// Revoke forgets a device by its id and returns what it removed: the device
+// first, then, for a phone, every watch it added. The caller tears down the
+// sessions each key is running right now. The next handshake from any of them
+// meets ErrNoPairing like any stranger's.
+//
+// Removal runs from phone to watch and never back. A watch holds what its phone
+// vouches for, so it goes with the phone; removing a watch touches nothing
+// else.
 //
 // Removing a guest and locking out a phone are the same action, deliberately.
 // Sharing does not get its own gesture with its own bugs: a shared phone is a
@@ -766,7 +882,7 @@ const (
 // The decision stays here rather than in the API layer. What is new is that
 // the box is told which door the request came through; which screen drew the
 // button still decides nothing.
-func (i *Identity) Revoke(id string, from Presence) ([]byte, error) {
+func (i *Identity) Revoke(id string, from Presence) ([]Removed, error) {
 	i.mu.Lock()
 	fullKey, meta := i.findLocked(id)
 	if meta == nil {
@@ -777,7 +893,20 @@ func (i *Identity) Revoke(id string, from Presence) ([]byte, error) {
 		i.mu.Unlock()
 		return nil, ErrLastOwnerProtected
 	}
-	delete(i.authorised, fullKey)
+	gone := []string{fullKey}
+	for key, watch := range i.authorised {
+		if watch.parent == fullKey {
+			gone = append(gone, key)
+		}
+	}
+	sort.Strings(gone[1:])
+	for _, key := range gone {
+		delete(i.authorised, key)
+	}
+	// A watch code minted by this phone dies with it, as its watches do.
+	if i.watchPairing != nil && i.watchPairing.parent == fullKey {
+		i.watchPairing = nil
+	}
 	i.mu.Unlock()
 
 	err := i.save()
@@ -785,26 +914,33 @@ func (i *Identity) Revoke(id string, from Presence) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	raw, err := base64.RawURLEncoding.DecodeString(fullKey)
-	if err != nil {
-		// The key was minted by EncodeToString; this cannot happen outside a
-		// corrupted file, and the revoke itself already stuck.
-		return nil, nil
+	out := make([]Removed, 0, len(gone))
+	for _, key := range gone {
+		raw, err := base64.RawURLEncoding.DecodeString(key)
+		if err != nil {
+			// The key was minted by EncodeToString; this cannot happen
+			// outside a corrupted file, and the revoke itself already stuck.
+			continue
+		}
+		out = append(out, Removed{ID: deviceID(key), Key: raw})
 	}
-	return raw, nil
+	return out, nil
 }
 
-// RosterEntry is one paired phone with its whole key, for the roster the box
+// RosterEntry is one paired device with its whole key, for the roster the box
 // signs for FTW Cloud. The service learns devices from nothing else, and it
-// needs the key to recognise the phone's Noise handshake.
+// needs the key to recognise the device's Noise handshake.
 type RosterEntry struct {
 	ID    string
 	Key   []byte
 	Role  string
 	Epoch uint64
+	// ParentRole is the role a watch's phone holds now, empty for a phone.
+	// The scopes the roster carries for a watch are those both roles share.
+	ParentRole string
 }
 
-// Roster lists every paired phone, sorted by id.
+// Roster lists every paired device, watches included, sorted by id.
 func (i *Identity) Roster() []RosterEntry {
 	i.mu.Lock()
 	out := make([]RosterEntry, 0, len(i.authorised))
@@ -813,7 +949,12 @@ func (i *Identity) Roster() []RosterEntry {
 		if err != nil {
 			continue
 		}
-		out = append(out, RosterEntry{ID: deviceID(key), Key: raw, Role: meta.role, Epoch: meta.epoch})
+		grant := i.grantLocked(key, meta)
+		if meta.role == apiauth.RoleWatch && grant.Parent == "" {
+			continue
+		}
+		out = append(out, RosterEntry{ID: grant.DeviceID, Key: raw, Role: meta.role, Epoch: meta.epoch,
+			ParentRole: grant.ParentRole})
 	}
 	i.mu.Unlock()
 	sort.Slice(out, func(a, b int) bool { return out[a].ID < out[b].ID })

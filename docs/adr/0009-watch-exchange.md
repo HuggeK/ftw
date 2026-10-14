@@ -1,7 +1,8 @@
 # ADR 0009: An Apple Watch works without the phone
 
-- Status: accepted. Milestone 1, the command log on the box, is built.
-  Nothing else described here has shipped.
+- Status: accepted. Milestones 1 to 3 are built: the command log on the box,
+  the registry names, and the watch role with its enrolment. The box does not
+  say `cmd.exchange` yet. Nothing else described here has shipped.
 - Date: 2026-10-14
 - Decided by: Fredrik on 14 October 2026. Before the design: a watch controls
   the box directly as well as through the phone; an unlocked watch on the

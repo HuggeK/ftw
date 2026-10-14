@@ -730,6 +730,12 @@ func (a *appLinkAPI) MintPairingCode(role string) ([]byte, time.Time, error) {
 	return code, expires, appLinkError(err)
 }
 
+// MintWatchCode issues a watch code bound to the owner phone that asked.
+func (a *appLinkAPI) MintWatchCode(parentID string) ([]byte, time.Time, error) {
+	code, expires, err := a.enroll.MintWatchCode(parentID, appenroll.WatchTTL)
+	return code, expires, appLinkError(err)
+}
+
 func (a *appLinkAPI) MintSpokenCode(role string) (string, time.Time, error) {
 	code, expires, err := a.enroll.MintSpokenCode(role)
 	return code, expires, appLinkError(err)
@@ -739,7 +745,17 @@ func (a *appLinkAPI) EnrollmentURL(code []byte, lanHint string) (string, error) 
 	return a.enroll.EnrollmentURL(code, lanHint)
 }
 
-func (a *appLinkAPI) AuthorisedCount() int { return a.enroll.AuthorisedCount() }
+// AuthorisedCount is how many phones are paired. A watch rides on its phone
+// and is not counted, so the page's "2 phones paired" stays true.
+func (a *appLinkAPI) AuthorisedCount() int {
+	phones := 0
+	for _, d := range a.enroll.Devices() {
+		if d.Parent == "" {
+			phones++
+		}
+	}
+	return phones
+}
 
 func (a *appLinkAPI) Devices() []api.AppDevice {
 	infos := a.enroll.Devices()
@@ -747,7 +763,7 @@ func (a *appLinkAPI) Devices() []api.AppDevice {
 	for _, d := range infos {
 		out = append(out, api.AppDevice{
 			ID: d.ID, AddedAtMs: d.AddedAtMs, LastSeenMs: d.LastSeenMs,
-			Role: d.Role, LastOwner: d.LastOwner,
+			Role: d.Role, LastOwner: d.LastOwner, Parent: d.Parent,
 		})
 	}
 	return out
@@ -765,34 +781,39 @@ func (a *appLinkAPI) SetDeviceRole(id, role string) error {
 	return appLinkError(a.enroll.SetRole(id, role))
 }
 
-// RevokeDevice locks one phone out. atTheBox is the API's word for the door
-// the request came through, and it is the only thing that decides whether the
-// last owner may go; Presence is enrollment's word for the same fact.
+// RevokeDevice locks one device out, and a phone's watches with it. atTheBox
+// is the API's word for the door the request came through, and it is the only
+// thing that decides whether the last owner may go; Presence is enrollment's
+// word for the same fact.
 func (a *appLinkAPI) RevokeDevice(id string, atTheBox bool) error {
-	key, err := a.enroll.Revoke(id, appenroll.Presence(atTheBox))
+	removed, err := a.enroll.Revoke(id, appenroll.Presence(atTheBox))
 	if err != nil {
 		return appLinkError(err)
 	}
-	// Forgetting the key locks the next handshake out; dropping the live
-	// sessions locks out the one running now. Both, or "remove" quietly
-	// means "remove within the hour".
-	if a.uplink != nil && key != nil {
-		a.uplink.DropSessionsByAppKey(key)
-	}
-	// A phone that may no longer read the house may no longer be told
-	// about it: its push subscriptions go with the grant, and the relay's
-	// pre-encrypted farewell rows for them go on the resync.
-	if a.st != nil {
-		n, err := a.st.DeletePushSubscriptionsByDevice(id)
-		switch {
-		case err != nil:
-			slog.Warn("could not sweep a revoked phone's push subscriptions", "device", id, "err", err)
-		case n > 0:
-			slog.Info("swept a revoked phone's push subscriptions", "device", id, "rows", n)
-			if a.uplink != nil {
-				go a.uplink.ResyncDeadman()
+	var swept int64
+	for _, gone := range removed {
+		// Forgetting the key locks the next handshake out; dropping the
+		// live sessions locks out the one running now. Both, or "remove"
+		// quietly means "remove within the hour".
+		if a.uplink != nil {
+			a.uplink.DropSessionsByAppKey(gone.Key)
+		}
+		// A device that may no longer read the house may no longer be told
+		// about it: its push subscriptions go with the grant, and the
+		// relay's pre-encrypted farewell rows for them go on the resync.
+		if a.st != nil {
+			n, err := a.st.DeletePushSubscriptionsByDevice(gone.ID)
+			switch {
+			case err != nil:
+				slog.Warn("could not sweep a revoked device's push subscriptions", "device", gone.ID, "err", err)
+			case n > 0:
+				slog.Info("swept a revoked device's push subscriptions", "device", gone.ID, "rows", n)
+				swept += n
 			}
 		}
+	}
+	if swept > 0 && a.uplink != nil {
+		go a.uplink.ResyncDeadman()
 	}
 	return nil
 }
@@ -812,6 +833,10 @@ func appLinkError(err error) error {
 		return api.ErrLastAppOwnerProtected
 	case errors.Is(err, appenroll.ErrUnknownRole):
 		return api.ErrUnknownAppRole
+	case errors.Is(err, appenroll.ErrWatchRole):
+		return api.ErrWatchAppRole
+	case errors.Is(err, appenroll.ErrWatchNeedsOwner):
+		return api.ErrWatchNeedsOwner
 	default:
 		return err
 	}

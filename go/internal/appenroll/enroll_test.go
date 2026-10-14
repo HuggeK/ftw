@@ -374,12 +374,12 @@ func TestDeviceListAndRevoke(t *testing.T) {
 
 	// Revoke by row id: the key comes back so live sessions can be dropped,
 	// and the next handshake meets ErrNoPairing like any stranger's.
-	key, err := id.Revoke(devices[1].ID, OverASession)
+	removed, err := id.Revoke(devices[1].ID, OverASession)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(key) != string(second) {
-		t.Fatal("revoke returned a different key than it removed")
+	if len(removed) != 1 || string(removed[0].Key) != string(second) || removed[0].ID != devices[1].ID {
+		t.Fatalf("revoke returned %+v, not the one row it removed", removed)
 	}
 	if _, err := id.Authorise(second, nil); !errors.Is(err, ErrNoPairing) {
 		t.Fatalf("a revoked key reconnected: %v", err)
