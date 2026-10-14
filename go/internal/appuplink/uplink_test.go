@@ -599,6 +599,9 @@ func (stubPlans) Latest() *mpc.Plan { return nil }
 func (stubPlans) Rev() uint64       { return 0 }
 func (stubPlans) CeilingW() *int64  { return nil }
 
+// newHandler builds a handler for a test that sends no command, so each one
+// gets an empty command log of its own. A test about commands builds its
+// handlers over one log, as the box does.
 func newHandler(
 	s appproto.Sender, caller apiauth.Caller, grants appproto.GrantReader,
 ) (*appproto.Handler, error) {
@@ -612,6 +615,7 @@ func newHandler(
 		Sender:     s,
 		Caller:     caller,
 		Grants:     grants,
+		Commands:   appproto.NewCmdLog(),
 		SrcGrid:    "meter",
 		SrcPV:      "meter",
 		SrcBattery: "meter",
@@ -733,6 +737,7 @@ func TestARevokedShareStopsACallAlreadyInFlight(t *testing.T) {
 			API:        gateway,
 			Caller:     caller,
 			Grants:     grants,
+			Commands:   appproto.NewCmdLog(),
 			Caps:       append(appproto.DefaultCaps(), appproto.CapApiPassthrough),
 			SrcGrid:    "meter",
 			SrcPV:      "meter",

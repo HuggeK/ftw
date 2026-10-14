@@ -587,6 +587,10 @@ func startAppLink(
 		deadman = deadmanFromState{st: st, wp: webPush}
 	}
 
+	// One command log for the box. Sessions come and go with their sockets,
+	// and a retry in the next session must meet the id the last one took.
+	cmds := appproto.NewCmdLog()
+
 	uplink, err := appuplink.New(appuplink.Options{
 		Enroll:  enroll,
 		Deadman: deadman,
@@ -596,8 +600,8 @@ func startAppLink(
 			grants appproto.GrantReader,
 		) (*appproto.Handler, error) {
 			// One handler per app session. They share the ports above, which
-			// are read-only apart from the mode, and the mode goes through
-			// control's own validation.
+			// are read-only apart from the mode and the command log, and the
+			// mode goes through control's own validation.
 			return appproto.New(appproto.Config{
 				Clock:        appproto.SystemClock{StartedAt: site.started, Source: "ntp"},
 				Site:         site,
@@ -611,6 +615,7 @@ func startAppLink(
 				API:          gateway,
 				Caller:       caller,
 				Grants:       grants,
+				Commands:     cmds,
 				// FTW Cloud is asked per session: its link is bound after
 				// this returns, and its grant moves while the box runs.
 				Caps:   cloud.caps(caps),

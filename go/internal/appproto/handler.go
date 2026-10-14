@@ -63,6 +63,11 @@ type Config struct {
 	// privileged request. Required, because revocation is not optional.
 	Grants GrantReader
 
+	// Commands is the box's command log, one table shared by every session.
+	// Required: a handler with a table of its own would let a retry in the
+	// next session act a second time.
+	Commands *CmdLog
+
 	// Caps is what this box advertises. Names must come from the generated
 	// contract constants; a typo is refused at construction rather than
 	// silently hiding a feature in the app.
@@ -97,7 +102,6 @@ type Handler struct {
 	log   *slog.Logger
 	modes []ModeInfo
 	dict  map[string]FieldDef
-	cmds  *cmdLog
 	// ops is this handler's own copy of the operation table.
 	ops map[string]opSpec
 
@@ -187,6 +191,8 @@ func New(cfg Config) (*Handler, error) {
 		return nil, errors.New("appproto: Sender is required")
 	case cfg.Grants == nil:
 		return nil, errors.New("appproto: Grants is required")
+	case cfg.Commands == nil:
+		return nil, errors.New("appproto: Commands is required")
 	}
 
 	// A role nobody recognises carries nothing, and a handler that would
@@ -222,7 +228,6 @@ func New(cfg Config) (*Handler, error) {
 		log:          cfg.Logger.With("component", "appproto"),
 		modes:        wireModes(control.ModeCatalog()),
 		dict:         fieldDict(cfg.SrcGrid, cfg.SrcPV, cfg.SrcBattery),
-		cmds:         newCmdLog(),
 		ops:          defaultOps(),
 		ctx:          ctx,
 		cancel:       cancel,
@@ -750,15 +755,10 @@ func (h *Handler) onCmd(ctx context.Context, env Envelope) error {
 	}
 
 	// Idempotency first. A retry must return the original outcome, not act a
-	// second time — that is the entire reason the key exists.
-	if rec, ok := h.cmds.lookup(cmd.CmdID); ok {
-		if err := h.sendCmdAck(rec.ack); err != nil {
-			return err
-		}
-		if rec.result != nil {
-			return h.sendCmdResult(*rec.result)
-		}
-		return nil
+	// second time — that is the entire reason the key exists. The box keeps
+	// the table, so the retry may come in any session of the same device.
+	if rec, ok := h.cfg.Commands.lookup(h.cmdRoot(), cmd.CmdID); ok {
+		return h.replayCmd(rec)
 	}
 
 	uptimeMs := h.cfg.Clock.UptimeMs()
@@ -897,17 +897,41 @@ func (h *Handler) onCmd(ctx context.Context, env Envelope) error {
 	}
 }
 
+// cmdRoot is the device whose command ids this session spends: the enrolled
+// device itself. Its subject is stable across sessions and names nobody else.
+func (h *Handler) cmdRoot() string {
+	return h.cfg.Caller.Subject
+}
+
+// replayCmd answers a command id the box has already taken with what happened
+// then.
+func (h *Handler) replayCmd(rec *cmdRecord) error {
+	if err := h.sendCmdAck(rec.ack); err != nil {
+		return err
+	}
+	if rec.result != nil {
+		return h.sendCmdResult(*rec.result)
+	}
+	return nil
+}
+
 // acceptCmd takes the intent: mints the lease, remembers the command id and
 // tells the app. From here on a retry replays whatever outcome follows
 // rather than acting a second time.
-func (h *Handler) acceptCmd(cmd Cmd, uptimeMs int64) (CmdAck, error) {
+//
+// took is false when another session of the same device took this id first,
+// between this session's lookup and now. The stored record has then been
+// replayed, and the caller must not act.
+func (h *Handler) acceptCmd(cmd Cmd, uptimeMs int64) (took bool, err error) {
 	ack := CmdAck{
 		CmdID:       cmd.CmdID,
 		LeaseID:     h.cfg.NewLeaseID(),
 		ExpiresAtMs: uptimeMs + LeaseMs,
 	}
-	h.cmds.remember(cmd.CmdID, ack, uptimeMs)
-	return ack, h.sendCmdAck(ack)
+	if rec, fresh := h.cfg.Commands.remember(h.cmdRoot(), cmd.CmdID, ack, uptimeMs); !fresh {
+		return false, h.replayCmd(rec)
+	}
+	return true, h.sendCmdAck(ack)
 }
 
 // settleAndReport records the outcome, reports it, and pushes a fresh plan
@@ -915,7 +939,7 @@ func (h *Handler) acceptCmd(cmd Cmd, uptimeMs int64) (CmdAck, error) {
 // the box means to do next, and the app must not show the old intent beside
 // the new state with neither looking wrong.
 func (h *Handler) settleAndReport(cmdID string, res CmdResult) error {
-	h.cmds.settle(cmdID, res)
+	h.cfg.Commands.settle(h.cmdRoot(), cmdID, res)
 	if err := h.sendCmdResult(res); err != nil {
 		return err
 	}
@@ -943,7 +967,7 @@ func (h *Handler) setMode(ctx context.Context, cmd Cmd, uptimeMs int64) error {
 		})
 	}
 
-	if _, err := h.acceptCmd(cmd, uptimeMs); err != nil {
+	if took, err := h.acceptCmd(cmd, uptimeMs); !took || err != nil {
 		return err
 	}
 

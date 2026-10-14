@@ -66,7 +66,8 @@ func helloBoxZone(t *testing.T, info appBoxInfo) string {
 			Role:   apiauth.RoleOwner,
 			Scopes: appproto.ScopesForRole(apiauth.RoleOwner),
 		},
-		Grants: ownerGrant{},
+		Grants:   ownerGrant{},
+		Commands: appproto.NewCmdLog(),
 	})
 	if err != nil {
 		t.Fatal(err)

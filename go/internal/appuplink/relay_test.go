@@ -22,6 +22,10 @@ import (
 type fakeRelay struct {
 	server *httptest.Server
 
+	// wmu serialises writes. A websocket takes one writer at a time, and a
+	// stream joining or leaving writes to the uplink beside its own reader.
+	wmu sync.Mutex
+
 	mu      sync.Mutex
 	epoch   int64
 	uplink  *websocket.Conn
@@ -137,8 +141,8 @@ func (r *fakeRelay) serveUplink(conn *websocket.Conn) {
 	// The relay's only two words. Both sides hear them, which is how a peer
 	// knows there is anybody to talk to.
 	for _, s := range streams {
-		_ = conn.WriteMessage(websocket.TextMessage, []byte(CtrlReady))
-		_ = s.WriteMessage(websocket.TextMessage, []byte(CtrlReady))
+		r.write(conn, websocket.TextMessage, []byte(CtrlReady))
+		r.write(s, websocket.TextMessage, []byte(CtrlReady))
 	}
 
 	defer func() {
@@ -179,7 +183,7 @@ func (r *fakeRelay) serveUplink(conn *websocket.Conn) {
 		streams := append([]*websocket.Conn(nil), r.streams...)
 		r.mu.Unlock()
 		for _, s := range streams {
-			_ = s.WriteMessage(websocket.BinaryMessage, message)
+			r.write(s, websocket.BinaryMessage, message)
 		}
 	}
 }
@@ -191,8 +195,8 @@ func (r *fakeRelay) serveStream(conn *websocket.Conn) {
 	r.mu.Unlock()
 
 	if uplink != nil {
-		_ = uplink.WriteMessage(websocket.TextMessage, []byte(CtrlReady))
-		_ = conn.WriteMessage(websocket.TextMessage, []byte(CtrlReady))
+		r.write(uplink, websocket.TextMessage, []byte(CtrlReady))
+		r.write(conn, websocket.TextMessage, []byte(CtrlReady))
 	}
 
 	defer func() {
@@ -207,7 +211,7 @@ func (r *fakeRelay) serveStream(conn *websocket.Conn) {
 		up := r.uplink
 		r.mu.Unlock()
 		if empty && up != nil {
-			_ = up.WriteMessage(websocket.TextMessage, []byte(CtrlGone))
+			r.write(up, websocket.TextMessage, []byte(CtrlGone))
 		}
 		_ = conn.Close()
 	}()
@@ -224,9 +228,15 @@ func (r *fakeRelay) serveStream(conn *websocket.Conn) {
 		up := r.uplink
 		r.mu.Unlock()
 		if up != nil {
-			_ = up.WriteMessage(websocket.BinaryMessage, message)
+			r.write(up, websocket.BinaryMessage, message)
 		}
 	}
+}
+
+func (r *fakeRelay) write(conn *websocket.Conn, kind int, message []byte) {
+	r.wmu.Lock()
+	defer r.wmu.Unlock()
+	_ = conn.WriteMessage(kind, message)
 }
 
 func (r *fakeRelay) seenHandles() []string {

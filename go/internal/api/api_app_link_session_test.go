@@ -234,6 +234,7 @@ func TestAppRigCallWaitsForTheCompleteResponse(t *testing.T) {
 			Epoch:   1,
 		},
 		Grants:     stillEnrolled{role: apiauth.RoleOwner},
+		Commands:   appproto.NewCmdLog(),
 		SrcGrid:    "meter",
 		SrcPV:      "meter",
 		SrcBattery: "meter",

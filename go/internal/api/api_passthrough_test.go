@@ -175,6 +175,7 @@ func newAppSession(t *testing.T, role string, opts ...func(*Deps)) *appRig {
 			Epoch:   1,
 		},
 		Grants:     stillEnrolled{role: role},
+		Commands:   appproto.NewCmdLog(),
 		SrcGrid:    "meter",
 		SrcPV:      "meter",
 		SrcBattery: "meter",

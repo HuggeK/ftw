@@ -324,6 +324,7 @@ func newRigWith(t *testing.T, prefs PlannerPrefs) (*Handler, *fakeBox, *recorder
 		Sender:       rec,
 		Caller:       ownerCaller(),
 		Grants:       newGrants(),
+		Commands:     NewCmdLog(),
 		SrcGrid:      "meter.p1",
 		SrcPV:        "inverter.sungrow",
 		SrcBattery:   "battery.sungrow",

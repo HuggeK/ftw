@@ -72,21 +72,44 @@ type cmdRecord struct {
 	storedAt int64
 }
 
-// cmdLog is the idempotency table.
-type cmdLog struct {
+// cmdKey names one intent: the device at the root of the caller's enrolment
+// and the command id that device minted. Two devices may mint the same id, and
+// each still means its own intent.
+type cmdKey struct {
+	root  string
+	cmdID string
+}
+
+// CmdLogPerRoot caps how many command ids one root device keeps.
+//
+// A person sends a few commands a day, and a slider a few a second while it
+// moves. A thousand in a day is far above both. The cap bounds memory when one
+// enrolled device floods the box, and it evicts only that device's oldest
+// ids, so no device can push another's out of the log.
+const CmdLogPerRoot = 1024
+
+// CmdLog is the box's idempotency table.
+//
+// One per box, shared by every app session. A session lives as long as its
+// socket, and a phone that loses its socket mid-command retries in a new one;
+// a table that died with the first session would let that retry act again.
+// Kept in memory and measured in box uptime, as every age here is.
+type CmdLog struct {
 	mu      sync.Mutex
-	entries map[string]*cmdRecord
+	entries map[cmdKey]*cmdRecord
 }
 
-func newCmdLog() *cmdLog {
-	return &cmdLog{entries: make(map[string]*cmdRecord)}
+// NewCmdLog makes an empty table.
+func NewCmdLog() *CmdLog {
+	return &CmdLog{entries: make(map[cmdKey]*cmdRecord)}
 }
 
-// lookup returns a remembered outcome, if the box has seen this id before.
-func (l *cmdLog) lookup(cmdID string) (*cmdRecord, bool) {
+// lookup returns a remembered outcome, if the box has seen this id from this
+// root device before.
+func (l *CmdLog) lookup(root, cmdID string) (*cmdRecord, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	rec, ok := l.entries[cmdID]
+	rec, ok := l.entries[cmdKey{root, cmdID}]
 	if !ok {
 		return nil, false
 	}
@@ -94,30 +117,65 @@ func (l *cmdLog) lookup(cmdID string) (*cmdRecord, bool) {
 	return &copied, true
 }
 
-// remember stores an ack and prunes anything past the retention window.
-func (l *cmdLog) remember(cmdID string, ack CmdAck, uptimeMs int64) {
+// remember stores an ack unless the id is already there, and prunes anything
+// past the retention window.
+//
+// Two sessions of one root device can pass lookup with the same id at the same
+// moment. Only the first to get here stores its ack and may act; the other
+// receives the stored record and must replay it instead.
+func (l *CmdLog) remember(root, cmdID string, ack CmdAck, uptimeMs int64) (*cmdRecord, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.entries[cmdID] = &cmdRecord{ack: ack, storedAt: uptimeMs}
-	for id, rec := range l.entries {
+
+	for k, rec := range l.entries {
 		if uptimeMs-rec.storedAt > CmdRetentionMs {
-			delete(l.entries, id)
+			delete(l.entries, k)
 		}
+	}
+
+	key := cmdKey{root, cmdID}
+	if rec, ok := l.entries[key]; ok {
+		copied := *rec
+		return &copied, false
+	}
+	l.entries[key] = &cmdRecord{ack: ack, storedAt: uptimeMs}
+	l.capRoot(key)
+	return nil, true
+}
+
+// capRoot drops one root device's oldest id, other than the one just stored,
+// when that device holds more than CmdLogPerRoot. Ids arrive one at a time, so
+// one drop is enough.
+func (l *CmdLog) capRoot(fresh cmdKey) {
+	held := 0
+	var oldest cmdKey
+	var oldestAt int64
+	for k, rec := range l.entries {
+		if k.root != fresh.root {
+			continue
+		}
+		held++
+		if k != fresh && (oldest == (cmdKey{}) || rec.storedAt < oldestAt) {
+			oldest, oldestAt = k, rec.storedAt
+		}
+	}
+	if held > CmdLogPerRoot {
+		delete(l.entries, oldest)
 	}
 }
 
 // settle attaches the outcome to a remembered command.
-func (l *cmdLog) settle(cmdID string, res CmdResult) {
+func (l *CmdLog) settle(root, cmdID string, res CmdResult) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if rec, ok := l.entries[cmdID]; ok {
+	if rec, ok := l.entries[cmdKey{root, cmdID}]; ok {
 		copied := res
 		rec.result = &copied
 	}
 }
 
 // size is for tests: the table must not grow without bound.
-func (l *cmdLog) size() int {
+func (l *CmdLog) size() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return len(l.entries)
