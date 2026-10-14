@@ -77,7 +77,17 @@ type PushRegister struct {
 	Kind        string `cbor:"kind"`
 	// ActivityID names a Live Activity. Unused until its push exists.
 	ActivityID string `cbor:"activityId,omitempty"`
+	// App is the app the token belongs to, so the service picks the APNs
+	// topic: PushAppIPhone, the default when absent, or PushAppWatch.
+	App string `cbor:"app,omitempty"`
 }
+
+// Apps a push token can belong to (ADR 0009, decision 8). Apple sees for a
+// watch what it sees for a phone, and no more.
+const (
+	PushAppIPhone = "iphone"
+	PushAppWatch  = "watch"
+)
 
 // PushUnregister forgets one token.
 type PushUnregister struct {

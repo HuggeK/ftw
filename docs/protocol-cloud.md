@@ -3,9 +3,10 @@
 Proposed with [ADR 0008](adr/0008-ftw-cloud.md). Nothing here has shipped.
 This document is normative: "must" is a requirement on the box, the service
 or the phone. The bytes live in `go/protocol/cloudwire`, with golden vectors
-in its `testdata`: `cloud-vectors.json` for the uplink and
-`cloud-app-vectors.json` for one whole app session. `srcfl/ftw-cloud` and the
-phone replay them. `cloudwire.View` is the phone's
+in its `testdata`: `cloud-vectors.json` for the uplink,
+`cloud-app-vectors.json` for one whole app session and
+`cloud-once-vectors.json` for one [one-shot read](#one-shot-read).
+`srcfl/ftw-cloud`, the phone and the watch replay them. `cloudwire.View` is the phone's
 [freshness](#freshness) rules in Go, and the cases listed there are its tests.
 
 The app protocol, which runs inside Noise between a phone and its box, is
@@ -25,11 +26,15 @@ for both live in `go/protocol`, under Apache-2.0
 - **Phone:** the iPhone app, paired with the box over Noise as today.
 - **Extension:** a widget, notification service extension or Live Activity
   on that phone.
+- **Watch:** an Apple Watch that an owner's phone added as a device of its
+  own ([ADR 0009](adr/0009-watch-exchange.md)). watchOS gives it HTTPS and
+  nothing lower, so it reads in one request.
 
 | Connection | Opened by | Transport | What protects it |
 |---|---|---|---|
 | Uplink | Box | `wss://cloud.ftw.energy/v1/box` | TLS 1.3, a handshake bound to the TLS session on both sides, every box message signed |
 | App session | Phone | `wss://cloud.ftw.energy/v1/app?home=<id>` | TLS 1.3, then Noise IK to the service's static key |
+| One-shot read | Watch | `POST https://cloud.ftw.energy/v1/app/once?home=<id>` | TLS 1.3, then Noise IK to the service's static key, inside one request |
 | Extension read | Extension | `GET https://cloud.ftw.energy/v1/now` | TLS and an extension token; the data inside is box-signed |
 | Push | Service | APNs | Box-signed payloads where they carry data |
 
@@ -422,8 +427,8 @@ The service never forwards these to a phone.
 |---|---|---|
 | `id` | text | The box's device id |
 | `key` | bstr, 32 B | The device's X25519 Noise static key |
-| `role` | text | `owner` or `viewer` |
-| `scopes` | [text] | Scopes the box derives from the role. The service holds no role table |
+| `role` | text | `owner`, `viewer` or `watch` |
+| `scopes` | [text] | Scopes the box derives from the role. For a watch, only those its phone's role also carries now. The service holds no role table |
 | `epoch` | uint | The device's epoch on the box |
 
 **Grant**
@@ -582,7 +587,7 @@ the table.
 | `watch` | Any device | `{hz}`: 1 when the phone looks at the home, 0 when it looks away. It holds until the next `watch` or the end of the session |
 | `tiles.get` | Devices with `ftw.history.read` | `{have}`, tile id to etag. The service answers with the `tiles` envelopes the phone lacks |
 | `token.get` | Any device | Answered with `token {token, expiresInS}`. A new token replaces the device's old one |
-| `push.register` | Any device | `{apnsToken, environment, kind, activityId}`. One registration per APNs token; a Live Activity and its push-to-start each register their own |
+| `push.register` | Any device | `{apnsToken, environment, kind, activityId, app}`. One registration per APNs token; a Live Activity and its push-to-start each register their own. `app` is `iphone`, the default when absent, or `watch`, and picks the APNs topic |
 | `push.unregister` | Any device | `{apnsToken}` |
 | `suspend` | Owner | `{deviceId}`. Suspends a device |
 | `unsuspend` | Owner | `{deviceId}`. Lifts a suspension |
@@ -646,6 +651,53 @@ Noise session, in the app protocol's `hello_ok.cloud`.
 - The box lists `cloud.link` in `hello_ok.caps` when its build can run the
   uplink. A build that names no service does not.
 
+## One-shot read
+
+A watch cannot open a WebSocket, so it reads with one HTTPS request
+([ADR 0009](adr/0009-watch-exchange.md), decision 7). The service admits it
+exactly as `/v1/app` admits a phone and keeps nothing after the answer.
+
+1. The watch posts to `https://cloud.ftw.energy/v1/app/once?home=<id>` over
+   TLS 1.3, with `content-type: application/octet-stream` and no `Origin`
+   header. The body is Noise IK message 1 and nothing else: the watch is the
+   initiator and a service Noise key the responder, as on the app session.
+   The prologue is `ftw.cloud.once.v1:` followed by the home id, so a
+   one-shot handshake and an app session handshake never stand in for each
+   other.
+2. Message 1 carries one unsigned envelope: `read`, `token.get`,
+   `push.register` or `push.unregister`. The service refuses any other type,
+   an owner's `suspend` among them, with 400 before message 2.
+3. The service admits the watch by the rules of the app session: its key in
+   the home's roster, a roster that has not run out, no suspension, a grant
+   that is on. A refusal is 403 with an empty body, before message 2, and does
+   not say which check failed.
+4. The answer is 200 with `content-type: application/octet-stream`. Its body
+   is message 2 and then, for a `read`, the envelopes that did not fit, as
+   transport messages. Each message, message 2 included, comes after its
+   length as u16 big endian.
+5. The service keeps no session and no Noise state after the answer.
+
+**`read`**
+
+| Field | Type | Meaning |
+|---|---|---|
+| `have` | map | `{boot, seq}`: the `boot` the watch's envelopes come from, and `seq`, class to the highest `seq` it holds from that boot. Empty means nothing |
+| `hz` | uint | 1 keeps the box's `watch` in force for 60 s, as a looking phone does. 0 leaves it as it is |
+
+Message 2 answers a `read` with the app session's `snapshot`, without the box
+envelopes `have` covers: one from the same `boot` with a `seq` no higher than
+the one the watch holds for its class. `more` counts the envelopes that follow
+message 2. A `token.get` gets `token {token, expiresInS}` in message 2, and
+`push.register` and `push.unregister` get an empty payload, once the service
+has stored the change.
+
+**Limits.** One read at a time per device and 30 a minute; message 1 at most
+4 KiB; the whole answer within 10 s. Past a limit the service answers 429, a
+longer message 1 gets 400, and a service without a Noise key answers 501.
+
+When FTW Cloud is off, a watch on its own reads `now` on the box's exchange
+through the relay instead, and prices and the plan wait for the phone.
+
 ## Extension token
 
 - 32 random bytes, base64url. The service stores its SHA-256, never the token.
@@ -669,6 +721,10 @@ Noise session, in the app protocol's `hello_ok.cloud`.
 | `widgets` | Content changed, no data | Widgets fetch with their token |
 | `liveactivity` | `home`, the `lp` envelope and the newest `hb` envelope, in base64 | The view shows numbers only if both signatures check, the `hb` covers that `lp`, and the charger source grades `live` by the freshness rules; otherwise "Open FTW". `staleDate` is set to when that grade would lapse |
 | `box.unreachable` | Generic, from the service | Sent after 600 s without the box's socket. No box signature, no arguments, no buttons |
+
+A watch registers with `app: watch`, and the service sends it to the watch
+app's APNs topic. A watch and its phone get byte-identical alert payloads, so
+Apple shows one alert when both are near.
 
 Each push goes only to devices whose effective scope covers what it carries:
 `alert` needs `ftw.events.read`, and `widgets` and `liveactivity` need
@@ -898,8 +954,9 @@ Class names, field names, close codes and the signing tags are not registry
 names. They live here and in `go/protocol`, held by golden vectors in both
 repositories.
 
-Role names, `owner` and `viewer`, are registry names, but `go/protocol` does
-not generate them yet, so `srcfl/ftw-cloud` spells `owner` by hand. Generating
+Role names, `owner`, `viewer` and `watch`, are registry names, but
+`go/protocol` does not generate them yet, so `srcfl/ftw-cloud` spells `owner`
+by hand. Generating
 the registry's roles would remove that copy.
 
 ## Numbers in one place
@@ -927,6 +984,7 @@ the registry's roles would remove that copy.
 | Envelopes queued per phone | 256 |
 | Phone messages | 20 in a burst, then 2 a second |
 | App session message 1 | Within 10 s |
+| One-shot reads | One at a time per device, 30 a minute; message 1 at most 4 KiB; answered within 10 s |
 | Roster `ttlS`, renewal | 24 hours, every 6 hours |
 | Extension token | 7 days |
 | Alert age for buttons | 10 minutes |
