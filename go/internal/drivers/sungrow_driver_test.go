@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/srcfl/ftw/go/internal/telemetry"
 )
@@ -267,6 +268,13 @@ func TestSungrowFeedInCurtailPreservesConfiguredInstallerLimit(t *testing.T) {
 	}
 }
 
+// sungrow.lua reads power every second and its running state, counters and
+// fault bits on a full read every five seconds, timed by host.millis. Move
+// the driver's clock past one so the next poll is a full read.
+func untilNextFullRead(env *HostEnv) {
+	env.Start = env.Start.Add(-5 * time.Second)
+}
+
 func TestSungrowPollSurfacesAndClearsThermalDeviceFault(t *testing.T) {
 	tel := telemetry.NewStore()
 	modbus := newRecordingModbus()
@@ -298,6 +306,7 @@ func TestSungrowPollSurfacesAndClearsThermalDeviceFault(t *testing.T) {
 
 	modbus.regs[12999] = 0x0040 // Running on-grid
 	modbus.regs[13055] = 0
+	untilNextFullRead(env)
 	if _, err := d.Poll(context.Background()); err != nil {
 		t.Fatalf("recovery poll: %v", err)
 	}
@@ -332,6 +341,7 @@ func TestSungrowProbesTheHybridBlockWhenTheDeviceTypeNeverAnswers(t *testing.T) 
 	// settles within a couple of polls rather than retrying for the session.
 	var faulted bool
 	for poll := 0; poll < 4; poll++ {
+		untilNextFullRead(env)
 		if _, err := d.Poll(context.Background()); err != nil {
 			t.Fatalf("poll %d: %v", poll, err)
 		}
