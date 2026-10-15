@@ -57,7 +57,7 @@ func TestRecoveryPublishesBeforeCorruptFutureInputs(t *testing.T) {
 					t.Fatalf("corrupt future input lost safe plan: %+v", svc.PlanSnapshot())
 				}
 				assertRecoveryPlan(t, svc.lastSlots, svc.lastParams, *plan)
-				if !strings.Contains(plan.Solver.FallbackReason, "invalid") || saved == nil || len(saved.Slots) != 2 || recorded != 2 {
+				if !strings.Contains(strings.Join(svc.PlanSnapshot().Warnings, " "), "invalid") || saved == nil || len(saved.Slots) != 2 || recorded != 2 {
 					t.Fatalf("missing failure reason or accepted inputs: solver=%+v saved=%v recorded=%d", plan.Solver, saved != nil, recorded)
 				}
 				if _, ok := svc.SlotDirectiveAt(start.Add(2 * time.Hour)); ok {
@@ -76,7 +76,7 @@ func TestRecoveryPublishesBeforeCorruptFutureInputs(t *testing.T) {
 
 func TestRecoveryMissingBatteryStateCannotInventEnergy(t *testing.T) {
 	for _, fleet := range []bool{false, true} {
-		for _, fault := range []string{"missing reading", "missing soc", "aged soc", "nan soc", "offline", "command fault"} {
+		for _, fault := range []string{"missing reading", "missing soc", "aged soc", "future soc", "nan soc", "offline", "command fault"} {
 			t.Run(fault+map[bool]string{false: "/aggregate", true: "/fleet"}[fleet], func(t *testing.T) {
 				svc := shadowTestService(t)
 				svc.Tele = telemetry.NewStore()
@@ -102,6 +102,8 @@ func TestRecoveryMissingBatteryStateCannotInventEnergy(t *testing.T) {
 					// A different reading may keep driver health live after its
 					// battery SoC source stops. No goroutine shares this fixture.
 					svc.Tele.Get("battery", telemetry.DerBattery).SoCUpdatedAt = time.Now().Add(-telemetry.BatterySoCMaxAge - time.Second)
+				case "future soc":
+					svc.Tele.Get("battery", telemetry.DerBattery).SoCUpdatedAt = time.Now().Add(10 * time.Minute)
 				case "offline":
 					svc.Tele.DriverHealthMut("battery").SetOffline()
 				case "command fault":
@@ -121,6 +123,72 @@ func TestRecoveryMissingBatteryStateCannotInventEnergy(t *testing.T) {
 					t.Fatalf("fresh state did not restore planning: %+v", svc.PlanSnapshot())
 				}
 			})
+		}
+	}
+}
+
+type successfulPrefixOptimizer struct{}
+
+func (successfulPrefixOptimizer) Optimize(ctx context.Context, slots []Slot, p Params) (Plan, error) {
+	plan, err := OptimizeContext(ctx, slots, p)
+	plan.Solver = &SolverInfo{Engine: "energyplan", Backend: "test", Status: "feasible"}
+	return plan, err
+}
+func (successfulPrefixOptimizer) Close() error { return nil }
+
+func TestShortenedExternalPlanKeepsOptimizerIdentity(t *testing.T) {
+	svc := shadowTestService(t)
+	start := time.Now().UTC().Truncate(time.Hour)
+	svc.now = func() time.Time { return start.Add(5 * time.Minute) }
+	svc.Optimizer = successfulPrefixOptimizer{}
+	svc.ForecastSnapshot = func(time.Time, []state.ForecastPoint) ForecastInputs {
+		return ForecastInputs{Resolve: func(_ context.Context, slots []Slot) []Slot {
+			slots[2].PVW = math.NaN()
+			return slots
+		}}
+	}
+	plan := svc.Replan(context.Background())
+	if plan == nil || len(plan.Actions) != 2 {
+		t.Fatal("configured optimizer did not produce the valid prefix")
+	}
+	if plan.Solver.Fallback || plan.Solver.Engine != "energyplan" || plan.Solver.Status != "feasible" || plan.Solver.FallbackReason != "" {
+		t.Fatalf("shortened configured solve was reported as a failed optimizer: %+v", plan.Solver)
+	}
+	warnings := svc.PlanSnapshot().Warnings
+	if len(warnings) == 0 || !strings.Contains(strings.Join(warnings, " "), "Plan ends at") {
+		t.Fatal("shortened horizon lost its warning")
+	}
+	assertRecoveryPlan(t, svc.lastSlots, svc.lastParams, *plan)
+}
+
+func TestRecoveryReportedExcessLoadsUseQualifiedCurrentMeasurement(t *testing.T) {
+	for _, forecastW := range []float64{21400, 55700} {
+		for _, qualified := range []bool{false, true} {
+			svc := shadowTestService(t)
+			start := time.Now().UTC().Truncate(time.Hour)
+			svc.now = func() time.Time { return start.Add(5 * time.Minute) }
+			svc.FuseMaxW, svc.BaseLoad = 17250, forecastW
+			svc.HouseholdMeasurement = func() telemetry.ForecastReading {
+				return telemetry.ForecastReading{HouseholdW: 2000, Valid: qualified}
+			}
+			plan := svc.Replan(context.Background())
+			if !qualified {
+				if plan != nil || svc.PlanSnapshot().Error == "" {
+					t.Fatalf("invented a safe current load from incomplete measurements: %g", forecastW)
+				}
+				continue
+			}
+			if plan == nil || len(plan.Actions) != 1 || plan.Actions[0].LoadW != 2000 || len(svc.PlanSnapshot().Warnings) == 0 {
+				t.Fatalf("bad future load %g discarded a measured safe current slot: %+v", forecastW, svc.PlanSnapshot())
+			}
+			assertRecoveryPlan(t, svc.lastSlots, svc.lastParams, *plan)
+			if _, ok := svc.SlotDirectiveAt(start.Add(time.Hour)); ok {
+				t.Fatal("dispatch crossed into the invalid future forecast")
+			}
+			svc.BaseLoad = 2000
+			if full := svc.Replan(context.Background()); full == nil || len(full.Actions) != 4 || len(svc.PlanSnapshot().Warnings) != 0 {
+				t.Fatal("corrected load forecast did not restore the full plan")
+			}
 		}
 	}
 }

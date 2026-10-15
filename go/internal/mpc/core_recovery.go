@@ -91,6 +91,7 @@ func corePlanWithRecovery(ctx context.Context, slots []Slot, p Params) (Plan, []
 		return Plan{}, nil, fullErr
 	}
 	slog.Warn("mpc: forecast prevents a full reserve plan", "err", fullErr, "kept_slots", count, "requested_slots", len(slots))
+	best.Solver.Status, best.Solver.Fallback = "fallback", true
 	markShortenedPlan(&best, slots[:count], "A later forecast exceeds the site's power limits.")
 	return best, slots[:count], nil
 }
@@ -118,14 +119,14 @@ func planningInputPrefix(slots []Slot) ([]Slot, error) {
 	return slots[:count], err
 }
 
-func markShortenedPlan(plan *Plan, slots []Slot, reason string) {
+func markShortenedPlan(plan *Plan, slots []Slot, reason string) string {
 	end, _ := checkedSlotEndMs(slots[len(slots)-1].StartMs, slots[len(slots)-1].LenMin)
-	if plan.Solver == nil {
-		plan.Solver = &SolverInfo{}
-	}
-	plan.Solver.Status, plan.Solver.Fallback = "fallback", true
-	if plan.Solver.FallbackReason != "" {
+	if plan.Solver != nil && plan.Solver.Fallback && plan.Solver.FallbackReason != "" {
 		reason = plan.Solver.FallbackReason + "; " + reason
 	}
-	plan.Solver.FallbackReason = fmt.Sprintf("Plan ends at %s. %s FTW will replan.", time.UnixMilli(end).Format("Mon 2 Jan 15:04 MST"), reason)
+	warning := fmt.Sprintf("Plan ends at %s. %s FTW will replan.", time.UnixMilli(end).Format("Mon 2 Jan 15:04 MST"), reason)
+	if plan.Solver != nil && plan.Solver.Fallback {
+		plan.Solver.FallbackReason = warning
+	}
+	return warning
 }
