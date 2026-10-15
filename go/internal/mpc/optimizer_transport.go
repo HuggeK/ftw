@@ -245,7 +245,8 @@ func (t *ProcessTransport) Close() error {
 	_ = t.stdin.Close()
 	select {
 	case err := <-t.waitCh:
-		t.cmd, t.stdin, t.scanner, t.waitCh = nil, nil, nil, nil
+		_ = t.stdout.Close()
+		t.cmd, t.stdin, t.stdout, t.scanner, t.waitCh = nil, nil, nil, nil, nil
 		return err
 	case <-time.After(time.Second):
 		t.stopLocked()

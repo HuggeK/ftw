@@ -178,6 +178,16 @@ func TestProcessTransportKeepsReplyAfterWorkerExit(t *testing.T) {
 	if err != nil || string(response) != `{"ok":true}` {
 		t.Fatalf("complete reply lost after child exit: %s %v", response, err)
 	}
+	stdout := transport.stdout
+	if err := transport.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if transport.stdout != nil {
+		t.Fatal("graceful close retained the owned stdout pipe")
+	}
+	if _, err := stdout.Read(make([]byte, 1)); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("graceful close leaked the read descriptor: %v", err)
+	}
 }
 
 // An install missing the bundled worker must say that the Go planner is used,
