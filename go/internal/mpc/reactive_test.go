@@ -46,6 +46,8 @@ func buildTestService(t *testing.T, planPV, planLoad float64) (*Service, *teleme
 	t.Cleanup(func() { st.Close() })
 	seedReactivePrices(t, st)
 	tel := telemetry.NewStore()
+	soc := .5
+	tel.Update("inverter", telemetry.DerBattery, 0, &soc, nil)
 	tel.DriverHealthMut("site").RecordSuccess()
 	tel.DriverHealthMut("inverter").RecordSuccess()
 
@@ -206,6 +208,8 @@ func buildDefaultTestService(t *testing.T, planPV, planLoad float64) (*Service, 
 	t.Cleanup(func() { st.Close() })
 	seedReactivePrices(t, st)
 	tel := telemetry.NewStore()
+	soc := .5
+	tel.Update("inverter", telemetry.DerBattery, 0, &soc, nil)
 	tel.DriverHealthMut("site").RecordSuccess()
 	tel.DriverHealthMut("inverter").RecordSuccess()
 
@@ -289,6 +293,9 @@ func twinDriftService(t *testing.T) *Service {
 	t.Cleanup(func() { st.Close() })
 	seedReactivePrices(t, st)
 	tel := telemetry.NewStore()
+	soc := .5
+	tel.Update("inverter", telemetry.DerBattery, 0, &soc, nil)
+	tel.RecordDriverSuccess("inverter")
 	s := New(st, tel, "SE3", reactiveTestParams())
 	s.Horizon = time.Hour
 	s.BaseLoad = 500

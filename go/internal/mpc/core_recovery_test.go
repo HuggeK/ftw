@@ -143,9 +143,9 @@ func TestCoreRecoveryRejectsUnsafeCurrentSlotAndInvalidInputs(t *testing.T) {
 			case "current overload":
 				slots[0].LoadW = 40000
 			case "invalid timeline":
-				slots[12].LenMin = 0
+				slots[0].LenMin = 0
 			case "invalid limit":
-				slots[12].Limits.MaxImportW = math.NaN()
+				slots[0].Limits.MaxImportW = math.NaN()
 			case "canceled":
 				cancel()
 			}

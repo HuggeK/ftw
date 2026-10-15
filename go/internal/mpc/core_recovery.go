@@ -17,11 +17,9 @@ func corePlanWithRecovery(ctx context.Context, slots []Slot, p Params) (Plan, []
 	if err := ctx.Err(); err != nil {
 		return Plan{}, nil, err
 	}
-	if err := validateSlotChronology(slots); err != nil {
-		return Plan{}, nil, err
-	}
-	if err := validatePlanningSlots(slots); err != nil {
-		return Plan{}, nil, err
+	slots, inputErr := planningInputPrefix(slots)
+	if len(slots) == 0 {
+		return Plan{}, nil, inputErr
 	}
 	if err := validatePlanningParams(p); err != nil {
 		return Plan{}, nil, err
@@ -41,6 +39,9 @@ func corePlanWithRecovery(ctx context.Context, slots []Slot, p Params) (Plan, []
 		}
 		if err == nil {
 			plan.Solver = coreSolverInfo(p, msSince(start))
+			if inputErr != nil {
+				markShortenedPlan(&plan, slots, "Later planning inputs are invalid: "+inputErr.Error()+".")
+			}
 			return plan, slots, nil
 		}
 		dpErr = err
@@ -60,6 +61,9 @@ func corePlanWithRecovery(ctx context.Context, slots []Slot, p Params) (Plan, []
 		if dpErr != nil {
 			plan.Solver.Status, plan.Solver.Fallback = "fallback", true
 			plan.Solver.FallbackReason = "Core price optimisation unavailable; using a reserve plan: " + dpErr.Error()
+		}
+		if inputErr != nil {
+			markShortenedPlan(&plan, slots, "Later planning inputs are invalid: "+inputErr.Error()+".")
 		}
 		return plan, slots, nil
 	}
@@ -86,9 +90,42 @@ func corePlanWithRecovery(ctx context.Context, slots []Slot, p Params) (Plan, []
 	if count == 0 {
 		return Plan{}, nil, fullErr
 	}
-	end := slots[count-1].StartMs + int64(slots[count-1].LenMin)*60000
-	best.Solver.Status, best.Solver.Fallback = "fallback", true
 	slog.Warn("mpc: forecast prevents a full reserve plan", "err", fullErr, "kept_slots", count, "requested_slots", len(slots))
-	best.Solver.FallbackReason = fmt.Sprintf("Plan ends at %s. A later forecast exceeds the site's power limits. FTW will replan.", time.UnixMilli(end).Format("Mon 2 Jan 15:04 MST"))
+	markShortenedPlan(&best, slots[:count], "A later forecast exceeds the site's power limits.")
 	return best, slots[:count], nil
+}
+
+// Invalid future values must not discard earlier, independently valid inputs.
+// A damaged timeline is ambiguous and stays an error for the whole request.
+func planningInputPrefix(slots []Slot) ([]Slot, error) {
+	if err := validateSlotChronology(slots); err != nil {
+		return nil, err
+	}
+	validate := func(n int) error { return validatePlanningSlots(slots[:n]) }
+	err := validate(len(slots))
+	if err == nil {
+		return slots, nil
+	}
+	count := 0
+	for low, high := 1, len(slots)-1; low <= high; {
+		mid := low + (high-low)/2
+		if validate(mid) == nil {
+			count, low = mid, mid+1
+		} else {
+			high = mid - 1
+		}
+	}
+	return slots[:count], err
+}
+
+func markShortenedPlan(plan *Plan, slots []Slot, reason string) {
+	end, _ := checkedSlotEndMs(slots[len(slots)-1].StartMs, slots[len(slots)-1].LenMin)
+	if plan.Solver == nil {
+		plan.Solver = &SolverInfo{}
+	}
+	plan.Solver.Status, plan.Solver.Fallback = "fallback", true
+	if plan.Solver.FallbackReason != "" {
+		reason = plan.Solver.FallbackReason + "; " + reason
+	}
+	plan.Solver.FallbackReason = fmt.Sprintf("Plan ends at %s. %s FTW will replan.", time.UnixMilli(end).Format("Mon 2 Jan 15:04 MST"), reason)
 }
