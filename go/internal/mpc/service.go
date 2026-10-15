@@ -218,7 +218,13 @@ type Service struct {
 	lastReason          string // reason paired with the currently published plan
 	lastPlanningError   string
 	lastPlanningFailure *PlanningFailure
-	planningWarnings    []string
+	// Failure writes serialize outside mu so support I/O cannot hold up
+	// dispatch readers or let an older write replace newer evidence.
+	failurePersistMu            sync.Mutex
+	persistedPlanningFailure    *PlanningFailure
+	planningFailureRestored     bool
+	planningFailureStorageError string
+	planningWarnings            []string
 	// latestReplanGeneration identifies the newest requested solve. Starting a
 	// newer generation cancels the older request; the generation check remains
 	// the final guard for work that does not stop promptly on context cancel.
@@ -338,7 +344,7 @@ func overlayLiveHouseLoad(slots []Slot, loadW float64, ok bool) {
 
 // New constructs a service. Caller wires it in main.go after store + telemetry.
 func New(st *state.Store, tl *telemetry.Store, zone string, p Params) *Service {
-	return &Service{
+	s := &Service{
 		Store:            st,
 		Tele:             tl,
 		Zone:             zone,
@@ -363,6 +369,8 @@ func New(st *state.Store, tl *telemetry.Store, zone string, p Params) *Service {
 		done:                  make(chan struct{}),
 		stopped:               make(chan struct{}),
 	}
+	s.restorePlanningFailure()
+	return s
 }
 
 // SetSiteMeter updates the grid-boundary driver used by reactive replanning.
@@ -1463,6 +1471,7 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 		return s.Latest()
 	}
 	defer s.finishReplan(request)
+	defer s.persistPlanningFailure()
 	ctx := request.ctx
 	p := request.params
 	var slots, forecastInputs, solverInputs []Slot
@@ -2039,8 +2048,10 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	plan.DecisionID = s.nextDecisionIDLocked()
 	s.last = &plan
 	if f := s.lastPlanningFailure; f != nil && f.RecoveredDecisionID == "" {
-		f.RecoveredDecisionID = plan.DecisionID
-		f.RecoveredAtMs = time.Now().UnixMilli()
+		recovered := *f
+		recovered.RecoveredDecisionID = plan.DecisionID
+		recovered.RecoveredAtMs = time.Now().UnixMilli()
+		s.lastPlanningFailure = &recovered
 	}
 	s.executionPlan = s.last
 	s.lastSlots = slots

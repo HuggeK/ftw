@@ -2,14 +2,18 @@ package api
 
 import (
 	"archive/zip"
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"strings"
@@ -26,7 +30,12 @@ import (
 
 func plannerSupportFixture(t *testing.T) (*Server, *mpc.Service) {
 	t.Helper()
-	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	return plannerSupportFixtureAt(t, filepath.Join(t.TempDir(), "state.db"))
+}
+
+func plannerSupportFixtureAt(t *testing.T, database string) (*Server, *mpc.Service) {
+	t.Helper()
+	store, err := state.Open(database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,5 +195,120 @@ func TestSupportDumpBeforeAnyAcceptedPlanIsExplicit(t *testing.T) {
 	}
 	if document["enabled"] != true || document["last_accepted_plan"] != nil || document["last_failure"] != nil {
 		t.Fatalf("missing evidence was confused with a captured plan or failure: %s", files["planner.json"])
+	}
+}
+
+func TestPlannerFailureCrashHelper(t *testing.T) {
+	database := os.Getenv("FTW_PLANNER_FAILURE_CRASH_DB")
+	if database == "" {
+		t.Skip("subprocess helper")
+	}
+	_, planner := plannerSupportFixtureAt(t, database)
+	planner.Defaults.ChargeEfficiency = math.NaN()
+	if planner.ReplanWithReason(context.Background(), os.Getenv("FTW_PLANNER_FAILURE_CRASH_REASON")) != nil {
+		t.Fatal("invalid inputs produced a plan")
+	}
+	fmt.Println("PLANNER_FAILURE_COMMITTED")
+	<-time.After(time.Minute)
+}
+
+func TestSupportDumpRestoresFailureAfterTwoProcessKills(t *testing.T) {
+	database := filepath.Join(t.TempDir(), "state.db")
+	for round := 1; round <= 2; round++ {
+		reason := fmt.Sprintf("outage-%d", round)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		t.Cleanup(cancel)
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestPlannerFailureCrashHelper$")
+		cmd.Env = append(os.Environ(), "FTW_PLANNER_FAILURE_CRASH_DB="+database, "FTW_PLANNER_FAILURE_CRASH_REASON="+reason)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = cmd.Process.Kill() })
+		ready := false
+		lines := bufio.NewScanner(stdout)
+		for lines.Scan() {
+			if lines.Text() == "PLANNER_FAILURE_COMMITTED" {
+				ready = true
+				break
+			}
+		}
+		if !ready {
+			_ = cmd.Wait()
+			t.Fatalf("helper did not finish a failed attempt: %v %v %s", ctx.Err(), lines.Err(), stderr.String())
+		}
+		if err := cmd.Process.Kill(); err != nil {
+			t.Fatal(err)
+		}
+		if err := cmd.Wait(); err == nil {
+			t.Fatal("helper exited cleanly")
+		}
+		cancel()
+
+		func() {
+			store, err := state.Open(database)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			planner := mpc.New(store, nil, "SE3", mpc.Params{})
+			server := New(&Deps{State: store, MPC: planner, Tel: telemetry.NewStore(), LogRing: telemetry.NewLogRing(), Ctrl: control.NewState(0, 50, "meter"), CtrlMu: &sync.Mutex{}})
+			files := readSupportFiles(t, server)
+			var document struct {
+				Failure      *mpc.PlanningFailure       `json:"last_failure"`
+				LastAccepted json.RawMessage            `json:"last_accepted_plan"`
+				Storage      mpc.PlanningFailureStorage `json:"failure_storage"`
+			}
+			if err := json.Unmarshal(files["planner.json"], &document); err != nil || document.Failure == nil {
+				t.Fatalf("failure disappeared after process kill %d: %s %v", round, files["planner.json"], err)
+			}
+			var inputs struct {
+				Params map[string]any `json:"params"`
+			}
+			if err := json.Unmarshal(document.Failure.Inputs, &inputs); err != nil {
+				t.Fatal(err)
+			}
+			if document.Failure.Trigger != reason || inputs.Params["ChargeEfficiency"] != "NaN" || document.Failure.CapturedAtMs <= 0 {
+				t.Fatalf("latest failed inputs were lost after kill %d: %+v", round, document.Failure)
+			}
+			if !document.Storage.Durable || !document.Storage.Restored || document.Storage.Error != "" {
+				t.Fatalf("durable restored evidence has the wrong status: %+v", document.Storage)
+			}
+			if string(document.LastAccepted) != "null" || planner.Latest() != nil || planner.Diagnose() != nil {
+				t.Fatal("failure evidence became an accepted plan after restart")
+			}
+			if _, ok := planner.SlotDirectiveAt(time.Now()); ok {
+				t.Fatal("failure evidence authorized dispatch after restart")
+			}
+		}()
+	}
+}
+
+func TestPlannerFailureFailedWriteKeepsPreviousDurableEvidence(t *testing.T) {
+	database := filepath.Join(t.TempDir(), "state.db")
+	_, planner := plannerSupportFixtureAt(t, database)
+	planner.Defaults.ChargeEfficiency = math.NaN()
+	planner.ReplanWithReason(context.Background(), "last-durable-attempt")
+	if !planner.PlanningFailureStorageSnapshot().Durable {
+		t.Fatal("initial failure was not durable")
+	}
+	_ = planner.Store.Close()
+	planner.ReplanWithReason(context.Background(), "failed-storage-attempt")
+	if status := planner.PlanningFailureStorageSnapshot(); status.Durable || status.Error == "" {
+		t.Fatalf("failed write claimed durability: %+v", status)
+	}
+	store, err := state.Open(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	restarted := mpc.New(store, nil, "SE3", mpc.Params{})
+	if failure := restarted.PlanningFailureSnapshot(); failure == nil || failure.Trigger != "last-durable-attempt" {
+		t.Fatalf("a failed write erased the previous durable evidence: %+v", failure)
 	}
 }

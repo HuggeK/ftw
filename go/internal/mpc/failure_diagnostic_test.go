@@ -175,6 +175,130 @@ func TestFailureEvidenceCannotBeOverwrittenBySupersededWork(t *testing.T) {
 	if newPlan == nil || failure == nil || failure.Error != "new current failure" || failure.RecoveredDecisionID != newPlan.DecisionID {
 		t.Fatalf("stale attempt replaced current evidence: %+v", failure)
 	}
+	restored := New(svc.Store, nil, svc.Zone, svc.Defaults).PlanningFailureSnapshot()
+	if restored == nil || restored.Error != failure.Error || restored.RecoveredDecisionID != newPlan.DecisionID {
+		t.Fatalf("stale attempt replaced durable evidence: %+v", restored)
+	}
+}
+
+func TestFailureEvidenceStorageRestoresWireAndRecoveryWithoutExecution(t *testing.T) {
+	svc := shadowTestService(t)
+	transport := &diagnosticFailureTransport{}
+	svc.Optimizer = &ExternalOptimizer{cfg: ExternalOptimizerConfig{Timeout: time.Second}, transport: transport}
+	plan := svc.Replan(context.Background())
+	if plan == nil {
+		t.Fatal("fixture did not recover")
+	}
+	restarted := New(svc.Store, nil, svc.Zone, svc.Defaults)
+	failure := restarted.PlanningFailureSnapshot()
+	if failure == nil || failure.RecoveredDecisionID != plan.DecisionID ||
+		!bytes.Equal(failure.OptimizerRequest.JSON, transport.request) || !bytes.Equal(failure.OptimizerResponse.JSON, transport.response) {
+		t.Fatalf("durable worker exchange or recovery was lost: %+v", failure)
+	}
+	status := restarted.PlanningFailureStorageSnapshot()
+	if !status.Enabled || !status.Durable || !status.Restored || status.Error != "" {
+		t.Fatalf("restore status is wrong: %+v", status)
+	}
+	if restarted.Latest() != nil || restarted.Diagnose() != nil {
+		t.Fatal("restoring failure evidence restored a plan")
+	}
+	if _, ok := restarted.SlotDirectiveAt(time.Now()); ok {
+		t.Fatal("restoring evidence authorized dispatch")
+	}
+	// A later success marks the old failure as recovered, without erasing it.
+	restarted.BaseLoad = 500
+	if restarted.Replan(context.Background()) == nil || restarted.PlanningFailureSnapshot().RecoveredDecisionID != plan.DecisionID {
+		t.Fatal("a clean replan erased the failure or rewrote its first recovery")
+	}
+	// Unchanged evidence requires no disk write on a later successful replan.
+	_ = svc.Store.Close()
+	restarted.persistPlanningFailure()
+	if status := restarted.PlanningFailureStorageSnapshot(); !status.Durable || status.Error != "" {
+		t.Fatalf("unchanged evidence was written again: %+v", status)
+	}
+}
+
+func TestFailureEvidenceStorageRejectsCorruptRecordsAndReportsReadErrors(t *testing.T) {
+	svc := shadowTestService(t)
+	for _, raw := range []string{`{`, `null`, `{"schema_version":2}`, `{"schema_version":1,"inputs":{}}`, strings.Repeat(" ", planningFailureRecordByteLimit+1)} {
+		if err := svc.Store.SaveConfig(planningFailureConfigKey, raw); err != nil {
+			t.Fatal(err)
+		}
+		restarted := New(svc.Store, nil, svc.Zone, svc.Defaults)
+		if restarted.PlanningFailureSnapshot() != nil || restarted.Latest() != nil || restarted.PlanningFailureStorageSnapshot().Error == "" {
+			t.Fatal("corrupt evidence was accepted or its restore error was hidden")
+		}
+	}
+	_ = svc.Store.Close()
+	restarted := New(svc.Store, nil, svc.Zone, svc.Defaults)
+	if restarted.PlanningFailureSnapshot() != nil || restarted.PlanningFailureStorageSnapshot().Error == "" {
+		t.Fatal("storage read failure was hidden")
+	}
+}
+
+func TestFailureEvidenceStorageFailureKeepsMemoryAndReportsError(t *testing.T) {
+	svc := shadowTestService(t)
+	_ = svc.Store.Close()
+	svc.Replan(context.Background())
+	failure := svc.PlanningFailureSnapshot()
+	status := svc.PlanningFailureStorageSnapshot()
+	if failure == nil || status.Durable || status.Error == "" || !strings.Contains(failure.Error, "Could not load electricity prices") {
+		t.Fatalf("failed write lost evidence or claimed durability: failure=%+v status=%+v", failure, status)
+	}
+}
+
+func TestFailureEvidenceStorageMarksRecoveryAfterRestart(t *testing.T) {
+	svc := shadowTestService(t)
+	valid := svc.Defaults
+	svc.Defaults.ChargeEfficiency = math.NaN()
+	svc.Replan(context.Background())
+	failure := svc.PlanningFailureSnapshot()
+	if failure == nil || failure.RecoveredDecisionID != "" {
+		t.Fatal("fixture did not retain an unrecovered failure")
+	}
+	restarted := New(svc.Store, nil, svc.Zone, valid)
+	restarted.BaseLoad = 500
+	plan := restarted.Replan(context.Background())
+	if plan == nil {
+		t.Fatal("valid restart did not recover")
+	}
+	retained := New(svc.Store, nil, svc.Zone, valid).PlanningFailureSnapshot()
+	if retained == nil || retained.CapturedAtMs != failure.CapturedAtMs || retained.RecoveredDecisionID != plan.DecisionID || retained.RecoveredAtMs <= 0 {
+		t.Fatalf("recovery after restart lost the original evidence or was not durable: %+v", retained)
+	}
+}
+
+func TestFailureEvidenceStorageDoesNotHoldDispatchLock(t *testing.T) {
+	svc := shadowTestService(t)
+	start := time.Now().UTC().Truncate(time.Hour)
+	svc.now = func() time.Time { return start.Add(5 * time.Minute) }
+	svc.Optimizer = &ExternalOptimizer{cfg: ExternalOptimizerConfig{Timeout: time.Second}, transport: &diagnosticFailureTransport{}}
+	svc.failurePersistMu.Lock()
+	locked := true
+	t.Cleanup(func() {
+		if locked {
+			svc.failurePersistMu.Unlock()
+		}
+	})
+	done := make(chan struct{})
+	go func() { defer close(done); svc.Replan(context.Background()) }()
+	waitFor(t, "accepted recovery before diagnostic write", func() bool { return svc.Latest() != nil })
+	if _, ok := svc.SlotDirectiveAt(svc.planningNow()); !ok {
+		t.Fatal("pending diagnostic I/O held up an accepted directive")
+	}
+	if status := svc.PlanningFailureStorageSnapshot(); status.Durable {
+		t.Fatal("pending I/O was reported as durable")
+	}
+	svc.failurePersistMu.Unlock()
+	locked = false
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("diagnostic write did not finish")
+	}
+	if status := svc.PlanningFailureStorageSnapshot(); !status.Durable || status.Error != "" {
+		t.Fatalf("finished write is not durable: %+v", status)
+	}
 }
 
 func TestNativeSupportFailureEvidenceMatchesRejectedWorkerRequest(t *testing.T) {

@@ -10,7 +10,7 @@ func (s *Server) supportPlanner(now time.Time) map[string]any {
 	out := map[string]any{
 		"schema_version": 1, "collected_at_ms": now.UnixMilli(),
 		"enabled":               s.deps.MPC != nil,
-		"failure_capture_scope": "latest failure in the current process; no failure history is stored",
+		"failure_capture_scope": "latest failure retained across restarts; no failure history is stored",
 	}
 	if s.deps.MPC == nil {
 		return out
@@ -25,6 +25,7 @@ func (s *Server) supportPlanner(now time.Time) map[string]any {
 	// from a newer failed attempt. Neither snapshot is an executable plan.
 	out["last_accepted_plan"] = json.RawMessage(supportJSON(s.deps.MPC.Diagnose()))
 	out["last_failure"] = json.RawMessage(supportJSON(s.deps.MPC.PlanningFailureSnapshot()))
+	out["failure_storage"] = s.deps.MPC.PlanningFailureStorageSnapshot()
 	return out
 }
 

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"reflect"
 	"strings"
@@ -12,8 +13,13 @@ import (
 
 const planningFailureByteLimit = 1 << 20
 
+const planningFailureConfigKey = "diagnostics/mpc_last_failure_v1"
+
+// Three bounded payloads can grow when JSON escapes their content.
+const planningFailureRecordByteLimit = 20 * planningFailureByteLimit
+
 // PlanningFailure is evidence from one attempt, never an executable plan.
-// Only the latest failure in this process is retained; a later success marks
+// Only the latest failure is retained across restarts; a later success marks
 // recovery without deleting the inputs needed to investigate the failure.
 type PlanningFailure struct {
 	SchemaVersion       int             `json:"schema_version"`
@@ -124,8 +130,93 @@ func (s *Service) recordPlanningFailure(r replanRequest, stage, message string, 
 	s.mu.Lock()
 	if !s.stopping && r.generation == s.latestReplanGeneration && !r.wasCanceledByService() {
 		s.lastPlanningFailure = f
+		s.planningFailureRestored = false
 	}
 	s.mu.Unlock()
+}
+
+type PlanningFailureStorage struct {
+	Enabled  bool   `json:"enabled"`
+	Durable  bool   `json:"durable"`
+	Restored bool   `json:"restored"`
+	Error    string `json:"error,omitempty"`
+}
+
+func (s *Service) PlanningFailureStorageSnapshot() PlanningFailureStorage {
+	if s == nil {
+		return PlanningFailureStorage{}
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return PlanningFailureStorage{Enabled: s.Store != nil,
+		Durable:  s.lastPlanningFailure != nil && s.lastPlanningFailure == s.persistedPlanningFailure,
+		Restored: s.planningFailureRestored, Error: s.planningFailureStorageError}
+}
+
+// Finish one attempt with a durable latest record, including its recovery
+// marker. SaveConfig uses SQLite FULL synchronous commits with a five-second
+// bound. No service/control lock spans I/O, and unchanged records need no write.
+func (s *Service) persistPlanningFailure() {
+	if s.Store == nil {
+		return
+	}
+	s.failurePersistMu.Lock()
+	defer s.failurePersistMu.Unlock()
+	s.mu.RLock()
+	f := s.lastPlanningFailure
+	unchanged := f == s.persistedPlanningFailure
+	s.mu.RUnlock()
+	if f == nil || unchanged {
+		return
+	}
+	raw, err := json.Marshal(f)
+	if err == nil && len(raw) > planningFailureRecordByteLimit {
+		err = errors.New("planner failure exceeds the storage limit")
+	}
+	if err == nil {
+		err = s.Store.SaveConfig(planningFailureConfigKey, string(raw))
+	}
+	s.mu.Lock()
+	if err == nil {
+		s.persistedPlanningFailure = f
+		s.planningFailureStorageError = ""
+	} else {
+		s.planningFailureStorageError = "Could not save planner failure evidence: " + err.Error()
+	}
+	s.mu.Unlock()
+	if err != nil {
+		slog.Warn("mpc: could not save failure evidence", "err", err)
+	}
+}
+
+// Construction restores evidence only. Accepted-plan and execution fields
+// stay empty; a diagnostic can never supply commands after a restart.
+func (s *Service) restorePlanningFailure() {
+	if s.Store == nil {
+		return
+	}
+	raw, found, err := s.Store.ConfigValue(planningFailureConfigKey)
+	if err == nil && !found {
+		return
+	}
+	var f PlanningFailure
+	if err == nil {
+		if len(raw) > planningFailureRecordByteLimit {
+			err = errors.New("stored planner failure exceeds the storage limit")
+		} else if json.Unmarshal([]byte(raw), &f) != nil || f.SchemaVersion != 1 ||
+			f.CapturedAtMs <= 0 || f.AttemptStartedAtMs <= 0 || f.Stage == "" || f.Error == "" ||
+			len(f.Inputs) > planningFailureRecordByteLimit || !json.Valid(f.Inputs) {
+			err = errors.New("invalid stored planner failure")
+		}
+	}
+	if err != nil {
+		s.planningFailureStorageError = "Could not restore planner failure evidence: " + err.Error()
+		slog.Warn("mpc: could not restore failure evidence", "err", err)
+		return
+	}
+	s.lastPlanningFailure = &f
+	s.persistedPlanningFailure = &f
+	s.planningFailureRestored = true
 }
 
 // Invalid inputs must remain inspectable when normal JSON encoding refuses
