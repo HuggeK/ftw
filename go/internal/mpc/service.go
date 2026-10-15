@@ -1957,12 +1957,16 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 			}
 		}
 	}
+	var horizonWarning string
 	if inputErr != nil {
-		markShortenedPlan(&plan, slots, "Later planning inputs are invalid: "+inputErr.Error()+".")
+		horizonWarning = markShortenedPlan(&plan, slots, "Later planning inputs are invalid: "+inputErr.Error()+".")
 	}
 	if len(slots) < requestedSlots {
-		warnings = append(warnings, plan.Solver.FallbackReason)
-		slog.Warn("mpc: publishing a shorter safe plan", "slots", len(slots), "requested_slots", requestedSlots, "reason", plan.Solver.FallbackReason)
+		if horizonWarning == "" {
+			horizonWarning = plan.Solver.FallbackReason
+		}
+		warnings = append(warnings, horizonWarning)
+		slog.Warn("mpc: publishing a shorter safe plan", "slots", len(slots), "requested_slots", requestedSlots, "reason", horizonWarning)
 		baseForecastSlots = baseForecastSlots[:len(slots)]
 		fallbackSlots = fallbackSlots[:len(slots)]
 	}
@@ -2567,8 +2571,11 @@ func currentSoC(t *telemetry.Store, fallback float64) (float64, bool) {
 }
 
 func freshBatterySoC(r *telemetry.DerReading) bool {
-	return r != nil && r.SoC != nil && finite(*r.SoC) && *r.SoC >= 0 && *r.SoC <= 1 &&
-		!r.SoCUpdatedAt.IsZero() && time.Since(r.SoCUpdatedAt) <= telemetry.BatterySoCMaxAge
+	if r == nil || r.SoC == nil || !finite(*r.SoC) || *r.SoC < 0 || *r.SoC > 1 || r.SoCUpdatedAt.IsZero() {
+		return false
+	}
+	age := time.Since(r.SoCUpdatedAt)
+	return age >= 0 && age <= telemetry.BatterySoCMaxAge
 }
 
 // onlineFleetParams takes fuseMaxW from the replan's copy, so the battery

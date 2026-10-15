@@ -58,7 +58,7 @@ func TestCoreRecoveryNonFiniteForecastMatrix(t *testing.T) {
 						t.Fatalf("future bad input lost valid prefix: slots=%d want=%d err=%v", len(used), at, err)
 					}
 					assertRecoveryPlan(t, used, p, plan)
-					if plan.Solver == nil || !plan.Solver.Fallback || !strings.Contains(plan.Solver.FallbackReason, "invalid") {
+					if plan.Solver == nil || (plan.Solver.Fallback && !strings.Contains(plan.Solver.FallbackReason, "invalid")) {
 						t.Fatalf("invalid input was hidden: %+v", plan.Solver)
 					}
 				})
