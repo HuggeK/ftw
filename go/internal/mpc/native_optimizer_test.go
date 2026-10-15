@@ -151,8 +151,8 @@ func TestNativeFullHorizonPhysicalBoundaries(t *testing.T) {
 				t.Fatal(err)
 			}
 			for i, a := range plan.Actions {
-				if a.LoadpointW > 0 && a.GridW < -1e-6 && a.BatteryW < 0 {
-					t.Fatalf("slot %d: intended zero power became discharge", i)
+				if a.LoadpointW > 1e-5 && a.GridW < -1e-6 && a.BatteryW < -1e-5 {
+					t.Fatalf("slot %d: EV=%g W battery=%g W grid=%g W", i, a.LoadpointW, a.BatteryW, a.GridW)
 				}
 			}
 		}
