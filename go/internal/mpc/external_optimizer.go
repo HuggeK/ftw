@@ -422,6 +422,10 @@ func (o *ExternalOptimizer) Close() error {
 // and dispatch keeps its separate fuse guard.
 const solverGridLimitToleranceW = 0.1
 
+// solverZeroPowerToleranceW matches the worker replay precision for an idle
+// action. At 1e-5 W the most energy it can admit is 0.00024 Wh per day.
+const solverZeroPowerToleranceW = 1e-5
+
 // ValidatePlan independently replays a candidate plan against the canonical
 // site sign convention and current constraints. Solver output is untrusted at
 // this boundary: NaN, stale slot alignment, energy drift, illegal EV steps, or
@@ -619,8 +623,9 @@ func ValidatePlan(slots []Slot, p Params, plan *Plan) error {
 			if lp.SurplusOnly && surplusOnlyExceedsHousePV(powerW, slot.LoadW, effectivePVW) {
 				return fmt.Errorf("slot %d surplus-only loadpoint %s exceeds PV leftover after house load", i, lp.ID)
 			}
-			if powerW > 0 && a.BatteryW < 0 && a.GridW < -50 {
-				return fmt.Errorf("slot %d loadpoint %s charges during battery-driven export", i, lp.ID)
+			if powerW > solverZeroPowerToleranceW && a.BatteryW < -solverZeroPowerToleranceW && a.GridW < -50 {
+				return fmt.Errorf("slot %d loadpoint %s charges during battery-driven export: ev_w=%.9f battery_w=%.9f grid_w=%.9f",
+					i, lp.ID, powerW, a.BatteryW, a.GridW)
 			}
 			if lp.blocksBatteryToEV() && loadpoint.BatteryDischargeFeedsEV(a.BatteryW, powerW, slot.LoadW, effectivePVW) {
 				return fmt.Errorf("slot %d battery discharge feeds loadpoint %s", i, lp.ID)
