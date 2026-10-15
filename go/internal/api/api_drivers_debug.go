@@ -751,7 +751,7 @@ func (s *Server) handleSupportDump(w http.ResponseWriter, r *http.Request) {
 	// below it is what you reach for when the report does not settle the
 	// question. Shipping them together means the person asking for help
 	// sends one file and never has to pick the right one.
-	addFile("00-help-report.md", []byte(s.buildSupportReport(r.Context(), time.Now())))
+	addFile("00-help-report.md", []byte(redactDumpLog(s.buildSupportReport(r.Context(), now))))
 
 	manifest := map[string]any{
 		"generated_at": now.Format(time.RFC3339),
@@ -765,6 +765,8 @@ func (s *Server) handleSupportDump(w http.ResponseWriter, r *http.Request) {
 			"00-help-report.md",
 			"config.redacted.yaml",
 			"drivers.json",
+			"planner.json",
+			"loadpoints.json",
 			"logs/global.log",
 			"logs/<driver>.log",
 			"telemetry/<driver>__<metric>.csv",
@@ -783,6 +785,8 @@ func (s *Server) handleSupportDump(w http.ResponseWriter, r *http.Request) {
 	// All driver health in one file — easier to scan than one-per-driver.
 	healthBody, _ := json.MarshalIndent(s.deps.Tel.AllHealth(), "", "  ")
 	addFile("drivers.json", healthBody)
+	addFile("planner.json", supportJSON(s.supportPlanner(now)))
+	addFile("loadpoints.json", supportJSON(s.loadpointsPayload(now)))
 
 	// Logs. Lua host.log and HTTP error bodies often carry OAuth JSON;
 	// redact before the zip leaves the house.
