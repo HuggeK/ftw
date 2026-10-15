@@ -164,8 +164,11 @@ func TestAnchorVehicleSoCAtBeforePlugIn(t *testing.T) {
 	now = t0.Add(10 * time.Minute)
 	m.Observe("a", true, 11000, 1500, true)
 
-	if m.AnchorVehicleSoCAt("a", 0.60, t0.Add(-anchorBeforePlugSlack-time.Minute)) {
-		t.Fatal("a reading long before plug-in may predate a drive")
+	if !m.AnchorVehicleSoCAt("a", 0.60, t0.Add(-anchorBeforePlugSlack-time.Minute)) {
+		t.Fatal("qualified pre-connection reading refused")
+	}
+	if st, _ := m.State("a"); math.Abs(st.CurrentSoC-.60) > 1e-9 {
+		t.Fatalf("energy before the connection was invented: %.4f", st.CurrentSoC)
 	}
 	if !m.AnchorVehicleSoCAt("a", 0.60, t0.Add(-time.Minute)) {
 		t.Fatal("a reading just before plug-in should anchor")
@@ -175,17 +178,23 @@ func TestAnchorVehicleSoCAtBeforePlugIn(t *testing.T) {
 	}
 }
 
-// After a restart the history starts mid-session. Energy at an earlier
-// reading is unknown, so the reading must not anchor.
-func TestAnchorVehicleSoCAtUnknownEnergyRefuses(t *testing.T) {
+// After a restart the history starts mid-session. Keep the qualified raw
+// reading and its source time without adding unknown earlier energy.
+func TestAnchorVehicleSoCAtUnknownEnergyKeepsRawReading(t *testing.T) {
 	m := NewManager()
 	m.Load([]Config{{ID: "a", VehicleCapacityWh: 60000, PluginSoC: 0.25}})
 	t0 := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
 	now := t0
 	m.SetNowFn(func() time.Time { return now })
 	m.Observe("a", true, 11000, 4000, true)
-	if m.AnchorVehicleSoCAt("a", 0.60, t0.Add(-2*time.Minute)) {
-		t.Fatal("energy before the first sample is unknown")
+	if !m.AnchorVehicleSoCAt("a", 0.60, t0.Add(-2*time.Minute)) {
+		t.Fatal("qualified reading with unknown earlier energy refused")
+	}
+	if st, _ := m.State("a"); math.Abs(st.CurrentSoC-.60) > 1e-9 {
+		t.Fatalf("unknown earlier energy was added: %.4f", st.CurrentSoC)
+	}
+	if !m.VehicleSoCSupersedes("a", t0.Add(-time.Minute)) {
+		t.Fatal("raw fallback used receipt time instead of measurement time")
 	}
 	if !m.AnchorVehicleSoCAt("a", 0.60, t0) {
 		t.Fatal("a reading at the first sample should anchor")
@@ -195,7 +204,10 @@ func TestAnchorVehicleSoCAtUnknownEnergyRefuses(t *testing.T) {
 		now = t0.Add(time.Duration(i) * 5 * time.Minute)
 		m.Observe("a", true, 11000, 4000+float64(i)*100, true)
 	}
-	if m.AnchorVehicleSoCAt("a", 0.60, t0) {
-		t.Fatal("trimmed history must not anchor")
+	if !m.AnchorVehicleSoCAt("a", 0.60, t0) {
+		t.Fatal("qualified reading outside retained history refused")
+	}
+	if st, _ := m.State("a"); math.Abs(st.CurrentSoC-.60) > 1e-9 {
+		t.Fatalf("trimmed energy history was invented: %.4f", st.CurrentSoC)
 	}
 }
