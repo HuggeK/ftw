@@ -1780,7 +1780,9 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 		}
 		if len(prefix) == 0 {
 			slog.Error("mpc: invalid current planning input; keeping previous plan", "err", err)
-			return fail("inputs", err.Error())
+			// Keep the rejected risk inputs captured above, rather than replacing
+			// them with the base forecast selected by the generic failure path.
+			return s.failedReplan(request, err.Error())
 		}
 		if len(prefix) < len(slots) {
 			slots, fallbackSlots = slots[:len(prefix)], fallbackSlots[:len(prefix)]

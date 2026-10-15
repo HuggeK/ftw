@@ -17,6 +17,32 @@ type diagnosticFailureTransport struct {
 	err               error
 }
 
+func TestFailureEvidenceKeepsRejectedDownsideInputs(t *testing.T) {
+	svc := shadowTestService(t)
+	start := time.Now().UTC().Truncate(time.Hour)
+	svc.now = func() time.Time { return start.Add(5 * time.Minute) }
+	svc.PV = func(time.Time, float64) float64 { return 1000 }
+	svc.PVForecastSafetyK = 1
+	svc.PVUncertaintyW = func() float64 { return math.NaN() }
+	if svc.Replan(context.Background()) != nil {
+		t.Fatal("invalid current downside forecast became a plan")
+	}
+	failure := svc.PlanningFailureSnapshot()
+	if failure == nil || failure.Stage != "risk_inputs" {
+		t.Fatalf("rejected downside evidence was overwritten: %+v", failure)
+	}
+	var inputs struct {
+		Slots []map[string]any `json:"slots"`
+	}
+	if err := json.Unmarshal(failure.Inputs, &inputs); err != nil || len(inputs.Slots) == 0 || inputs.Slots[0]["PVW"] != "NaN" {
+		t.Fatalf("failure reports the valid base forecast instead of rejected risk inputs: %s %v", failure.Inputs, err)
+	}
+	restored := New(svc.Store, nil, svc.Zone, svc.Defaults).PlanningFailureSnapshot()
+	if restored == nil || !bytes.Equal(restored.Inputs, failure.Inputs) || restored.Stage != "risk_inputs" {
+		t.Fatal("rejected risk inputs were not durable")
+	}
+}
+
 func (f *diagnosticFailureTransport) RoundTrip(_ context.Context, payload []byte) ([]byte, error) {
 	f.request = append([]byte(nil), payload...)
 	if f.err != nil {
