@@ -1557,9 +1557,11 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	if len(slots) == 0 {
 		return s.failedReplan(request, "No current electricity price slots are available")
 	}
-	if err := validateSlotChronology(slots); err != nil {
-		slog.Error("mpc: invalid slot chronology; keeping previous plan", "err", err)
-		return s.failedReplan(request, err.Error())
+	requestedSlots := len(slots)
+	slots, inputErr := planningInputPrefix(slots)
+	if len(slots) == 0 {
+		slog.Error("mpc: invalid current planning input; keeping previous plan", "err", inputErr)
+		return s.failedReplan(request, inputErr.Error())
 	}
 	// Keep the point forecast and a downside-PV copy. The Core DP and the
 	// Energyplan worker both plan against the downside copy; the point
@@ -1620,7 +1622,11 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 			return s.failedReplan(request, "Waiting for an online battery with capacity and charge level")
 		}
 	} else if p.CapacityWh > 0 {
-		p.InitialSoC = currentSoC(s.Tele, p.InitialSoC)
+		var ok bool
+		p.InitialSoC, ok = currentSoC(s.Tele, p.InitialSoC)
+		if !ok {
+			return s.failedReplan(request, "Waiting for an online battery with a fresh charge level")
+		}
 	} else {
 		p.InitialSoC = 0
 	}
@@ -1668,9 +1674,16 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	// tomorrow" (because discharging loses η_rt while the extra retail-
 	// priced terminal credit is never realised).
 	if p.TerminalSoCPrice <= 0 {
+		terminalPrices := prices
+		if inputErr != nil {
+			terminalPrices = make([]state.PricePoint, len(slots))
+			for i, slot := range slots {
+				terminalPrices[i] = state.PricePoint{TotalOreKwh: slot.PriceOre, SpotOreKwh: slot.SpotOre}
+			}
+		}
 		switch p.Mode {
 		case ModeSelfConsumption, ModeCheapCharge, ModePassiveArbitrage:
-			p.TerminalSoCPrice = selfConsumptionTerminalPrice(prices,
+			p.TerminalSoCPrice = selfConsumptionTerminalPrice(terminalPrices,
 				site.ExportBonusOreKwh, site.ExportFeeOreKwh)
 		default:
 			// Arbitrage: stored SoC at horizon end will be discharged at
@@ -1688,7 +1701,7 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 			// terminal value from ~262 to ~310, much closer to the
 			// realisable discharge value, without being naive about
 			// always discharging at the peak.
-			p.TerminalSoCPrice = upperHalfMeanPrice(prices)
+			p.TerminalSoCPrice = upperHalfMeanPrice(terminalPrices)
 		}
 	}
 
@@ -1730,13 +1743,16 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 		}
 	}
 
-	if err := validatePlanningSlots(slots); err != nil {
-		slog.Error("mpc: invalid optimization inputs; keeping previous plan", "basis", "primary", "err", err)
-		return s.failedReplan(request, err.Error())
-	}
-	if err := validatePlanningSlots(fallbackSlots); err != nil {
-		slog.Error("mpc: invalid optimization inputs; keeping previous plan", "basis", "go-fallback", "err", err)
-		return s.failedReplan(request, err.Error())
+	for _, inputs := range [][]Slot{slots, fallbackSlots} {
+		prefix, err := planningInputPrefix(inputs)
+		if len(prefix) == 0 {
+			slog.Error("mpc: invalid current planning input; keeping previous plan", "err", err)
+			return s.failedReplan(request, err.Error())
+		}
+		if len(prefix) < len(slots) {
+			slots, fallbackSlots = slots[:len(prefix)], fallbackSlots[:len(prefix)]
+			inputErr = err
+		}
 	}
 	if err := validatePlanningParams(p); err != nil {
 		slog.Error("mpc: invalid optimization parameters; keeping previous plan", "err", err)
@@ -1796,7 +1812,14 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 		// not bet on sun that may not arrive.
 		slots = fallbackSlots
 		solveStart := time.Now()
-		plan = coreReservePlan(context.WithoutCancel(ctx), slots, p)
+		var err error
+		plan, slots, err = corePlanWithRecovery(context.WithoutCancel(ctx), slots, p)
+		if request.wasCanceledByService() {
+			return s.canceledReplan(request, "core-recovery")
+		}
+		if err != nil {
+			return s.failedReplan(request, "Core could not build a safe plan: "+err.Error())
+		}
 		setCoreReserveSolver(&plan, p, msSince(solveStart))
 	} else {
 		candidate, err := s.Optimizer.Optimize(ctx, slots, p)
@@ -1876,15 +1899,38 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 			slog.Error("mpc: primary optimizer failed; using Core DP fallback", "err", err)
 			slots = fallbackSlots
 			solveStart := time.Now()
-			plan = coreReservePlan(context.WithoutCancel(ctx), slots, p)
+			var fallbackErr error
+			plan, slots, fallbackErr = corePlanWithRecovery(context.WithoutCancel(ctx), slots, p)
+			if request.wasCanceledByService() {
+				return s.canceledReplan(request, "core-recovery")
+			}
+			if fallbackErr != nil {
+				return s.failedReplan(request, "Optimizer failed: "+err.Error()+"; Core could not build a safe plan: "+fallbackErr.Error())
+			}
 			setCoreReserveSolver(&plan, p, msSince(solveStart))
-			// Same solver, different standing: the operator asked for the
-			// external planner and did not get it. Everything that warns about
-			// a degraded optimizer keys on this flag, not on the engine name.
+			// Mark Core's reserve as a fallback when the operator requested
+			// the external planner. Clients use the flag to show that change.
 			plan.Solver.Status = "fallback"
 			plan.Solver.Fallback = true
-			plan.Solver.FallbackReason = err.Error()
+			if plan.Solver.FallbackReason != "" {
+				plan.Solver.FallbackReason = err.Error() + "; " + plan.Solver.FallbackReason
+			} else {
+				plan.Solver.FallbackReason = err.Error()
+			}
 		}
+	}
+	var horizonWarning string
+	if inputErr != nil {
+		horizonWarning = markShortenedPlan(&plan, slots, "Later planning inputs are invalid: "+inputErr.Error()+".")
+	}
+	if len(slots) < requestedSlots {
+		if horizonWarning == "" {
+			horizonWarning = plan.Solver.FallbackReason
+		}
+		warnings = append(warnings, horizonWarning)
+		slog.Warn("mpc: publishing a shorter safe plan", "slots", len(slots), "requested_slots", requestedSlots, "reason", horizonWarning)
+		baseForecastSlots = baseForecastSlots[:len(slots)]
+		fallbackSlots = fallbackSlots[:len(slots)]
 	}
 	if err := validatePlanSlotAlignment(slots, plan.Actions); err != nil {
 		slog.Error("mpc: rejected plan with invalid slot timeline",
@@ -1923,7 +1969,7 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	// self-consumption mode: the SC baseline is the plan itself, which
 	// makes the badge trivially zero and distracts from the price
 	// signal. For SC runs the UI still has the plan cost on its own.
-	if p.Mode != ModeSelfConsumption && !recoveryRequired && coreDPModelError(p) == nil && (plan.Solver == nil || plan.Solver.Backend != "ev_reserve") {
+	if p.Mode != ModeSelfConsumption && !recoveryRequired && coreDPModelError(p) == nil && (plan.Solver == nil || (!plan.Solver.Fallback && plan.Solver.Backend != "ev_reserve")) {
 		bl := ComputeBaselines(slots, p)
 		plan.Baselines = &bl
 	}
@@ -1976,6 +2022,7 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	s.lastReason = request.reason
 	s.publishedReplanGeneration = request.generation
 	s.lastPlanningError = ""
+	s.planningWarnings = warnings
 	reason := request.reason
 	replanAtMs := s.lastReplanAt.UnixMilli()
 	saveDiag := s.SaveDiag
@@ -2456,27 +2503,35 @@ func lookupPVInput(forecasts []state.ForecastPoint, ts int64) (float64, *state.F
 	return 0, nil
 }
 
-// currentSoC averages battery SoC from telemetry (0–1).
-func currentSoC(t *telemetry.Store, fallback float64) float64 {
+// currentSoC averages fresh online battery SoC (0–1). A caller without a
+// telemetry source can plan from its supplied state. A live store must not
+// turn missing measurements into that configured initial state.
+func currentSoC(t *telemetry.Store, fallback float64) (float64, bool) {
 	if t == nil {
-		return fallback
+		return fallback, true
 	}
 	bats := t.ReadingsByType(telemetry.DerBattery)
-	if len(bats) == 0 {
-		return fallback
-	}
 	var sum float64
 	var n int
 	for _, b := range bats {
-		if b.SoC != nil {
+		h := t.DriverHealth(b.Driver)
+		if (h == nil || h.IsOnline()) && freshBatterySoC(b) {
 			sum += *b.SoC
 			n++
 		}
 	}
 	if n == 0 {
-		return fallback
+		return 0, false
 	}
-	return sum / float64(n)
+	return sum / float64(n), true
+}
+
+func freshBatterySoC(r *telemetry.DerReading) bool {
+	if r == nil || r.SoC == nil || !finite(*r.SoC) || *r.SoC < 0 || *r.SoC > 1 || r.SoCUpdatedAt.IsZero() {
+		return false
+	}
+	age := time.Since(r.SoCUpdatedAt)
+	return age >= 0 && age <= telemetry.BatterySoCMaxAge
 }
 
 // onlineFleetParams takes fuseMaxW from the replan's copy, so the battery
@@ -2496,7 +2551,7 @@ func (s *Service) onlineFleetParams(p Params, fleet []BatteryFleetMember, fuseMa
 			continue
 		}
 		r := s.Tele.Get(b.Driver, telemetry.DerBattery)
-		if r == nil || r.SoC == nil {
+		if !freshBatterySoC(r) {
 			continue
 		}
 		totalCap += b.CapacityWh

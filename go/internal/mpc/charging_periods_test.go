@@ -139,7 +139,7 @@ func TestValidatePlanCountsADepartureMissOnlyAboveHalfARun(t *testing.T) {
 			p.Loadpoint = &LoadpointSpec{ID: "easee", CapacityWh: 76800, InitialSoC: .75 - tc.need/76800, SoCMax: .75,
 				Levels: 11, PluggedIn: true, TargetSoC: .75, TargetSlotIdx: 3, MaxChargeW: 11000,
 				AllowedStepsW: []float64{0, 3600, 11000}, ChargeEfficiency: 1, SurplusOnly: true, Charging: tc.charging}
-			plan := coreReservePlan(context.Background(), slots, p)
+			plan := mustCoreReservePlan(t, slots, p)
 			if err := ValidatePlan(slots, p, &plan); err != nil {
 				t.Fatal(err)
 			}
