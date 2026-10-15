@@ -85,6 +85,7 @@ type ProcessTransport struct {
 	mu        *contextGate
 	cmd       *exec.Cmd
 	stdin     io.WriteCloser
+	stdout    io.ReadCloser
 	scanner   *bufio.Scanner
 	waitCh    chan error
 	idleTimer *time.Timer
@@ -175,19 +176,24 @@ func (t *ProcessTransport) ensureStartedLocked() error {
 	if err != nil {
 		return fmt.Errorf("optimizer stdin: %w", err)
 	}
-	stdout, err := cmd.StdoutPipe()
+	// Own the read end. Cmd.Wait closes StdoutPipe as soon as the child exits,
+	// which can discard a complete reply before scanLine gets scheduled.
+	stdout, stdoutWriter, err := os.Pipe()
 	if err != nil {
 		_ = stdin.Close()
 		return fmt.Errorf("optimizer stdout: %w", err)
 	}
+	cmd.Stdout = stdoutWriter
 	if err := cmd.Start(); err != nil {
 		_ = stdin.Close()
 		_ = stdout.Close()
+		_ = stdoutWriter.Close()
 		return fmt.Errorf("start optimizer %q: %w", t.cfg.Command[0], err)
 	}
+	_ = stdoutWriter.Close()
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- cmd.Wait() }()
-	t.cmd, t.stdin, t.scanner, t.waitCh = cmd, stdin, bufio.NewScanner(stdout), waitCh
+	t.cmd, t.stdin, t.stdout, t.scanner, t.waitCh = cmd, stdin, stdout, bufio.NewScanner(stdout), waitCh
 	t.scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
 	return nil
 }
@@ -223,9 +229,10 @@ func (t *ProcessTransport) stopLocked() {
 		return
 	}
 	_ = t.stdin.Close()
+	_ = t.stdout.Close()
 	_ = t.cmd.Process.Kill()
 	<-t.waitCh
-	t.cmd, t.stdin, t.scanner, t.waitCh = nil, nil, nil, nil
+	t.cmd, t.stdin, t.stdout, t.scanner, t.waitCh = nil, nil, nil, nil, nil
 }
 
 func (t *ProcessTransport) Close() error {
@@ -238,7 +245,8 @@ func (t *ProcessTransport) Close() error {
 	_ = t.stdin.Close()
 	select {
 	case err := <-t.waitCh:
-		t.cmd, t.stdin, t.scanner, t.waitCh = nil, nil, nil, nil
+		_ = t.stdout.Close()
+		t.cmd, t.stdin, t.stdout, t.scanner, t.waitCh = nil, nil, nil, nil, nil
 		return err
 	case <-time.After(time.Second):
 		t.stopLocked()
