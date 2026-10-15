@@ -1796,7 +1796,14 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 		// not bet on sun that may not arrive.
 		slots = fallbackSlots
 		solveStart := time.Now()
-		plan = coreReservePlan(context.WithoutCancel(ctx), slots, p)
+		var err error
+		plan, slots, err = corePlanWithRecovery(context.WithoutCancel(ctx), slots, p)
+		if request.wasCanceledByService() {
+			return s.canceledReplan(request, "core-recovery")
+		}
+		if err != nil {
+			return s.failedReplan(request, "Core could not build a safe plan: "+err.Error())
+		}
 		setCoreReserveSolver(&plan, p, msSince(solveStart))
 	} else {
 		candidate, err := s.Optimizer.Optimize(ctx, slots, p)
@@ -1876,15 +1883,31 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 			slog.Error("mpc: primary optimizer failed; using Core DP fallback", "err", err)
 			slots = fallbackSlots
 			solveStart := time.Now()
-			plan = coreReservePlan(context.WithoutCancel(ctx), slots, p)
+			var fallbackErr error
+			plan, slots, fallbackErr = corePlanWithRecovery(context.WithoutCancel(ctx), slots, p)
+			if request.wasCanceledByService() {
+				return s.canceledReplan(request, "core-recovery")
+			}
+			if fallbackErr != nil {
+				return s.failedReplan(request, "Optimizer failed: "+err.Error()+"; Core could not build a safe plan: "+fallbackErr.Error())
+			}
 			setCoreReserveSolver(&plan, p, msSince(solveStart))
-			// Same solver, different standing: the operator asked for the
-			// external planner and did not get it. Everything that warns about
-			// a degraded optimizer keys on this flag, not on the engine name.
+			// Mark Core's reserve as a fallback when the operator requested
+			// the external planner. Clients use the flag to show that change.
 			plan.Solver.Status = "fallback"
 			plan.Solver.Fallback = true
-			plan.Solver.FallbackReason = err.Error()
+			if plan.Solver.FallbackReason != "" {
+				plan.Solver.FallbackReason = err.Error() + "; " + plan.Solver.FallbackReason
+			} else {
+				plan.Solver.FallbackReason = err.Error()
+			}
 		}
+	}
+	if len(slots) < len(baseForecastSlots) {
+		warnings = append(warnings, plan.Solver.FallbackReason)
+		slog.Warn("mpc: publishing a shorter safe plan", "slots", len(slots), "requested_slots", len(baseForecastSlots), "reason", plan.Solver.FallbackReason)
+		baseForecastSlots = baseForecastSlots[:len(slots)]
+		fallbackSlots = fallbackSlots[:len(slots)]
 	}
 	if err := validatePlanSlotAlignment(slots, plan.Actions); err != nil {
 		slog.Error("mpc: rejected plan with invalid slot timeline",
@@ -1923,7 +1946,7 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	// self-consumption mode: the SC baseline is the plan itself, which
 	// makes the badge trivially zero and distracts from the price
 	// signal. For SC runs the UI still has the plan cost on its own.
-	if p.Mode != ModeSelfConsumption && !recoveryRequired && coreDPModelError(p) == nil && (plan.Solver == nil || plan.Solver.Backend != "ev_reserve") {
+	if p.Mode != ModeSelfConsumption && !recoveryRequired && coreDPModelError(p) == nil && (plan.Solver == nil || (!plan.Solver.Fallback && plan.Solver.Backend != "ev_reserve")) {
 		bl := ComputeBaselines(slots, p)
 		plan.Baselines = &bl
 	}
@@ -1976,6 +1999,7 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	s.lastReason = request.reason
 	s.publishedReplanGeneration = request.generation
 	s.lastPlanningError = ""
+	s.planningWarnings = warnings
 	reason := request.reason
 	replanAtMs := s.lastReplanAt.UnixMilli()
 	saveDiag := s.SaveDiag

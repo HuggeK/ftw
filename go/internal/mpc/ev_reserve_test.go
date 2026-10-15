@@ -7,6 +7,15 @@ import (
 	"time"
 )
 
+func mustCoreReservePlan(t *testing.T, slots []Slot, p Params) Plan {
+	t.Helper()
+	plan, err := coreReservePlan(context.Background(), slots, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return plan
+}
+
 func nearTargetReserveFixture() ([]Slot, Params) {
 	p := Params{Mode: ModeArbitrage, CapacityWh: 9600, InitialSoC: .5, SoCMin: .1, SoCMax: .95, SoCLevels: 21, ActionLevels: 21, MaxChargeW: 4800, MaxDischargeW: 4800, ChargeEfficiency: .95, DischargeEfficiency: .95}
 	p.Loadpoint = &LoadpointSpec{ID: "easee", CapacityWh: 75000, InitialSoC: .7721774800618489, SoCMin: 0, SoCMax: .8, Levels: 11, PluggedIn: true, TargetSoC: .8, TargetSlotIdx: 11, MaxChargeW: 11000, ChargeEfficiency: .9, NoBatteryToEV: true}
@@ -25,7 +34,7 @@ func TestEVReserveReachesExactNearTargetWithoutWholeSlotOvercharge(t *testing.T)
 			slots[0].ExecutionStartMs = slots[0].StartMs + int64(15-remainingFirstMinutes)*60000
 		}
 		before := time.Now()
-		plan := coreReservePlan(context.Background(), slots, p)
+		plan := mustCoreReservePlan(t, slots, p)
 		if err := ValidatePlan(slots, p, &plan); err != nil {
 			t.Fatal(err)
 		}
@@ -57,7 +66,7 @@ func TestEVReserveReportsRealShortfallAndKeepsLimits(t *testing.T) {
 	slots, p := nearTargetReserveFixture()
 	p.Loadpoint.InitialSoC = .2
 	p.Loadpoint.TargetSlotIdx = 0
-	plan := coreReservePlan(context.Background(), slots, p)
+	plan := mustCoreReservePlan(t, slots, p)
 	if err := ValidatePlan(slots, p, &plan); err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +83,7 @@ func TestEVReserveReportsRealShortfallAndKeepsLimits(t *testing.T) {
 func TestEVReservePreservesSolarOnlyAndNoBatteryToEV(t *testing.T) {
 	slots, p := nearTargetReserveFixture()
 	p.Loadpoint.SurplusOnly = true
-	plan := coreReservePlan(context.Background(), slots, p)
+	plan := mustCoreReservePlan(t, slots, p)
 	if err := ValidatePlan(slots, p, &plan); err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +92,7 @@ func TestEVReservePreservesSolarOnlyAndNoBatteryToEV(t *testing.T) {
 	}
 	slots[0].PVW = -5000
 	p.Loadpoint.AllowedStepsW = []float64{0, 4140, 11000}
-	plan = coreReservePlan(context.Background(), slots, p)
+	plan = mustCoreReservePlan(t, slots, p)
 	if err := ValidatePlan(slots, p, &plan); err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +105,7 @@ func TestValidateEVPulseRejectsUnsafeOnPowerDespiteLegalAverage(t *testing.T) {
 	for _, mutation := range []string{"fuse", "step", "unknown identity", "solar"} {
 		t.Run(mutation, func(t *testing.T) {
 			slots, p := nearTargetReserveFixture()
-			plan := coreReservePlan(context.Background(), slots, p)
+			plan := mustCoreReservePlan(t, slots, p)
 			switch mutation {
 			case "fuse":
 				slots[0].Limits.MaxImportW = 10000
@@ -118,7 +127,7 @@ func TestEVReserveUsesMinimumStepWhenHouseBlocksMaximum(t *testing.T) {
 	slots, p := nearTargetReserveFixture()
 	p.Loadpoint.MinChargeW = 4140
 	p.InitialSoC = p.SoCMin
-	plan := coreReservePlan(context.Background(), slots, p)
+	plan := mustCoreReservePlan(t, slots, p)
 	if err := ValidatePlan(slots, p, &plan); err != nil {
 		t.Fatal(err)
 	}

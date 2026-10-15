@@ -14,21 +14,20 @@ import (
 // is unavailable. It uses exact energy, legal on-power and idle/charge pulses;
 // optional home-battery trading must not consume the car's available headroom.
 // The service still validates the complete plan before publication.
-func coreReservePlan(ctx context.Context, slots []Slot, p Params) Plan {
+func coreReservePlan(ctx context.Context, slots []Slot, p Params) (Plan, error) {
+	if err := coreDPModelError(p); err != nil {
+		return Plan{}, err
+	}
+	bands, err := reserveBatteryBands(slots, p)
+	if err != nil {
+		return Plan{}, err
+	}
 	loads := p.activeLoadpoints()
-	if len(loads) != 1 || loads[0].TargetSoC <= 0 {
-		plan, _ := OptimizeContext(ctx, slots, p)
-		return plan
+	var lp *LoadpointSpec
+	if len(loads) == 1 {
+		lp = loads[0]
 	}
-	lp := loads[0]
 	plan := Plan{GeneratedAtMs: time.Now().UnixMilli(), Mode: p.Mode, HorizonSlots: len(slots), CapacityWh: p.CapacityWh, InitialSoC: p.InitialSoC}
-	if coreDPModelError(p) != nil {
-		return plan
-	}
-	eff := lp.ChargeEfficiency
-	if eff <= 0 {
-		eff = .9
-	}
 	chargeEff, dischargeEff := p.ChargeEfficiency, p.DischargeEfficiency
 	if chargeEff <= 0 {
 		chargeEff = .95
@@ -36,36 +35,40 @@ func coreReservePlan(ctx context.Context, slots []Slot, p Params) Plan {
 	if dischargeEff <= 0 {
 		dischargeEff = .95
 	}
-	energy, evEnergy := p.InitialSoC*p.CapacityWh, lp.InitialSoC*lp.CapacityWh
-	ceiling := lp.SoCMax
-	if ceiling <= lp.SoCMin {
-		ceiling = 1
+	energy := p.InitialSoC * p.CapacityWh
+	eff, evEnergy, target := .9, 0.0, 0.0
+	var steps []float64
+	if lp != nil {
+		if lp.ChargeEfficiency > 0 {
+			eff = lp.ChargeEfficiency
+		}
+		evEnergy = lp.InitialSoC * lp.CapacityWh
+		ceiling := lp.SoCMax
+		if ceiling <= lp.SoCMin {
+			ceiling = 1
+		}
+		target = min(lp.TargetSoC, ceiling) * lp.CapacityWh
+		steps = lp.normalizedSteps()
 	}
-	target := min(lp.TargetSoC, ceiling) * lp.CapacityWh
-	steps := lp.normalizedSteps()
 	for i, slot := range slots {
-		if ctx.Err() != nil {
-			return Plan{}
+		if err := ctx.Err(); err != nil {
+			return Plan{}, err
 		}
 		hours := slot.DurationHours()
-		if hours <= 0 {
-			return Plan{}
-		}
 		minBatteryW := -min(p.MaxDischargeW, max(0, energy-p.SoCMin*p.CapacityWh)*dischargeEff/hours)
 		maxBatteryW := min(p.MaxChargeW, max(0, p.SoCMax*p.CapacityWh-energy)/chargeEff/hours)
+		// Retain energy for later import peaks and empty capacity for later
+		// export peaks. EV charging uses the room left after this reserve.
+		minBatteryW = max(minBatteryW, reservePowerForEnergy(bands[i+1].min-energy, hours, chargeEff, dischargeEff))
+		maxBatteryW = min(maxBatteryW, reservePowerForEnergy(bands[i+1].max-energy, hours, chargeEff, dischargeEff))
 		house := slot.LoadW + slot.PVW
 		chooseBattery := func(peak float64) (float64, bool) {
-			low, high := minBatteryW, maxBatteryW
-			if slot.Limits.MaxExportW > 0 {
-				low = max(low, -slot.Limits.MaxExportW-house)
-			}
-			if slot.Limits.MaxImportW > 0 {
-				high = min(high, slot.Limits.MaxImportW-house-peak)
-			}
-			if peak > 0 && lp.blocksBatteryToEV() {
+			low, high := reserveBatteryPowerRange(slot, p, peak)
+			low, high = max(low, minBatteryW), min(high, maxBatteryW)
+			if peak > 0 && lp != nil && lp.blocksBatteryToEV() {
 				low = max(low, -max(0, house))
 			}
-			if low > high {
+			if low > high+1e-7 {
 				return 0, false
 			}
 			b := min(max(0, low), high)
@@ -77,10 +80,10 @@ func coreReservePlan(ctx context.Context, slots []Slot, p Params) Plan {
 		peak, battery := 0.0, 0.0
 		battery, ok := chooseBattery(0)
 		if !ok {
-			return Plan{}
+			return Plan{}, fmt.Errorf("slot %d: battery cannot keep the forecast within the site power limits", i)
 		}
 		need := max(0, target-evEnergy)
-		if need > 1e-6 && i <= lp.TargetSlotIdx {
+		if lp != nil && need > 1e-6 && i <= lp.TargetSlotIdx {
 			for j := len(steps) - 1; j > 0; j-- {
 				step := steps[j]
 				if lp.SurplusOnly && surplusOnlyExceedsHousePV(step, slot.LoadW, slot.PVW) {
@@ -95,15 +98,92 @@ func coreReservePlan(ctx context.Context, slots []Slot, p Params) Plan {
 		average := min(peak, need/(eff*hours))
 		evEnergy += average * eff * hours
 		energy += loadpoint.BatteryEnergyDeltaWh(battery, hours, chargeEff, dischargeEff)
-		a := Action{ExecutionStartMs: slot.ExecutionStartMs, SlotStartMs: slot.StartMs, SlotLenMin: slot.LenMin, PriceOre: slot.PriceOre, SpotOre: slot.SpotOre, PVW: slot.PVW, LoadW: slot.LoadW, BatteryW: battery, GridW: house + battery + average, SoC: energy / p.CapacityWh,
-			LoadpointW: average, LoadpointSoC: evEnergy / lp.CapacityWh, LoadpointPowerW: map[string]float64{lp.ID: average}, LoadpointSoCByID: map[string]float64{lp.ID: evEnergy / lp.CapacityWh}, LoadpointMaxPowerW: map[string]float64{lp.ID: peak}, Reason: "EV deadline reserve"}
+		a := Action{ExecutionStartMs: slot.ExecutionStartMs, SlotStartMs: slot.StartMs, SlotLenMin: slot.LenMin, PriceOre: slot.PriceOre, SpotOre: slot.SpotOre, PVW: slot.PVW, LoadW: slot.LoadW, BatteryW: battery, GridW: house + battery + average, SoC: energy / p.CapacityWh, Reason: "Site power reserve"}
+		if lp != nil {
+			a.LoadpointW, a.LoadpointSoC = average, evEnergy/lp.CapacityWh
+			a.LoadpointPowerW = map[string]float64{lp.ID: average}
+			a.LoadpointSoCByID = map[string]float64{lp.ID: evEnergy / lp.CapacityWh}
+			a.LoadpointMaxPowerW = map[string]float64{lp.ID: peak}
+			a.Reason = "EV deadline reserve"
+		}
 		a.CostOre = reserveSlotCost(slot, p, a)
 		plan.TotalCostOre += a.CostOre
 		plan.Actions = append(plan.Actions, a)
 	}
-	plan.LoadpointShortfallWh = map[string]float64{lp.ID: max(0, target-evEnergy)}
+	if lp != nil && lp.TargetSoC > 0 && lp.TargetSlotIdx >= 0 && lp.TargetSlotIdx < len(slots) {
+		plan.LoadpointShortfallWh = map[string]float64{lp.ID: max(0, target-evEnergy)}
+	}
 	plan.Solver = &SolverInfo{Engine: "core", Backend: "ev_reserve", Status: "feasible"}
-	return plan
+	if lp == nil {
+		plan.Solver.Backend = "site_reserve"
+	}
+	return plan, nil
+}
+
+type reserveEnergyBand struct{ min, max float64 }
+
+// Work backwards from the operating band. Each interval keeps the energy
+// states from which the remaining house forecast can still be served.
+func reserveBatteryBands(slots []Slot, p Params) ([]reserveEnergyBand, error) {
+	if err := validateSlotChronology(slots); err != nil {
+		return nil, err
+	}
+	chargeEff, dischargeEff := p.ChargeEfficiency, p.DischargeEfficiency
+	if chargeEff <= 0 {
+		chargeEff = .95
+	}
+	if dischargeEff <= 0 {
+		dischargeEff = .95
+	}
+	initial := p.InitialSoC * p.CapacityWh
+	floor, ceiling := min(initial, p.SoCMin*p.CapacityWh), max(initial, p.SoCMax*p.CapacityWh)
+	bands := make([]reserveEnergyBand, len(slots)+1)
+	bands[len(slots)] = reserveEnergyBand{floor, ceiling}
+	for i := len(slots) - 1; i >= 0; i-- {
+		low, high := reserveBatteryPowerRange(slots[i], p, 0)
+		if low > high {
+			return nil, fmt.Errorf("slot %d: forecast exceeds the site and battery power limits", i)
+		}
+		hours := slots[i].DurationHours()
+		bands[i] = reserveEnergyBand{
+			max(floor, bands[i+1].min-loadpoint.BatteryEnergyDeltaWh(high, hours, chargeEff, dischargeEff)),
+			min(ceiling, bands[i+1].max-loadpoint.BatteryEnergyDeltaWh(low, hours, chargeEff, dischargeEff)),
+		}
+		if bands[i].min > bands[i].max+1e-6 {
+			return nil, fmt.Errorf("slot %d: battery capacity cannot keep the forecast within the site power limits", i)
+		}
+	}
+	if initial < bands[0].min-1e-6 || initial > bands[0].max+1e-6 {
+		return nil, fmt.Errorf("battery charge level cannot cover the forecast within the site power limits")
+	}
+	return bands, nil
+}
+
+func reservePowerForEnergy(deltaWh, hours, chargeEff, dischargeEff float64) float64 {
+	if deltaWh < 0 {
+		return deltaWh * dischargeEff / hours
+	}
+	return deltaWh / (chargeEff * hours)
+}
+
+func reserveBatteryPowerRange(slot Slot, p Params, peak float64) (low, high float64) {
+	low, high = -p.MaxDischargeW, p.MaxChargeW
+	house := slot.LoadW + slot.PVW
+	if slot.Limits.MaxExportW > 0 {
+		low = max(low, -slot.Limits.MaxExportW-house)
+	}
+	if slot.Limits.MaxImportW > 0 {
+		high = min(high, slot.Limits.MaxImportW-house-peak)
+	}
+	for _, baseline := range []float64{house, house + peak} {
+		switch p.Mode {
+		case ModeSelfConsumption:
+			low, high = max(low, -max(0, baseline)), min(high, max(0, -baseline))
+		case ModeCheapCharge, ModePassiveArbitrage:
+			low = max(low, -max(0, baseline))
+		}
+	}
+	return low, high
 }
 
 func setCoreReserveSolver(plan *Plan, p Params, elapsed float64) {

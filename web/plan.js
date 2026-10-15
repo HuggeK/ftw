@@ -331,6 +331,7 @@ import {
     alert.textContent = solver.backend === "ev_reserve"
       ? "FTW is using a reserve plan for the departure target. Price optimisation is unavailable."
         + (missingWh > 1 ? ` The car is ${(missingWh / 1000).toFixed(1)} kWh short at departure. Check charging limits or allow more time.` : "")
+        + reason
       : 'Mathematical optimizer unavailable. This plan uses the built-in Go fallback.' + reason;
   }
 
@@ -827,7 +828,7 @@ import {
             ? `${solver.engine} fallback`
             : [solver.engine, solver.backend].filter(Boolean).join(' / ');
           const solverTitle = solver.fallback
-            ? `Primary optimizer failed: ${solver.fallback_reason || 'unknown error'}`
+            ? `Reserve plan: ${solver.fallback_reason || 'price optimisation unavailable'}`
             : `Solver status: ${solver.status || 'unknown'}; formulation: ${solver.formulation || 'unknown'}; solve: ${(solver.solve_ms || 0).toFixed(1)} ms`;
           parts.push(
             `<span title="${escapeHTML(solverTitle)}"><span class="s-label">solver </span>` +

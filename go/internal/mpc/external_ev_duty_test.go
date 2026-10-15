@@ -10,7 +10,7 @@ import (
 
 func TestExternalEVDutyRoundTripAndLegacyRejection(t *testing.T) {
 	slots, p := nearTargetReserveFixture()
-	want := coreReservePlan(context.Background(), slots, p)
+	want := mustCoreReservePlan(t, slots, p)
 	wire := externalResponse{Plan: externalPlan{TotalCostOre: want.TotalCostOre, FlexShortfallWh: want.LoadpointShortfallWh}}
 	for _, a := range want.Actions {
 		wire.Plan.Actions = append(wire.Plan.Actions, externalAction{SlotStartMs: a.SlotStartMs, ExecutionStartMs: a.ExecutionStartMs, SlotLenMin: a.SlotLenMin, BatteryW: a.BatteryW, GridW: a.GridW, SoCPct: a.SoC * 100, CostOre: a.CostOre, FlexPowerW: a.LoadpointPowerW, FlexMaxPowerW: a.LoadpointMaxPowerW, FlexEnergyWh: map[string]float64{"easee": a.LoadpointSoC * 75000}})
