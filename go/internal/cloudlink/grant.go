@@ -38,6 +38,9 @@ type linkRecord struct {
 	// Ending means the box asked the service to delete the home and waits
 	// for the receipt. The key stays until it arrives.
 	Ending bool `json:"ending,omitempty"`
+	// Host is the instance of the service that holds this home, as a
+	// wrong-shard close named it. Empty is Endpoint's own host.
+	Host string `json:"host,omitempty"`
 }
 
 // KV is the part of the state store the grant needs.

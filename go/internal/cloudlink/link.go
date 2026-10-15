@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"slices"
 	"strings"
@@ -169,6 +170,8 @@ type Options struct {
 	ServiceKeys []*ecdsa.PublicKey
 	RootCAs     *x509.CertPool
 	Tick        time.Duration
+	NetDial     func(ctx context.Context, network, addr string) (net.Conn, error)
+	Now         func() time.Time
 }
 
 // Link is the box's one uplink to FTW Cloud.
@@ -207,8 +210,14 @@ type Link struct {
 	lpSeq      uint64
 	resyncAt   time.Time
 	attempt    int
-	purgedAt   int64
-	rosterDue  bool
+	// shardHops counts wrong-shard closes since the box was last
+	// connected, and hostFails dials in a row that failed at the kept
+	// host (linkRecord.Host), since hostFailedSince.
+	shardHops       int
+	hostFails       int
+	hostFailedSince time.Time
+	purgedAt        int64
+	rosterDue       bool
 
 	// events wait for the writer; eventsDropped counts those that never
 	// left. closing is set by Bye, after which the link does not dial
@@ -255,6 +264,9 @@ func New(opts Options) (*Link, error) {
 	}
 	if opts.Started.IsZero() {
 		opts.Started = time.Now()
+	}
+	if opts.Now == nil {
+		opts.Now = time.Now
 	}
 	if opts.Tick <= 0 {
 		opts.Tick = 250 * time.Millisecond
@@ -966,7 +978,7 @@ func (l *Link) caps(snap grantSnapshot) []string {
 	if l.opts.Tunnel != nil {
 		out = append(out, cloudwire.CapTun)
 	}
-	return out
+	return append(out, cloudwire.CapShard)
 }
 
 // tlsConfig is TLS 1.3 only, with the system roots unless a test or a dev
@@ -974,3 +986,6 @@ func (l *Link) caps(snap grantSnapshot) []string {
 func (l *Link) tlsConfig() *tls.Config {
 	return &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: l.opts.RootCAs}
 }
+
+// now is the wall clock, or a test's.
+func (l *Link) now() time.Time { return l.opts.Now() }

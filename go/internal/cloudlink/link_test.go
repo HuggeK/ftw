@@ -181,6 +181,12 @@ type fakeService struct {
 	purge       bool
 	afterHello  func(conn *websocket.Conn, home string)
 	rosterSeqOK uint64
+	// wrongShard, when set, closes after hello with CloseWrongShard and
+	// this host, as an instance that does not hold the home;
+	// restartBeforeOK closes after hello with CloseRestart, as a service
+	// that is stopping.
+	wrongShard      string
+	restartBeforeOK bool
 
 	wmu   sync.Mutex
 	mu    sync.Mutex
@@ -194,10 +200,18 @@ type fakeService struct {
 }
 
 func newFakeService(t *testing.T) *fakeService {
+	return newFakeServiceCert(t, nil)
+}
+
+// newFakeServiceCert serves with cert, or httptest's own when nil.
+func newFakeServiceCert(t *testing.T, cert *tls.Certificate) *fakeService {
 	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	s := &fakeService{t: t, key: key, ch: make(chan cloudwire.Envelope, 256)}
 	s.srv = httptest.NewUnstartedServer(http.HandlerFunc(s.handle))
 	s.srv.TLS = &tls.Config{MinVersion: tls.VersionTLS13}
+	if cert != nil {
+		s.srv.TLS.Certificates = []tls.Certificate{*cert}
+	}
 	s.srv.StartTLS()
 	t.Cleanup(s.srv.Close)
 	return s
@@ -262,7 +276,18 @@ func (s *fakeService) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	s.home, s.pub, s.hello = home, pub, msg
+	shard := s.wrongShard
 	s.mu.Unlock()
+	if shard != "" {
+		closeWith(conn, cloudwire.CloseWrongShard, shard)
+		_, _, _ = conn.ReadMessage()
+		return
+	}
+	if s.restartBeforeOK {
+		closeWith(conn, cloudwire.CloseRestart, "0")
+		_, _, _ = conn.ReadMessage()
+		return
+	}
 
 	okEKM := ekm
 	if s.badEKM {
@@ -376,11 +401,20 @@ func newHarness(t *testing.T, svc *fakeService) *harness {
 // newHarnessKeys is a box that trusts keys; nil means the keys this build
 // carries.
 func newHarnessKeys(t *testing.T, svc *fakeService, keys []*ecdsa.PublicKey) *harness {
+	return newHarnessWith(t, svc, keys, nil, nil)
+}
+
+// newHarnessWith also takes the box's state store, and tweak may change the
+// options before the link starts.
+func newHarnessWith(t *testing.T, svc *fakeService, keys []*ecdsa.PublicKey, kv *memKV, tweak func(*Options)) *harness {
 	t.Helper()
-	h := &harness{svc: svc, site: &fakeSite{grid: 1200, state: protocol.SourceLive}, kv: &memKV{},
+	if kv == nil {
+		kv = &memKV{}
+	}
+	h := &harness{svc: svc, site: &fakeSite{grid: 1200, state: protocol.SourceLive}, kv: kv,
 		keyPath: filepath.Join(t.TempDir(), "cloud.key"), pushed: make(chan string, 8),
 		roster: &fakeRosterState{}, tunnel: &fakeTunnel{ch: make(chan cloudwire.Tun, 64)}}
-	link, err := New(Options{
+	opts := Options{
 		Site: h.site, Roster: fakeRoster{state: h.roster}, KV: h.kv, KeyPath: h.keyPath, Build: "test",
 		Started: time.Now().Add(-time.Minute), ClockSynced: func() bool { return true },
 		Notify:   func(kind string) { h.pushed <- kind },
@@ -388,7 +422,11 @@ func newHarnessKeys(t *testing.T, svc *fakeService, keys []*ecdsa.PublicKey) *ha
 		Endpoint: svc.endpoint(), ServiceKeys: keys,
 		RootCAs: svc.roots(), Tick: 20 * time.Millisecond,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
-	})
+	}
+	if tweak != nil {
+		tweak(&opts)
+	}
+	link, err := New(opts)
 	if err != nil {
 		t.Fatal(err)
 	}

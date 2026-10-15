@@ -41,7 +41,7 @@ func TestTheBoxLinksForItsPhonesAndSendsNoReadings(t *testing.T) {
 	if err := cloudwire.Unmarshal(env.B, &hello); err != nil {
 		t.Fatal(err)
 	}
-	if len(hello.GrantID) != 0 || !slices.Equal(hello.Caps, []string{cloudwire.MsgRoster, cloudwire.CapTun}) {
+	if len(hello.GrantID) != 0 || !slices.Equal(hello.Caps, []string{cloudwire.MsgRoster, cloudwire.CapTun, cloudwire.CapShard}) {
 		t.Fatalf("hello names grant %x and caps %v", hello.GrantID, hello.Caps)
 	}
 
