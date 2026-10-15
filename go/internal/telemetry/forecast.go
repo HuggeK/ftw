@@ -285,6 +285,11 @@ type ForecastAccumulator struct {
 }
 
 func (a *ForecastAccumulator) Observe(r ForecastReading) []ForecastInterval {
+	// Quarter-hour boundaries use wall time. Use that clock for gaps and
+	// interpolation too; a post-boot clock correction can leave monotonic
+	// elapsed time short while wall time jumps across many quarters.
+	r.At = r.At.Round(0)
+	r.Latest = r.Latest.Round(0)
 	if !r.Valid || r.Latest.IsZero() || r.Latest.After(r.At) {
 		a.previous = nil
 		a.covered = 0
