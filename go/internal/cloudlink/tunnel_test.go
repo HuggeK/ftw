@@ -171,8 +171,17 @@ func TestTunDoesNotSpendTheCopysBudget(t *testing.T) {
 		}
 		svc.waitFor(cloudwire.MsgTun, 3*time.Second)
 	}
+	// The last tun is counted when it leaves, a moment after the service
+	// sees it; and the copy's own heartbeat may go meanwhile on a slow
+	// runner. What must hold is that the tunnel's 40 KiB never lands on the
+	// copy's count.
+	deadline := time.Now().Add(3 * time.Second)
 	st := h.link.Status()
-	if st.BytesLast24h != before || st.TunBytesLast24h < 40_960 {
+	for st.TunBytesLast24h < 40_960 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+		st = h.link.Status()
+	}
+	if st.BytesLast24h-before >= 40_960 || st.TunBytesLast24h < 40_960 {
 		t.Fatalf("copy %d → %d bytes, tunnel %d", before, st.BytesLast24h, st.TunBytesLast24h)
 	}
 }

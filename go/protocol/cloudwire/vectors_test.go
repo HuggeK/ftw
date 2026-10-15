@@ -97,7 +97,7 @@ func vectorBodies(grantKey []byte, boxPK []byte) []struct {
 			Have: map[string]string{}, RosterSeq: 3,
 		}},
 		{"roster", "box", MsgRoster, Roster{
-			Header: h(2, 60_010), RosterSeq: 4, TTLS: 86_400,
+			Header: h(2, 60_010), RosterSeq: 4, TTLS: 86_400, Noise: bytes.Repeat([]byte{0x77}, 32),
 			Devices: []Device{
 				{ID: "q5Lw0Zb1", Key: bytes.Repeat([]byte{0x55}, 32), Role: "owner",
 					Scopes: []string{protocol.ScopeLiveRead, protocol.ScopeHistoryRead, protocol.ScopePlanRead,
@@ -177,7 +177,7 @@ func vectorBodies(grantKey []byte, boxPK []byte) []struct {
 		// The tunnel. A box linked at pairing, with the readable copy off:
 		// two phones that may open a session, one QR code on the screen.
 		{"roster tunnel only", "box", MsgRoster, Roster{
-			Header: h(12, 74_000), RosterSeq: 5, TTLS: 86_400,
+			Header: h(12, 74_000), RosterSeq: 5, TTLS: 86_400, Noise: bytes.Repeat([]byte{0x77}, 32),
 			Devices: []Device{
 				{ID: "q5Lw0Zb1", Key: bytes.Repeat([]byte{0x55}, 32), Role: "owner", Scopes: []string{}, Epoch: 1, Tun: true},
 				{ID: "Zf09xQ2a", Key: bytes.Repeat([]byte{0x66}, 32), Role: "viewer", Scopes: []string{}, Epoch: 2, Tun: true},
@@ -188,7 +188,7 @@ func vectorBodies(grantKey []byte, boxPK []byte) []struct {
 		// A revoke that waits for its receipt: the grant keeps its id and
 		// loses its scopes and purposes.
 		{"roster revoking", "box", MsgRoster, Roster{
-			Header: h(13, 75_000), RosterSeq: 6, TTLS: 86_400,
+			Header: h(13, 75_000), RosterSeq: 6, TTLS: 86_400, Noise: bytes.Repeat([]byte{0x77}, 32),
 			Devices: []Device{
 				{ID: "q5Lw0Zb1", Key: bytes.Repeat([]byte{0x55}, 32), Role: "owner", Scopes: []string{}, Epoch: 1, Tun: true},
 			},
@@ -200,6 +200,22 @@ func vectorBodies(grantKey []byte, boxPK []byte) []struct {
 		{"tun down", "", MsgTun, Tun{Dev: "q5Lw0Zb1", Sid: 7, D: bytes.Repeat([]byte{0x99}, 112)}},
 		{"tun up", "", MsgTun, Tun{Dev: "q5Lw0Zb1", Sid: 7, D: bytes.Repeat([]byte{0x9a}, 48)}},
 		{"tun end", "", MsgTun, Tun{Dev: "q5Lw0Zb1", Sid: 7, D: []byte{}}},
+		// An agent row: no tun and no copy scopes, because only the keys
+		// part opens its session (docs/agents.md).
+		{"roster with an agent", "box", MsgRoster, Roster{
+			Header: h(14, 76_000), RosterSeq: 7, TTLS: 86_400, Noise: bytes.Repeat([]byte{0x77}, 32),
+			Devices: []Device{
+				{ID: "q5Lw0Zb1", Key: bytes.Repeat([]byte{0x55}, 32), Role: "owner", Scopes: []string{}, Epoch: 1, Tun: true},
+				{ID: "oKGio6Sl", Key: bytes.Repeat([]byte{0xa0}, 32), Role: protocol.RoleSupport, Scopes: []string{},
+					Epoch: 1, Agent: &Agent{
+						Scopes: []string{protocol.ScopeDispatchHold, protocol.ScopeLiveRead, protocol.ScopeLogsRead},
+						Ops:    []string{protocol.OpLoadpointHold}, Caps: protocol.Caps{HoldS: 900, MaxW: 7400, PerMin: 6},
+						ExpiresAtMs: 1_793_000_000_000,
+						Principal:   protocol.Principal{Client: "Sourceful support", ClientID: protocol.SupportClientID, Ticket: "FTW-123"},
+					}},
+			},
+			Grant: Grant{Scopes: []string{}, Purposes: []string{}, Controller: ControllerSourceful},
+		}},
 	}
 }
 

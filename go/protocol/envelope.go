@@ -65,6 +65,10 @@ type Envelope struct {
 	// B is the body, left encoded so the handler can unmarshal it into the
 	// type the message name implies.
 	B cbor.RawMessage `cbor:"b,omitempty"`
+	// By names the person behind a call from a Sourceful support session:
+	// the staff member's id, at most ByMax bytes. FTW Cloud asserts it and
+	// the box writes it to its audit log. Absent on every other session.
+	By string `cbor:"by,omitempty"`
 }
 
 // Frame is one envelope on one lane. Package appwire owns the byte layout, the

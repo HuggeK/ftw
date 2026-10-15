@@ -274,6 +274,10 @@ type Roster struct {
 	// first session through the service, for a phone the roster does not
 	// list yet.
 	Pending []Pending `cbor:"pending"`
+	// Noise is the box's X25519 Noise static key, the one in its pairing
+	// QR code. FTW Cloud's keys part opens an agent's session to it, and
+	// trusts it only as signed here, by the home's key.
+	Noise []byte `cbor:"noise"`
 }
 
 // Device is one paired phone.
@@ -289,6 +293,21 @@ type Device struct {
 	// Tun says the device may open a session to the box through the
 	// service. It needs no grant: the readable copy is a purpose on top.
 	Tun bool `cbor:"tun"`
+	// Agent is set on an agent row: an assistant, Sourceful support or the
+	// release check (docs/agents.md). Absent on a phone or a watch.
+	Agent *Agent `cbor:"agent,omitempty"`
+}
+
+// Agent is an agent row's grant, as the box enforces it. The service must
+// stop admitting the row at ExpiresAtMs by its own clock, never admit it
+// through the relay, and may tighten the caps but never loosen them.
+type Agent struct {
+	// Scopes and Ops are the grant at the approving owner's scopes now.
+	Scopes      []string           `cbor:"scopes"`
+	Ops         []string           `cbor:"ops"`
+	Caps        protocol.Caps      `cbor:"caps"`
+	ExpiresAtMs int64              `cbor:"expiresAtMs"`
+	Principal   protocol.Principal `cbor:"principal"`
 }
 
 // Pending is one pairing code on the box's screen, by its PairingHash.

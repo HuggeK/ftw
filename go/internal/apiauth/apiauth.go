@@ -69,6 +69,13 @@ const (
 	KindLAN = "lan"
 )
 
+// AgentRole reports whether a role is an agent's: a grant an owner gave to an
+// assistant, to Sourceful support or to the release check, never to a paired
+// device. Pairing codes and role changes refuse these roles.
+func AgentRole(role string) bool {
+	return role == RoleAgent || role == RoleSupport || role == RoleRelease
+}
+
 // Tier is how much a route costs before it runs.
 //
 // It comes from what the handler DOES, declared beside the handler, and never

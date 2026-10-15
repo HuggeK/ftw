@@ -581,13 +581,17 @@ func knownRole(role string) error {
 }
 
 // phoneRole refuses a role a phone cannot hold: one the registry does not
-// define, and watch, which only MintWatchCode hands out.
+// define, watch, which only MintWatchCode hands out, and an agent's, which
+// only an owner's signed grant hands out.
 func phoneRole(role string) error {
 	if err := knownRole(role); err != nil {
 		return err
 	}
 	if role == apiauth.RoleWatch {
 		return ErrWatchRole
+	}
+	if apiauth.AgentRole(role) {
+		return fmt.Errorf("%w: %q is an agent's role", ErrUnknownRole, role)
 	}
 	return nil
 }

@@ -148,6 +148,30 @@ func TestAnUnknownRoleIsRefusedEverywhere(t *testing.T) {
 	}
 }
 
+// An agent's role comes only from an owner's signed grant. A pairing code or
+// a role change that named one would hand a phone an agent's reach without
+// any of an agent's limits.
+func TestAnAgentsRoleIsNeverAPhones(t *testing.T) {
+	id, _ := newIdentity(t)
+	owner := pair(t, id, apiauth.RoleOwner)
+	pair(t, id, apiauth.RoleOwner)
+
+	for _, role := range []string{apiauth.RoleAgent, apiauth.RoleSupport, apiauth.RoleRelease} {
+		if _, _, err := id.MintPairingCode(role, PairingTTL); !errors.Is(err, ErrUnknownRole) {
+			t.Errorf("minting a code for %s: %v", role, err)
+		}
+		if _, _, err := id.MintSpokenCode(role); !errors.Is(err, ErrUnknownRole) {
+			t.Errorf("minting a box code for %s: %v", role, err)
+		}
+		if err := id.SetRole(owner.DeviceID, role); !errors.Is(err, ErrUnknownRole) {
+			t.Errorf("setting %s: %v", role, err)
+		}
+	}
+	if got := roleOf(t, id, owner.DeviceID); got != apiauth.RoleOwner {
+		t.Fatalf("the row is now %q", got)
+	}
+}
+
 // --------------------------------------------------------------------------
 // Whoever creates a home owns it
 // --------------------------------------------------------------------------
