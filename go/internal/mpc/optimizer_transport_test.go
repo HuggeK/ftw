@@ -115,6 +115,15 @@ func TestProcessTransportWriteCancellationRestartsWorker(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = transport.Close() })
 
+	// Start the blocking worker before measuring cancellation. A slow test
+	// process launch must not make the replacement act as the first worker.
+	if err := transport.ensureStartedLocked(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "write-blocking worker readiness", func() bool {
+		_, err := os.Stat(marker)
+		return err == nil
+	})
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	started := time.Now()
 	_, err = transport.RoundTrip(ctx, bytes.Repeat([]byte("x"), 2<<20))
@@ -134,6 +143,50 @@ func TestProcessTransportWriteCancellationRestartsWorker(t *testing.T) {
 	}
 	if string(response) != `{"ok":true}` {
 		t.Fatalf("RoundTrip after canceled write = %s, want healthy worker response", response)
+	}
+}
+
+func TestProcessTransportKeepsReplyAfterWorkerExit(t *testing.T) {
+	if os.Args[len(os.Args)-1] == "reply-before-exit-helper" {
+		_, _ = os.Stdout.WriteString(`{"ok":true}` + "\n")
+		os.Exit(0)
+	}
+	transport, err := NewProcessTransport(ProcessTransportConfig{
+		Command: []string{os.Args[0], "-test.run=^TestProcessTransportKeepsReplyAfterWorkerExit$", "--", "reply-before-exit-helper"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = transport.Close() })
+	if err := transport.ensureStartedLocked(); err != nil {
+		t.Fatal(err)
+	}
+	// Force Wait to finish before the reader runs. A complete reply must
+	// remain readable even when the child exits immediately after writing it.
+	select {
+	case err := <-transport.waitCh:
+		transport.waitCh <- err // Close still owns reaping the finished worker.
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("helper did not exit")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	response, err := scanLine(ctx, transport.scanner)
+	if err != nil || string(response) != `{"ok":true}` {
+		t.Fatalf("complete reply lost after child exit: %s %v", response, err)
+	}
+	stdout := transport.stdout
+	if err := transport.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if transport.stdout != nil {
+		t.Fatal("graceful close retained the owned stdout pipe")
+	}
+	if _, err := stdout.Read(make([]byte, 1)); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("graceful close leaked the read descriptor: %v", err)
 	}
 }
 
