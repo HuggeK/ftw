@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.143.1
+
+### Patch Changes
+
+- fd7aea2: Update the bundled Energyplan planner to 0.5.2. Within the box's time budget, the plan for a long sunny horizon no longer empties the battery and sells the solar. On a sunny two-day home case at about a Raspberry Pi 4's 1.5 s budget the plan now costs 77 kr instead of 100 kr; the best plan costs 77 kr. Core still validates every plan.
+- da2aa98: Discard missing forecast measurement intervals when the system clock changes after startup. Use wall time consistently so a clock correction cannot create false high household-load observations.
+- 2b0cf6f: Accept idle solver rounding within 0.00001 W when checking EV charging during battery export. Keep rejecting real discharge and include exact powers in rejection diagnostics.
+- 022eb41: Keep a safe plan when a later forecast cannot meet the site limits. The reserve planner prepares the battery for future peaks and reports why it shortened a plan, while Core still checks every planned action.
+  
+  Retain valid intervals before corrupt future forecast values, use the reserve when the DP grid exceeds its memory budget, and require fresh battery charge readings before planning from live telemetry.
+- d7cb09d: Keep complete planner worker replies readable when the worker exits before Core reads them. Retain bounded cancellation and worker restart behavior.
+- 5636993: Include the latest failed planner inputs, worker request and response, and current charging state in support packages. Retain the latest failure across restarts with a durable SQLite commit and report storage errors. Keep failure evidence distinct from accepted plans and redact credentials before export.
+
 ## 0.143.0
 
 ### Minor Changes
