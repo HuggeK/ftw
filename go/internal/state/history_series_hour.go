@@ -135,7 +135,12 @@ func (s *Store) ensureSeriesHours(ctx context.Context) error {
 		return err
 	}
 	defer s.historyWriteMu.Unlock()
-	tx, err := s.history.BeginTx(ctx, nil)
+	conn, err := s.history.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -177,7 +182,12 @@ func (s *Store) backfillSeriesHoursSnapshot(ctx context.Context, maxHours int) (
 	defer cancelTx()
 	// Deferred: reading never owns SQLite's writer. A concurrent write makes
 	// the later upgrade fail with BUSY_SNAPSHOT, including the cursor write.
-	tx, err := s.history.BeginTx(txCtx, nil)
+	conn, err := s.history.Conn(txCtx)
+	if err != nil {
+		return false, err
+	}
+	defer conn.Close()
+	tx, err := conn.BeginTx(txCtx, nil)
 	if err != nil {
 		return false, err
 	}
@@ -235,7 +245,11 @@ func (s *Store) backfillSeriesHoursSnapshot(ctx context.Context, maxHours int) (
 	if err := lockContext(writeCtx, s.historyWriteMu.TryLock); err != nil {
 		return false, err
 	}
-	defer s.historyWriteMu.Unlock()
+	defer func() {
+		_ = tx.Rollback()
+		_ = conn.Close()
+		s.historyWriteMu.Unlock()
+	}()
 	stmt, err := tx.PrepareContext(writeCtx, `INSERT INTO ts_series_hour
 		(driver_id,metric_id,hour_ms,sum_value,min_value,max_value,n,last_ts_ms)
 		VALUES (?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`)

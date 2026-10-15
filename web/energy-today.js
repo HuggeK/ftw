@@ -1,0 +1,56 @@
+const ENERGY_FIELDS = {
+  "e-import": "import_wh",
+  "e-export": "export_wh",
+  "e-pv": "pv_wh",
+  "e-charged": "bat_charged_wh",
+  "e-discharged": "bat_discharged_wh",
+  "e-load": "load_wh",
+  "overview-e-import": "import_wh",
+  "overview-e-export": "export_wh",
+  "overview-e-pv": "pv_wh",
+};
+
+function knownWh(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+export function energyTodayReading(today, key) {
+  const total = today?.[key];
+  if (knownWh(total)) return {wh: total, partial: false};
+  const measured = today?.measured?.[key];
+  if (knownWh(measured)) return {wh: measured, partial: true};
+  return {wh: null, partial: false};
+}
+
+export function formatEnergyToday(today, key, withUnit = true) {
+  const {wh, partial} = energyTodayReading(today, key);
+  if (wh === null) return "Unknown";
+  const kwh = wh / 1000;
+  const digits = kwh >= 100 ? 0 : kwh >= 10 ? 1 : 2;
+  return `${partial ? "≥ " : ""}${kwh.toFixed(digits)}${withUnit ? " kWh" : ""}`;
+}
+
+export function updateEnergyToday(today, root = document) {
+  for (const [id, key] of Object.entries(ENERGY_FIELDS)) {
+    const el = root.getElementById(id);
+    if (!el) continue;
+    const {partial} = energyTodayReading(today, key);
+    el.textContent = formatEnergyToday(today, key);
+    el.title = partial ? "Recorded energy only; missing readings are excluded." : "";
+  }
+  const group = root.getElementById("e-pv")?.closest(".energy-group");
+  if (!group) return;
+  let note = root.getElementById("energy-today-quality");
+  if (!note) {
+    note = root.createElement("p");
+    note.id = "energy-today-quality";
+    note.className = "card-sub";
+    group.append(note);
+  }
+  const keys = new Set(Object.values(ENERGY_FIELDS));
+  const incomplete = [...keys].some(key => !knownWh(today?.[key]));
+  note.hidden = !incomplete;
+  note.textContent = today
+    ? "Gaps in today's readings. ≥ shows recorded energy only."
+    : "Today's energy is not available yet.";
+}

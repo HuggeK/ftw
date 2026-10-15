@@ -10,6 +10,8 @@ const (
 	RoleOwner = "owner"
 	// RoleViewer — Viewer.
 	RoleViewer = "viewer"
+	// RoleWatch — Watch.
+	RoleWatch = "watch"
 )
 
 // RoleScopes is what each role carries, with '*' already expanded.
@@ -22,6 +24,7 @@ var RoleScopes = map[string][]string{
 		"ftw.plan.read",
 		"ftw.health.read",
 		"ftw.assets.read",
+		"ftw.events.read",
 		"ftw.dispatch.write",
 		"ftw.mode.write",
 		"ftw.members.read",
@@ -29,5 +32,11 @@ var RoleScopes = map[string][]string{
 	},
 	RoleViewer: {
 		"ftw.live.read",
+	},
+	RoleWatch: {
+		"ftw.live.read",
+		"ftw.plan.read",
+		"ftw.events.read",
+		"ftw.dispatch.write",
 	},
 }

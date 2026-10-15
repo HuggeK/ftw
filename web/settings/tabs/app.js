@@ -59,6 +59,7 @@
   // What each role may do, in the words the row uses. The box is what
   // enforces these; this only names them.
   function roleText(role) {
+    if (role === "watch") return "Can look and charge";
     return role === "viewer" ? "Can look" : "Can change things";
   }
 
@@ -70,17 +71,27 @@
   // has to be honest about what is on the other side of the button, and about
   // what is left: a household with viewers still paired keeps its viewers, and
   // one down to a single phone is left with nothing paired at all.
-  function removalWarning(d, total) {
-    if (!d.last_owner) {
-      return "Remove this phone? It loses access immediately and must scan a new code to come back.";
+  //
+  // A watch belongs to the phone that added it. Removing the watch touches
+  // nothing else; removing the phone removes its watches too, so the warning
+  // says so.
+  function removalWarning(d, phones, watches) {
+    if (d.parent) {
+      return "Remove this watch? It loses access immediately. Its phone can add it again.";
     }
-    if (total === 1) {
+    var also = watches > 0
+      ? (watches === 1 ? " Its watch goes with it." : " Its " + watches + " watches go with it.")
+      : "";
+    if (!d.last_owner) {
+      return "Remove this phone? It loses access immediately and must scan a new code to come back." + also;
+    }
+    if (phones === 1) {
       return "This is the last phone. Remove it and nothing can see or change this " +
-        "home until you pair a phone again, with a code from this page. Remove it?";
+        "home until you pair a phone again, with a code from this page." + also + " Remove it?";
     }
     return "This is the only phone that can change things. Remove it and the phones " +
       "left can look but change nothing, until you pair another owner with a code " +
-      "from this page. Remove it?";
+      "from this page." + also + " Remove it?";
   }
 
   // Reports a refusal the box gave, rather than swallowing it. Without a
@@ -104,6 +115,9 @@
   // Removing a guest and locking a phone out are the same button, because
   // they are the same thing: a guest's phone is a paired phone. Removal is
   // immediate — the box drops any live session too.
+  //
+  // A watch comes right after the phone that added it, set in under it. Its
+  // reach follows that phone, so it has no role button of its own.
   function refreshDevices() {
     var list = document.getElementById("app-link-devices");
     if (!list) return;
@@ -119,14 +133,18 @@
         var shareButton = document.getElementById("app-link-share");
         if (shareButton) shareButton.hidden = devices.length === 0;
         if (devices.length === 0) return;
+        var phones = devices.filter(function (d) { return !d.parent; }).length;
+        var watchesOf = function (id) {
+          return devices.filter(function (d) { return d.parent === id; }).length;
+        };
 
         devices.forEach(function (d) {
           var row = document.createElement("div");
-          row.className = "app-device-row";
+          row.className = d.parent ? "app-device-row app-device-watch" : "app-device-row";
 
           var name = document.createElement("span");
           name.className = "mono";
-          name.textContent = "Phone " + d.id;
+          name.textContent = (d.parent ? "Watch " : "Phone ") + d.id;
           row.appendChild(name);
 
           var what = document.createElement("span");
@@ -149,7 +167,7 @@
             only.className = "hint";
             only.textContent = "The only phone that can change things. Pair another owner to step this one down.";
             row.appendChild(only);
-          } else {
+          } else if (!d.parent) {
             var toRole = d.role === "viewer" ? "owner" : "viewer";
             var change = document.createElement("button");
             change.type = "button";
@@ -175,7 +193,7 @@
           btn.type = "button";
           btn.textContent = "Remove";
           btn.addEventListener("click", function () {
-            if (!confirm(removalWarning(d, devices.length))) return;
+            if (!confirm(removalWarning(d, phones, watchesOf(d.id)))) return;
             btn.disabled = true;
             fetch("/api/app-link/devices/" + encodeURIComponent(d.id), { method: "DELETE" })
               .then(function (r) {

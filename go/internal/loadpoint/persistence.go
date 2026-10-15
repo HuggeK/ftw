@@ -25,6 +25,12 @@ func (m *Manager) WaitForPersistence(ctx context.Context) error {
 // Caller holds Manager.mu. The optional status reader is memory-only.
 func (m *Manager) snapshot(lp *loadpointRuntime) State {
 	st := lp.snapshot()
+	if !st.Schedule.Empty() {
+		// Older clients read the ready time as a UTC minute on today's date.
+		now, loc := m.now(), zone(m.loc)
+		st.Schedule.readClock(now, loc)
+		st.Schedule.TimeOfDayMinUTC = utcMinuteToday(now, st.Schedule.clock, loc)
+	}
 	if writer, ok := m.sessionStore.(interface{ GroupStatus(string) error }); ok {
 		retention := func(group string) string {
 			err := writer.GroupStatus(group)

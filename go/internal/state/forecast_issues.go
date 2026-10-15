@@ -62,6 +62,8 @@ CREATE TABLE IF NOT EXISTS forecast_errors (
 	available_at_ms INTEGER NOT NULL, payload TEXT NOT NULL,
  PRIMARY KEY(series,config_version,lead,start_ms,end_ms));
 CREATE INDEX IF NOT EXISTS forecast_errors_time ON forecast_errors(start_ms);
+CREATE INDEX IF NOT EXISTS forecast_errors_retention ON forecast_errors(
+ end_ms DESC,start_ms DESC,series DESC,lead DESC,config_version DESC,length(payload));
 `)
 	return err
 }
@@ -426,14 +428,23 @@ func (s *Store) LoadForecastIssues(ctx context.Context, since, until int64, limi
 	return out, nil
 }
 
-func (s *Store) LoadForecastObservations(ctx context.Context, since, until int64) ([]forecasting.Observation, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT payload FROM forecast_observations
+func (s *Store) LoadForecastObservations(ctx context.Context, since, until int64) (out []forecasting.Observation, err error) {
+	timing := newForecastReadTiming(ctx, "observations")
+	defer timing.finish(&err)
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	timing.conn = conn
+	timing.next("query")
+	rows, err := conn.QueryContext(ctx, `SELECT payload FROM forecast_observations
  WHERE start_ms>=? AND end_ms<=? ORDER BY start_ms,end_ms,config_version LIMIT ?`, since, until, MaxForecastObservations+1)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	out := make([]forecasting.Observation, 0, 3000)
+	timing.rows = rows
+	timing.next("scan")
+	out = make([]forecasting.Observation, 0, 3000)
 	totalBytes := 0
 	for rows.Next() {
 		if len(out) == MaxForecastObservations {
@@ -443,10 +454,12 @@ func (s *Store) LoadForecastObservations(ctx context.Context, since, until int64
 		if err = rows.Scan(&data); err != nil {
 			return nil, err
 		}
+		timing.rowCount++
 		totalBytes += len(data)
 		if len(data) > maxForecastRecordBytes || totalBytes > MaxForecastObservationBytes {
 			return nil, errors.New("oversized forecast observation load")
 		}
+		timing.next("decode")
 		var observation forecasting.Observation
 		if err = json.Unmarshal([]byte(data), &observation); err != nil {
 			return nil, err
@@ -455,6 +468,7 @@ func (s *Store) LoadForecastObservations(ctx context.Context, since, until int64
 			return nil, err
 		}
 		out = append(out, observation)
+		timing.next("scan")
 	}
 	return out, rows.Err()
 }
@@ -565,14 +579,23 @@ func (s *Store) PruneForecastErrors(ctx context.Context, now int64) error {
 
 // LoadForecastErrors reads a bounded set of valid residuals. With hourly set,
 // adjacent replans and quarter-hour points cannot crowd independent days out.
-func (s *Store) LoadForecastErrors(ctx context.Context, since, until int64, hourly bool) ([]forecasting.ErrorSample, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT payload FROM forecast_errors WHERE start_ms>=? AND end_ms<=? AND available_at_ms<=?
+func (s *Store) LoadForecastErrors(ctx context.Context, since, until int64, hourly bool) (out []forecasting.ErrorSample, err error) {
+	timing := newForecastReadTiming(ctx, "errors")
+	defer timing.finish(&err)
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	timing.conn = conn
+	timing.next("query")
+	rows, err := conn.QueryContext(ctx, `SELECT payload FROM forecast_errors WHERE start_ms>=? AND end_ms<=? AND available_at_ms<=?
  AND (?=0 OR start_ms%3600000=0) ORDER BY start_ms DESC,series,lead LIMIT ?`, since, until, until, hourly, MaxForecastErrors+1)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	out := make([]forecasting.ErrorSample, 0, min(MaxForecastErrors, 40000))
+	timing.rows = rows
+	timing.next("scan")
+	out = make([]forecasting.ErrorSample, 0, min(MaxForecastErrors, 40000))
 	totalBytes := 0
 	for rows.Next() {
 		if len(out) == MaxForecastErrors {
@@ -582,10 +605,12 @@ func (s *Store) LoadForecastErrors(ctx context.Context, since, until int64, hour
 		if err = rows.Scan(&data); err != nil {
 			return nil, err
 		}
+		timing.rowCount++
 		totalBytes += len(data)
 		if len(data) > maxForecastRecordBytes || totalBytes > MaxForecastErrorBytes {
 			return nil, errors.New("oversized forecast error load")
 		}
+		timing.next("decode")
 		var sample forecasting.ErrorSample
 		if err = json.Unmarshal([]byte(data), &sample); err != nil {
 			return nil, err
@@ -594,6 +619,7 @@ func (s *Store) LoadForecastErrors(ctx context.Context, since, until int64, hour
 			return nil, fmt.Errorf("invalid archived forecast error: %w", err)
 		}
 		out = append(out, sample)
+		timing.next("scan")
 	}
 	if err = rows.Err(); err != nil {
 		return nil, err

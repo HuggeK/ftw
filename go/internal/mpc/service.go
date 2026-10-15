@@ -2,6 +2,7 @@ package mpc
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"maps"
 	"math"
@@ -213,8 +214,10 @@ type Service struct {
 	// before Start; config reload replaces them with UpdateSiteEconomics.
 	SiteEconomics
 
-	lastReplanAt time.Time
-	lastReason   string // reason paired with the currently published plan
+	lastReplanAt      time.Time
+	lastReason        string // reason paired with the currently published plan
+	lastPlanningError string
+	planningWarnings  []string
 	// latestReplanGeneration identifies the newest requested solve. Starting a
 	// newer generation cancels the older request; the generation check remains
 	// the final guard for work that does not stop promptly on context cancel.
@@ -461,6 +464,8 @@ type PlanSnapshot struct {
 	Reason      string
 	Pending     bool
 	Outdated    bool
+	Error       string
+	Warnings    []string
 	loadpointID string
 }
 
@@ -475,6 +480,7 @@ func (s *Service) PlanSnapshot() PlanSnapshot {
 	out := PlanSnapshot{
 		Plan: s.last, ReplanAt: s.lastReplanAt, Reason: s.lastReason,
 		Pending: outdated && s.activeReplanCancel != nil, Outdated: outdated,
+		Error: s.lastPlanningError, Warnings: slices.Clone(s.planningWarnings),
 		loadpointID: s.lastLoadpointID,
 	}
 	s.mu.RUnlock()
@@ -1368,6 +1374,8 @@ func (s *Service) beginReplanLocked(ctx context.Context, reason string) replanRe
 		cancel()
 	}
 	s.latestReplanGeneration++
+	s.lastPlanningError = ""
+	s.planningWarnings = nil
 	s.activeReplanCancel = serviceCancel
 	s.replanWG.Add(1)
 	return replanRequest{
@@ -1391,11 +1399,19 @@ func (r replanRequest) wasCanceledByService() bool {
 
 func (s *Service) finishReplan(request replanRequest) {
 	defer s.replanWG.Done()
+	contextErr := request.ctx.Err()
 	request.cancel()
 	s.mu.Lock()
 	if request.generation == s.latestReplanGeneration {
 		s.activeReplanCancel = nil
 		if s.publishedReplanGeneration != request.generation {
+			if s.lastPlanningError == "" {
+				if contextErr != nil {
+					s.lastPlanningError = "Planning stopped: " + contextErr.Error()
+				} else {
+					s.lastPlanningError = "Planning did not produce a usable plan"
+				}
+			}
 			// Keep the last plan during a normal recalculation, but stop using
 			// it when the replacement fails. A later retry must publish a new
 			// plan before dispatch resumes; queuing work alone is not enough.
@@ -1456,7 +1472,7 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 			"mode", request.params.Mode,
 			"reason", request.reason,
 			"err", err)
-		return s.Latest()
+		return s.failedReplan(request, err.Error())
 	}
 	now := s.planningNow()
 	s.mu.RLock()
@@ -1472,7 +1488,7 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	prices, err := s.Store.LoadPrices(s.Zone, sinceMs, untilMs)
 	if err != nil {
 		slog.Warn("mpc: load prices", "err", err)
-		return nil
+		return s.failedReplan(request, "Could not load electricity prices: "+err.Error())
 	}
 	if request.wasCanceledByService() {
 		return s.canceledReplan(request, "load-prices")
@@ -1480,7 +1496,7 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	// The plan covers the published prices and nothing beyond them.
 	if len(prices) == 0 {
 		slog.Info("mpc: no prices available yet")
-		return nil
+		return s.failedReplan(request, "Waiting for electricity prices")
 	}
 
 	// Price rows may start up to 15 minutes before now, while weather rows
@@ -1520,12 +1536,12 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 		}
 		if len(resolved) != len(slots) {
 			slog.Error("mpc: forecast changed horizon length; keeping previous plan")
-			return s.Latest()
+			return s.failedReplan(request, "The forecast changed the planning horizon")
 		}
 		for i := range slots {
 			if resolved[i].StartMs != slots[i].StartMs || resolved[i].LenMin != slots[i].LenMin {
 				slog.Error("mpc: forecast changed interval; keeping previous plan", "slot", i)
-				return s.Latest()
+				return s.failedReplan(request, fmt.Sprintf("The forecast changed planning slot %d", i))
 			}
 			// Forecast selection cannot replace market data or physical limits.
 			slots[i].PVW, slots[i].LoadW = resolved[i].PVW, resolved[i].LoadW
@@ -1539,11 +1555,11 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	// Qualified load models own their level. Unqualified historic daily
 	// totals must not impose a floor on a changed or low-load household.
 	if len(slots) == 0 {
-		return nil
+		return s.failedReplan(request, "No current electricity price slots are available")
 	}
 	if err := validateSlotChronology(slots); err != nil {
 		slog.Error("mpc: invalid slot chronology; keeping previous plan", "err", err)
-		return s.Latest()
+		return s.failedReplan(request, err.Error())
 	}
 	// Keep the point forecast and a downside-PV copy. The Core DP and the
 	// Energyplan worker both plan against the downside copy; the point
@@ -1595,13 +1611,13 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	if len(fleet) > 0 {
 		if err := validateBatteryFleetMembers(fleet); err != nil {
 			slog.Error("mpc: invalid optimization parameters; keeping previous plan", "err", err)
-			return s.Latest()
+			return s.failedReplan(request, err.Error())
 		}
 		var ok bool
 		p, ok = s.onlineFleetParams(p, fleet, fuseMaxW)
 		if !ok {
 			slog.Warn("mpc: no online battery capacity with SoC — keeping previous plan")
-			return s.Latest()
+			return s.failedReplan(request, "Waiting for an online battery with capacity and charge level")
 		}
 	} else if p.CapacityWh > 0 {
 		p.InitialSoC = currentSoC(s.Tele, p.InitialSoC)
@@ -1692,12 +1708,18 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 				p.Loadpoints = []*LoadpointSpec{spec}
 			}
 		}
-		// Check the probe output before activeLoadpoints filters it. A plugged-in
-		// spec with broken physics must stop planning, not disappear and make the
-		// service silently solve a different battery-only problem.
+	}
+	warnings := limitPlanningLoadpointSteps(&p)
+	s.mu.Lock()
+	if request.generation == s.latestReplanGeneration {
+		s.planningWarnings = warnings
+	}
+	s.mu.Unlock()
+	if s.Loadpoints != nil || s.Loadpoint != nil {
+		// Invalid physics must not disappear into a battery-only problem.
 		if err := validateLoadpointSpecs(planningLoadpointSpecs(p), make(map[string]string)); err != nil {
 			slog.Error("mpc: invalid optimization parameters; keeping previous plan", "err", err)
-			return s.Latest()
+			return s.failedReplan(request, err.Error())
 		}
 		active := p.activeLoadpoints()
 		if len(active) > 0 {
@@ -1710,15 +1732,15 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 
 	if err := validatePlanningSlots(slots); err != nil {
 		slog.Error("mpc: invalid optimization inputs; keeping previous plan", "basis", "primary", "err", err)
-		return s.Latest()
+		return s.failedReplan(request, err.Error())
 	}
 	if err := validatePlanningSlots(fallbackSlots); err != nil {
 		slog.Error("mpc: invalid optimization inputs; keeping previous plan", "basis", "go-fallback", "err", err)
-		return s.Latest()
+		return s.failedReplan(request, err.Error())
 	}
 	if err := validatePlanningParams(p); err != nil {
 		slog.Error("mpc: invalid optimization parameters; keeping previous plan", "err", err)
-		return s.Latest()
+		return s.failedReplan(request, err.Error())
 	}
 	recoveryRequired := planningParamsRequireRecovery(p)
 	if recoveryRequired && s.Optimizer == nil {
@@ -1731,7 +1753,7 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 				"soc_start", p.InitialSoC,
 				"soc_min", p.SoCMin,
 				"soc_max", p.SoCMax)
-			return s.Latest()
+			return s.failedReplan(request, "Battery charge level cannot be represented within its limits")
 		}
 		if clamped {
 			slog.Warn("mpc: planning from clamped SoC",
@@ -1845,11 +1867,11 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 					"soc_start", p.InitialSoC,
 					"soc_min", p.SoCMin,
 					"soc_max", p.SoCMax)
-				return s.Latest()
+				return s.failedReplan(request, "Optimizer failed: "+err.Error())
 			}
 			if modelErr := coreDPModelError(p); modelErr != nil {
 				slog.Error("mpc: primary failed and fallback cannot represent this site; keeping previous plan", "err", err, "fallback", modelErr)
-				return s.Latest()
+				return s.failedReplan(request, "Optimizer failed: "+err.Error()+"; fallback unavailable: "+modelErr.Error())
 			}
 			slog.Error("mpc: primary optimizer failed; using Core DP fallback", "err", err)
 			slots = fallbackSlots
@@ -1870,7 +1892,7 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 			"mode", p.Mode,
 			"reason", request.reason,
 			"err", err)
-		return s.Latest()
+		return s.failedReplan(request, err.Error())
 	}
 	if err := ValidatePlan(slots, p, &plan); err != nil {
 		engine := "go-dp"
@@ -1883,7 +1905,7 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 			"reason", request.reason,
 			"engine", engine,
 			"err", err)
-		return s.Latest()
+		return s.failedReplan(request, err.Error())
 	}
 
 	// Tag each action with the effective EMS mode so the UI can render
@@ -1953,6 +1975,7 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	s.plannedPredictions = pp
 	s.lastReason = request.reason
 	s.publishedReplanGeneration = request.generation
+	s.lastPlanningError = ""
 	reason := request.reason
 	replanAtMs := s.lastReplanAt.UnixMilli()
 	saveDiag := s.SaveDiag

@@ -4,6 +4,11 @@ This version uses GNU AGPL v3 only, with the narrow Energyplan combination
 permission in [LICENSE](LICENSE). [NOTICE](NOTICE) preserves prior Apache
 rights and attribution. Third-party files retain their own licenses.
 
+The wire-format module in [`go/protocol`](go/protocol) is the exception: it
+uses Apache-2.0 only, as its own [LICENSE](go/protocol/LICENSE) states.
+Clients and services that speak the protocol, such as FTW Cloud, may import it
+on those terms. Core links it; that does not change Core's license.
+
 ## Use and redistribution
 
 You may inspect, run, modify and sell the AGPL-covered software. When you

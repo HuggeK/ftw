@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/srcfl/ftw/go/internal/mpc"
+	"github.com/srcfl/ftw/go/internal/units"
 )
 
 // planFrom projects the planner's output onto the wire.
@@ -39,14 +40,22 @@ func planFrom(p *mpc.Plan, rev uint64, ceilingW *int64, uptimeMs int64, now time
 
 	for _, a := range p.Actions {
 		price := int64(math.Round(a.PriceOre))
-		out.Slots = append(out.Slots, PlanSlot{
+		slot := PlanSlot{
 			StartMs:    a.ExecutionStart(),
 			DurationMs: int64(math.Round(a.DurationHours() * 3600000)),
 			BatteryW:   roundW(a.BatteryW),
 			GridW:      roundW(a.GridW),
 			PriceMinor: &price,
 			Reason:     reasonCode(a, mean, minSoC, ceilingW),
-		})
+		}
+		// The level the plan leads to, so a phone can say where the battery
+		// ends up and not only what it does. Left out rather than guessed
+		// when the planner's number is not a level.
+		if units.ValidFraction(a.SoC) {
+			soc := units.PermilleFromFraction(a.SoC)
+			slot.SocPermille = &soc
+		}
+		out.Slots = append(out.Slots, slot)
 	}
 
 	return out

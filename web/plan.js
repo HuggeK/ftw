@@ -256,6 +256,7 @@ import {
       plan,
       status: state.status || {},
       socOpts: state.socOpts,
+      planning: state.planMeta || {},
     });
     applyStateBadge('plan-state-badge', brief.state);
     setText('plan-next-action', brief.next.action);
@@ -780,6 +781,8 @@ import {
     if (summary) {
       if (!state.enabled || !state.enabled.mpc) {
         summary.textContent = unavailablePlannerCopy(state.enabled && state.enabled.mpcReason).summary;
+      } else if (state.planMeta && state.planMeta.error && !state.planMeta.replanning) {
+        summary.textContent = 'Cannot plan · ' + state.planMeta.error;
       } else if (!plan) {
         const visibleInputs = [];
         if (state.prices && state.prices.length) visibleInputs.push('prices');

@@ -173,6 +173,20 @@ func (s *Store) mergedSeries(ctx context.Context, coldDir, driver, metric string
 		if err != nil {
 			return nil, err
 		}
+		// An absorbed sample day leaves hourly summaries, not raw rows. Keep
+		// those in stored-resolution exports with their count and envelope.
+		if s.seriesHoursReady() {
+			summaries := make(map[int64]*seriesBucketAcc)
+			if err := s.addSummaryOnlySeriesBuckets(ctx, coldDir, driver, metric, since, until, 1, summaries); err != nil {
+				return nil, err
+			}
+			for _, summary := range summaries {
+				if len(out) >= maxRawSeriesPoints {
+					return nil, ErrHistoryQueryLimit
+				}
+				out = append(out, summary.point())
+			}
+		}
 		sort.Slice(out, func(i, j int) bool { return out[i].TsMs < out[j].TsMs })
 		return out, nil
 	}

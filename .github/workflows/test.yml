@@ -99,6 +99,20 @@ jobs:
         # tests still check queue latency, cancellation and operation limits.
         run: go test -count=1 -timeout 300s ./...
 
+      # go/protocol is its own module, so ./... above skips it. FTW Cloud
+      # imports it, and it must build without the box.
+      - name: Protocol module
+        working-directory: go/protocol
+        run: |
+          go vet ./...
+          go test -count=1 ./...
+      - name: Protocol module imports nothing from the box
+        run: bash .github/scripts/check-protocol-boundary.sh go/protocol
+      # FTW Cloud reads and never controls. The uplink's build graph says so:
+      # it reaches no control, API or loadpoint code.
+      - name: FTW Cloud uplink imports nothing that controls
+        run: bash .github/scripts/check-cloudlink-imports.sh go
+
   web:
     name: web
     needs: changes

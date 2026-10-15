@@ -29,7 +29,7 @@ func TestScheduleCheckedReportsStorageFailureWithoutChangingGoal(t *testing.T) {
 	}
 	m.RollSchedules(time.Now())
 	after, _ := m.State("garage")
-	if after.Schedule != old || after.TargetSoC != before.TargetSoC || after.TargetTime != before.TargetTime {
+	if after.Schedule.withoutClock() != old || after.TargetSoC != before.TargetSoC || after.TargetTime != before.TargetTime {
 		t.Fatalf("failed save changed the running goal: %+v", after)
 	}
 }

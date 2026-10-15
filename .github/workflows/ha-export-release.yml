@@ -1,0 +1,65 @@
+name: Publish offline HA exporter
+
+on:
+  workflow_dispatch:
+    inputs:
+      tool_tag:
+        description: 'Separate exporter beta tag, for example ha-export-v1-beta.1'
+        required: true
+      source_commit:
+        description: 'Exact tested 40-character FTW commit'
+        required: true
+      dry_run:
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ha-export-release
+  cancel-in-progress: false
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate the separate tool tag and exact source
+        env:
+          TAG: ${{ inputs.tool_tag }}
+          COMMIT: ${{ inputs.source_commit }}
+        run: |
+          [[ "$TAG" =~ ^ha-export-v[1-9][0-9]*-beta\.[1-9][0-9]*$ ]]
+          [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]]
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - run: >-
+          python -m pip install --only-binary=:all: -r tools/ha-backup-export/requirements.txt
+      - working-directory: tools/ha-backup-export
+        run: python -m unittest -v test_export test_release_tag
+      - name: Package the tested source and receipt
+        env:
+          TAG: ${{ inputs.tool_tag }}
+          COMMIT: ${{ inputs.source_commit }}
+        run: python tools/ha-backup-export/package.py
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ha-export-package
+          path: bin/ha-export/*
+      - name: Publish immutable tool beta
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tool_tag }}
+          COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          bash tools/ha-backup-export/create-release-tag.sh "$TAG" "$COMMIT"
+          gh release create "$TAG" bin/ha-export/* --verify-tag \
+            --prerelease --latest=false --title "FTW Home Assistant export $TAG" \
+            --notes 'Offline Linux/Python export with pinned SecureTar. Keeps the source backup and checked internal links. This is a tool beta; it does not publish or update Core, prove every HA layout, or promote native stable.'

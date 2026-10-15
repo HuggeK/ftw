@@ -7,6 +7,7 @@ import (
 
 	"github.com/srcfl/ftw/go/internal/drivers"
 	"github.com/srcfl/ftw/go/internal/loadmodel"
+	"github.com/srcfl/ftw/go/internal/localzone"
 	"github.com/srcfl/ftw/go/internal/modelstate"
 	"github.com/srcfl/ftw/go/internal/telemetry"
 	"math"
@@ -405,7 +406,7 @@ func TestForecastLearningIDCarriesAcrossPortablePathPolicy(t *testing.T) {
 
 	// The receipt an earlier build wrote for this site.
 	options := forecastMeasurementOptions(cfg, nil)
-	v := forecastSite{Meter: cfg.SiteMeterDriver(), Timezone: forecastTimezone(), Options: options}
+	v := forecastSite{Meter: cfg.SiteMeterDriver(), Timezone: localzone.Name(), Options: options}
 	weather := *cfg.Weather
 	learning := forecastLearningDrivers(v.Meter, v.Options.ExpectedFlows, cfg.Drivers)
 	old, err := forecastResolvedPathRevision(v, &weather, learning)

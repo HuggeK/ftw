@@ -63,10 +63,27 @@ type Config struct {
 	// privileged request. Required, because revocation is not optional.
 	Grants GrantReader
 
+	// Commands is the box's command log, one table shared by every session.
+	// Required: a handler with a table of its own would let a retry in the
+	// next session act a second time.
+	Commands *CmdLog
+
+	// Exchange makes this a watch's exchange session (ADR 0009, decision 2).
+	// It takes hello, cmd and now, and answers every other request
+	// E_UNKNOWN_OP. It never streams and pushes no plan after a command.
+	// Every frame it sends is lane 0 apart from hello_ok.
+	Exchange bool
+
 	// Caps is what this box advertises. Names must come from the generated
 	// contract constants; a typo is refused at construction rather than
 	// silently hiding a feature in the app.
 	Caps []string
+
+	// Cloud answers hello_ok's FTW Cloud session information, or nil while
+	// FTW Cloud is off. Asked once per hello, for every role: a viewer reads
+	// FTW Cloud too and checks the box's signatures the same way. Nil on a
+	// box without the uplink.
+	Cloud func() *CloudSession
 
 	// Source ids for the three frozen power fields. The dictionary points
 	// each reading at one of these, which is how the app turns a number
@@ -91,7 +108,6 @@ type Handler struct {
 	log   *slog.Logger
 	modes []ModeInfo
 	dict  map[string]FieldDef
-	cmds  *cmdLog
 	// ops is this handler's own copy of the operation table.
 	ops map[string]opSpec
 
@@ -181,6 +197,8 @@ func New(cfg Config) (*Handler, error) {
 		return nil, errors.New("appproto: Sender is required")
 	case cfg.Grants == nil:
 		return nil, errors.New("appproto: Grants is required")
+	case cfg.Commands == nil:
+		return nil, errors.New("appproto: Commands is required")
 	}
 
 	// A role nobody recognises carries nothing, and a handler that would
@@ -216,7 +234,6 @@ func New(cfg Config) (*Handler, error) {
 		log:          cfg.Logger.With("component", "appproto"),
 		modes:        wireModes(control.ModeCatalog()),
 		dict:         fieldDict(cfg.SrcGrid, cfg.SrcPV, cfg.SrcBattery),
-		cmds:         newCmdLog(),
 		ops:          defaultOps(),
 		ctx:          ctx,
 		cancel:       cancel,
@@ -254,6 +271,32 @@ func ScopesForRole(role string) apiauth.ScopeSet {
 	return apiauth.NewScopeSet(apiauth.RoleScopes[role]...)
 }
 
+// GrantScopes lists what an enrolment carries now, in the registry's order.
+//
+// A phone carries its role's scopes. A watch carries those of its role's
+// scopes that its parent's role carries too, so a watch never does more than
+// its phone can do this second (ADR 0009, decision 4). A watch with no parent
+// carries nothing.
+func GrantScopes(role, parentRole string) []string {
+	own := apiauth.RoleScopes[role]
+	if role != apiauth.RoleWatch {
+		return own
+	}
+	parent := ScopesForRole(parentRole)
+	out := make([]string, 0, len(own))
+	for _, scope := range own {
+		if parent.Has(scope) {
+			out = append(out, scope)
+		}
+	}
+	return out
+}
+
+// ScopesForGrant is GrantScopes as a set.
+func ScopesForGrant(role, parentRole string) apiauth.ScopeSet {
+	return apiauth.NewScopeSet(GrantScopes(role, parentRole)...)
+}
+
 // liveCaller is whose session this is, as the box's records stand this second.
 //
 // Not the snapshot the handshake took. A socket outlives a revoke, and it
@@ -269,14 +312,14 @@ func ScopesForRole(role string) apiauth.ScopeSet {
 // that is the right way round — the app drawing a button is presentation, and
 // the box refusing it is the enforcement.
 func (h *Handler) liveCaller() (apiauth.Caller, bool) {
-	role, epoch, ok := h.cfg.Grants.Grant()
+	grant, ok := h.cfg.Grants.Grant()
 	if !ok {
 		return apiauth.Caller{}, false
 	}
 	caller := h.cfg.Caller
-	caller.Role = role
-	caller.Epoch = epoch
-	caller.Scopes = ScopesForRole(role)
+	caller.Role = grant.Role
+	caller.Epoch = grant.Epoch
+	caller.Scopes = ScopesForGrant(grant.Role, grant.ParentRole)
 	return caller, true
 }
 
@@ -309,6 +352,9 @@ func (h *Handler) Handle(ctx context.Context, frame []byte) error {
 }
 
 func (h *Handler) dispatch(ctx context.Context, env Envelope) error {
+	if h.cfg.Exchange {
+		return h.dispatchExchange(ctx, env)
+	}
 	switch env.T {
 	case MsgHello:
 		return h.onHello(env)
@@ -373,11 +419,14 @@ func (h *Handler) onHello(env Envelope) error {
 
 	caps := h.cfg.Caps
 	hint := ""
+	var cloud *CloudSession
 	if proto == ProtoFloor {
 		// Floor mode speaks the frozen subset and nothing else. Advertising
 		// more would invite an app that cannot use it to try.
 		caps = []string{CapStatusCore}
 		hint = HintAppUpdate
+	} else if h.cfg.Cloud != nil {
+		cloud = h.cfg.Cloud()
 	}
 
 	source, syncedAtMs := h.cfg.Clock.Sync()
@@ -401,6 +450,7 @@ func (h *Handler) onHello(env Envelope) error {
 		Role:       h.cfg.Caller.Role,
 		Scopes:     h.cfg.Caller.Scopes.Names(),
 		Subscribed: fastSub,
+		Cloud:      cloud,
 	}
 
 	h.mu.Lock()
@@ -576,8 +626,14 @@ func (h *Handler) Tick() error {
 	// command will be refused for a conflict it cannot see. Only the snapshot
 	// carries the number, so a change in it costs one bulk frame — which is
 	// also how the client resyncs mid-session rather than on reconnect.
+	//
+	// A field that stopped coming is the same kind of news. A delta carries
+	// values, not absences, so a phase the meter no longer reports would stay
+	// on the client at its last value; the snapshot replaces the client's
+	// whole set instead.
+	fields := fieldValues(snap, h.modes)
 	h.mu.Lock()
-	stale := snap.ControlRev != h.lastRev
+	stale := snap.ControlRev != h.lastRev || anyGone(h.lastSent, fields)
 	h.mu.Unlock()
 	if stale {
 		if err := h.sendSnapshot(); err != nil {
@@ -585,7 +641,6 @@ func (h *Handler) Tick() error {
 		}
 	}
 
-	fields := fieldValues(snap, h.modes)
 	sources := wireSources(snap, uptimeMs)
 	blocked := snap.DispatchBlockedBy
 	if blocked == nil {
@@ -709,6 +764,16 @@ func (h *Handler) fitDelta(body *Delta, bucket int) (map[string]int64, uint8, er
 	return nil, 0, fmt.Errorf("appproto: an empty delta does not fit a %d-byte bucket", bucket)
 }
 
+// anyGone reports whether a field the client was sent is missing now.
+func anyGone(sent, now map[string]int64) bool {
+	for k := range sent {
+		if _, ok := now[k]; !ok {
+			return true
+		}
+	}
+	return false
+}
+
 func fidOf(key string) uint64 {
 	v, err := strconv.ParseUint(key, 10, 32)
 	if err != nil {
@@ -740,15 +805,10 @@ func (h *Handler) onCmd(ctx context.Context, env Envelope) error {
 	}
 
 	// Idempotency first. A retry must return the original outcome, not act a
-	// second time — that is the entire reason the key exists.
-	if rec, ok := h.cmds.lookup(cmd.CmdID); ok {
-		if err := h.sendCmdAck(rec.ack); err != nil {
-			return err
-		}
-		if rec.result != nil {
-			return h.sendCmdResult(*rec.result)
-		}
-		return nil
+	// second time — that is the entire reason the key exists. The box keeps
+	// the table, so the retry may come in any session of the same device.
+	if rec, ok := h.cfg.Commands.lookup(h.cmdRoot(), cmd.CmdID); ok {
+		return h.replayCmd(rec)
 	}
 
 	uptimeMs := h.cfg.Clock.UptimeMs()
@@ -887,17 +947,45 @@ func (h *Handler) onCmd(ctx context.Context, env Envelope) error {
 	}
 }
 
+// cmdRoot is the device whose command ids this session spends: the enrolled
+// device itself, or for a watch the phone that added it. A subject is stable
+// across sessions and names nobody else.
+func (h *Handler) cmdRoot() string {
+	if grant, ok := h.cfg.Grants.Grant(); ok && grant.Root != "" {
+		return grant.Root
+	}
+	return h.cfg.Caller.Subject
+}
+
+// replayCmd answers a command id the box has already taken with what happened
+// then.
+func (h *Handler) replayCmd(rec *cmdRecord) error {
+	if err := h.sendCmdAck(rec.ack); err != nil {
+		return err
+	}
+	if rec.result != nil {
+		return h.sendCmdResult(*rec.result)
+	}
+	return nil
+}
+
 // acceptCmd takes the intent: mints the lease, remembers the command id and
 // tells the app. From here on a retry replays whatever outcome follows
 // rather than acting a second time.
-func (h *Handler) acceptCmd(cmd Cmd, uptimeMs int64) (CmdAck, error) {
+//
+// took is false when another session of the same device took this id first,
+// between this session's lookup and now. The stored record has then been
+// replayed, and the caller must not act.
+func (h *Handler) acceptCmd(cmd Cmd, uptimeMs int64) (took bool, err error) {
 	ack := CmdAck{
 		CmdID:       cmd.CmdID,
 		LeaseID:     h.cfg.NewLeaseID(),
 		ExpiresAtMs: uptimeMs + LeaseMs,
 	}
-	h.cmds.remember(cmd.CmdID, ack, uptimeMs)
-	return ack, h.sendCmdAck(ack)
+	if rec, fresh := h.cfg.Commands.remember(h.cmdRoot(), cmd.CmdID, ack, uptimeMs); !fresh {
+		return false, h.replayCmd(rec)
+	}
+	return true, h.sendCmdAck(ack)
 }
 
 // settleAndReport records the outcome, reports it, and pushes a fresh plan
@@ -905,11 +993,13 @@ func (h *Handler) acceptCmd(cmd Cmd, uptimeMs int64) (CmdAck, error) {
 // the box means to do next, and the app must not show the old intent beside
 // the new state with neither looking wrong.
 func (h *Handler) settleAndReport(cmdID string, res CmdResult) error {
-	h.cmds.settle(cmdID, res)
+	h.cfg.Commands.settle(h.cmdRoot(), cmdID, res)
 	if err := h.sendCmdResult(res); err != nil {
 		return err
 	}
-	if res.State == CmdApplied {
+	// An exchange answers with two frames of one size and nothing after
+	// them, so a watch reads the new plan from FTW Cloud instead.
+	if res.State == CmdApplied && !h.cfg.Exchange {
 		return h.sendPlan(nil)
 	}
 	return nil
@@ -933,7 +1023,7 @@ func (h *Handler) setMode(ctx context.Context, cmd Cmd, uptimeMs int64) error {
 		})
 	}
 
-	if _, err := h.acceptCmd(cmd, uptimeMs); err != nil {
+	if took, err := h.acceptCmd(cmd, uptimeMs); !took || err != nil {
 		return err
 	}
 

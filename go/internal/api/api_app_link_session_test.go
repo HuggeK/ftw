@@ -20,6 +20,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -55,6 +56,11 @@ func (e *realEnroller) MintSpokenCode(role string) (string, time.Time, error) {
 	return code, expires, enrollError(err)
 }
 
+func (e *realEnroller) MintWatchCode(parentID string) ([]byte, time.Time, error) {
+	code, expires, err := e.id.MintWatchCode(parentID, appenroll.WatchTTL)
+	return code, expires, enrollError(err)
+}
+
 func (e *realEnroller) EnrollmentURL(code []byte, lanHint string) (string, error) {
 	return e.id.EnrollmentURL(code, lanHint)
 }
@@ -66,7 +72,7 @@ func (e *realEnroller) Devices() []AppDevice {
 	for _, d := range e.id.Devices() {
 		out = append(out, AppDevice{
 			ID: d.ID, AddedAtMs: d.AddedAtMs, LastSeenMs: d.LastSeenMs,
-			Role: d.Role, LastOwner: d.LastOwner,
+			Role: d.Role, LastOwner: d.LastOwner, Parent: d.Parent,
 		})
 	}
 	return out
@@ -91,6 +97,10 @@ func enrollError(err error) error {
 		return ErrLastAppOwnerProtected
 	case errors.Is(err, appenroll.ErrUnknownRole):
 		return ErrUnknownAppRole
+	case errors.Is(err, appenroll.ErrWatchRole):
+		return ErrWatchAppRole
+	case errors.Is(err, appenroll.ErrWatchNeedsOwner):
+		return ErrWatchNeedsOwner
 	default:
 		return err
 	}
@@ -234,6 +244,7 @@ func TestAppRigCallWaitsForTheCompleteResponse(t *testing.T) {
 			Epoch:   1,
 		},
 		Grants:     stillEnrolled{role: apiauth.RoleOwner},
+		Commands:   appproto.NewCmdLog(),
 		SrcGrid:    "meter",
 		SrcPV:      "meter",
 		SrcBattery: "meter",
@@ -447,6 +458,74 @@ func TestTheAppCannotMakeAnotherOwner(t *testing.T) {
 	}
 	if owners != 1 {
 		t.Fatalf("%d owners, want the one who was there before", owners)
+	}
+}
+
+// A watch comes only from its owner phone, over that phone's session.
+//
+// The registry names the role, so the box's own enrolment knows it. A watch
+// belongs to the owner phone that adds it (ADR 0009): the box's page has no
+// phone to bind one to, and changing a phone into a watch would leave a watch
+// with no phone above it. A session that is not the enrolled owner's phone
+// gets nothing either. The rule's success path is in
+// api_app_link_watch_test.go. This runs against the real enrolment because a
+// stub that knows only owner and viewer would refuse for its own reasons.
+func TestNoDoorButItsPhoneHandsOutAWatch(t *testing.T) {
+	enrol := newEnrolment(t)
+
+	code, _, err := enrol.id.MintPairingCode(apiauth.RoleViewer, appenroll.InviteTTL)
+	if err != nil {
+		t.Fatalf("minting the guest's code: %v", err)
+	}
+	guest, err := enrol.id.Authorise(appKey(2), code)
+	if err != nil {
+		t.Fatalf("enrolling the guest: %v", err)
+	}
+
+	lan := func(method, path, body string) *http.Request {
+		r := httptest.NewRequest(method, path, strings.NewReader(body))
+		r.Header.Set("Content-Type", "application/json")
+		r.Host = "192.168.1.1"
+		r.RemoteAddr = "192.168.1.5:1234"
+		return r
+	}
+	s := New(&Deps{AppEnroll: enrol})
+
+	for _, c := range []struct {
+		name  string
+		serve func(http.ResponseWriter)
+	}{
+		{"a scanned watch code from the LAN", func(w http.ResponseWriter) {
+			s.handleAppLinkPairing(w, lan(http.MethodPost, "/api/app-link/pairing", `{"role":"watch"}`))
+		}},
+		{"a spoken watch code from the LAN", func(w http.ResponseWriter) {
+			s.handleAppLinkPairing(w, lan(http.MethodPost, "/api/app-link/pairing", `{"role":"watch","kind":"spoken"}`))
+		}},
+		{"the guest changed into a watch from the LAN", func(w http.ResponseWriter) {
+			r := lan(http.MethodPatch, "/api/app-link/devices/"+guest.DeviceID, `{"role":"watch"}`)
+			r.SetPathValue("id", guest.DeviceID)
+			s.handleAppLinkDeviceRole(w, r)
+		}},
+	} {
+		w := httptest.NewRecorder()
+		c.serve(w)
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("%s answered %d %s, want 403", c.name, w.Code, w.Body.String())
+		}
+	}
+
+	rig := newAppSession(t, apiauth.RoleOwner, withEnrolment(enrol))
+	status, refusal, body := rig.call(t, 1, appproto.APIReq{
+		Method: appproto.APIPost, Path: "/api/app-link/pairing",
+		Body: []byte(`{"role":"watch"}`), StepUp: true})
+	if status != http.StatusForbidden {
+		t.Fatalf("a watch code over the session answered %d %q %s, want 403", status, refusal, body)
+	}
+
+	for _, d := range enrol.Devices() {
+		if d.Role == apiauth.RoleWatch {
+			t.Fatalf("%s is now a watch", d.ID)
+		}
 	}
 }
 

@@ -3,8 +3,8 @@
 # The single source for every name shared between this app and the box, and
 # the same file in both repositories — byte for byte.
 #
-# In srcfl/ftw it generates Go constants: go/internal/appproto/contract_gen.go
-# and go/internal/apiauth/contract_gen.go, from `go generate ./internal/...`.
+# In srcfl/ftw it generates Go constants: go/protocol/contract_gen.go and
+# go/internal/apiauth/contract_gen.go, from `go generate ./internal/...`.
 # In srcfl/ftw-webapp there is no generator — src/lib/protocol/contract.ts and
 # the error table in src/lib/protocol/messages.ts are written by hand and read
 # back against this file by tests/registry-contract.test.ts.
@@ -50,6 +50,29 @@ frozen_fields:
   10: { name: ev_w, kind: power, unit: W }
 
 # ---------------------------------------------------------------------------
+# Field ids after the frozen set. They travel like the frozen ids, in lane
+# 0's delta and in FTW Cloud's live body, under the same rules: integers,
+# sent only while the box has the reading, and an id never changes meaning.
+# They are depth for a node's own view, not the core view, so an app draws
+# Now without them and a box may stop sending one. Lane 0 drops the highest
+# id first when a delta does not fit its bucket, so these give way first.
+#
+# The grid's phase currents come from the site meter in tenths of an ampere,
+# signed by the site convention: positive while the phase draws from the
+# grid. A meter that gives magnitudes and no power per phase sends positive
+# values both ways, so a positive current alone does not prove import. The
+# box sends only the phases the site has, each while the meter is online and
+# reports it, and their freshness is the grid meter's. grid_fuse_da is the
+# main fuse per phase from the box's config, sent with the phases as their
+# scale.
+# ---------------------------------------------------------------------------
+extra_fields:
+  11: { name: grid_l1_da, kind: current, unit: dA }
+  12: { name: grid_l2_da, kind: current, unit: dA }
+  13: { name: grid_l3_da, kind: current, unit: dA }
+  14: { name: grid_fuse_da, kind: current, unit: dA }
+
+# ---------------------------------------------------------------------------
 # Capabilities. A set of names, not version numbers. Absent means the box does
 # not have it; the UI hides the feature and never crashes.
 # ---------------------------------------------------------------------------
@@ -76,6 +99,14 @@ capabilities:
   # history.5m. Present does not mean every path is reachable: reads and
   # configuration go through, anything that moves energy stays on cmd.
   - api.passthrough
+  # The box can run the FTW Cloud uplink. Absent means the app uses the relay
+  # only and offers no FTW Cloud. It says nothing about whether the owner
+  # turned FTW Cloud on; the box's grant decides that.
+  - cloud.link
+  # The box can take a watch: it opens the relay's exchange socket and mints
+  # watch codes. Absent means the phone offers no Add watch. The wire is
+  # docs/watch-exchange.md in srcfl/ftw-webapp.
+  - cmd.exchange
 
 # ---------------------------------------------------------------------------
 # Scopes. One object axis, two verb axes: <object>.<read|write>.
@@ -87,6 +118,7 @@ scopes:
   - { name: ftw.plan.read, desc: Dispatch plan and its reasoning }
   - { name: ftw.health.read, desc: Box and driver health }
   - { name: ftw.assets.read, desc: Devices and their capabilities }
+  - { name: ftw.events.read, desc: Events behind notifications }
   - { name: ftw.dispatch.write, desc: Control energy assets }
   - { name: ftw.mode.write, desc: Change site operating mode }
   - { name: ftw.members.read, desc: See who has access }
@@ -99,6 +131,29 @@ roles:
   viewer:
     label: Viewer
     scopes: [ftw.live.read]
+  # A watch that an owner phone added. That phone is its parent, and each check
+  # keeps only the scopes below that the parent holds at that moment, so a
+  # watch never does more than its phone can do now. Read and charge: no site
+  # mode, no members, no history and no passthrough.
+  watch:
+    label: Watch
+    scopes: [ftw.live.read, ftw.plan.read, ftw.events.read, ftw.dispatch.write]
+
+# ---------------------------------------------------------------------------
+# FTW Cloud. What an owner can let the box share with FTW Cloud, and why.
+# docs/protocol-cloud.md in srcfl/ftw is the wire format.
+#
+# cloud_scopes are the scopes a grant may name: the box sends a class only
+# when the grant holds its scope, and a device reads it only when its own
+# role carries the scope too. ftw.assets.read is left out on purpose: the
+# box sends no device inventory, names or capabilities to FTW Cloud.
+#
+# cloud_purposes are what the data may be used for. serve is the owner's own
+# phones and widgets. stats is household statistics, a separate consent that
+# is off unless the owner turns it on.
+# ---------------------------------------------------------------------------
+cloud_scopes: [ftw.live.read, ftw.history.read, ftw.plan.read, ftw.health.read, ftw.events.read]
+cloud_purposes: [serve, stats]
 
 # ---------------------------------------------------------------------------
 # Command operations. What a `cmd` frame may name, and the scope the grant
@@ -219,7 +274,7 @@ client_errors:
 # the two into one enum cannot express "connected, but the inverter is quiet".
 # ---------------------------------------------------------------------------
 source_states: [live, lagging, stale, down, never]
-carrier_states: [webrtc, relay, cache, none]
+carrier_states: [webrtc, relay, cloud, cache, none]
 
 # ---------------------------------------------------------------------------
 # History resolutions backed by what the box actually stores.

@@ -4,6 +4,7 @@ import (
 	"math"
 	"strconv"
 
+	"github.com/srcfl/ftw/go/internal/control"
 	"github.com/srcfl/ftw/go/internal/units"
 )
 
@@ -68,6 +69,13 @@ func wireSources(snap Snapshot, uptimeMs int64) map[string]SourceWire {
 	return out
 }
 
+// LiveView is the frozen fields and the graded source table exactly as a
+// session renders them. The FTW Cloud uplink sends the same numbers, so it
+// reads them here rather than computing a second set.
+func LiveView(snap Snapshot, uptimeMs int64) (map[string]int64, map[string]SourceWire) {
+	return fieldValues(snap, wireModes(control.ModeCatalog())), wireSources(snap, uptimeMs)
+}
+
 // modeIndex is field 1's value: the mode's position in the catalogue that
 // hello_ok sent.
 //
@@ -103,7 +111,27 @@ func fieldValues(snap Snapshot, modes []ModeInfo) map[string]int64 {
 	if snap.EVWKnown {
 		f[fidKey(FidEvW)] = roundW(snap.EVW)
 	}
+	phases := false
+	for i, a := range snap.GridPhaseA {
+		if a == nil || math.IsNaN(*a) || math.IsInf(*a, 0) {
+			continue
+		}
+		f[fidKey(gridPhaseFids[i])] = deciamps(*a)
+		phases = true
+	}
+	if phases && snap.FuseA > 0 {
+		f[fidKey(FidGridFuseDa)] = deciamps(snap.FuseA)
+	}
 	return f
+}
+
+// gridPhaseFids are the extra fields for L1, L2 and L3, in that order.
+var gridPhaseFids = [3]Fid{FidGridL1Da, FidGridL2Da, FidGridL3Da}
+
+// deciamps is the one place amps become integers: tenths of an ampere, which
+// is finer than any meter's useful resolution and keeps lane 0 numeric.
+func deciamps(a float64) int64 {
+	return int64(math.Round(a * 10))
 }
 
 // roundW is the one place watts become integers. A NaN from a driver that lost
@@ -119,7 +147,7 @@ func roundW(w float64) int64 {
 // fidKey renders a field id as the text map key the wire uses.
 func fidKey(f Fid) string { return strconv.FormatUint(uint64(f), 10) }
 
-// fieldDict maps each frozen field to its name, unit and source.
+// fieldDict maps each field to its name, unit and source.
 //
 // The client caches this across sessions, which is what lets a delta be bare
 // id-to-value pairs. srcId is what turns a reading into a freshness claim:
@@ -133,8 +161,8 @@ func fieldDict(srcGrid, srcPV, srcBattery string) map[string]FieldDef {
 	}
 	def := func(f Fid, srcID string) FieldDef {
 		return FieldDef{
-			Name:  FrozenFieldNames[f],
-			Unit:  orNil(FrozenFieldUnits[f]),
+			Name:  FieldNames[f],
+			Unit:  orNil(FieldUnits[f]),
 			SrcID: orNil(srcID),
 		}
 	}
@@ -153,6 +181,12 @@ func fieldDict(srcGrid, srcPV, srcBattery string) map[string]FieldDef {
 		// so it carries none, like the mode. The value's absence, not a
 		// per-driver age, is what says the site has no charger.
 		fidKey(FidEvW): def(FidEvW, ""),
+		// The phases are the site meter's own readings, as fresh as it is.
+		fidKey(FidGridL1Da): def(FidGridL1Da, srcGrid),
+		fidKey(FidGridL2Da): def(FidGridL2Da, srcGrid),
+		fidKey(FidGridL3Da): def(FidGridL3Da, srcGrid),
+		// The fuse is the box's config, not a reading.
+		fidKey(FidGridFuseDa): def(FidGridFuseDa, ""),
 	}
 }
 

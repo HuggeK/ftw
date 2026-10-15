@@ -15,6 +15,13 @@ The following prior notices and Apache license apply to that material.
 They do not offer later changes under Apache-2.0. Git history records authors,
 changes and dates. Separately licensed third-party files keep their notices.
 
+Wire-format module: 2026-10-12
+------------------------------
+The Go module in go/protocol, github.com/srcfl/ftw/go/protocol, is licensed
+under Apache-2.0 only, as go/protocol/LICENSE states. This includes its
+changes made after the snapshot above. The rest of the project keeps the
+license stated above.
+
 Prior notice, retained verbatim
 -------------------------------
 FTW

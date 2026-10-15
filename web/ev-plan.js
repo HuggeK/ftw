@@ -17,12 +17,15 @@ export function chargingLevels(lp = {}) {
   const freshCar = hasCar && !lp.vehicle_stale;
   const fromCar = hasCar;
   const displayNow = fromCar ? (lp.vehicle_soc ?? 0) : lp.current_soc;
-  const planningNow = freshCar && lp.soc_source === 'vehicle'
-    ? (lp.vehicle_soc ?? 0)
-    : lp.current_soc;
+  // planning_soc is the value the planner starts from. A stale car reading
+  // can still be that value when it is newer than the manual level.
+  const hasPlanning = fraction(lp.planning_soc);
+  const planningFromVehicle = lp.planning_from_vehicle === true || (!hasPlanning && freshCar && lp.soc_source === 'vehicle');
+  const planningNow = hasPlanning ? lp.planning_soc
+    : freshCar && lp.soc_source === 'vehicle' ? (lp.vehicle_soc ?? 0) : lp.current_soc;
   const limit = freshCar && fraction(lp.vehicle_charge_limit) && lp.vehicle_charge_limit > 0
     ? lp.vehicle_charge_limit : null;
-  const unconfirmed = !fraction(planningNow) || lp.soc_source === 'assumed' || lp.soc_source === 'completed';
+  const unconfirmed = !fraction(planningNow) || (!planningFromVehicle && (lp.soc_source === 'assumed' || lp.soc_source === 'completed'));
   const vehicleGoal = lp.schedule?.finish_at_vehicle_limit === true || lp.finish_at_vehicle_limit === true;
   const goal = vehicleGoal ? (limit ?? 1) : (lp.schedule?.soc || lp.target_soc);
   const target = fraction(goal) && goal > 0 ? Math.min(goal, limit ?? 1) : null;

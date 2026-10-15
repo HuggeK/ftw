@@ -1,8 +1,10 @@
 package appproto
 
 import (
+	"reflect"
 	"testing"
 
+	"github.com/srcfl/ftw/go/internal/apiauth"
 	"github.com/srcfl/ftw/go/internal/control"
 )
 
@@ -187,7 +189,7 @@ func TestNewRefusesACapabilityNotInTheRegistry(t *testing.T) {
 	_, err := New(Config{
 		Clock: clock, Site: box, Info: box, Modes: box, Plans: box,
 		Codec: testCodec{}, Sender: rec,
-		Caller: ownerCaller(), Grants: newGrants(),
+		Caller: ownerCaller(), Grants: newGrants(), Commands: NewCmdLog(),
 		Caps: []string{"status.core", "status.kore"},
 	})
 	if err == nil {
@@ -252,5 +254,77 @@ func TestSubWhileBootingIsRefusedWithARetryableCode(t *testing.T) {
 	}
 	if h.Subscribed() {
 		t.Fatal("a booting box accepted a subscription")
+	}
+}
+
+// Every role reads FTW Cloud, so every role learns the box's key, home id,
+// boot and names. The hook answers nil while FTW Cloud is off, and hello_ok
+// then says nothing about it.
+func TestHelloOKCarriesTheCloudSessionForEveryRole(t *testing.T) {
+	session := &CloudSession{
+		PK: append([]byte{4}, make([]byte, 64)...), Home: "abcdefghijklmnopqrstuvwxyz",
+		Boot:       make([]byte, 16),
+		Sources:    map[string]string{"AAAAAAAAAAA": "meter.p1"},
+		Loadpoints: map[string]string{"BBBBBBBBBBB": "garage"},
+	}
+	for _, c := range []struct {
+		name   string
+		caller apiauth.Caller
+		hook   func() *CloudSession
+		want   *CloudSession
+	}{
+		{"owner", ownerCaller(), func() *CloudSession { return session }, session},
+		{"viewer", viewerCaller(), func() *CloudSession { return session }, session},
+		{"FTW Cloud off", ownerCaller(), func() *CloudSession { return nil }, nil},
+		{"no uplink", viewerCaller(), nil, nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h, _, rec, _ := newRig(t)
+			h.cfg.Caller, h.cfg.Cloud = c.caller, c.hook
+			deliver(t, h, MsgHello, nil, Hello{Proto: ProtoRange{Min: 0, Max: ProtoMax}})
+			ok := body[HelloOK](t, rec.only(t, MsgHelloOK))
+			if !reflect.DeepEqual(ok.Cloud, c.want) {
+				t.Fatalf("cloud = %+v, want %+v", ok.Cloud, c.want)
+			}
+		})
+	}
+}
+
+// An app too old for full mode gets the frozen subset, and FTW Cloud is not in
+// it.
+func TestFloorModeLeavesTheCloudSessionOut(t *testing.T) {
+	h, _, rec, _ := newRig(t)
+	h.cfg.Cloud = func() *CloudSession {
+		t.Fatal("floor mode asked for FTW Cloud's session information")
+		return nil
+	}
+	deliver(t, h, MsgHello, nil, Hello{Proto: ProtoRange{Min: 0, Max: ProtoFloor}})
+	if ok := body[HelloOK](t, rec.only(t, MsgHelloOK)); ok.Cloud != nil {
+		t.Fatalf("floor hello_ok carries %+v", ok.Cloud)
+	}
+}
+
+// The field rides under one key, so an older app skips it whole.
+func TestTheCloudSessionWireNames(t *testing.T) {
+	raw, err := Marshal(HelloOK{Cloud: &CloudSession{PK: []byte{4}, Home: "h", Boot: []byte{1},
+		Sources: map[string]string{"s": "d"}, Loadpoints: map[string]string{"l": "p"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var generic map[string]any
+	if err := Unmarshal(raw, &generic); err != nil {
+		t.Fatal(err)
+	}
+	cloud, ok := generic["cloud"].(map[any]any)
+	if !ok {
+		t.Fatalf("hello_ok keys %v", generic)
+	}
+	for _, k := range []string{"pk", "home", "boot", "sources", "loadpoints"} {
+		if _, ok := cloud[k]; !ok {
+			t.Fatalf("cloud has no %q: %v", k, cloud)
+		}
+	}
+	if len(cloud) != 5 {
+		t.Fatalf("cloud has %d keys: %v", len(cloud), cloud)
 	}
 }

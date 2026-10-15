@@ -19,7 +19,7 @@ import (
 // executable. Core never loads the old engine. The caller must stop Core and
 // hold the source engine's file lock until conversion finishes.
 // Original databases and Parquet files are never removed or rewritten here.
-func ConvertBetaHistory(ctx context.Context, statePath string, source *sql.DB, report func(string)) error {
+func ConvertBetaHistory(ctx context.Context, statePath string, source *sql.DB, report func(string), coldOverride ...string) error {
 	// A writable connection can checkpoint an existing state WAL when an
 	// interrupted attempt closes, changing its own source fingerprint. Keep
 	// the source read-only until the verified destination can be selected.
@@ -29,6 +29,10 @@ func ConvertBetaHistory(ctx context.Context, statePath string, source *sql.DB, r
 	}
 	defer cfg.Close()
 	cfg.SetMaxOpenConns(1)
+	cold, err := betaConversionColdDir(ctx, cfg, statePath, coldOverride)
+	if err != nil {
+		return err
+	}
 	var generation string
 	if err := cfg.QueryRowContext(ctx, `SELECT value FROM config WHERE key='history_duckdb_generation'`).Scan(&generation); err != nil {
 		return fmt.Errorf("read beta history generation: %w", err)
@@ -62,9 +66,23 @@ func ConvertBetaHistory(ctx context.Context, statePath string, source *sql.DB, r
 				err = errors.New("published history failed integrity check")
 			}
 		}
+		var summarized int
+		var coldErr error
+		if err == nil {
+			err = done.QueryRowContext(ctx, `SELECT COUNT(*) FROM history_migrations WHERE name=?`, convertedChartSummaries).Scan(&summarized)
+		}
+		if err == nil && summarized != 0 {
+			coldErr = verifyConvertedColdFiles(ctx, done, cold)
+		}
 		done.Close()
 		if err != nil {
 			return errors.New("history.db already exists without a matching conversion receipt; preserve it and investigate")
+		}
+		if summarized == 0 {
+			return errors.New(incompleteConvertedCharts)
+		}
+		if coldErr != nil {
+			return coldErr
 		}
 		if selected == generation {
 			return nil
@@ -81,7 +99,7 @@ func ConvertBetaHistory(ctx context.Context, statePath string, source *sql.DB, r
 	if report != nil {
 		report("fingerprint beta sources")
 	}
-	sourceHash, err := betaSourceHash(ctx, statePath)
+	sourceHash, err := betaSourceHash(ctx, statePath, cold)
 	if err != nil {
 		return err
 	}
@@ -176,6 +194,9 @@ func ConvertBetaHistory(ctx context.Context, statePath string, source *sql.DB, r
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	if err := mergeBetaColdFiles(ctx, dest, cold, report); err != nil {
+		return err
+	}
 	// This unpublished destination has no live readers. A rollback journal
 	// avoids keeping a second full index in WAL while CREATE INDEX commits.
 	// SQLite rolls back an interrupted build before a later resume opens WAL.
@@ -192,15 +213,18 @@ func ConvertBetaHistory(ctx context.Context, statePath string, source *sql.DB, r
 	if _, err := dest.ExecContext(ctx, sampleTimeIndexSQL); err != nil {
 		return err
 	}
-	afterHash, err := betaSourceHash(ctx, statePath)
+	if err := summarizeConvertedSamples(ctx, dest, report); err != nil {
+		return fmt.Errorf("summarize converted samples: %w", err)
+	}
+	afterHash, err := betaSourceHash(ctx, statePath, cold)
 	if err != nil {
 		return err
 	}
 	if afterHash != sourceHash {
 		return errors.New("beta source changed during conversion; stop all writers and preserve the partial copy")
 	}
-	// Hourly aggregates are rebuilt from all samples in Core. This does not
-	// reinterpret counters as energy; the copied ledger retains its provenance.
+	// Core retires raw rows on its first start. All chart summaries must be
+	// durable before publication; the copied ledger keeps its provenance.
 	if _, err := dest.ExecContext(ctx, `INSERT OR IGNORE INTO history_migrations(name) VALUES (?),('sqlite-v1'),(?)`, "generation:"+generation, "beta-converted:"+generation); err != nil {
 		return err
 	}
@@ -226,7 +250,7 @@ func ConvertBetaHistory(ctx context.Context, statePath string, source *sql.DB, r
 	if err := os.Chmod(tmp, 0600); err != nil {
 		return err
 	}
-	if err := writeConversionReceipt(ctx, tmp, destPath, sourceHash, generation); err != nil {
+	if err := writeConversionReceipt(ctx, tmp, destPath, sourceHash, generation, cold); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp, destPath); err != nil {
@@ -787,7 +811,7 @@ func BetaHistoryDatabasePath(statePath string) string {
 	}
 	return strings.TrimSuffix(statePath, filepath.Ext(statePath)) + ".history.duckdb"
 }
-func betaSourceHash(ctx context.Context, statePath string) (string, error) {
+func betaSourceHash(ctx context.Context, statePath string, coldDirs ...string) (string, error) {
 	oldPath := BetaHistoryDatabasePath(statePath)
 	fingerprint := sha256.New()
 	for _, path := range []string{statePath, statePath + "-wal", oldPath, oldPath + ".wal", hotHistoryPath(statePath), hotHistoryPath(statePath) + "-wal"} {
@@ -804,6 +828,19 @@ func betaSourceHash(ctx context.Context, statePath string) (string, error) {
 		}
 		fmt.Fprintf(fingerprint, "%s:%s\n", filepath.Base(path), digest)
 	}
+	if len(coldDirs) > 0 {
+		paths, err := conversionColdPaths(coldDirs[0])
+		if err != nil {
+			return "", err
+		}
+		for _, path := range paths {
+			digest, err := historyFileHashContext(ctx, path)
+			if err != nil {
+				return "", err
+			}
+			fmt.Fprintf(fingerprint, "cold:%s:%s\n", parquetSummaryKey(path), digest)
+		}
+	}
 	return fmt.Sprintf("%x", fingerprint.Sum(nil)), nil
 }
 
@@ -811,14 +848,19 @@ type conversionReceipt struct {
 	Generation    string `json:"generation"`
 	SourceSHA256  string `json:"source_sha256"`
 	HistorySHA256 string `json:"history_sha256"`
+	ColdDir       string `json:"cold_dir,omitempty"`
 }
 
-func writeConversionReceipt(ctx context.Context, tmp, dest, sourceHash, generation string) error {
+func writeConversionReceipt(ctx context.Context, tmp, dest, sourceHash, generation string, coldDirs ...string) error {
 	digest, err := historyFileHashContext(ctx, tmp)
 	if err != nil {
 		return err
 	}
-	data, err := json.Marshal(conversionReceipt{generation, sourceHash, digest})
+	var cold string
+	if len(coldDirs) > 0 {
+		cold = coldDirs[0]
+	}
+	data, err := json.Marshal(conversionReceipt{Generation: generation, SourceSHA256: sourceHash, HistorySHA256: digest, ColdDir: cold})
 	if err != nil {
 		return err
 	}
@@ -850,7 +892,7 @@ func verifyPublishedConversion(ctx context.Context, statePath, dest, generation 
 	if err := json.Unmarshal(data, &receipt); err != nil {
 		return err
 	}
-	sourceHash, err := betaSourceHash(ctx, statePath)
+	sourceHash, err := betaSourceHash(ctx, statePath, receipt.ColdDir)
 	if err != nil {
 		return err
 	}

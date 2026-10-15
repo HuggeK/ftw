@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
+	"math"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -17,6 +19,7 @@ import (
 	"github.com/srcfl/ftw/go/internal/config"
 	"github.com/srcfl/ftw/go/internal/control"
 	"github.com/srcfl/ftw/go/internal/loadpoint"
+	"github.com/srcfl/ftw/go/internal/localzone"
 	"github.com/srcfl/ftw/go/internal/mpc"
 	"github.com/srcfl/ftw/go/internal/notifications"
 	"github.com/srcfl/ftw/go/internal/prices"
@@ -58,9 +61,10 @@ func (a *appSite) Snapshot() appproto.Snapshot {
 	mode := a.ctrl.Mode
 	siteMeterDriver := a.ctrl.SiteMeterDriver
 	rev := a.revision.Observe(a.ctrl)
+	fuseA, fusePhases := a.ctrl.SiteFuseAmps, a.ctrl.SiteFusePhases
 	a.ctrlMu.Unlock()
 
-	snap := appproto.Snapshot{Mode: mode, ControlRev: rev}
+	snap := appproto.Snapshot{Mode: mode, ControlRev: rev, FuseA: fuseA}
 
 	uptimeMs := time.Since(a.started).Milliseconds()
 	seen := map[string]bool{}
@@ -96,6 +100,7 @@ func (a *appSite) Snapshot() appproto.Snapshot {
 		if health := a.tel.DriverHealth(siteMeterDriver); health != nil && health.IsOnline() {
 			if reading := a.tel.Get(siteMeterDriver, telemetry.DerMeter); reading != nil {
 				snap.GridW = reading.SmoothedW
+				snap.GridPhaseA = gridPhaseAmps(reading, fusePhases)
 			}
 		} else {
 			// The invariant is that stale site-meter data stops dispatch.
@@ -165,11 +170,65 @@ func (a *appSite) Snapshot() appproto.Snapshot {
 	return snap
 }
 
+// gridPhaseAmps reads the site meter's current on each of the site's phases
+// and gives it the site convention's sign.
+//
+// Meters differ here. Some sign the current; many, Sungrow among them, give
+// only its size. The power on the same phase already carries the site's
+// sign, because the driver converted it, so where the meter reports that
+// power its sign is the phase's direction. Otherwise the driver's own sign
+// stands. This converts no vendor sign: it copies a site sign onto a size,
+// and a current the driver already signed keeps its sign.
+//
+// Only the site's phases are read, in L1 to L3 order, as the fuse guard
+// reads them: a one-phase site owns no L2, whatever the payload holds.
+func gridPhaseAmps(r *telemetry.DerReading, phases int) [3]*float64 {
+	var out [3]*float64
+	if r == nil || len(r.Data) == 0 {
+		return out
+	}
+	var d struct {
+		L1A *float64 `json:"l1_a"`
+		L2A *float64 `json:"l2_a"`
+		L3A *float64 `json:"l3_a"`
+		L1W *float64 `json:"l1_w"`
+		L2W *float64 `json:"l2_w"`
+		L3W *float64 `json:"l3_w"`
+	}
+	if err := json.Unmarshal(r.Data, &d); err != nil {
+		return out
+	}
+	if phases <= 0 || phases > len(out) {
+		phases = len(out)
+	}
+	amps := [3]*float64{d.L1A, d.L2A, d.L3A}
+	watts := [3]*float64{d.L1W, d.L2W, d.L3W}
+	finite := func(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
+	for i := 0; i < phases; i++ {
+		if amps[i] == nil || !finite(*amps[i]) {
+			continue
+		}
+		a := *amps[i]
+		if w := watts[i]; w != nil && finite(*w) && *w != 0 {
+			a = math.Copysign(math.Abs(a), *w)
+		}
+		out[i] = &a
+	}
+	return out
+}
+
 // appBoxInfo is what the box calls itself.
 type appBoxInfo struct {
 	id    string
 	build string
 	tz    string
+}
+
+// newAppBoxInfo names the box's own zone as the host sets it. The app renders
+// plan slot times in it, so a box in Stockholm and a phone abroad still agree
+// on when tonight's cheap hours are.
+func newAppBoxInfo(id, build string) appBoxInfo {
+	return appBoxInfo{id: id, build: build, tz: localzone.Name()}
 }
 
 func (a appBoxInfo) Identity() appproto.Identity {
@@ -414,6 +473,22 @@ func (a *appLoadpoints) SetSoC(id string, soc float64) bool {
 	return true
 }
 
+// Readings is every charger as the manager holds it. The car's level counts
+// only while it is plugged in: unplugged, the manager's number is the last
+// session's, and a watch would draw it as now.
+func (a *appLoadpoints) Readings() []appproto.LoadpointReading {
+	states := a.mgr.States()
+	out := make([]appproto.LoadpointReading, 0, len(states))
+	for _, st := range states {
+		out = append(out, appproto.LoadpointReading{
+			ID: st.ID, Plugged: st.PluggedIn,
+			SoC: st.CurrentSoC, SoCKnown: st.PluggedIn,
+			PowerW: st.CurrentPowerW,
+		})
+	}
+	return out
+}
+
 func (a *appLoadpoints) ObservedSoC(id string) (float64, bool) {
 	st, ok := a.mgr.State(id)
 	return st.CurrentSoC, ok
@@ -511,6 +586,7 @@ func startAppLink(
 	siteMeterStale time.Duration,
 	gateway *lateAPI,
 	webPush *notifications.WebPush,
+	cloud *cloudSession,
 ) (*appenroll.Identity, *appuplink.Uplink, bool, error) {
 	enabled := cfg != nil && cfg.AppLink.On()
 
@@ -522,16 +598,11 @@ func startAppLink(
 		return enroll, nil, false, nil
 	}
 
-	// The box's own zone, read from the host. The app renders plan slot times
-	// in it, so a box in Stockholm and a phone abroad still agree on when
-	// tonight's cheap hours are.
-	tz := time.Now().Location().String()
-
 	site := &appSite{
 		tel: tel, ctrl: ctrl, ctrlMu: ctrlMu, revision: revision,
 		started: processStarted, siteMeterStale: siteMeterStale,
 	}
-	info := appBoxInfo{id: boxID, build: build, tz: tz}
+	info := newAppBoxInfo(boxID, build)
 	modes := &appModes{ctrl: ctrl, ctrlMu: ctrlMu, state: st, mpc: planner, prefs: prefs}
 	plans := &appPlans{planner: planner, ctrl: ctrl, ctrlMu: ctrlMu}
 
@@ -583,17 +654,24 @@ func startAppLink(
 		deadman = deadmanFromState{st: st, wp: webPush}
 	}
 
-	uplink, err := appuplink.New(appuplink.Options{
-		Enroll:  enroll,
-		Deadman: deadman,
-		Handler: func(
+	// One command log for the box. Sessions come and go with their sockets,
+	// and a retry in the next session must meet the id the last one took.
+	cmds := appproto.NewCmdLog()
+
+	// The box takes a watch through the relay's exchange (ADR 0009), and
+	// says so, so a phone offers "Add watch".
+	caps = append(caps, appproto.CapCmdExchange)
+
+	// handlerFor builds one handler for one session: a phone's stream, or a
+	// watch's exchange. They share the ports above, which are read-only
+	// apart from the mode and the command log, and the mode goes through
+	// control's own validation.
+	handlerFor := func(exchange bool) appuplink.HandlerBuilder {
+		return func(
 			sender appproto.Sender,
 			caller apiauth.Caller,
 			grants appproto.GrantReader,
 		) (*appproto.Handler, error) {
-			// One handler per app session. They share the ports above, which
-			// are read-only apart from the mode, and the mode goes through
-			// control's own validation.
 			return appproto.New(appproto.Config{
 				Clock:        appproto.SystemClock{StartedAt: site.started, Source: "ntp"},
 				Site:         site,
@@ -607,9 +685,14 @@ func startAppLink(
 				API:          gateway,
 				Caller:       caller,
 				Grants:       grants,
-				Caps:         caps,
-				Codec:        appuplink.Codec(),
-				Sender:       sender,
+				Commands:     cmds,
+				Exchange:     exchange,
+				// FTW Cloud is asked per session: its link is bound after
+				// this returns, and its grant moves while the box runs.
+				Caps:   cloud.caps(caps),
+				Cloud:  cloud.info,
+				Codec:  appuplink.Codec(),
+				Sender: sender,
 				// The three frozen power fields point at the source whose
 				// freshness governs them. The site meter is the only one the
 				// box can name without knowing the site's hardware.
@@ -617,7 +700,14 @@ func startAppLink(
 				SrcPV:      siteMeterName(ctrl, ctrlMu),
 				SrcBattery: siteMeterName(ctrl, ctrlMu),
 			})
-		},
+		}
+	}
+
+	uplink, err := appuplink.New(appuplink.Options{
+		Enroll:          enroll,
+		Deadman:         deadman,
+		Handler:         handlerFor(false),
+		ExchangeHandler: handlerFor(true),
 	})
 	if err != nil {
 		return enroll, nil, enabled, err
@@ -718,6 +808,12 @@ func (a *appLinkAPI) MintPairingCode(role string) ([]byte, time.Time, error) {
 	return code, expires, appLinkError(err)
 }
 
+// MintWatchCode issues a watch code bound to the owner phone that asked.
+func (a *appLinkAPI) MintWatchCode(parentID string) ([]byte, time.Time, error) {
+	code, expires, err := a.enroll.MintWatchCode(parentID, appenroll.WatchTTL)
+	return code, expires, appLinkError(err)
+}
+
 func (a *appLinkAPI) MintSpokenCode(role string) (string, time.Time, error) {
 	code, expires, err := a.enroll.MintSpokenCode(role)
 	return code, expires, appLinkError(err)
@@ -727,7 +823,17 @@ func (a *appLinkAPI) EnrollmentURL(code []byte, lanHint string) (string, error) 
 	return a.enroll.EnrollmentURL(code, lanHint)
 }
 
-func (a *appLinkAPI) AuthorisedCount() int { return a.enroll.AuthorisedCount() }
+// AuthorisedCount is how many phones are paired. A watch rides on its phone
+// and is not counted, so the page's "2 phones paired" stays true.
+func (a *appLinkAPI) AuthorisedCount() int {
+	phones := 0
+	for _, d := range a.enroll.Devices() {
+		if d.Parent == "" {
+			phones++
+		}
+	}
+	return phones
+}
 
 func (a *appLinkAPI) Devices() []api.AppDevice {
 	infos := a.enroll.Devices()
@@ -735,7 +841,7 @@ func (a *appLinkAPI) Devices() []api.AppDevice {
 	for _, d := range infos {
 		out = append(out, api.AppDevice{
 			ID: d.ID, AddedAtMs: d.AddedAtMs, LastSeenMs: d.LastSeenMs,
-			Role: d.Role, LastOwner: d.LastOwner,
+			Role: d.Role, LastOwner: d.LastOwner, Parent: d.Parent,
 		})
 	}
 	return out
@@ -753,34 +859,39 @@ func (a *appLinkAPI) SetDeviceRole(id, role string) error {
 	return appLinkError(a.enroll.SetRole(id, role))
 }
 
-// RevokeDevice locks one phone out. atTheBox is the API's word for the door
-// the request came through, and it is the only thing that decides whether the
-// last owner may go; Presence is enrollment's word for the same fact.
+// RevokeDevice locks one device out, and a phone's watches with it. atTheBox
+// is the API's word for the door the request came through, and it is the only
+// thing that decides whether the last owner may go; Presence is enrollment's
+// word for the same fact.
 func (a *appLinkAPI) RevokeDevice(id string, atTheBox bool) error {
-	key, err := a.enroll.Revoke(id, appenroll.Presence(atTheBox))
+	removed, err := a.enroll.Revoke(id, appenroll.Presence(atTheBox))
 	if err != nil {
 		return appLinkError(err)
 	}
-	// Forgetting the key locks the next handshake out; dropping the live
-	// sessions locks out the one running now. Both, or "remove" quietly
-	// means "remove within the hour".
-	if a.uplink != nil && key != nil {
-		a.uplink.DropSessionsByAppKey(key)
-	}
-	// A phone that may no longer read the house may no longer be told
-	// about it: its push subscriptions go with the grant, and the relay's
-	// pre-encrypted farewell rows for them go on the resync.
-	if a.st != nil {
-		n, err := a.st.DeletePushSubscriptionsByDevice(id)
-		switch {
-		case err != nil:
-			slog.Warn("could not sweep a revoked phone's push subscriptions", "device", id, "err", err)
-		case n > 0:
-			slog.Info("swept a revoked phone's push subscriptions", "device", id, "rows", n)
-			if a.uplink != nil {
-				go a.uplink.ResyncDeadman()
+	var swept int64
+	for _, gone := range removed {
+		// Forgetting the key locks the next handshake out; dropping the
+		// live sessions locks out the one running now. Both, or "remove"
+		// quietly means "remove within the hour".
+		if a.uplink != nil {
+			a.uplink.DropSessionsByAppKey(gone.Key)
+		}
+		// A device that may no longer read the house may no longer be told
+		// about it: its push subscriptions go with the grant, and the
+		// relay's pre-encrypted farewell rows for them go on the resync.
+		if a.st != nil {
+			n, err := a.st.DeletePushSubscriptionsByDevice(gone.ID)
+			switch {
+			case err != nil:
+				slog.Warn("could not sweep a revoked device's push subscriptions", "device", gone.ID, "err", err)
+			case n > 0:
+				slog.Info("swept a revoked device's push subscriptions", "device", gone.ID, "rows", n)
+				swept += n
 			}
 		}
+	}
+	if swept > 0 && a.uplink != nil {
+		go a.uplink.ResyncDeadman()
 	}
 	return nil
 }
@@ -800,6 +911,10 @@ func appLinkError(err error) error {
 		return api.ErrLastAppOwnerProtected
 	case errors.Is(err, appenroll.ErrUnknownRole):
 		return api.ErrUnknownAppRole
+	case errors.Is(err, appenroll.ErrWatchRole):
+		return api.ErrWatchAppRole
+	case errors.Is(err, appenroll.ErrWatchNeedsOwner):
+		return api.ErrWatchNeedsOwner
 	default:
 		return err
 	}

@@ -59,3 +59,9 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.1 // indirect
 )
+
+// The wire format shared with FTW Cloud is its own module, Apache-2.0, in
+// ./protocol. It has no tags yet, so the box builds it from this checkout.
+require github.com/srcfl/ftw/go/protocol v0.0.0-00010101000000-000000000000
+
+replace github.com/srcfl/ftw/go/protocol => ./protocol

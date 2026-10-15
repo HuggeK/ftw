@@ -77,6 +77,7 @@ func newTieredSession(t *testing.T, role string) *tieredRig {
 			Epoch:   1,
 		},
 		Grants:     stillEnrolled{role: role},
+		Commands:   appproto.NewCmdLog(),
 		SrcGrid:    "meter",
 		SrcPV:      "meter",
 		SrcBattery: "meter",

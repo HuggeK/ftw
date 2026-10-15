@@ -7,6 +7,8 @@
   script are deleted, not deprecated
 - Preserves: ADR 0003's retirement of the earlier remote-access implementation.
   Nothing from it returns
+- Revisited by: [ADR 0008](0008-ftw-cloud.md), proposed, which adds a second,
+  read-only path for homes that turn FTW Cloud on
 
 ## Context
 

@@ -39,6 +39,9 @@ func (s *Store) integrateHistoryRange(ctx context.Context, since, until int64, s
 		out.ImportWh += r.imp
 		out.ExportWh += r.exp
 		out.LoadWh += r.load
+		if r.missing&(MissingGrid|MissingLoad) != 0 {
+			return nil
+		}
 		out.HistoryCoveredMs += r.covered
 		for idx < len(slots) && slots[idx].EndMs <= r.first {
 			idx++
@@ -90,6 +93,9 @@ func (s *Store) ImportWhIntervals(ctx context.Context, intervals [][2]int64) ([]
 			idx++
 		}
 		if idx < len(intervals) && intervals[idx][0] <= r.first && intervals[idx][1] >= r.last {
+			if r.missing&MissingGrid != 0 {
+				return nil
+			}
 			wh[idx] += r.imp
 			covered[idx] += r.covered
 		}

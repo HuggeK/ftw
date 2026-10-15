@@ -135,7 +135,15 @@ func (b BucketSummary) validate() error {
 
 // Retry receipts wrap these updates, so an uncertain commit cannot add the
 // same tick twice. Collapse duplicate source timestamps before aggregation.
-func (s *Store) insertAggregateSamples(ctx context.Context, tx *sql.Tx, rs []resolvedSample) error {
+func (s *Store) insertAggregateSamples(ctx context.Context, tx *sql.Tx, rs []resolvedSample) (err error) {
+	return s.aggregateSamples(ctx, tx, rs, true)
+}
+
+// Offline conversion already holds the complete raw dataset. It builds its
+// summaries separately, then keeps any older hours whose raw rows expired.
+func (s *Store) aggregateSamples(ctx context.Context, tx *sql.Tx, rs []resolvedSample, updateSeriesHours bool) (err error) {
+	timing := newHistoryWriteTiming("group_samples")
+	defer func() { err = timing.failure(err) }()
 	unique := make(map[[3]int64]resolvedSample, len(rs))
 	for _, r := range rs {
 		k := [3]int64{r.dID, r.mID, r.ts}
@@ -163,11 +171,13 @@ func (s *Store) insertAggregateSamples(ctx context.Context, tx *sql.Tx, rs []res
 		hotKey := bucketKey{r.dID, r.mID, bucketStart(r.ts, HistoryResolutionMS), HistoryResolutionMS}
 		seen, loaded := seenByBucket[hotKey]
 		if !loaded {
+			timing.next("read_bucket")
 			err := tx.QueryRowContext(ctx, `SELECT seen_ms FROM ts_buckets WHERE driver_id=? AND metric_id=? AND start_ms=? AND resolution_ms=?`, hotKey.driver, hotKey.metric, hotKey.start, hotKey.width).Scan(&seen)
 			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return err
 			}
 		}
+		timing.next("group_samples")
 		var added bool
 		seen, added = addBucketTimestamp(seen, r.ts-hotKey.start)
 		seenByBucket[hotKey] = seen
@@ -184,13 +194,17 @@ func (s *Store) insertAggregateSamples(ctx context.Context, tx *sql.Tx, rs []res
 		addSeriesHourSample(hours, r.dID, r.mID, r.ts, r.v)
 	}
 	// Seed legacy source hours before adding new summaries during migration.
-	if err := s.seedSeriesHours(ctx, tx, rs); err != nil {
-		return err
+	if updateSeriesHours {
+		timing.next("seed_hours")
+		if err := s.seedSeriesHours(ctx, tx, rs); err != nil {
+			return err
+		}
 	}
 	for k, b := range groups {
 		if err := b.validate(); err != nil {
 			return err
 		}
+		timing.next("check_archive")
 		var sealed int
 		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM ts_bucket_days WHERE day_ms=? AND through_ms>?)`, bucketStart(k.start, 24*time.Hour.Milliseconds()), k.start).Scan(&sealed); err != nil {
 			return err
@@ -198,6 +212,7 @@ func (s *Store) insertAggregateSamples(ctx context.Context, tx *sql.Tx, rs []res
 		if sealed != 0 {
 			return fmt.Errorf("history interval already archived: %d; correction requires a complete bucket", k.start)
 		}
+		timing.next("write_bucket")
 		_, err := tx.ExecContext(ctx, `INSERT INTO ts_buckets(driver_id,metric_id,start_ms,resolution_ms,first_ms,last_ms,n,sum_value,min_value,max_value,last_value,seen_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
  ON CONFLICT(driver_id,metric_id,start_ms,resolution_ms) DO UPDATE SET
  seen_ms=excluded.seen_ms,first_ms=MIN(first_ms,excluded.first_ms),last_ms=MAX(last_ms,excluded.last_ms),
@@ -208,6 +223,7 @@ func (s *Store) insertAggregateSamples(ctx context.Context, tx *sql.Tx, rs []res
 			return err
 		}
 		if k.width == HistoryResolutionMS {
+			timing.next("write_latest")
 			// Keep one actual observation per series after its chart buckets
 			// leave SQLite. Status codes must never come from a bucket mean.
 			if _, err := tx.ExecContext(ctx, `INSERT INTO ts_latest(driver_id,metric_id,ts_ms,value) VALUES(?,?,?,?)
@@ -216,10 +232,15 @@ func (s *Store) insertAggregateSamples(ctx context.Context, tx *sql.Tx, rs []res
 			}
 		}
 	}
+	timing.next("write_aggregate_hours")
 	if err := upsertSeriesHoursTableTx(ctx, tx, "ts_aggregate_hours", hours); err != nil {
 		return err
 	}
-	return s.upsertSeriesHoursTx(ctx, tx, hours)
+	if updateSeriesHours {
+		timing.next("write_series_hours")
+		return s.upsertSeriesHoursTx(ctx, tx, hours)
+	}
+	return nil
 }
 
 func nonNilBytes(b []byte) []byte {

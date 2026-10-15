@@ -86,13 +86,28 @@ type APIGateway interface {
 // GrantReader is this session's enrolment, as it stands right now.
 //
 // Read on every privileged request rather than at the handshake, because a
-// socket outlives a revoke and it outlives a role change too. One string and
-// one integer behind a mutex that is already there.
+// socket outlives a revoke and it outlives a role change too. A few strings
+// and one integer behind a mutex that is already there.
 type GrantReader interface {
-	// Grant is what the enrolment currently carries: the role it holds and
-	// the epoch that answer was written under. ok is false when the device is
-	// no longer enrolled at all — a revoke is an absence, not a stale number.
-	Grant() (role string, epoch uint64, ok bool)
+	// Grant is what the enrolment currently carries. ok is false when the
+	// device is no longer enrolled at all — a revoke is an absence, not a
+	// stale number.
+	Grant() (Enrolment, bool)
+}
+
+// Enrolment is one device's grant as the box holds it this second.
+type Enrolment struct {
+	// Role is the registry role the device holds.
+	Role string
+	// Epoch is the version of the grant this answer was written under.
+	Epoch uint64
+	// ParentRole is the role held now by the phone that added a watch, and
+	// empty for a phone. A watch carries only what both roles carry.
+	ParentRole string
+	// Root is the subject whose command ids this device spends: empty for a
+	// phone, which spends its own, and the parent phone's for a watch. One
+	// intent sent by the watch and by its phone then acts once.
+	Root string
 }
 
 // --------------------------------------------------------------------------

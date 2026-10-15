@@ -34,6 +34,8 @@ const (
 
 var ensureBackupDiskSpace = state.EnsureDiskSpace
 
+var moveRestoreEntry = os.Rename
+
 // ComponentInventory records the independently versioned runtime that created
 // the backup. Driver artifacts themselves are also captured under data/.
 type ComponentInventory struct {
@@ -68,6 +70,8 @@ type Manifest struct {
 	CreatedAt     time.Time          `json:"created_at"`
 	DatabaseFile  string             `json:"database_file"`
 	DatabaseEntry string             `json:"database_entry"`
+	SourceDataDir string             `json:"source_data_dir,omitempty"`
+	ConfigFile    string             `json:"config_file,omitempty"`
 	Components    ComponentInventory `json:"components"`
 	Files         []FileEntry        `json:"files"`
 }
@@ -94,8 +98,9 @@ type Info struct {
 }
 
 type RestoreResult struct {
-	DataDir   string `json:"data_dir"`
-	SafetyDir string `json:"safety_dir,omitempty"`
+	DataDir        string `json:"data_dir"`
+	SafetyDir      string `json:"safety_dir,omitempty"`
+	SafetyComplete bool   `json:"safety_complete"`
 }
 
 // Inspect performs a full verification and returns stable archive metadata.
@@ -209,19 +214,19 @@ func Create(ctx context.Context, opts CreateOptions) (Info, error) {
 	}
 	databaseFile = filepath.ToSlash(databaseFile)
 	databaseEntry := "data/" + databaseFile + ".gz"
+	configPath := opts.ConfigPath
+	if configPath == "" {
+		configPath = filepath.Join(dataDir, "config.yaml")
+	}
+	configPath, err = filepath.Abs(configPath)
+	if err != nil {
+		return Info{}, err
+	}
+	configFile, err := filepath.Rel(dataDir, configPath)
+	if err != nil || configFile == ".." || strings.HasPrefix(configFile, ".."+string(filepath.Separator)) {
+		return Info{}, errors.New("backup config is outside data directory")
+	}
 	if hasStored {
-		configPath := opts.ConfigPath
-		if configPath == "" {
-			configPath = filepath.Join(dataDir, "config.yaml")
-		}
-		configPath, err = filepath.Abs(configPath)
-		if err != nil {
-			return Info{}, err
-		}
-		configFile, err := filepath.Rel(dataDir, configPath)
-		if err != nil || configFile == ".." || strings.HasPrefix(configFile, ".."+string(filepath.Separator)) {
-			return Info{}, errors.New("backup config is outside data directory")
-		}
 		databaseRef, err := filepath.Rel(filepath.Dir(configPath), filepath.Join(dataDir, databaseFile))
 		if err != nil {
 			return Info{}, err
@@ -290,6 +295,7 @@ func Create(ctx context.Context, opts CreateOptions) (Info, error) {
 	manifest := Manifest{
 		Format: Format, SchemaVersion: SchemaVersion, CreatedAt: created,
 		DatabaseFile: databaseFile, DatabaseEntry: databaseEntry,
+		SourceDataDir: dataDir, ConfigFile: filepath.ToSlash(configFile),
 		Components: opts.Components, Files: files,
 	}
 	if err := validateManifest(manifest); err != nil {
@@ -341,6 +347,7 @@ func backupExtraBytes(sources []sourceEntry) (int64, error) {
 func collectSources(dataDir, statePath, outputDir string) ([]sourceEntry, error) {
 	stateRel, _ := filepath.Rel(dataDir, statePath)
 	cacheRel, _ := filepath.Rel(dataDir, filepath.Join(filepath.Dir(statePath), "cache.db"))
+	cloudKeyRel, _ := filepath.Rel(dataDir, filepath.Join(filepath.Dir(statePath), "cloud.key"))
 	outputRel, outputInside := filepath.Rel(dataDir, outputDir)
 	if outputInside != nil || outputRel == ".." || strings.HasPrefix(outputRel, ".."+string(filepath.Separator)) {
 		outputRel = ""
@@ -399,6 +406,12 @@ func collectSources(dataDir, statePath, outputDir string) ([]sourceEntry, error)
 		// The live cache.db is never copied; Create archives a consistent
 		// copy instead. Restore moves all of them aside anyway.
 		if strings.HasPrefix(rel, stateRel+".snapshot") || rel == cacheRel || strings.HasPrefix(rel, cacheRel+"-") {
+			return nil
+		}
+		// FTW Cloud's key never goes into a backup. A box restored elsewhere
+		// must not speak for the old box's home: its grant reads as off until
+		// an owner turns FTW Cloud on again, under a new home id.
+		if rel == cloudKeyRel || rel == cloudKeyRel+".tmp" {
 			return nil
 		}
 		info, err := d.Info()
@@ -743,6 +756,12 @@ func validateManifest(manifest Manifest) error {
 	if manifest.CreatedAt.IsZero() || !safeDataPath(manifest.DatabaseEntry) || !safeRelativePath(manifest.DatabaseFile) {
 		return errors.New("backup: invalid manifest identity or database path")
 	}
+	if manifest.ConfigFile != "" && !safeRelativePath(manifest.ConfigFile) {
+		return errors.New("backup: invalid config path")
+	}
+	if manifest.SourceDataDir != "" && !filepath.IsAbs(manifest.SourceDataDir) {
+		return errors.New("backup: source data directory must be absolute")
+	}
 	seen := make(map[string]bool, len(manifest.Files))
 	symlinks := make(map[string]string)
 	databaseFound := false
@@ -858,7 +877,11 @@ func RestoreContents(archivePath, dataDir string, now time.Time) (RestoreResult,
 	if !info.IsDir() {
 		return RestoreResult{}, fmt.Errorf("backup: restore target is not a directory: %s", dataDir)
 	}
-	if _, err := verifyInWorkspace(archivePath, dataDir); err != nil {
+	if err := checkRestorePointsBeforeRestore(dataDir); err != nil {
+		return RestoreResult{}, err
+	}
+	manifest, err := verifyInWorkspace(archivePath, dataDir)
+	if err != nil {
 		return RestoreResult{}, err
 	}
 	staging, err := os.MkdirTemp(dataDir, ".ftw-restore-stage-")
@@ -866,8 +889,18 @@ func RestoreContents(archivePath, dataDir string, now time.Time) (RestoreResult,
 		return RestoreResult{}, err
 	}
 	defer os.RemoveAll(staging)
+	if err := writeRestoreStage(dataDir, staging, ""); err != nil {
+		return RestoreResult{}, fmt.Errorf("backup: record extraction phase: %w", err)
+	}
 	if err := extractArchive(archivePath, staging); err != nil {
 		return RestoreResult{}, err
+	}
+	seed := manifest.ConfigFile
+	if seed == "" {
+		seed = "config.yaml"
+	}
+	if err := config.RelocateBackup(staging, dataDir, manifest.SourceDataDir, manifest.DatabaseFile, seed); err != nil {
+		return RestoreResult{}, fmt.Errorf("backup: relocate settings: %w", err)
 	}
 	stamp := now.UTC()
 	if stamp.IsZero() {
@@ -883,27 +916,36 @@ func RestoreContents(archivePath, dataDir string, now time.Time) (RestoreResult,
 		_ = os.Remove(safetyDir)
 		return RestoreResult{}, err
 	}
+	if err := writeRestorePoint(safetyDir, current, false); err != nil {
+		return RestoreResult{}, fmt.Errorf("backup: record previous file list: %w", err)
+	}
+	if err := writeRestoreStage(dataDir, staging, filepath.Base(safetyDir)); err != nil {
+		return RestoreResult{}, fmt.Errorf("backup: record preservation phase: %w", err)
+	}
 	movedCurrent := make([]string, 0, len(current))
 	for _, name := range current {
-		if err := os.Rename(filepath.Join(dataDir, name), filepath.Join(safetyDir, name)); err != nil {
-			rollbackErr := restoreMoveSet(safetyDir, dataDir, movedCurrent)
-			_ = os.Remove(safetyDir)
+		if err := moveRestoreEntry(filepath.Join(dataDir, name), filepath.Join(safetyDir, name)); err != nil {
+			rollbackErr := rollbackRestorePoint(safetyDir, dataDir, movedCurrent)
 			return RestoreResult{}, errors.Join(fmt.Errorf("backup: preserve current %s: %w", name, err), rollbackErr)
 		}
 		movedCurrent = append(movedCurrent, name)
 	}
+	if err := completeRestorePoint(dataDir, safetyDir, current); err != nil {
+		rollbackErr := rollbackRestorePoint(safetyDir, dataDir, movedCurrent)
+		return RestoreResult{}, errors.Join(fmt.Errorf("backup: confirm previous files: %w", err), rollbackErr)
+	}
 
 	restored, err := topLevelEntries(staging)
 	if err != nil {
-		rollbackErr := restoreMoveSet(safetyDir, dataDir, movedCurrent)
+		rollbackErr := rollbackRestorePoint(safetyDir, dataDir, movedCurrent)
 		return RestoreResult{}, errors.Join(err, rollbackErr)
 	}
 	activated := make([]string, 0, len(restored))
 	for _, name := range restored {
-		if err := os.Rename(filepath.Join(staging, name), filepath.Join(dataDir, name)); err != nil {
+		if err := moveRestoreEntry(filepath.Join(staging, name), filepath.Join(dataDir, name)); err != nil {
 			rollbackErr := errors.Join(
 				restoreMoveSet(dataDir, staging, activated),
-				restoreMoveSet(safetyDir, dataDir, movedCurrent),
+				rollbackRestorePoint(safetyDir, dataDir, movedCurrent),
 			)
 			return RestoreResult{}, errors.Join(fmt.Errorf("backup: activate restored %s: %w", name, err), rollbackErr)
 		}
@@ -912,12 +954,15 @@ func RestoreContents(archivePath, dataDir string, now time.Time) (RestoreResult,
 	if err := syncDir(dataDir); err != nil {
 		rollbackErr := errors.Join(
 			restoreMoveSet(dataDir, staging, activated),
-			restoreMoveSet(safetyDir, dataDir, movedCurrent),
+			rollbackRestorePoint(safetyDir, dataDir, movedCurrent),
 			syncDir(dataDir),
 		)
 		return RestoreResult{}, errors.Join(fmt.Errorf("backup: sync activated restore: %w", err), rollbackErr)
 	}
-	return RestoreResult{DataDir: dataDir, SafetyDir: safetyDir}, nil
+	if err := retireRestoreStaging(dataDir, staging); err != nil {
+		return RestoreResult{}, fmt.Errorf("backup: archive active but old extraction copies could not be retained separately: %w", err)
+	}
+	return RestoreResult{DataDir: dataDir, SafetyDir: safetyDir, SafetyComplete: true}, nil
 }
 
 // RevertContents puts a RestoreContents safety directory back into service.
@@ -936,12 +981,16 @@ func RevertContents(dataDir, safetyDir string) (RestoreResult, error) {
 	if filepath.Dir(safetyDir) != dataDir || !strings.HasPrefix(filepath.Base(safetyDir), ".ftw-pre-restore-") {
 		return RestoreResult{}, errors.New("backup: safety directory is not a direct FTW restore point")
 	}
-	if info, statErr := os.Stat(safetyDir); statErr != nil || !info.IsDir() {
+	if info, statErr := os.Lstat(safetyDir); statErr != nil || !info.IsDir() {
 		if statErr != nil {
 			return RestoreResult{}, statErr
 		}
 		return RestoreResult{}, errors.New("backup: safety path is not a directory")
 	}
+	if err := verifyRestorePoint(safetyDir); err != nil {
+		return RestoreResult{}, err
+	}
+	currentComplete := currentRestoreStateComplete(dataDir)
 	rejected, err := os.MkdirTemp(dataDir, ".ftw-rejected-restore-")
 	if err != nil {
 		return RestoreResult{}, err
@@ -956,29 +1005,48 @@ func RevertContents(dataDir, safetyDir string) (RestoreResult, error) {
 	if err != nil {
 		return RestoreResult{}, err
 	}
+	if err := writeRestorePoint(rejected, current, false); err != nil {
+		return RestoreResult{}, fmt.Errorf("backup: record rejected file list: %w", err)
+	}
+	// Retain moved data even if an error prevents rollback. A failed revert
+	// must never delete readings that are absent from the source archive.
+	keepRejected = true
 	movedCurrent := make([]string, 0, len(current))
 	for _, name := range current {
-		if err := os.Rename(filepath.Join(dataDir, name), filepath.Join(rejected, name)); err != nil {
-			rollbackErr := restoreMoveSet(rejected, dataDir, movedCurrent)
+		if err := moveRestoreEntry(filepath.Join(dataDir, name), filepath.Join(rejected, name)); err != nil {
+			rollbackErr := rollbackRestorePoint(rejected, dataDir, movedCurrent)
 			return RestoreResult{}, errors.Join(fmt.Errorf("backup: stage rejected %s: %w", name, err), rollbackErr)
 		}
 		movedCurrent = append(movedCurrent, name)
 	}
+	if err := errors.Join(syncDir(dataDir), syncDir(rejected)); err != nil {
+		rollbackErr := rollbackRestorePoint(rejected, dataDir, movedCurrent)
+		return RestoreResult{}, errors.Join(fmt.Errorf("backup: confirm rejected files: %w", err), rollbackErr)
+	}
+	if currentComplete {
+		if err := writeRestorePoint(rejected, current, true); err != nil {
+			rollbackErr := rollbackRestorePoint(rejected, dataDir, movedCurrent)
+			return RestoreResult{}, errors.Join(fmt.Errorf("backup: confirm rejected file list: %w", err), rollbackErr)
+		}
+	}
 	previous, err := topLevelEntries(safetyDir)
 	if err != nil {
-		rollbackErr := restoreMoveSet(rejected, dataDir, movedCurrent)
+		rollbackErr := rollbackRestorePoint(rejected, dataDir, movedCurrent)
 		return RestoreResult{}, errors.Join(err, rollbackErr)
 	}
 	restored := make([]string, 0, len(previous))
 	for _, name := range previous {
-		if err := os.Rename(filepath.Join(safetyDir, name), filepath.Join(dataDir, name)); err != nil {
-			rollbackErr := errors.Join(
-				restoreMoveSet(dataDir, safetyDir, restored),
-				restoreMoveSet(rejected, dataDir, movedCurrent),
-			)
+		if err := moveRestoreEntry(filepath.Join(safetyDir, name), filepath.Join(dataDir, name)); err != nil {
+			rollbackErr := restoreMoveSet(dataDir, safetyDir, restored)
+			if rollbackErr == nil {
+				rollbackErr = rollbackRestorePoint(rejected, dataDir, movedCurrent)
+			}
 			return RestoreResult{}, errors.Join(fmt.Errorf("backup: reactivate previous %s: %w", name, err), rollbackErr)
 		}
 		restored = append(restored, name)
+	}
+	if err := os.Remove(filepath.Join(safetyDir, restorePointFile)); err != nil {
+		return RestoreResult{DataDir: dataDir, SafetyDir: rejected}, fmt.Errorf("backup: previous data is active but rejected restore remains at %s: %w", rejected, err)
 	}
 	if err := os.Remove(safetyDir); err != nil {
 		keepRejected = true
@@ -992,7 +1060,7 @@ func RevertContents(dataDir, safetyDir string) (RestoreResult, error) {
 	if err := syncDir(dataDir); err != nil {
 		return RestoreResult{}, err
 	}
-	return RestoreResult{DataDir: dataDir, SafetyDir: safetyDir}, nil
+	return RestoreResult{DataDir: dataDir, SafetyDir: safetyDir, SafetyComplete: currentComplete}, nil
 }
 
 func topLevelEntries(dir string, exclude ...string) ([]string, error) {
@@ -1018,7 +1086,7 @@ func topLevelEntries(dir string, exclude ...string) ([]string, error) {
 }
 
 func isRestoreInternalName(name string) bool {
-	return strings.HasPrefix(name, ".ftw-restore-stage-") ||
+	return name == restorePointFile || strings.HasPrefix(name, ".ftw-abandoned-stage-") || strings.HasPrefix(name, ".ftw-restore-stage-") ||
 		strings.HasPrefix(name, ".ftw-pre-restore-") ||
 		strings.HasPrefix(name, ".ftw-rejected-restore-")
 }
@@ -1026,7 +1094,7 @@ func isRestoreInternalName(name string) bool {
 func restoreMoveSet(fromDir, toDir string, names []string) error {
 	var result error
 	for i := len(names) - 1; i >= 0; i-- {
-		if err := os.Rename(filepath.Join(fromDir, names[i]), filepath.Join(toDir, names[i])); err != nil {
+		if err := moveRestoreEntry(filepath.Join(fromDir, names[i]), filepath.Join(toDir, names[i])); err != nil {
 			result = errors.Join(result, fmt.Errorf("backup: roll back move for %s: %w", names[i], err))
 		}
 	}

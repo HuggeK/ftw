@@ -127,7 +127,9 @@ func decode[T any](t *testing.T, env appproto.Envelope) T {
 // these tests. Revocation and demotion have their own tests in appproto.
 type stillEnrolled struct{ role string }
 
-func (s stillEnrolled) Grant() (string, uint64, bool) { return s.role, 1, true }
+func (s stillEnrolled) Grant() (appproto.Enrolment, bool) {
+	return appproto.Enrolment{Role: s.role, Epoch: 1}, true
+}
 
 // newAppSession builds a real API server and one app session onto it.
 //
@@ -175,6 +177,7 @@ func newAppSession(t *testing.T, role string, opts ...func(*Deps)) *appRig {
 			Epoch:   1,
 		},
 		Grants:     stillEnrolled{role: role},
+		Commands:   appproto.NewCmdLog(),
 		SrcGrid:    "meter",
 		SrcPV:      "meter",
 		SrcBattery: "meter",

@@ -370,6 +370,9 @@ func (s *Store) RecordTickWithOptionalHistory(p *HistoryPoint, samples []Sample,
 // commit succeed and will never retry it again. Its current, possibly uncertain
 // commit retains its receipt until a later batch succeeds.
 func (s *Store) recordHistoryBatch(ctx context.Context, batchID, payloadHash string, p *HistoryPoint, samples []Sample, observations []EnergyObservation, acknowledgedSequence int64) (int64, error) {
+	if p != nil && p.Missing != 0 && !s.aggregateHistory.Load() {
+		return 0, errors.New("partial history requires aggregate storage")
+	}
 	if err := validateHistorySamples(samples); err != nil {
 		return 0, err
 	}
@@ -437,10 +440,10 @@ func (s *Store) writeHistoryBatchTx(ctx context.Context, tx *sql.Tx, batchID, pa
 	}
 	if s.aggregateHistory.Load() {
 		if err := s.recordDashboardTx(ctx, tx, p); err != nil {
-			return 0, false, err
+			return 0, false, fmt.Errorf("dashboard: %w", err)
 		}
 		if err := s.insertAggregateSamples(ctx, tx, rs); err != nil {
-			return 0, false, err
+			return 0, false, fmt.Errorf("samples: %w", err)
 		}
 	} else {
 		if p != nil {
@@ -473,8 +476,14 @@ type historyBatchCommit struct {
 	seq       int64
 }
 
-func (s *Store) recordHistoryBatches(ctx context.Context, batches []historyBatch, acknowledgedSequence int64) (historyBatchCommit, error) {
-	var out historyBatchCommit
+func (s *Store) recordHistoryBatches(ctx context.Context, batches []historyBatch, acknowledgedSequence int64) (out historyBatchCommit, err error) {
+	phase := "prepare"
+	timing := newHistoryWriteTiming("prepare")
+	defer func() {
+		if err != nil {
+			err = fmt.Errorf("history %s: %w [processed_ticks=%d batch_ticks=%d]", phase, err, out.committed, len(batches))
+		}
+	}()
 	if len(batches) == 0 {
 		return out, nil
 	}
@@ -486,39 +495,55 @@ func (s *Store) recordHistoryBatches(ctx context.Context, batches []historyBatch
 	prep := make([]prepared, 0, len(batches))
 	for _, b := range batches {
 		if err := validateHistorySamples(b.payload.Samples); err != nil {
-			return out, err
+			return out, timing.failure(err)
 		}
 		var p *HistoryPoint
 		if b.payload.Point != nil {
 			point, err := normalizeHistoryPoint(*b.payload.Point)
 			if err != nil {
-				return out, err
+				return out, timing.failure(err)
 			}
 			p = &point
 		}
 		if err := s.hydrateIntern(); err != nil {
-			return out, err
+			return out, timing.failure(err)
 		}
 		rs, err := s.resolveSamples(b.payload.Samples)
 		if err != nil {
-			return out, err
+			return out, timing.failure(err)
 		}
 		prep = append(prep, prepared{b: b, p: p, rs: rs})
 	}
 
+	phase = "writer lock"
+	timing.next("writer_lock")
 	if err := lockContext(ctx, s.historyWriteMu.TryLock); err != nil {
-		return out, err
+		return out, timing.failure(err)
 	}
 	defer s.historyWriteMu.Unlock()
-	tx, err := s.history.BeginTx(ctx, nil)
+	phase = "connection"
+	timing.next("connection")
+	conn, err := s.history.Conn(ctx)
 	if err != nil {
-		return out, err
+		return out, timing.failure(err)
+	}
+	// A cancelled Tx may report ErrTxDone before its automatic rollback
+	// releases SQLite's writer. Conn.Close waits for that rollback, so the
+	// next batch cannot read a snapshot and then fail its upgrade with BUSY.
+	defer conn.Close()
+	phase = "begin"
+	timing.next("begin")
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return out, timing.failure(err)
 	}
 	defer tx.Rollback()
+	phase = "tick"
+	timing.next("tick")
 	for _, item := range prep {
 		seq, skipped, err := s.writeHistoryBatchTx(ctx, tx, item.b.id, item.b.hash, item.p, item.rs, item.b.payload.Observations)
 		if err != nil {
-			return out, err
+			return out, timing.failure(err)
 		}
 		out.committed++
 		out.seq = seq
@@ -529,11 +554,15 @@ func (s *Store) recordHistoryBatches(ctx context.Context, batches []historyBatch
 			}
 		}
 	}
+	phase = "receipts"
+	timing.next("receipts")
 	if err := ackHistoryReceipts(ctx, tx, out.seq, acknowledgedSequence); err != nil {
-		return out, err
+		return out, timing.failure(err)
 	}
+	phase = "commit"
+	timing.next("commit")
 	if err := tx.Commit(); err != nil {
-		return out, err
+		return out, timing.failure(err)
 	}
 	return out, nil
 }

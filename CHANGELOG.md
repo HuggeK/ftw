@@ -1,5 +1,176 @@
 # Changelog
 
+## 0.143.0
+
+### Minor Changes
+
+- 6e05ac5: The plan an app reads (`plan.get` and the plan pushed after a command) now carries the battery's planned level at the end of each slot, `socPermille`, in thousandths: the same name and unit as the FTW Cloud plan class. A phone can then say where the battery ends up, not only what it does. A level the planner did not give as a number is left out. Older apps ignore the field.
+- 7c72a5b: An Apple Watch can charge the car and read the house without its phone (ADR 0009). The box keeps a second relay socket, `/r/<epoch>/<handle>/exchange`, beside its uplink, and answers a watch's one-shot HTTPS requests on it: a Noise IK handshake with prologue `ftw.exchange.v1:` that carries the watch's hello and the box's `hello_ok`, then `cmd` and `now`. Watch sessions live in a table of eight apart from the phones' four, so a watch never pushes a phone out, and each ends after four exchanges, a minute idle or three minutes. Every answer is two lane 0 frames, so a read, a command and a refusal have one length; a command's result that has not settled in 3 s leaves a tick in its place, and asking again with the same `cmdId` returns it. The box answers a command no sooner than 400 ms after it arrived, applied or refused, so the time to answer does not tell the relay which; a command that takes longer answers when it is done. The box takes at most 60 handshakes a minute and answers a stranger or a removed watch with silence. It now says `cmd.exchange`, so a phone can offer "Add watch". Losing the exchange socket changes nothing for the uplink or local control.
+
+### Patch Changes
+
+- 9fa327f: An app command retried in a new session no longer acts twice. Each app session kept its own list of command ids, so when a phone lost its connection mid-command and sent the command again, the box acted again. The box now keeps one list for all sessions, keyed by the device and its command id, and holds each id for 24 hours of uptime, as the protocol says. Another device's command with the same id still counts as new.
+- 5c1feae: The box streams the grid's three phase currents to the app and to FTW Cloud, so the phone can show each phase against the main fuse. They go as extra fields 11–13 in tenths of an ampere, signed by the site convention, with the main fuse as field 14. A meter that gives only the size of each current, such as Sungrow, gets its sign from the power on the same phase. The box sends only the phases the site has, and only while the site meter is online. When a field stops coming, the box resends the whole snapshot once, so a phone never keeps a phase at its last value. Lane 0 keeps its 512-byte frame, and these fields are the first to give way when a delta does not fit.
+- 5d2e7fe: Specify how an Apple Watch reads its home from FTW Cloud in one HTTPS request (ADR 0009). `go/protocol/cloudwire` gains the one-shot read: `POST /v1/app/once`, a Noise IK handshake with prologue `ftw.cloud.once.v1:`, `read {have, hz}` and `token.get` in message 1, and an answer of length-prefixed messages. `push.register` gains `app`, `iphone` or `watch`, so the service picks the APNs topic, and the roster may carry a device with role `watch`. Golden vectors for one read are in `cloudwire/testdata/cloud-once-vectors.json`. Nothing on the box changes; FTW Cloud serves the route in a later step.
+- 00d791c: Know the shared registry's new names for an Apple Watch: role `watch` and capability `cmd.exchange` (ADR 0009). The box claims neither yet. Its page and the app refuse a watch code, and refuse to change a phone into a watch, until a phone can add one.
+- a6ddfea: An owner's phone can add an Apple Watch as a device of its own (ADR 0009). The phone asks for a watch code over its session, with a passkey step-up on that request; the code binds to the phone and leaves a pending phone code alone. The box stores the watch with role `watch` and the phone as its parent. A watch holds the watch role's scopes that its phone holds at that moment, so demoting the phone narrows the watch at once. Removing a phone removes its watches; removing a watch touches nothing else. A watch never gets a stream session. The box's page and `GET /api/app-link/devices` list each watch under its phone, and FTW Cloud's roster carries it with the scopes the box derives. The box does not offer the watch path yet: `cmd.exchange` stays unsaid until the exchange socket lands.
+
+## 0.142.2
+
+### Patch Changes
+
+- 4d9018a: Bundle sungrow 1.6.0, which reads grid, PV and battery power, SoC and per-phase values once a second, so live figures on the phone move every second instead of every five. Counters, temperature, frequency and fault bits keep the five-second rate.
+- 5bc76c9: Honour the interval a driver returns from `driver_poll`, as the driver contract says. Core ignored it before and polled every five seconds. The returned wait now sets the next poll, between one second and thirty seconds. A driver that calls `host.set_poll_interval` keeps that interval, as before, whatever it returns.
+  
+  Bundled drivers that return one second now read once a second: ambibox_v2x, ferroamp, ferroamp_dc2_v2x, pixii_pv, sdm630, sonnen and zap. myuplink reads every thirty seconds instead of every five. easee_cloud, tesla_wall_connector and zaptec_cloud wait ten seconds after a failed read, and solaredge_legacy thirty seconds after a failed SunSpec probe.
+
+## 0.142.1
+
+### Patch Changes
+
+- 49439b2: Show recorded energy after gaps in today's solar or consumption readings, with a clear mark for partial totals. Keep missing totals unknown in the flow view instead of showing zero.
+
+## 0.142.0
+
+### Minor Changes
+
+- 3c60ca7: Add the owner-controlled FTW Cloud capability, with cloud uplink, phone sessions, signed notifications and owner-facing Cloud APIs. Local operation remains the default; Cloud requires the owner's consent.
+
+## 0.141.7
+
+### Patch Changes
+
+- b1b3469: Let phones read their home from FTW Cloud. While FTW Cloud is on, the box tells every paired phone, over its own encrypted session, the key it signs with and the names behind its anonymous ids, so a phone can check what the service forwards. Boxes that can run the uplink say so to the app. `POST` and `DELETE /api/cloud/stats` record and withdraw an owner's consent to statistics; nothing is sent for it yet.
+- b1b3469: With FTW Cloud on and events in the grant, the box sends its notifications as signed events for the owners' phones; names never leave the house. A restart the box chooses, an update among them, tells FTW Cloud so it holds back "box out of reach". A new notification, "The car may not be ready", tells once per plug-in when the box knows the car's level and the plan cannot reach the goal by the ready time. A car that reports nothing itself gets "Car charged" in kWh once the box's estimate from a level someone set reaches the target. "Car plugged in" now waits 90 seconds and is sent only when the box needs the level or a goal. Each notification transport now has its own 10-second limit, so one that hangs no longer delays the others.
+- c6ab8ee: Release builds know FTW Cloud at `wss://cloud.ftw.energy` by the service's public key, so an owner can turn FTW Cloud on. Nothing changes until they do. The box checks every message from the service against that key and refuses a service that signs with any other.
+- b1b3469: Add the FTW Cloud uplink, off unless an owner turns it on. `GET /api/cloud` shows the grant and the bytes sent in the last 24 hours, `GET /api/cloud/preview` shows the exact bytes that leave the house, and `POST` and `DELETE /api/cloud/grant` turn it on and off. Backups no longer include `cloud.key`.
+
+## 0.141.6
+
+### Patch Changes
+
+- 22a8f32: A phone that opens the app just after the hour finds the box at once over the relay. The relay turns its rendezvous handles on the hour but closes each box's old room on its own turn in a five-minute spread, so a phone could wait up to five minutes in an empty room. The box now joins the new hour's handle when the hour turns and keeps the old one until the relay closes it.
+
+## 0.141.5
+
+### Patch Changes
+
+- 85e1b7a: Limit charging steps to the charger's max power when loading, saving and planning, and show a warning. Show the latest planning failure in Plan instead of leaving it on Preparing.
+
+## 0.141.4
+
+### Patch Changes
+
+- 18945ce: Report connection wait, SQL query, scan and decode times when a forecast read fails, without recording measurement values or extending its deadline.
+
+## 0.141.3
+
+### Patch Changes
+
+- 3d07f27: Export stopped older split SQLite history without requiring the later partial-history tables. Refuse incomplete quality tables and preserve the source during backup.
+
+## 0.141.2
+
+### Patch Changes
+
+- fd9540c: Pulse only the latest known sample in the Live chart. Earlier points before a missing measurement stay still, and an unknown latest sample has no live marker.
+
+## 0.141.1
+
+### Patch Changes
+
+- 51bf2d6: Name the box's time zone, for example Europe/Stockholm, wherever Core reports it: the app hello, daily energy, savings and the load research export. A box without TZ set said "Local", which the app and web client cannot use to show plan times in the household's zone.
+- 851eaee: Keep the EV ready time on the household clock. A goal set to 07:00 stays 07:00 when summer time starts or ends; before, it moved an hour until saved again. A goal saved by an older version keeps the time it shows on the day of the update.
+- 97ff226: Show and save the EV ready time on the household clock, even from a browser in another time zone. `GET /api/loadpoints` now sends `time_of_day_min`, minutes after midnight in the box's zone, and the schedule routes accept it. It wins over `time_of_day_min_utc`, which Core still sends and accepts for older clients.
+- afaa603: Keep history for working devices when another device is offline. Show missing power, state of charge and energy as unknown, preserve gaps through retention and backup, and flag incomplete measurements or an invalid household balance. Separate additive schema-7 tables keep partial rows out of older readers and preserve them across a native rollback.
+- af22b48: Accept Core backup timestamps with nanoseconds in the native migration CLI on older Python versions. Keep the verified bytes and backup age checks.
+
+## 0.141.0
+
+### Minor Changes
+
+- 8ac0b4c: Add an offline Home Assistant backup exporter that keeps internal driver links, checks protected archives and leaves existing data in place on failure.
+
+### Patch Changes
+
+- 2f47f63: Record complete restore points before activation. Refuse incomplete or older unverified points before reverting, and retain moved data if rollback fails. Full backups from older releases still import normally.
+- f4f3af0: Bind each restore stage to its own phase so a later extraction-only retry can keep older complete safety points without accepting partial activation.
+- 9618f8f: Keep interrupted revert state separate from complete active data. Retain abandoned extraction copies after a successful retry so normal restore and revert can continue.
+
+## 0.140.11
+
+### Patch Changes
+
+- 4d00c26: Keep managed driver selections and their undo paths when restoring a full backup to a new data directory. Refuse unknown external driver paths before activating the restored data.
+
+## 0.140.10
+
+### Patch Changes
+
+- 644f872: Merge retained Parquet readings before beta history conversion publishes its
+  summaries. Preserve distinct and late rows, keep the selected beta value on
+  overlap, and verify archive fingerprints before Core retires duplicate files.
+
+## 0.140.9
+
+### Patch Changes
+
+- 0bba433: Build chart summaries before selecting converted DuckDB history so the first Core start retains every series when it retires raw rows.
+- e615535: Fix the offline DuckDB history converter build by keeping its separate module in step with Core's dependencies. CI now checks conversion, resume and the Linux ARM64 and AMD64 builds.
+
+## 0.140.8
+
+### Patch Changes
+
+- 1cc469c: Move internal file paths with restored data, including active SQLite settings and old backup formats. Stop a move with unresolved external paths before replacing the destination.
+- 3c2d0f2: Keep absorbed Parquet summaries in stored-resolution history exports after restart, with their recorded count and hourly resolution.
+
+## 0.140.7
+
+### Patch Changes
+
+- d002bbc: Report elapsed write phases and the SQL step when a history write fails, so field timeouts can be traced without logging measurements or changing the write deadline.
+
+## 0.140.6
+
+### Patch Changes
+
+- 6ac681f: Keep imported chart history visible after restart when Core retires raw telemetry samples.
+- b261625: Recover inherited charts from the original state database or a retained history file after an earlier beta lost access to them. Keep new history and accounting.
+
+## 0.140.5
+
+### Patch Changes
+
+- 748a357: Prune forecast records without repeatedly scanning the retained records. Keep short delete transactions and refresh the budget after concurrent writes.
+- a877542: Wait for a cancelled history transaction to finish rollback before retrying. Report the phase of a failed history write.
+- 9c0aeff: Wait for cancelled history maintenance transactions to finish rollback before allowing another writer to enter.
+- f146a1e: Plan EV charging from the car's latest SoC when that reading is newer than the manual level, including a cloud report up to an hour old. The charging view plans from the same number. A newer manual correction still wins, and the slider stays available when the car report is not a live reading.
+
+## 0.140.4
+
+### Patch Changes
+
+- 2dca732: Use a metadata index to keep forecast scores within the archive limits. This avoids reading every score payload and sorting the full archive after each scoring page.
+
+## 0.140.3
+
+### Patch Changes
+
+- 96a9c5b: Expected charge follows the car when the next step charges it, instead of the home battery's state of charge.
+- 6f13aa5: Choose PV and household-load forecast sources for each lead bucket. Keep cold-start load evidence within its horizon and keep day and night errors separate when setting PV uncertainty and planning margins.
+
+## 0.140.2
+
+### Patch Changes
+
+- 5226090: Update the bundled Energyplan planner to 0.5.1. Plans with a car get cheaper within the box's time budget: once the planner has met the car's charging goals, it plans the battery around that charging again instead of keeping the battery schedule its goal search left. On the home box that schedule cost up to about 10 kr in one plan. A car that needs less than two minimum charging runs gets one run at the cheapest time, and a need of at most half a run counts as met instead of starting the charger. Core still validates every plan.
+- 4000391: A planned EV charge now gets its share of the fuse on the worst phase, not only in the site total. When house load sits mostly on one phase, the battery charges less so the car is not cut by its charger's load balancer, and the next hour of the plan leaves the same headroom.
+- e0a57fc: Show an EV departure miss only when it is more than half of one minimum charging run, about 155 Wh for a 4.14 kW charger. Energyplan treats a smaller need as met instead of starting the charger for it. A car that is charging when the plan starts still counts a miss above 1 Wh.
+- 6526638: Keep one Modbus writer per device. The proxy defaults to read only. When external writes are enabled, FTW keeps reading but stops all device writes until the owner changes the setting and restarts Core. Restrict proxy requests to configured unit IDs, give driver traffic priority, and close idle clients on shutdown.
+  
+  Rename the Home Assistant settings tab to Integrations. Home Assistant MQTT and the Modbus proxy each keep their own section.
+
 ## 0.140.1
 
 ### Patch Changes

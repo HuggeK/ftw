@@ -93,6 +93,16 @@ type Snapshot struct {
 	EVW      float64
 	EVWKnown bool
 
+	// GridPhaseA is the site meter's current on L1, L2 and L3 in amps, signed
+	// by the site convention: positive while the phase draws from the grid.
+	// Nil for a phase the site does not have or the meter does not report,
+	// and all nil while the meter is offline. The wire carries tenths of an
+	// ampere, converted at the edge of this package.
+	GridPhaseA [3]*float64
+	// FuseA is the main fuse per phase, the scale the phases are read
+	// against. Sent only with at least one phase.
+	FuseA float64
+
 	Sources []Source
 
 	// DispatchBlockedBy names the source ids currently stopping dispatch.
@@ -179,6 +189,21 @@ type Loadpoints interface {
 	SetSurplusOnly(id string, v bool) (prev bool, ok bool)
 	// ObservedSurplusOnly is the flag as the box holds it now.
 	ObservedSurplusOnly(id string) (v bool, ok bool)
+	// Readings is every charger as the box holds it now, in its configured
+	// order: what a watch's now draws.
+	Readings() []LoadpointReading
+}
+
+// LoadpointReading is one charger as the box holds it now.
+type LoadpointReading struct {
+	ID      string
+	Plugged bool
+	// SoC is the car's level as a fraction in [0,1], meaningful only while
+	// SoCKnown.
+	SoC      float64
+	SoCKnown bool
+	// PowerW is the charger's draw, positive while charging.
+	PowerW float64
 }
 
 // PlannerPrefsSnapshot is the household planner preference as the box holds

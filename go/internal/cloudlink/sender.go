@@ -1,0 +1,650 @@
+package cloudlink
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"reflect"
+	"slices"
+	"sort"
+	"time"
+
+	"github.com/fxamacker/cbor/v2"
+	"github.com/srcfl/ftw/go/protocol"
+	"github.com/srcfl/ftw/go/protocol/cloudwire"
+)
+
+// Cadence and limits, from the protocol's "Numbers in one place".
+const (
+	periodIdle    = 5 * time.Second
+	periodWatched = time.Second
+	// lpPeriodMin holds lp at 2 s until a Pi 4 bench shows what composing
+	// it costs.
+	lpPeriodMin   = 2 * time.Second
+	watchFor      = 60 * time.Second
+	fullEvery     = 15 * time.Minute
+	resyncEvery   = 5 * time.Minute
+	pricesEvery   = time.Minute
+	rosterRenew   = 6 * time.Hour
+	rosterTTLS    = 86_400
+	budgetBytes   = 20_000_000
+	budgetMinutes = 24 * 60
+)
+
+// sentFrame is the last frame of a class that left the house, exactly.
+type sentFrame struct {
+	T     string
+	Frame []byte
+	AtMs  int64
+}
+
+// budget counts bytes sent over a rolling 24 hours of uptime, per minute.
+// Past budgetBytes the box sends only bye and roster, and no hb, so data on
+// phones ages to stale rather than looking current.
+type budget struct {
+	bytes  [budgetMinutes]int64
+	minute [budgetMinutes]int64
+}
+
+func (b *budget) add(uptimeMs, n int64) {
+	m := uptimeMs / 60_000
+	i := m % budgetMinutes
+	if b.minute[i] != m {
+		b.minute[i], b.bytes[i] = m, 0
+	}
+	b.bytes[i] += n
+}
+
+func (b *budget) total(uptimeMs int64) int64 {
+	m := uptimeMs / 60_000
+	var sum int64
+	for i := range b.bytes {
+		if age := m - b.minute[i]; age >= 0 && age < budgetMinutes {
+			sum += b.bytes[i]
+		}
+	}
+	return sum
+}
+
+// cadence is one connection's view of what it last sent.
+type cadence struct {
+	full       bool
+	lastFull   time.Time
+	liveKey    string
+	liveAt     time.Time
+	lpLast     *cloudwire.LP
+	lpAt       time.Time
+	pricesKey  string
+	pricesAt   time.Time
+	anyAt      time.Time // last live or hb
+	rosterAt   time.Time
+	watchUntil time.Time
+
+	// When each class was last composed, and whether a change it found is
+	// still waiting for its period. Composing reads the box, and on a Pi
+	// the loadpoint view is not free, so it happens no faster than a
+	// message could go.
+	liveCheckedAt, lpCheckedAt time.Time
+	liveWaiting, lpWaiting     bool
+}
+
+// liveCheckEvery is how often the source table is looked at, so a table
+// change goes within a second whatever the period.
+const liveCheckEvery = time.Second
+
+// run sends until the connection or the grant ends.
+func (w *writer) run(ctx context.Context, events <-chan cloudwire.Envelope) error {
+	l := w.link
+	tick := time.NewTicker(l.opts.Tick)
+	defer tick.Stop()
+	connHome := l.current().home
+	// A roster goes at every connect, which also renews its ttlS: the
+	// service counts that from when it received the last one.
+	st := &cadence{full: true}
+	var purgeSince time.Time
+
+	for {
+		snap := l.current()
+		if snap.g == nil || snap.home != connHome {
+			return errors.New("cloudlink: the grant changed under the connection")
+		}
+		now := time.Now()
+		if snap.g.Revoked {
+			if purgeSince.IsZero() {
+				if err := w.bye(snap, cloudwire.ByeRevoked, true); err != nil {
+					return err
+				}
+				purgeSince = now
+			} else if now.Sub(purgeSince) > purgeWait {
+				return errors.New("cloudlink: no purge receipt yet")
+			}
+		} else {
+			if err := w.closeIfAsked(snap); err != nil {
+				return err
+			}
+			if err := w.sendEvents(snap, now); err != nil {
+				return err
+			}
+			if err := w.tick(snap, st, now); err != nil {
+				return err
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-tick.C:
+		case <-l.wake:
+		case env := <-events:
+			if err := w.downlink(snap, st, env); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// downlink acts on watch, resync and purged, and on nothing else.
+func (w *writer) downlink(snap grantSnapshot, st *cadence, env cloudwire.Envelope) error {
+	l := w.link
+	switch env.T {
+	case cloudwire.MsgWatch:
+		var b cloudwire.Watch
+		if cloudwire.Unmarshal(env.B, &b) == nil && b.Hz == 1 {
+			st.watchUntil = time.Now().Add(watchFor)
+		}
+	case cloudwire.MsgResync:
+		var b cloudwire.Resync
+		if cloudwire.Unmarshal(env.B, &b) != nil {
+			return nil
+		}
+		l.mu.Lock()
+		honoured := l.resyncAt.IsZero() || time.Since(l.resyncAt) >= resyncEvery
+		if honoured {
+			l.resyncAt = time.Now()
+		}
+		l.mu.Unlock()
+		if !honoured {
+			return nil
+		}
+		if slices.Contains(b.What, cloudwire.ResyncFull) {
+			st.full = true
+		}
+		if slices.Contains(b.What, cloudwire.ResyncRoster) {
+			st.rosterAt = time.Time{}
+		}
+	}
+	return nil
+}
+
+// acceptPurged finishes a revoke on a valid receipt: signed by the service,
+// for this home and grant, while the grant is being revoked.
+func (l *Link) acceptPurged(snap grantSnapshot, env cloudwire.Envelope) bool {
+	var b cloudwire.Purged
+	cur := l.current()
+	if cur.g == nil || !cur.g.Revoked || cur.home != snap.home || !l.verifiedByService(snap.home, env) ||
+		cloudwire.Unmarshal(env.B, &b) != nil || b.What != cloudwire.PurgedHome || !bytes.Equal(b.GrantID, cur.g.ID) {
+		return false
+	}
+	l.finishPurge(b.AtMs)
+	return true
+}
+
+// tick sends whatever is due.
+func (w *writer) tick(snap grantSnapshot, st *cadence, now time.Time) error {
+	l := w.link
+
+	l.mu.Lock()
+	due := l.rosterDue
+	l.rosterDue = false
+	h := time.Duration(cloudwire.Heartbeat(l.table)) * time.Millisecond
+	l.mu.Unlock()
+	if due || st.rosterAt.IsZero() || now.Sub(st.rosterAt) >= rosterRenew {
+		_, roster := l.rosterNumber(snap)
+		if _, err := w.sendBody(snap, cloudwire.MsgRoster, &roster, true); err != nil {
+			return err
+		}
+		st.rosterAt = now
+	}
+
+	period := periodIdle
+	if now.Before(st.watchUntil) {
+		period = periodWatched
+	}
+	lpPeriod := max(period, lpPeriodMin)
+	full := st.full || now.Sub(st.lastFull) >= fullEvery
+	hbDue := now.Sub(st.anyAt) >= h
+
+	var ages map[string]int64
+	if snap.allowed(cloudwire.MsgLive) && (full || hbDue || now.Sub(st.liveCheckedAt) >= liveCheckEvery) {
+		st.liveCheckedAt = now
+		live, tableChanged := l.projectLive(snap, l.opts.Site.Live())
+		ages = live.Ages
+		key := liveKey(live)
+		changed := tableChanged || key != st.liveKey
+		st.liveWaiting = false
+		switch {
+		case full || tableChanged || (changed && now.Sub(st.liveAt) >= period):
+			if !full && !tableChanged {
+				live.Sources, live.FieldSources = nil, nil
+			}
+			sent, err := w.sendBody(snap, cloudwire.MsgLive, &live, false)
+			if err != nil {
+				return err
+			}
+			if sent {
+				st.liveKey, st.liveAt, st.anyAt = key, now, now
+			}
+		case changed:
+			st.liveWaiting = true
+		}
+	}
+
+	if snap.allowed(cloudwire.MsgLP) && (full || now.Sub(st.lpCheckedAt) >= lpPeriod) {
+		st.lpCheckedAt = now
+		st.lpWaiting = false
+		if lp, ok := l.opts.Site.Loadpoints(); ok {
+			lp = l.projectLP(snap, lp)
+			changed := st.lpLast == nil || lpChanged(*st.lpLast, lp)
+			switch {
+			case full || (changed && now.Sub(st.lpAt) >= lpPeriod):
+				sent, err := w.sendBody(snap, cloudwire.MsgLP, &lp, false)
+				if err != nil {
+					return err
+				}
+				if sent {
+					st.lpLast, st.lpAt = &lp, now
+				}
+			case changed:
+				st.lpWaiting = true
+			}
+		}
+	}
+	if full {
+		st.full, st.lastFull = false, now
+	}
+
+	if snap.allowed(cloudwire.MsgPrices) && (st.pricesKey == "" || now.Sub(st.pricesAt) >= pricesEvery) {
+		st.pricesAt = now
+		if p, ok := l.opts.Site.Prices(); ok {
+			if key := pricesKey(p); key != st.pricesKey {
+				sent, err := w.sendBody(snap, cloudwire.MsgPrices, &p, false)
+				if err != nil {
+					return err
+				}
+				if sent {
+					st.pricesKey = key
+				}
+			}
+		}
+	}
+
+	// hb never vouches for a live or lp that waits for its period, and its
+	// ages were read on this tick.
+	if now.Sub(st.anyAt) >= h && !st.liveWaiting && !st.lpWaiting {
+		hb := l.heartbeat(ages)
+		sent, err := w.sendBody(snap, cloudwire.MsgHB, &hb, false)
+		if err != nil {
+			return err
+		}
+		if sent {
+			st.anyAt = now
+		}
+	}
+	return nil
+}
+
+// sendBody stamps the header, sends, and records the seq of a live or lp so
+// hb can name it. body is a pointer to a cloudwire body with a Header.
+func (w *writer) sendBody(snap grantSnapshot, t string, body any, force bool) (bool, error) {
+	l := w.link
+	l.mu.Lock()
+	if !force && l.budget.total(l.uptimeMs()) >= budgetBytes {
+		l.mu.Unlock()
+		return false, nil
+	}
+	h := l.header()
+	l.mu.Unlock()
+	reflect.ValueOf(body).Elem().FieldByName("Header").Set(reflect.ValueOf(h))
+
+	if err := w.send(snap, t, reflect.ValueOf(body).Elem().Interface()); err != nil {
+		return false, err
+	}
+	l.mu.Lock()
+	switch t {
+	case cloudwire.MsgLive:
+		l.liveSeq = h.Seq
+	case cloudwire.MsgLP:
+		l.lpSeq = h.Seq
+	}
+	l.mu.Unlock()
+	return true, nil
+}
+
+func (w *writer) bye(snap grantSnapshot, why string, purge bool) error {
+	_, err := w.sendBody(snap, cloudwire.MsgBye, &cloudwire.Bye{Why: why, Purge: purge}, true)
+	return err
+}
+
+// heartbeat names the newest live and lp sent and how old each reading is.
+func (l *Link) heartbeat(ages map[string]int64) cloudwire.HB {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return cloudwire.HB{Clock: l.clockName(), SrcRev: l.srcRev, LiveSeq: l.liveSeq, LpSeq: l.lpSeq, Ages: ages}
+}
+
+// project cuts opaque ids and ages from the box's names.
+func (l *Link) project(gk []byte, in Live) cloudwire.Live {
+	up := l.uptimeMs()
+	out := cloudwire.Live{
+		Fields: in.Fields, Sources: map[string]cloudwire.Source{},
+		FieldSources: map[string][]string{}, Ages: map[string]int64{},
+	}
+	for name, s := range in.Sources {
+		id := cloudwire.SourceID(gk, name)
+		out.Sources[id] = cloudwire.Source{Kind: s.Kind, State: s.State,
+			LastOkMs: max(0, s.LastOkUptimeMs), StaleAfterMs: s.StaleAfterMs}
+		if (s.State == protocol.SourceLive || s.State == protocol.SourceLagging) && s.LastOkUptimeMs >= 0 {
+			out.Ages[id] = max(0, up-s.LastOkUptimeMs)
+		}
+	}
+	for f, names := range in.FieldSources {
+		out.FieldSources[f] = ids(gk, names)
+	}
+	out.DispatchBlockedBy = ids(gk, in.DispatchBlockedBy)
+	return out
+}
+
+// projectLive is project plus the source revision, which moves when the
+// table changed. The comparison ignores lastOkMs, which moves every reading.
+func (l *Link) projectLive(snap grantSnapshot, in Live) (cloudwire.Live, bool) {
+	out := l.project(snap.g.GrantKey, in)
+	table := tableKey(out)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	changed := table != l.tableKey
+	if changed {
+		l.srcRev++
+		l.tableKey = table
+		l.table = out.Sources
+	}
+	out.SrcRev = l.srcRev
+	return out, changed
+}
+
+func ids(grantKey []byte, names []string) []string {
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		out = append(out, cloudwire.SourceID(grantKey, n))
+	}
+	sort.Strings(out)
+	return out
+}
+
+// projectLP replaces loadpoint and driver names with opaque ids.
+func (l *Link) projectLP(snap grantSnapshot, in cloudwire.LP) cloudwire.LP {
+	gk := snap.g.GrantKey
+	out := cloudwire.LP{ControlRev: in.ControlRev}
+	for _, lp := range in.Loadpoints {
+		lp.ID = cloudwire.LoadpointID(gk, lp.ID)
+		if lp.Src != "" {
+			lp.Src = cloudwire.SourceID(gk, lp.Src)
+		}
+		out.Loadpoints = append(out.Loadpoints, lp)
+	}
+	for _, f := range in.Feedback {
+		if f.Src != "" {
+			f.Src = cloudwire.SourceID(gk, f.Src)
+		}
+		out.Feedback = append(out.Feedback, f)
+	}
+	return out
+}
+
+// The change tests: encodings of what a phone must hear about, without the
+// fields that move every reading.
+
+func digest(v any) string {
+	raw, err := cloudwire.Marshal(v)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
+func liveKey(l cloudwire.Live) string {
+	return digest([]any{l.Fields, l.DispatchBlockedBy, l.SrcRev})
+}
+
+func tableKey(l cloudwire.Live) string {
+	table := map[string]cloudwire.Source{}
+	for id, s := range l.Sources {
+		s.LastOkMs = 0
+		table[id] = s
+	}
+	return digest([]any{table, l.FieldSources})
+}
+
+// lpKey is lp without its ages and its measured values, which lpChanged
+// compares with a deadband instead.
+func lpKey(lp cloudwire.LP) string {
+	c := cloudwire.LP{ControlRev: lp.ControlRev}
+	for _, p := range lp.Loadpoints {
+		p.SocAgeS, p.SocPermille, p.PowerW, p.SessionWh = nil, nil, 0, 0
+		if p.Manual != nil {
+			m := *p.Manual
+			m.SinceAgeMs = 0
+			p.Manual = &m
+		}
+		c.Loadpoints = append(c.Loadpoints, p)
+	}
+	for _, f := range lp.Feedback {
+		f.AgeMs, f.ActualW = nil, nil
+		c.Feedback = append(c.Feedback, f)
+	}
+	return digest(c)
+}
+
+// Deadbands for lp's measured values. A charging car moves its power every
+// reading; sending lp for each would cost about 12 MB a day. A change of
+// state goes at once, a reading only when it moved by more than this, and
+// the full lp every 15 minutes carries exact values. Live field 10 carries
+// the site's charging power every period anyway.
+const (
+	lpPowerBandW      = 100
+	lpPowerBandRatio  = 0.05
+	lpEnergyBandWh    = 100
+	lpSocBandPermille = 10
+)
+
+// lpChanged reports whether cur says something prev did not.
+func lpChanged(prev, cur cloudwire.LP) bool {
+	if lpKey(prev) != lpKey(cur) {
+		return true
+	}
+	moved := func(a, b int64) bool {
+		band := max(lpPowerBandW, int64(lpPowerBandRatio*float64(max(abs(a), abs(b)))))
+		return abs(a-b) > band
+	}
+	for i, p := range cur.Loadpoints {
+		q := prev.Loadpoints[i]
+		if moved(q.PowerW, p.PowerW) || abs(q.SessionWh-p.SessionWh) >= lpEnergyBandWh ||
+			(q.SocPermille == nil) != (p.SocPermille == nil) ||
+			(p.SocPermille != nil && abs(*q.SocPermille-*p.SocPermille) >= lpSocBandPermille) {
+			return true
+		}
+	}
+	for i, f := range cur.Feedback {
+		g := prev.Feedback[i]
+		if (g.ActualW == nil) != (f.ActualW == nil) || (f.ActualW != nil && moved(*g.ActualW, *f.ActualW)) {
+			return true
+		}
+	}
+	return false
+}
+
+func abs(v int64) int64 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+func pricesKey(p cloudwire.Prices) string {
+	return digest([]any{p.T0Ms, p.SlotMs, p.SpotMinor, p.TotalMinor})
+}
+
+// rosterNumber builds the roster and its number. The number rises when the
+// devices or the grant differ from what it was last computed from.
+func (l *Link) rosterNumber(snap grantSnapshot) (uint64, cloudwire.Roster) {
+	r := cloudwire.Roster{TTLS: rosterTTLS, Grant: cloudwire.Grant{
+		ID: snap.g.ID, Scopes: snap.g.Scopes, Purposes: snap.g.Purposes, Controller: snap.g.Controller,
+	}}
+	for _, d := range l.opts.Roster.Devices() {
+		var scopes []string
+		for _, s := range protocol.CloudScopes {
+			if slices.Contains(d.Scopes, s) {
+				scopes = append(scopes, s)
+			}
+		}
+		r.Devices = append(r.Devices, cloudwire.Device{ID: d.ID, Key: d.Key, Role: d.Role, Scopes: scopes, Epoch: d.Epoch})
+	}
+	sort.Slice(r.Devices, func(a, b int) bool { return r.Devices[a].ID < r.Devices[b].ID })
+	sum := digest([]any{r.Devices, r.Grant})
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	state, err := loadJSON[rosterState](l.opts.KV, rosterKey)
+	if err != nil || state == nil {
+		state = &rosterState{}
+	}
+	if state.Digest != sum {
+		state.Seq++
+		state.Digest = sum
+		if err := saveJSON(l.opts.KV, rosterKey, state); err != nil {
+			l.log.Warn("could not store the FTW Cloud roster number", "err", err)
+		}
+	}
+	r.RosterSeq = state.Seq
+	return state.Seq, r
+}
+
+// bumpRoster moves the roster number past the service's.
+func (l *Link) bumpRoster(past uint64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	state, err := loadJSON[rosterState](l.opts.KV, rosterKey)
+	if err != nil || state == nil {
+		state = &rosterState{}
+	}
+	state.Seq = past + 1
+	if err := saveJSON(l.opts.KV, rosterKey, state); err != nil {
+		l.log.Warn("could not store the FTW Cloud roster number", "err", err)
+	}
+	l.rosterDue = true
+}
+
+// --------------------------------------------------------------------------
+// Preview
+// --------------------------------------------------------------------------
+
+// Preview is what GET /api/cloud/preview shows: the exact bytes that leave
+// the house, and the same bytes decoded for reading.
+type Preview struct {
+	State string `json:"state"`
+	Home  string `json:"home,omitempty"`
+	// Sample is true when nothing has been sent yet: the frames are what the
+	// box would send now, unsigned, with ids cut by the grant's key or, with
+	// FTW Cloud off, by a key of zeros.
+	Sample bool           `json:"sample"`
+	Frames []PreviewFrame `json:"frames"`
+}
+
+// PreviewFrame is one class's last frame.
+type PreviewFrame struct {
+	T string `json:"t"`
+	// Frame is the whole WebSocket message, base64 in JSON.
+	Frame []byte `json:"frame"`
+	// AgeMs is how long ago it was sent, by box uptime.
+	AgeMs int64 `json:"ageMs"`
+	// Body is the signed body decoded, for people to read. The frame is the
+	// record; this is a rendering of it.
+	Body any `json:"body"`
+}
+
+var previewDec, _ = cbor.DecOptions{DefaultMapType: reflect.TypeOf(map[string]any(nil))}.DecMode()
+
+// Preview returns the last frame of each class, or a sample.
+func (l *Link) Preview() Preview {
+	status := l.Status()
+	l.mu.Lock()
+	sent := make([]sentFrame, 0, len(l.sent))
+	for _, f := range l.sent {
+		sent = append(sent, f)
+	}
+	up := l.uptimeMs()
+	l.mu.Unlock()
+	sort.Slice(sent, func(a, b int) bool { return sent[a].T < sent[b].T })
+
+	p := Preview{State: status.State, Home: status.Home, Frames: []PreviewFrame{}}
+	if len(sent) == 0 {
+		p.Sample = true
+		sent = l.sample()
+	}
+	for _, f := range sent {
+		pf := PreviewFrame{T: f.T, Frame: f.Frame, AgeMs: up - f.AtMs}
+		if payload, err := cloudwire.DecodeFrame(f.Frame); err == nil {
+			if env, err := cloudwire.DecodeEnvelope(payload); err == nil {
+				var body any
+				if previewDec.Unmarshal(env.B, &body) == nil {
+					pf.Body = body
+				}
+			}
+		}
+		p.Frames = append(p.Frames, pf)
+	}
+	return p
+}
+
+// sample composes, unsigned and unsent, what the box would send now.
+func (l *Link) sample() []sentFrame {
+	snap := l.current()
+	if snap.g == nil {
+		snap.g = &grantRecord{GrantKey: make([]byte, cloudwire.GrantKeyBytes), Scopes: protocol.CloudScopes}
+	}
+	up := l.uptimeMs()
+	var out []sentFrame
+	add := func(t string, body any) {
+		env, err := cloudwire.Seal(nil, snap.home, t, body)
+		if err != nil {
+			return
+		}
+		raw, err := env.Encode()
+		if err != nil {
+			return
+		}
+		frame, err := cloudwire.EncodeFrame(raw)
+		if err == nil {
+			out = append(out, sentFrame{T: t, Frame: frame, AtMs: up})
+		}
+	}
+	h := cloudwire.Header{Boot: l.boot, UptimeMs: up}
+	gk := snap.g.GrantKey
+	if snap.allowed(cloudwire.MsgLive) {
+		live := l.project(gk, l.opts.Site.Live())
+		live.Header = h
+		add(cloudwire.MsgLive, live)
+	}
+	if lp, ok := l.opts.Site.Loadpoints(); ok && snap.allowed(cloudwire.MsgLP) {
+		lp = l.projectLP(snap, lp)
+		lp.Header = h
+		add(cloudwire.MsgLP, lp)
+	}
+	if p, ok := l.opts.Site.Prices(); ok && snap.allowed(cloudwire.MsgPrices) {
+		p.Header = h
+		add(cloudwire.MsgPrices, p)
+	}
+	return out
+}

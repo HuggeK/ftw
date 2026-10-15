@@ -1,12 +1,14 @@
 package appuplink
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -21,6 +23,10 @@ import (
 // relay_contract_test.go pins them to the constants the app compiled against.
 type fakeRelay struct {
 	server *httptest.Server
+
+	// wmu serialises writes. A websocket takes one writer at a time, and a
+	// stream joining or leaving writes to the uplink beside its own reader.
+	wmu sync.Mutex
 
 	mu      sync.Mutex
 	epoch   int64
@@ -41,6 +47,13 @@ type fakeRelay struct {
 
 	joined  chan struct{}
 	deadman chan struct{}
+
+	// The exchange half: the box's second socket, every answer it writes,
+	// and how many times it has joined.
+	exchange       *websocket.Conn
+	answers        chan []byte
+	exchangeJoins  int
+	exchangeJoined chan struct{}
 }
 
 // deadmanRowWire is the POST /deadman body, as the contract writes it.
@@ -54,10 +67,13 @@ type deadmanRowWire struct {
 
 func newFakeRelay(epoch int64) *fakeRelay {
 	r := &fakeRelay{
-		epoch:       epoch,
-		joined:      make(chan struct{}, 16),
-		deadman:     make(chan struct{}, 64),
-		deadmanRows: map[string]deadmanRowWire{},
+		epoch:   epoch,
+		joined:  make(chan struct{}, 16),
+		deadman: make(chan struct{}, 64),
+		answers: make(chan []byte, 64),
+
+		exchangeJoined: make(chan struct{}, 16),
+		deadmanRows:    map[string]deadmanRowWire{},
 	}
 	r.server = httptest.NewServer(http.HandlerFunc(r.handle))
 	return r
@@ -121,11 +137,14 @@ func (r *fakeRelay) handle(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if role == "box" {
+	switch role {
+	case "box":
 		r.serveUplink(conn)
-		return
+	case "exchange":
+		r.serveExchange(conn)
+	default:
+		r.serveStream(conn)
 	}
-	r.serveStream(conn)
 }
 
 func (r *fakeRelay) serveUplink(conn *websocket.Conn) {
@@ -137,8 +156,8 @@ func (r *fakeRelay) serveUplink(conn *websocket.Conn) {
 	// The relay's only two words. Both sides hear them, which is how a peer
 	// knows there is anybody to talk to.
 	for _, s := range streams {
-		_ = conn.WriteMessage(websocket.TextMessage, []byte(CtrlReady))
-		_ = s.WriteMessage(websocket.TextMessage, []byte(CtrlReady))
+		r.write(conn, websocket.TextMessage, []byte(CtrlReady))
+		r.write(s, websocket.TextMessage, []byte(CtrlReady))
 	}
 
 	defer func() {
@@ -179,7 +198,7 @@ func (r *fakeRelay) serveUplink(conn *websocket.Conn) {
 		streams := append([]*websocket.Conn(nil), r.streams...)
 		r.mu.Unlock()
 		for _, s := range streams {
-			_ = s.WriteMessage(websocket.BinaryMessage, message)
+			r.write(s, websocket.BinaryMessage, message)
 		}
 	}
 }
@@ -191,8 +210,8 @@ func (r *fakeRelay) serveStream(conn *websocket.Conn) {
 	r.mu.Unlock()
 
 	if uplink != nil {
-		_ = uplink.WriteMessage(websocket.TextMessage, []byte(CtrlReady))
-		_ = conn.WriteMessage(websocket.TextMessage, []byte(CtrlReady))
+		r.write(uplink, websocket.TextMessage, []byte(CtrlReady))
+		r.write(conn, websocket.TextMessage, []byte(CtrlReady))
 	}
 
 	defer func() {
@@ -207,7 +226,7 @@ func (r *fakeRelay) serveStream(conn *websocket.Conn) {
 		up := r.uplink
 		r.mu.Unlock()
 		if empty && up != nil {
-			_ = up.WriteMessage(websocket.TextMessage, []byte(CtrlGone))
+			r.write(up, websocket.TextMessage, []byte(CtrlGone))
 		}
 		_ = conn.Close()
 	}()
@@ -224,9 +243,80 @@ func (r *fakeRelay) serveStream(conn *websocket.Conn) {
 		up := r.uplink
 		r.mu.Unlock()
 		if up != nil {
-			_ = up.WriteMessage(websocket.BinaryMessage, message)
+			r.write(up, websocket.BinaryMessage, message)
 		}
 	}
+}
+
+// serveExchange holds the box's exchange socket and keeps every answer it
+// writes. A test plays the watch's side with post.
+func (r *fakeRelay) serveExchange(conn *websocket.Conn) {
+	r.mu.Lock()
+	r.exchange = conn
+	r.exchangeJoins++
+	r.mu.Unlock()
+	select {
+	case r.exchangeJoined <- struct{}{}:
+	default:
+	}
+	defer func() {
+		r.mu.Lock()
+		if r.exchange == conn {
+			r.exchange = nil
+		}
+		r.mu.Unlock()
+		_ = conn.Close()
+	}()
+	for {
+		kind, message, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		if kind == websocket.BinaryMessage {
+			r.answers <- message
+		}
+	}
+}
+
+// post is the relay's /x/ route in one call: an id of its own in front of the
+// body, down the exchange socket, and the answer that comes back behind the
+// same id. Nil when the box stays silent.
+func (r *fakeRelay) post(id byte, body []byte, wait time.Duration) []byte {
+	r.mu.Lock()
+	conn := r.exchange
+	r.mu.Unlock()
+	if conn == nil {
+		return nil
+	}
+	tag := bytes.Repeat([]byte{id}, 16)
+	r.write(conn, websocket.BinaryMessage, append(append([]byte(nil), tag...), body...))
+	deadline := time.After(wait)
+	for {
+		select {
+		case answer := <-r.answers:
+			if bytes.Equal(answer[:16], tag) {
+				return answer[16:]
+			}
+		case <-deadline:
+			return nil
+		}
+	}
+}
+
+// dropExchange closes the box's exchange socket from the relay's side.
+func (r *fakeRelay) dropExchange() {
+	r.mu.Lock()
+	conn := r.exchange
+	r.mu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
+	}
+}
+
+func (r *fakeRelay) write(conn *websocket.Conn, kind int, message []byte) {
+	r.wmu.Lock()
+	defer r.wmu.Unlock()
+	_ = conn.WriteMessage(kind, message)
 }
 
 func (r *fakeRelay) seenHandles() []string {

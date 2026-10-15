@@ -283,12 +283,97 @@ func TestBetaConversionKeepsOriginalsAndResumesAfterPublish(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	pts, err := s.LoadSeries("meter", "power", 1, 2300, 0)
+	pts, err := s.loadArchiveSeriesRaw(context.Background(), "meter", "power", 1, 2300)
 	if err != nil || len(pts) != 2300 {
 		t.Fatalf("converted data=%d %v", len(pts), err)
 	}
 	if got, _ := s.LoadConfig("saved_goal"); got != "80% by 07:00" {
 		t.Fatal("goal changed", got)
+	}
+	if err := s.RetireRawHistory(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	kept, err := s.LoadSeriesBucketsOrRaw("meter", "power", 0, 10000, 0)
+	if err != nil || len(kept) != 1 || kept[0].N != 2300 {
+		t.Fatalf("retirement lost converted chart summaries: %v %v", kept, err)
+	}
+}
+
+func TestBetaConversionRefusesReceiptWithoutChartSummaries(t *testing.T) {
+	path, source := betaSQLiteFixture(t)
+	if err := ConvertBetaHistory(context.Background(), path, source, nil); err != nil {
+		t.Fatal(err)
+	}
+	dest := historyDatabasePath(path)
+	db, err := openRaw(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DELETE FROM history_migrations WHERE name=?`, convertedChartSummaries); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	before, err := historyFileHash(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = ConvertBetaHistory(context.Background(), path, source, nil)
+	if err == nil || !strings.Contains(err.Error(), "lacks chart summaries") {
+		t.Fatal("accepted an older incomplete conversion", err)
+	}
+	after, err := historyFileHash(dest)
+	if err != nil || before != after {
+		t.Fatal("incomplete destination changed", err)
+	}
+	stateBefore, err := historyFileHash(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := RetireRawOnOpen
+	RetireRawOnOpen = true
+	t.Cleanup(func() { RetireRawOnOpen = previous })
+	if s, err := Open(path); err == nil || !strings.Contains(err.Error(), "lacks chart summaries") {
+		if s != nil {
+			s.Close()
+		}
+		t.Fatal("Core accepted an older incomplete conversion", err)
+	}
+	after, err = historyFileHash(dest)
+	if err != nil || before != after {
+		t.Fatal("Core changed incomplete history", err)
+	}
+	stateAfter, err := historyFileHash(path)
+	if err != nil || stateBefore != stateAfter {
+		t.Fatal("Core changed config before refusing conversion", err)
+	}
+}
+
+func TestBetaConversionAlreadyPlainHistoryKeepsStarting(t *testing.T) {
+	path, source := betaSQLiteFixture(t)
+	if err := ConvertBetaHistory(context.Background(), path, source, nil); err != nil {
+		t.Fatal(err)
+	}
+	previous := RetireRawOnOpen
+	RetireRawOnOpen = true
+	t.Cleanup(func() { RetireRawOnOpen = previous })
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.history.Exec(`DELETE FROM history_migrations WHERE name=?`, convertedChartSummaries); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	// Earlier releases already retired raw rows on some sites. No further
+	// retirement can drop their data; keep these stores usable during upgrade.
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal("already plain history cannot upgrade", err)
+	}
+	defer s.Close()
+	points, err := s.LoadSeriesBucketsOrRaw("meter", "power", 0, 10000, 0)
+	if err != nil || len(points) != 1 || points[0].N != 2300 {
+		t.Fatal("already retained summaries changed", points, err)
 	}
 }
 

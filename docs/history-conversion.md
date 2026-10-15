@@ -4,7 +4,27 @@ Only boxes that selected DuckDB history need this tool. Fresh installations
 and older SQLite + Parquet installations start Core without a manual conversion.
 The normal Core binary, container and release builds do not include DuckDB.
 
-Use the converter from the same commit as the new Core candidate. Build it on
+Use the converter from the same commit as the new Core candidate. Native beta
+releases with converter packages include
+`ftw-history-migrate-VERSION-linux-arm64.tar.gz` and an `amd64` package, each
+with a `.sha256` file. Download the package for the new Linux host and check
+its checksum before unpacking. Inside, `history-converter.json` records the
+source beta, commit, state schema and binary hash. Match these to the native
+release's `ftw-native-release.json`. For stable, use the converter from the
+beta listed in that native receipt's `source_beta` field.
+
+Run conversion on a stopped source or a separate restored copy. A 32-bit source
+or a host with older system libraries can export its backup to a new 64-bit
+Linux host and run the converter there. This does not qualify every old backup
+format; check the migration guide's tested routes before starting Core.
+
+If the selected release has no converter package, do not use a tool from a
+different commit. Maintainers publish the matching packages with
+`history-converter-release.yml`, using the exact `source_beta`. That workflow
+tests the source, checks the published native receipt and adds both packages
+without replacing Core's assets or its receipt.
+
+For development, build the same source on
 the target architecture from `go/tools/history-migrate` with `go build -o
 ftw-history-migrate .`, or use its Dockerfile from the repository root:
 
@@ -32,20 +52,51 @@ volume for a backup if space is tight; do not extract a large backup alongside
 an active control loop on the same SD card. Conversion needs room for both the
 originals and the new SQLite file. It never removes the originals.
 
-Run locally on the box, using the real host path rather than a container path:
+Run from the old Core's working directory, using real host paths. On a stopped
+copy or another mount, name the copied archive directory explicitly:
 
 ```sh
-./ftw-history-migrate -state /path/to/data/state.db
+./ftw-history-migrate -state /path/to/data/state.db -cold /path/to/data/cold
 ```
 
 The tool checks the beta generation, fingerprints the sources, copies and
-reads back each table, merges any remaining legacy SQLite rows and hot history,
+reads back each table, merges any remaining legacy SQLite rows, hot history and
+retained long-format Parquet days,
 and replays energy observations through the existing ledger rules. Hot catalog
 IDs map by name to the selected catalog. Saved device IDs, charging goals,
 SoC estimates and model state stay in state.db.
 
+SQLite settings select the cold directory unless `-cold` names the stopped
+copy. With no saved cold setting, the default is `cold` in Core's working directory.
+Explicit relative settings use the old Core's working directory. An unavailable
+saved path, linked archive, or unsupported Parquet layout stops conversion;
+keep that data and its backup. The tool fingerprints the cold files, joins
+readings by driver, metric and timestamp, and keeps the selected beta/hot value
+on overlap. File receipts become active only after verified publication, so
+Core can retire the duplicate archive without losing its unique or late rows.
+Changed files stop an interrupted conversion from resuming against other data.
+Planner diagnostics and bucket archives stay with their existing readers;
+the sample-day conversion leaves those files unchanged.
+
+An older summary without raw timestamps cannot prove whether an older
+archive-only row already belongs to it. Conversion stops that ambiguous case
+and keeps the sources. A later row can extend the retained hour; the result
+keeps hourly resolution rather than claiming missing raw detail. Older
+conversions with unverified retained cold files require a separate conversion
+from the stopped pre-conversion full backup, including those archives.
+
+The tool builds ten-second, minute and hour summaries before it selects the
+new history file. It keeps older hour summaries whose raw rows have expired.
+Core can then retire raw rows on its first start without dropping a series.
+If a prior converter published a file without these summaries, preserve that
+directory and convert a separate, stopped copy of the pre-conversion full
+backup. The tool refuses to treat that older conversion as complete.
+Core also refuses a start that would retire remaining raw rows from an older
+conversion without these summaries. Stores that already have no raw rows can
+keep running; this does not certify their earlier conversion.
+
 An interruption leaves history.db.converting. Restart the same tool with Core
-still stopped. It resumes copied beta tables and skips completed merge phases;
+still stopped. It resumes copied beta tables and chart summaries and skips completed merge phases;
 a partial merge phase replays safely. Changed source fingerprints stop the
 resume rather than mixing generations. Publication uses a file sync, rename
 and directory sync before selecting the new generation. A crash after publication

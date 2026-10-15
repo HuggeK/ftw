@@ -19,6 +19,9 @@ type Physics struct {
 	DrawA    float64
 	EnergyWh float64
 	Plugged  bool
+	// Stalled is a charger that stops delivering while the car still wants
+	// energy, as a tripped relay or a cloud-side fault does.
+	Stalled bool
 }
 
 func newPhysics(m Model, tauS float64) Physics {
@@ -39,7 +42,7 @@ func (p Physics) PowerW() float64 {
 }
 
 func (p Physics) targetA() float64 {
-	if !p.Plugged || p.LimitA < minChargeAmps {
+	if !p.Plugged || p.Stalled || p.LimitA < minChargeAmps {
 		return 0
 	}
 	if p.LimitA > p.MaxAmps {

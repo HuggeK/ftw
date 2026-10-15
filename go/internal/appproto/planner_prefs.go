@@ -45,7 +45,7 @@ func (h *Handler) setPlannerPrefs(cmd Cmd, uptimeMs int64) error {
 		return h.rejectArg(cmd, "safety_k", nil)
 	}
 
-	if _, err := h.acceptCmd(cmd, uptimeMs); err != nil {
+	if took, err := h.acceptCmd(cmd, uptimeMs); !took || err != nil {
 		return err
 	}
 

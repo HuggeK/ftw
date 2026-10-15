@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -46,6 +47,7 @@ import (
 	"github.com/srcfl/ftw/go/internal/ha"
 	"github.com/srcfl/ftw/go/internal/loadmodel"
 	"github.com/srcfl/ftw/go/internal/loadpoint"
+	"github.com/srcfl/ftw/go/internal/localzone"
 	"github.com/srcfl/ftw/go/internal/mpc"
 	"github.com/srcfl/ftw/go/internal/notifications"
 	"github.com/srcfl/ftw/go/internal/ocpp"
@@ -73,6 +75,7 @@ const (
 // One instance is shared across all handlers; mutations use the contained
 // mutexes from each package.
 type Deps struct {
+	HistoryMeasurementSources func() telemetry.ForecastOptions
 	// SiteMeasurementSources reuses the configured physical-flow inventory.
 	// These are source declarations, never forecast values or derived load.
 	SiteMeasurementSources func() telemetry.ForecastOptions
@@ -104,6 +107,10 @@ type Deps struct {
 	// that could quietly disagree with it. Nil in tests and minimal
 	// embeddings; GET /api/fleet-ping then says so.
 	FleetPing *fleetping.Pinger
+
+	// Cloud is the box's FTW Cloud grant and uplink. Nil in tests and
+	// minimal embeddings; the /api/cloud routes then say it is unavailable.
+	Cloud CloudGrant
 
 	CfgMu         *sync.RWMutex
 	Cfg           *config.Config
@@ -421,6 +428,7 @@ func (s *Server) routes() {
 	s.handle("DELETE /api/app-link/devices/{id}", Configure, s.handleAppLinkDeviceRevoke)
 	s.handle("PATCH  /api/app-link/devices/{id}", Configure, s.handleAppLinkDeviceRole)
 	s.handle("GET  /api/fleet-ping", Read, s.handleFleetPing)
+	s.cloudRoutes()
 	s.handle("POST /api/mode", Actuate, s.handleSetMode, Via(appproto.OpSetMode))
 	s.handle("GET  /api/planner/prefs", Read, s.handleGetPlannerPrefs)
 	s.handle("POST /api/planner/prefs", Actuate, s.handleSetPlannerPrefs, Via(appproto.OpPlannerPrefsSet))
@@ -1138,14 +1146,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			// 0; rendering that as a hard "0 Wh" looks like a real reading
 			// instead of "no data yet". Mirror the old `len(pts) > 1` guard.
 			if d.Intervals > 0 {
-				energyToday = map[string]any{
-					"import_wh":         d.ImportWh,
-					"export_wh":         d.ExportWh,
-					"pv_wh":             d.PVWh,
-					"bat_charged_wh":    d.BatChargedWh,
-					"bat_discharged_wh": d.BatDischargedWh,
-					"load_wh":           d.LoadWh,
-				}
+				energyToday = energyTodayFields(d)
 			}
 		} else {
 			slog.Warn("failed to integrate today's energy", "err", err)
@@ -1252,6 +1253,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 		resp["energy"] = energy
 	}
+	s.qualifyStatusHistory(resp, ctrl.SiteMeterDriver)
 	writeJSON(w, 200, resp)
 }
 
@@ -1271,14 +1273,17 @@ func currentGridEnergySlot(st *state.Store, now time.Time) (map[string]any, erro
 	if err != nil {
 		return nil, err
 	}
+	if d.Intervals == 0 {
+		d.Missing |= state.MissingGrid
+	}
 	return map[string]any{
 		"slot_start_ms": slotStart.UnixMilli(),
 		"slot_end_ms":   slotEnd.UnixMilli(),
 		"elapsed_s":     now.Sub(slotStart).Seconds(),
-		"import_wh":     d.ImportWh,
-		"export_wh":     d.ExportWh,
+		"import_wh":     d.Missing.Value(state.MissingGrid, d.ImportWh),
+		"export_wh":     d.Missing.Value(state.MissingGrid, d.ExportWh),
 		// Observational only — see comment above. Do not bill against this.
-		"net_wh": d.ImportWh - d.ExportWh,
+		"net_wh": d.Missing.Value(state.MissingGrid, d.ImportWh-d.ExportWh),
 	}, nil
 }
 
@@ -1675,6 +1680,8 @@ func (s *Server) handlePostConfig(w http.ResponseWriter, r *http.Request) {
 		"status":           "ok",
 		"restart_required": len(restartReasons) > 0,
 		"restart_reasons":  restartReasons,
+		"warnings":         newCfg.LoadpointWarnings,
+		"loadpoints":       newCfg.Loadpoints,
 	})
 }
 
@@ -2273,11 +2280,18 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 		}
 		inner["ts"] = row.TsMs
 		// Fill from flat columns for charting
-		inner["grid_w"] = row.GridW
-		inner["pv_w"] = row.PVW
-		inner["bat_w"] = row.BatW
-		inner["load_w"] = row.LoadW
-		inner["bat_soc"] = row.BatSoC
+		inner["grid_w"] = row.Missing.Value(state.MissingGrid, row.GridW)
+		inner["pv_w"] = row.Missing.Value(state.MissingPV, row.PVW)
+		inner["bat_w"] = row.Missing.Value(state.MissingBattery, row.BatW)
+		inner["load_w"] = row.Missing.Value(state.MissingLoad, row.LoadW)
+		inner["bat_soc"] = row.Missing.Value(state.MissingSoC, row.BatSoC)
+		inner["load_house_w"] = inner["load_w"]
+		for field, flag := range map[string]state.HistoryMissing{"ev_w": state.MissingEV, "v2x_w": state.MissingV2X} {
+			if row.Missing&flag != 0 {
+				inner[field] = nil
+			}
+		}
+		inner["history_quality"] = row.Missing.Quality()
 		inner["n"] = row.N
 		inner["resolution_ms"] = row.ResolutionMS
 		inner["first_ms"] = row.FirstMS
@@ -2342,7 +2356,7 @@ func parseRange(s string) int64 {
 // Response: {"days": [{"day":"YYYY-MM-DD","import_wh":..., "export_wh":...,
 //
 //	"pv_wh":..., "bat_charged_wh":..., "bat_discharged_wh":...,
-//	"load_wh":...}], "tz": "Local"}
+//	"load_wh":...}], "tz": "Europe/Stockholm"}
 //
 // Buckets are local-day. Today is the last entry. Mirrors the integration
 // loop in handleStatus's energy-today block — same site convention, same
@@ -2425,17 +2439,21 @@ func (s *Server) handleEnergyDaily(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		if de.Intervals == 0 {
+			de.Missing |= state.MissingPower
+		}
 		out = append(out, map[string]any{
+			"history_quality":   de.Missing.Quality(),
 			"day":               dayKey,
-			"import_wh":         de.ImportWh,
-			"export_wh":         de.ExportWh,
-			"pv_wh":             de.PVWh,
-			"bat_charged_wh":    de.BatChargedWh,
-			"bat_discharged_wh": de.BatDischargedWh,
-			"load_wh":           de.LoadWh,
+			"import_wh":         de.Missing.Value(state.MissingGrid, de.ImportWh),
+			"export_wh":         de.Missing.Value(state.MissingGrid, de.ExportWh),
+			"pv_wh":             de.Missing.Value(state.MissingPV, de.PVWh),
+			"bat_charged_wh":    de.Missing.Value(state.MissingBattery, de.BatChargedWh),
+			"bat_discharged_wh": de.Missing.Value(state.MissingBattery, de.BatDischargedWh),
+			"load_wh":           de.Missing.Value(state.MissingLoad, de.LoadWh),
 		})
 	}
-	writeJSON(w, 200, map[string]any{"days": out, "tz": loc.String()})
+	writeJSON(w, 200, map[string]any{"days": out, "tz": localzone.Name()})
 }
 
 // ---- /api/prices ----
@@ -2589,6 +2607,19 @@ func (s *Server) handleMPCPlan(w http.ResponseWriter, r *http.Request) {
 		"last_replan_reason": snapshot.Reason,
 		"replanning":         snapshot.Pending,
 		"outdated":           snapshot.Outdated,
+		"error":              snapshot.Error,
+		"warnings":           snapshot.Warnings,
+	}
+	if s.deps.Cfg != nil && s.deps.CfgMu != nil {
+		s.deps.CfgMu.RLock()
+		warnings := append([]string(nil), s.deps.Cfg.LoadpointWarnings...)
+		s.deps.CfgMu.RUnlock()
+		for _, warning := range snapshot.Warnings {
+			if !slices.Contains(warnings, warning) {
+				warnings = append(warnings, warning)
+			}
+		}
+		meta["warnings"] = warnings
 	}
 	if plan == nil {
 		writeJSON(w, 200, map[string]any{"enabled": true, "plan": nil, "meta": meta})
@@ -3679,6 +3710,7 @@ func (s *Server) handleLoadpoints(w http.ResponseWriter, r *http.Request) {
 	if s.deps.Tel != nil {
 		decorateLoadpointsWithVehicle(states, s.deps.Tel)
 	}
+	s.applyPlanningSoC(states, time.Now())
 	s.decorateLoadpointsWithManual(states)
 	s.decorateLoadpointsWithBatteryBoost(states)
 	s.decorateLoadpointsWithPlan(states)
@@ -3687,6 +3719,29 @@ func (s *Server) handleLoadpoints(w http.ResponseWriter, r *http.Request) {
 		"vehicle_limit_goal_supported": true,
 		"loadpoints":                   s.loadpointsWithFeedback(states),
 	})
+}
+
+// applyPlanningSoC records the SoC a new plan starts from. It uses the
+// same picker and timestamp rule as the MPC loadpoint spec, so the
+// charging view's "Planning from" line matches the planner even when the
+// displayed car reading is older than the live-control window.
+func (s *Server) applyPlanningSoC(states []loadpoint.State, now time.Time) {
+	if s.deps == nil || s.deps.Loadpoints == nil {
+		return
+	}
+	for i := range states {
+		if !states[i].PluggedIn {
+			continue
+		}
+		var pick telemetry.VehiclePick
+		if s.deps.Tel != nil {
+			delivering := states[i].CurrentPowerW > loadpoint.DeliveringW
+			pick = telemetry.PlanningVehiclePick(s.deps.Tel, delivering, now)
+		}
+		soc, fromVehicle := s.deps.Loadpoints.PlanningStartSoC(states[i].ID, pick.SoC, pick.UpdatedAt, pick.Driver != "")
+		states[i].PlanningSoC = &soc
+		states[i].PlanningFromVehicle = fromVehicle
+	}
 }
 
 // decorateLoadpointsWithVehicle overlays the best-matching DerVehicle
@@ -3913,6 +3968,9 @@ func (s *Server) applyLoadpointSchedule(id string, raw json.RawMessage) (int, st
 	if sched.TimeOfDayMinUTC < 0 || sched.TimeOfDayMinUTC >= 1440 {
 		return 400, "time_of_day_min_utc must be 0..1439"
 	}
+	if min, ok := sched.TimeOfDayMin(); ok && (min < 0 || min >= 1440) {
+		return 400, "time_of_day_min must be 0..1439"
+	}
 	if sched.Days > 0x7F {
 		return 400, "days must be a 7-bit weekday mask (0..127, bit 0 = Monday)"
 	}
@@ -3965,7 +4023,11 @@ func (s *Server) replanForScheduleChange(id string) {
 // PUT /api/loadpoints/{id}/schedule replaces the loadpoint's schedule.
 // The body is the schedule object itself:
 //
-//	{"soc_pct": 80, "time_of_day_min_utc": 360, "recurring": true, "days": 31}
+//	{"soc": 0.8, "time_of_day_min": 420, "time_of_day_min_utc": 300, "recurring": true, "days": 31}
+//
+// time_of_day_min is the ready time on the household clock and wins
+// when present. Older clients send only time_of_day_min_utc, the UTC
+// minute of that time on today's date.
 //
 // Priced Configure where its sibling POST …/target is Actuate, because
 // a schedule is a standing instruction about future days: saved late,

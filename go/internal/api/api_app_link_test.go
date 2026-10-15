@@ -24,12 +24,15 @@ func lanAuthOnDeps(enroll *stubEnroller) *Deps {
 // A stub enroller. Pairing is the one surface that hands out a credential, so
 // what matters here is who is allowed to ask, not what comes back.
 type stubEnroller struct {
-	minted     int
-	spoken     int
-	revoked    int
-	mintedRole string
-	roleSet    string
-	err        error
+	minted  int
+	spoken  int
+	watch   int
+	revoked int
+	// watchParent is the phone the last watch code was bound to.
+	watchParent string
+	mintedRole  string
+	roleSet     string
+	err         error
 	// lastOwner makes the stub refuse to demote its one row, and to remove it
 	// for anyone who is not standing at the box — the way appenroll does when
 	// it is the only owner left.
@@ -64,6 +67,15 @@ func (s *stubEnroller) MintSpokenCode(role string) (string, time.Time, error) {
 	s.spoken++
 	s.mintedRole = role
 	return "ABCD-EFGH", time.Now().Add(5 * time.Minute), nil
+}
+
+func (s *stubEnroller) MintWatchCode(parentID string) ([]byte, time.Time, error) {
+	if s.err != nil {
+		return nil, time.Time{}, s.err
+	}
+	s.watch++
+	s.watchParent = parentID
+	return make([]byte, 16), time.Now().Add(10 * time.Minute), nil
 }
 
 func (s *stubEnroller) EnrollmentURL(code []byte, lanHint string) (string, error) {

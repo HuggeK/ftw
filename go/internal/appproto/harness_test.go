@@ -16,7 +16,7 @@ import (
 // testCodec is the frame layout from docs/protocol.md, implemented here so the
 // tests drive real bytes rather than passing structs to themselves.
 //
-// go/internal/appwire owns the production one. Keeping a copy in _test.go means
+// go/protocol/appwire owns the production one. Keeping a copy in _test.go means
 // a test passing here says the message layer works against the documented
 // layout, not that a stub agreed with itself — and it cannot be mistaken for
 // the real codec, because it does not ship.
@@ -245,16 +245,20 @@ type fakeGrants struct {
 	role  string
 	epoch uint64
 	gone  bool
+	// parentRole and root make the grant a watch's: the role its phone holds
+	// now, and that phone's subject.
+	parentRole string
+	root       string
 }
 
 func newGrants() *fakeGrants { return &fakeGrants{role: apiauth.RoleOwner, epoch: 1} }
 
 func newViewerGrants() *fakeGrants { return &fakeGrants{role: apiauth.RoleViewer, epoch: 1} }
 
-func (g *fakeGrants) Grant() (string, uint64, bool) {
+func (g *fakeGrants) Grant() (Enrolment, bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.role, g.epoch, !g.gone
+	return Enrolment{Role: g.role, Epoch: g.epoch, ParentRole: g.parentRole, Root: g.root}, !g.gone
 }
 
 // revoke is what appenroll.Revoke does to a row: it stops existing.
@@ -324,6 +328,7 @@ func newRigWith(t *testing.T, prefs PlannerPrefs) (*Handler, *fakeBox, *recorder
 		Sender:       rec,
 		Caller:       ownerCaller(),
 		Grants:       newGrants(),
+		Commands:     NewCmdLog(),
 		SrcGrid:      "meter.p1",
 		SrcPV:        "inverter.sungrow",
 		SrcBattery:   "battery.sungrow",

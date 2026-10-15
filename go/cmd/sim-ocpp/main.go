@@ -121,6 +121,17 @@ func main() {
 			}
 			w.WriteHeader(204)
 		})
+		for path, stalled := range map[string]bool{"stall": true, "resume": false} {
+			mux.HandleFunc("POST /charger/{id}/"+path, func(w http.ResponseWriter, r *http.Request) {
+				sim := findSim(sims, r.PathValue("id"))
+				if sim == nil {
+					http.NotFound(w, r)
+					return
+				}
+				sim.Stall(stalled)
+				w.WriteHeader(204)
+			})
+		}
 		go func() {
 			slog.Info("control listening", "addr", *control)
 			if err := http.ListenAndServe(*control, mux); err != nil {

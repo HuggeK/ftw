@@ -3,32 +3,21 @@ package appproto
 import (
 	"context"
 	"errors"
-	"fmt"
-	"math"
 	"time"
+
+	"github.com/srcfl/ftw/go/protocol"
 )
 
 // History: the box's side of the tile protocol.
 //
-// The geometry here — resolutions, tile spans, strides, ids, the etag — is
-// the same arithmetic as the app's src/lib/protocol/history.ts, because the
-// two ends must compute identical tiles from identical inputs or the etag
-// comparison silently degrades into "always refetch". Spans and retention
-// come from contract/registry.yaml through contract_gen.go; nothing here is
-// hand-written twice.
+// The tile geometry — resolutions, tile spans, strides, ids, the etag — lives
+// in package protocol, because FTW Cloud must compute the same tiles. This
+// file plans which tiles answer a query and reads them from the store.
 //
 // Power series are derived from the energy ledger: a bucket's mean power is
 // its energy divided by its width. That is an average, and it is presented as
 // one — the chunk carries its step, and the app labels it. Sub-bucket wiggles
 // are gone, which is the correct price for history that survives a restart.
-
-// HistorySample is one stored bucket of one series, in mean watts.
-type HistorySample struct {
-	// StartMs is the bucket start, wall clock.
-	StartMs int64
-	// W is the mean power over the bucket, site-signed.
-	W float64
-}
 
 // HistoryProvider answers windows of stored series.
 //
@@ -43,11 +32,15 @@ type HistoryProvider interface {
 	Window(ctx context.Context, names []string, stepMs, fromMs, toMs int64) (map[string][]HistorySample, error)
 }
 
-// resolutionStepMs is the stored bucket width per resolution. This is the
-// meaning of the resolution's name; the registry carries spans and retention.
-var resolutionStepMs = map[Resolution]int64{
-	ResN5m: 300_000,
-	ResN1h: 3_600_000,
+// The geometry the planner below shares with the app and with FTW Cloud.
+var resolutionStepMs = protocol.ResolutionStepMs
+
+func pointsPerTile(res Resolution) int64 { return protocol.PointsPerTile(res) }
+
+func tileStartFor(res Resolution, atMs int64) int64 { return protocol.TileStartFor(res, atMs) }
+
+func tileIDFor(res Resolution, stride, startMs int64) string {
+	return protocol.TileIDFor(res, stride, startMs)
 }
 
 // resolutionOrder is fine to coarse: the order the box clamps along.
@@ -63,44 +56,13 @@ const (
 	historyTimeout   = 15 * time.Second
 )
 
-// missingSample marks a hole on the wire. Distinct from zero, which is a
-// real reading. Same value as the app's MISSING_SAMPLE.
-const missingSample = math.MinInt32
-
 func retentionMsOf(res Resolution) int64 {
 	return int64(ResolutionRetentionDays[res]) * 86_400_000
-}
-
-func pointsPerTile(res Resolution) int64 {
-	return ResolutionTileSpanMs[res] / resolutionStepMs[res]
-}
-
-func tileStartFor(res Resolution, atMs int64) int64 {
-	span := ResolutionTileSpanMs[res]
-	return (atMs / span) * span
-}
-
-// tileIDFor matches the app's tileId(): res/stride/tileIndex.
-func tileIDFor(res Resolution, stride, startMs int64) string {
-	return fmt.Sprintf("%s/%d/%d", res, stride, startMs/ResolutionTileSpanMs[res])
-}
-
-// etagOf is FNV-1a over the packed block, eight hex digits — the same hash
-// the app computes, because the whole point of an etag is that both ends
-// agree on it.
-func etagOf(data []byte) string {
-	h := uint32(0x811c9dc5)
-	for _, b := range data {
-		h ^= uint32(b)
-		h *= 0x01000193
-	}
-	return fmt.Sprintf("%08x", h)
 }
 
 type plannedTile struct {
 	id      string
 	startMs int64
-	points  int64
 }
 
 type historyPlan struct {
@@ -175,7 +137,6 @@ func planHistoryQuery(res Resolution, fromMs, toMs int64, maxPoints int) history
 		tiles = append(tiles, plannedTile{
 			id:      tileIDFor(chosen, stride, start),
 			startMs: start,
-			points:  perTile / stride,
 		})
 	}
 
@@ -427,8 +388,8 @@ func (h *Handler) serveHistory(ctx context.Context, req historyRequest) error {
 	return h.sendBulk(MsgHistEnd, &req.id, HistEnd{ResActual: req.plan.res, Gaps: req.gaps})
 }
 
-// buildTile reads the provider and packs one tile: int32 LE columns, one
-// block per series, MISSING where the store has no bucket.
+// buildTile reads the provider and packs one tile. The packing is
+// protocol.PackTile, which FTW Cloud shares.
 func (h *Handler) buildTile(
 	ctx context.Context,
 	series []string,
@@ -438,69 +399,10 @@ func (h *Handler) buildTile(
 ) (HistChunk, error) {
 	stepMs := resolutionStepMs[plan.res]
 	tileEnd := tile.startMs + ResolutionTileSpanMs[plan.res]
-	points := tile.points
 
 	windows, err := h.cfg.History.Window(ctx, series, stepMs, tile.startMs, tileEnd)
 	if err != nil {
 		return HistChunk{}, err
 	}
-
-	data := make([]byte, int64(len(series))*points*4)
-	for s, name := range series {
-		samples := windows[name]
-
-		// Stored buckets fold into strided points by plain mean: the ledger's
-		// buckets are equal width, so each carries equal weight.
-		sums := make([]float64, points)
-		counts := make([]int64, points)
-		for _, sample := range samples {
-			if sample.StartMs < tile.startMs || sample.StartMs >= tileEnd {
-				continue
-			}
-			p := (sample.StartMs - tile.startMs) / (stepMs * plan.stride)
-			if p < 0 || p >= points {
-				continue
-			}
-			sums[p] += sample.W
-			counts[p]++
-		}
-
-		base := int64(s) * points * 4
-		for p := int64(0); p < points; p++ {
-			v := int32(missingSample)
-			if counts[p] > 0 {
-				v = clampSample(sums[p] / float64(counts[p]))
-			}
-			off := base + p*4
-			u := uint32(v)
-			data[off] = byte(u)
-			data[off+1] = byte(u >> 8)
-			data[off+2] = byte(u >> 16)
-			data[off+3] = byte(u >> 24)
-		}
-	}
-
-	return HistChunk{
-		TileID:  tile.id,
-		Etag:    etagOf(data),
-		Res:     plan.res,
-		StartMs: tile.startMs,
-		StepMs:  plan.stepMs,
-		Series:  series,
-		Data:    data,
-		Partial: tileEnd > nowMs,
-	}, nil
-}
-
-func clampSample(v float64) int32 {
-	r := math.Round(v)
-	// One step inside the limits: MinInt32 itself means "missing", and a
-	// real reading must never be mistaken for a hole.
-	if r >= math.MaxInt32 {
-		return math.MaxInt32
-	}
-	if r <= missingSample+1 {
-		return missingSample + 1
-	}
-	return int32(r)
+	return protocol.PackTile(plan.res, plan.stride, tile.startMs, series, windows, nowMs), nil
 }

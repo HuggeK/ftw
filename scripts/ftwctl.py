@@ -346,7 +346,16 @@ def verified_backup(api: API, path: Path) -> tuple[str, str, int, str]:
     created = entry.get("created_at", "")
     try:
         from datetime import datetime, timezone
-        age = (datetime.now(timezone.utc) - datetime.fromisoformat(created.replace("Z", "+00:00"))).total_seconds()
+        if not isinstance(created, str):
+            raise ValueError("creation time must be a string")
+        # Older Python accepts only three or six fractional digits. Core's
+        # RFC3339 timestamps can use any precision up to nanoseconds.
+        created = re.sub(r"\.(\d+)(?=Z$|[+-]\d{2}:\d{2}$)",
+                         lambda match: "." + match.group(1).ljust(6, "0")[:6], created)
+        instant = datetime.fromisoformat(created.replace("Z", "+00:00"))
+        if instant.tzinfo is None:
+            raise ValueError("creation time must include a timezone")
+        age = (datetime.now(timezone.utc) - instant).total_seconds()
     except ValueError as exc:
         raise FTWError("backup has no valid creation time") from exc
     if age < -300 or age > 24 * 3600:

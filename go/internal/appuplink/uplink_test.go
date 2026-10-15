@@ -19,9 +19,9 @@ import (
 	"github.com/srcfl/ftw/go/internal/apiauth"
 	"github.com/srcfl/ftw/go/internal/appenroll"
 	"github.com/srcfl/ftw/go/internal/appproto"
-	"github.com/srcfl/ftw/go/internal/appwire"
 	"github.com/srcfl/ftw/go/internal/control"
 	"github.com/srcfl/ftw/go/internal/mpc"
+	"github.com/srcfl/ftw/go/protocol/appwire"
 )
 
 // The handle derivation must agree with the app byte for byte, or the box and
@@ -599,6 +599,9 @@ func (stubPlans) Latest() *mpc.Plan { return nil }
 func (stubPlans) Rev() uint64       { return 0 }
 func (stubPlans) CeilingW() *int64  { return nil }
 
+// newHandler builds a handler for a test that sends no command, so each one
+// gets an empty command log of its own. A test about commands builds its
+// handlers over one log, as the box does.
 func newHandler(
 	s appproto.Sender, caller apiauth.Caller, grants appproto.GrantReader,
 ) (*appproto.Handler, error) {
@@ -612,6 +615,7 @@ func newHandler(
 		Sender:     s,
 		Caller:     caller,
 		Grants:     grants,
+		Commands:   appproto.NewCmdLog(),
 		SrcGrid:    "meter",
 		SrcPV:      "meter",
 		SrcBattery: "meter",
@@ -733,6 +737,7 @@ func TestARevokedShareStopsACallAlreadyInFlight(t *testing.T) {
 			API:        gateway,
 			Caller:     caller,
 			Grants:     grants,
+			Commands:   appproto.NewCmdLog(),
 			Caps:       append(appproto.DefaultCaps(), appproto.CapApiPassthrough),
 			SrcGrid:    "meter",
 			SrcPV:      "meter",
@@ -778,11 +783,11 @@ func TestARevokedShareStopsACallAlreadyInFlight(t *testing.T) {
 
 	// What the settings page does: forget the key, then tear down whatever
 	// it is running right now.
-	key, err := r.enroll.Revoke(deviceIDOf(app.staticPublic()), appenroll.AtTheBox)
+	removed, err := r.enroll.Revoke(deviceIDOf(app.staticPublic()), appenroll.AtTheBox)
 	if err != nil {
 		t.Fatalf("Revoke: %v", err)
 	}
-	if dropped := r.uplink.DropSessionsByAppKey(key); dropped != 1 {
+	if dropped := r.uplink.DropSessionsByAppKey(removed[0].Key); dropped != 1 {
 		t.Fatalf("dropped %d sessions, want 1", dropped)
 	}
 

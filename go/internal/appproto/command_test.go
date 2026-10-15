@@ -2,6 +2,7 @@ package appproto
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/srcfl/ftw/go/internal/apiauth"
@@ -235,19 +236,160 @@ func TestARetryReplaysTheOutcomeAndDoesNotActTwice(t *testing.T) {
 // The table is remembered for a day and then forgotten, so a box that has been
 // up for months is not carrying every command it has ever seen.
 func TestCommandIdsAreForgottenAfterTheRetentionWindow(t *testing.T) {
-	log := newCmdLog()
-	log.remember("old", CmdAck{CmdID: "old"}, 1_000)
-	log.remember("new", CmdAck{CmdID: "new"}, 1_000+CmdRetentionMs+1)
+	log := NewCmdLog()
+	log.remember("app:aBcD1234", "old", CmdAck{CmdID: "old"}, 1_000)
+	log.remember("app:wXyZ9876", "other", CmdAck{CmdID: "other"}, 1_000)
+	log.remember("app:aBcD1234", "new", CmdAck{CmdID: "new"}, 1_000+CmdRetentionMs+1)
 
-	if _, ok := log.lookup("old"); ok {
+	if _, ok := log.lookup("app:aBcD1234", "old"); ok {
 		t.Fatal("a command id outlived the retention window")
 	}
-	if _, ok := log.lookup("new"); !ok {
+	if _, ok := log.lookup("app:wXyZ9876", "other"); ok {
+		t.Fatal("another device's command id outlived the retention window")
+	}
+	if _, ok := log.lookup("app:aBcD1234", "new"); !ok {
 		t.Fatal("the fresh command id was pruned")
 	}
 	if log.size() != 1 {
 		t.Fatalf("table holds %d entries, want 1", log.size())
 	}
+}
+
+// One day less a millisecond is still inside the window.
+func TestACommandIdIsKeptForTheWholeDay(t *testing.T) {
+	log := NewCmdLog()
+	log.remember("app:aBcD1234", "kept", CmdAck{CmdID: "kept"}, 1_000)
+	log.remember("app:aBcD1234", "later", CmdAck{CmdID: "later"}, 1_000+CmdRetentionMs)
+
+	if _, ok := log.lookup("app:aBcD1234", "kept"); !ok {
+		t.Fatal("a command id was forgotten inside the retention window")
+	}
+}
+
+// Two sessions of one device can both miss the id and both reach the point of
+// acting. Only the first may act; the second gets the first one's record.
+func TestOnlyTheFirstToRememberAnIdMayAct(t *testing.T) {
+	log := NewCmdLog()
+	if _, fresh := log.remember("app:aBcD1234", "x", CmdAck{CmdID: "x", LeaseID: "first"}, 1_000); !fresh {
+		t.Fatal("the first remember of an id was not fresh")
+	}
+	rec, fresh := log.remember("app:aBcD1234", "x", CmdAck{CmdID: "x", LeaseID: "second"}, 1_001)
+	if fresh {
+		t.Fatal("the second remember of an id was allowed to act")
+	}
+	if rec.ack.LeaseID != "first" {
+		t.Fatalf("the second session got lease %q, want the first one's", rec.ack.LeaseID)
+	}
+	if _, fresh := log.remember("app:wXyZ9876", "x", CmdAck{CmdID: "x", LeaseID: "other"}, 1_002); !fresh {
+		t.Fatal("another device's id was taken as a repeat")
+	}
+}
+
+// A device that floods the box loses its own oldest ids, never another
+// device's.
+func TestOneDeviceCannotPushAnothersIdsOut(t *testing.T) {
+	log := NewCmdLog()
+	log.remember("app:wXyZ9876", "theirs", CmdAck{CmdID: "theirs"}, 1_000)
+	for i := 0; i <= CmdLogPerRoot; i++ {
+		id := fmt.Sprintf("flood-%d", i)
+		log.remember("app:aBcD1234", id, CmdAck{CmdID: id}, int64(2_000+i))
+	}
+
+	if _, ok := log.lookup("app:wXyZ9876", "theirs"); !ok {
+		t.Fatal("a flood from one device pushed another device's id out")
+	}
+	if _, ok := log.lookup("app:aBcD1234", "flood-0"); ok {
+		t.Fatal("the flooding device kept more ids than its cap")
+	}
+	if _, ok := log.lookup("app:aBcD1234", fmt.Sprintf("flood-%d", CmdLogPerRoot)); !ok {
+		t.Fatal("the newest id was dropped")
+	}
+	if got := log.size(); got != CmdLogPerRoot+1 {
+		t.Fatalf("table holds %d entries, want %d", got, CmdLogPerRoot+1)
+	}
+}
+
+// A newly stored id survives the cap even when it shares its time with older
+// ones, or the command it guards could act twice.
+func TestTheCapNeverDropsTheIdJustStored(t *testing.T) {
+	log := NewCmdLog()
+	for i := 0; i <= CmdLogPerRoot; i++ {
+		id := fmt.Sprintf("same-ms-%d", i)
+		log.remember("app:aBcD1234", id, CmdAck{CmdID: id}, 1_000)
+		if _, ok := log.lookup("app:aBcD1234", id); !ok {
+			t.Fatalf("id %d was dropped as it was stored", i)
+		}
+	}
+}
+
+// The command log belongs to the box, so a retry in a new session of the same
+// device replays the outcome. Before, each session kept its own log and the
+// retry acted a second time.
+func TestARetryInAnotherSessionReplaysTheOutcome(t *testing.T) {
+	h, box, rec, clock := newRig(t)
+	subscribe(t, h, rec)
+
+	cmd := cmdSetMode(string(control.ModeCharge), 7, 200_000, nil)
+	deliver(t, h, MsgCmd, nil, cmd)
+	firstAck := body[CmdAck](t, rec.only(t, MsgCmdAck))
+	h.Close()
+
+	next, nextRec := sessionOf(t, h, ownerCaller(), box, clock)
+	deliver(t, next, MsgCmd, nil, cmd)
+
+	if box.setModeCalls != 1 {
+		t.Fatalf("the dispatcher ran %d times for one command id", box.setModeCalls)
+	}
+	if got := body[CmdAck](t, nextRec.only(t, MsgCmdAck)); got.LeaseID != firstAck.LeaseID {
+		t.Fatalf("the new session issued lease %q, original %q", got.LeaseID, firstAck.LeaseID)
+	}
+	if res := body[CmdResult](t, nextRec.only(t, MsgCmdResult)); res.State != CmdApplied {
+		t.Fatalf("the new session replayed state %q", res.State)
+	}
+	if nextRec.has(MsgPlan) {
+		t.Fatal("a replay pushed a plan; nothing changed")
+	}
+}
+
+// Command ids are minted per device. Another device that sends the same id
+// means its own intent, and the box acts on it.
+func TestAnotherDevicesSameIdIsANewCommand(t *testing.T) {
+	h, box, rec, clock := newRig(t)
+	subscribe(t, h, rec)
+
+	cmd := cmdSetMode(string(control.ModeCharge), 7, 200_000, nil)
+	deliver(t, h, MsgCmd, nil, cmd)
+
+	other := ownerCaller()
+	other.Subject = apiauth.KindApp + ":qRsT5678"
+	next, nextRec := sessionOf(t, h, other, box, clock)
+	deliver(t, next, MsgCmd, nil, cmd)
+
+	if box.setModeCalls != 2 {
+		t.Fatalf("the dispatcher ran %d times; another device's id must act", box.setModeCalls)
+	}
+	if res := body[CmdResult](t, nextRec.only(t, MsgCmdResult)); res.State != CmdApplied {
+		t.Fatalf("the other device's command ended %q", res.State)
+	}
+}
+
+// sessionOf opens a second session on the same box as h, sharing its command
+// log, for the device caller names.
+func sessionOf(t *testing.T, h *Handler, caller apiauth.Caller, box *fakeBox, clock *fakeClock) (*Handler, *recorder) {
+	t.Helper()
+	rec := &recorder{}
+	cfg := h.cfg
+	cfg.Sender = rec
+	cfg.Caller = caller
+	cfg.Grants = newGrants()
+	cfg.NewLeaseID = func() string { return "lease-" + caller.Subject }
+	next, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(next.Close)
+	subscribe(t, next, rec)
+	return next, rec
 }
 
 func TestAModeTheBoxDoesNotHaveIsRefused(t *testing.T) {

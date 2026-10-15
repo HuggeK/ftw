@@ -47,29 +47,44 @@ func (s *Store) tryArchiveBatch(parent context.Context, prepare, write func(cont
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
 	var busyMS int
+	var tx *sql.Tx
+	var restoreBusy, viewLocked, writerLocked bool
+	defer func() {
+		if tx != nil {
+			_ = tx.Rollback()
+		}
+		if restoreBusy {
+			restore, done := context.WithTimeout(context.Background(), time.Second)
+			if _, err := conn.ExecContext(restore, fmt.Sprintf("PRAGMA busy_timeout=%d", busyMS)); err != nil {
+				// Never lend changed lock behaviour to live work.
+				_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+			}
+			done()
+		}
+		// ErrTxDone can precede SQLite's automatic rollback. Close waits
+		// for that rollback before another live or archive writer can enter.
+		_ = conn.Close()
+		if writerLocked {
+			s.historyWriteMu.Unlock()
+		}
+		if viewLocked {
+			s.archiveViewMu.Unlock()
+		}
+	}()
 	if err := conn.QueryRowContext(parent, `PRAGMA busy_timeout`).Scan(&busyMS); err != nil {
 		return err
 	}
-	defer func() {
-		restore, done := context.WithTimeout(context.Background(), time.Second)
-		defer done()
-		if _, err := conn.ExecContext(restore, fmt.Sprintf("PRAGMA busy_timeout=%d", busyMS)); err != nil {
-			// Never lend a connection with changed lock behaviour to live work.
-			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
-		}
-	}()
+	restoreBusy = true
 	if _, err := conn.ExecContext(parent, `PRAGMA busy_timeout=0`); err != nil {
 		return err
 	}
 	txCtx, cancelTx := context.WithCancel(parent)
 	defer cancelTx()
-	tx, err := conn.BeginTx(txCtx, nil)
+	tx, err = conn.BeginTx(txCtx, nil)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
 	if prepare != nil {
 		readCtx, cancel := context.WithTimeout(parent, 30*time.Second)
 		err := prepare(readCtx, tx)
@@ -89,11 +104,11 @@ func (s *Store) tryArchiveBatch(parent context.Context, prepare, write func(cont
 	if err := lockContext(ctx, s.archiveViewMu.TryLock); err != nil {
 		return err
 	}
-	defer s.archiveViewMu.Unlock()
+	viewLocked = true
 	if err := lockContext(ctx, s.historyWriteMu.TryLock); err != nil {
 		return err
 	}
-	defer s.historyWriteMu.Unlock()
+	writerLocked = true
 	if err := write(ctx, tx); err != nil {
 		return err
 	}

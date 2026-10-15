@@ -52,6 +52,9 @@ func TestStartupAliasCannotReplayCountersWhileRawHistoryKeepsWriting(t *testing.
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
+	if err := st.EnableHistoryAggregation(); err != nil {
+		t.Fatal(err)
+	}
 	serial := state.Device{DriverName: "meter", Make: "inverter", Serial: "one", MAC: "aa:bb:cc:dd:ee:ff"}
 	if _, err := st.RegisterDevice(serial); err != nil {
 		t.Fatal(err)

@@ -420,10 +420,19 @@
     chargerSaveQueue = operation;
     return operation.then(function (result) {
       if (chargerSaveQueue !== operation) return;
+      if (result && Array.isArray(result.loadpoints)) {
+        ctx.config.loadpoints = result.loadpoints;
+        result.loadpoints.forEach(function (lp, idx) {
+          var input = document.querySelector('[data-path="loadpoints.' + idx + '.allowed_steps_w__str"]');
+          if (input) input.value = fmtStepsW(lp.allowed_steps_w);
+        });
+      }
       if (button) button.disabled = false;
-      feedback(result && result.restart_required
+      var message = result && result.restart_required
         ? 'Charger settings saved. FTW requires a restart to apply them.'
-        : 'Charger settings saved. No Save button needed.', 'success');
+        : 'Charger settings saved. No Save button needed.';
+      var warnings = result && Array.isArray(result.warnings) ? result.warnings : [];
+      feedback(message + (warnings.length ? ' ' + warnings.join(' ') : ''), warnings.length ? 'warning' : 'success');
     }).catch(function (e) {
       if (chargerSaveQueue !== operation) return;
       if (button) button.disabled = false;

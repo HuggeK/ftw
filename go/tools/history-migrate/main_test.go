@@ -6,15 +6,174 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"testing"
+	"time"
 
+	"github.com/parquet-go/parquet-go"
 	"github.com/srcfl/ftw/go/internal/state"
 	_ "modernc.org/sqlite"
 )
+
+func TestRealBetaRetainedParquetMergesDistinctReadings(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	cfg, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = cfg.Exec(`CREATE TABLE config(key TEXT PRIMARY KEY,value TEXT NOT NULL);INSERT INTO config VALUES('history_duckdb_generation','cold-days'),('saved_goal','80% by 07:00')`)
+	cfg.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := sql.Open("duckdb", filepath.Join(dir, "history.duckdb")+"?threads=1&memory_limit=128MB&autoload_known_extensions=false&autoinstall_known_extensions=false")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	for _, stmt := range betaSchema {
+		if _, err := source.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := source.Exec(`DROP TABLE ts_series_hour;INSERT INTO history_migrations(name) VALUES('generation:cold-days');INSERT INTO ts_drivers VALUES(7,'meter');INSERT INTO ts_metrics VALUES(9,'power','W');INSERT INTO ts_samples SELECT 7,9,1800000000000+i,i/10.0 FROM range(1,5004) t(i);CHECKPOINT`); err != nil {
+		t.Fatal(err)
+	}
+	type coldRow struct {
+		Ts     int64   `parquet:"ts_ms"`
+		Driver string  `parquet:"driver"`
+		Metric string  `parquet:"metric"`
+		Value  float64 `parquet:"value"`
+	}
+	cold := filepath.Join(dir, "cold")
+	day := time.UnixMilli(1800000000000).UTC().Format("2006/01/02.parquet")
+	archive := filepath.Join(cold, day)
+	if err := os.MkdirAll(filepath.Dir(archive), 0700); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Create(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := parquet.NewGenericWriter[coldRow](f)
+	_, err = w.Write([]coldRow{{1800000000001, "meter", "power", 999}, {1800000006000, "meter", "power", 777}, {1800000002000, "new-meter", "power", 888}})
+	if err = errors.Join(err, w.Close(), f.Close()); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.ConvertBetaHistory(context.Background(), path, source, nil, cold); err != nil {
+		t.Fatal(err)
+	}
+	previous := state.RetireRawOnOpen
+	state.RetireRawOnOpen = true
+	t.Cleanup(func() { state.RetireRawOnOpen = previous })
+	for start := 0; start < 2; start++ {
+		s, err := state.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.AbsorbColdHistory(context.Background(), cold); err != nil {
+			s.Close()
+			t.Fatal(err)
+		}
+		for _, points := range []int{0, 1000} {
+			got, err := s.LoadSeriesBucketsOrRaw("meter", "power", 1800000000000, 1800000010000, points)
+			var n int64
+			var sum float64
+			for _, p := range got {
+				n += p.N
+				sum += p.V * float64(p.N)
+			}
+			want := float64(5003*5004)/20 + 777
+			if err != nil || n != 5004 || math.Abs(sum-want) > 1e-6 {
+				s.Close()
+				t.Fatalf("start=%d points=%d n=%d sum=%v want=%v err=%v", start, points, n, sum, want, err)
+			}
+			newSeries, err := s.LoadSeriesBucketsOrRaw("new-meter", "power", 1800000000000, 1800000010000, points)
+			if err != nil || len(newSeries) != 1 || newSeries[0].N != 1 || newSeries[0].V != 888 {
+				s.Close()
+				t.Fatal("new series lost", newSeries, err)
+			}
+		}
+		if goal, found := s.LoadConfig("saved_goal"); !found || goal != "80% by 07:00" {
+			s.Close()
+			t.Fatal("saved goal changed", goal, found)
+		}
+		s.Close()
+	}
+	if _, err := os.Stat(archive); !os.IsNotExist(err) {
+		t.Fatal("verified duplicate file still active", err)
+	}
+}
+
+func TestRealBetaWithoutHourTableSurvivesRawRetirement(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	cfg, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = cfg.Exec(`CREATE TABLE config(key TEXT PRIMARY KEY,value TEXT NOT NULL);INSERT INTO config VALUES('history_duckdb_generation','no-hours')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Close()
+	source, err := sql.Open("duckdb", filepath.Join(dir, "history.duckdb")+"?threads=1&memory_limit=128MB&autoload_known_extensions=false&autoinstall_known_extensions=false")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	for _, stmt := range betaSchema {
+		if _, err := source.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := source.Exec(`DROP TABLE ts_series_hour;
+ INSERT INTO history_migrations(name) VALUES('generation:no-hours');
+ INSERT INTO ts_drivers VALUES(7,'offline-meter');
+ INSERT INTO ts_metrics VALUES(9,'power','W');
+ INSERT INTO ts_samples SELECT 7,9,1800000000000+i,i/10.0 FROM range(1,5004) t(i);
+ CHECKPOINT`); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	err = state.ConvertBetaHistory(ctx, path, source, func(phase string) {
+		if strings.HasPrefix(phase, "summarize samples: ") {
+			cancel()
+		}
+	})
+	// Check retirement first so the released converter fails on the data
+	// defect, rather than only on its missing resumable summary phase.
+	if err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	if err := state.ConvertBetaHistory(context.Background(), path, source, nil); err != nil {
+		t.Fatal("resume summaries", err)
+	}
+	previous := state.RetireRawOnOpen
+	state.RetireRawOnOpen = true
+	t.Cleanup(func() { state.RetireRawOnOpen = previous })
+	for start := range 2 {
+		s, err := state.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		points, readErr := s.LoadSeriesBucketsOrRaw("offline-meter", "power", 1800000000000, 1800000010000, 0)
+		s.Close()
+		want := float64(5003*5004) / (2 * 10 * 5003)
+		if readErr != nil || len(points) != 1 || math.Abs(points[0].V-want) > 1e-9 || points[0].N != 5003 {
+			t.Fatalf("start %d lost summary: points=%v err=%v want=%v", start, points, readErr, want)
+		}
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatal("summary phase did not stop after a committed batch", err)
+	}
+}
 
 func TestRealBetaConversionPreservesIDsGoalsAndHotSamples(t *testing.T) {
 	dir := t.TempDir()
@@ -169,20 +328,30 @@ func TestRealBetaConversionPreservesIDsGoalsAndHotSamples(t *testing.T) {
 	if got, _ := s.LoadConfig("goal"); got != "80% by 07:00" {
 		t.Fatal(got)
 	}
-	points, err := s.LoadSeries("meter", "power", 0, 20000, 0)
-	if err != nil || len(points) != 10002 {
-		t.Fatalf("rows=%d err=%v", len(points), err)
-	}
-	for i, p := range points {
-		if p.Value != float64(i+1)/10 {
-			t.Fatalf("changed row %d: %+v", i, p)
-		}
-	}
 	db, err := sql.Open("sqlite", state.HistoryDatabasePath(path))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	rows, err = db.Query(`SELECT ts_ms,value FROM ts_samples WHERE driver_id=7 AND metric_id=9 ORDER BY ts_ms`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for rows.Next() {
+		var ts int64
+		var value float64
+		if err := rows.Scan(&ts, &value); err != nil {
+			t.Fatal(err)
+		}
+		n++
+		if ts != int64(n) || value != float64(n)/10 {
+			t.Fatalf("changed raw row %d: %d/%v", n, ts, value)
+		}
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil || n != 10002 {
+		t.Fatalf("raw rows=%d err=%v", n, err)
+	}
 	var indexed int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name='idx_ts_samples_ts'`).Scan(&indexed); err != nil || indexed != 1 {
 		t.Fatal("published history lacks its time index", indexed, err)
@@ -203,6 +372,11 @@ func TestRealBetaConversionPreservesIDsGoalsAndHotSamples(t *testing.T) {
 	}
 	if err := db.QueryRow(`SELECT n FROM ts_series_hour WHERE hour_ms=0`).Scan(&summaryCount); err != nil || summaryCount != 10002 {
 		t.Fatal("hot sample summary lost", summaryCount, err)
+	}
+	if os.Getenv("FTW_STORAGE_ADMISSION") == "1" {
+		if err := db.QueryRow(`SELECT SUM(n) FROM ts_buckets WHERE metric_id>=1000 AND resolution_ms=10000`).Scan(&summaryCount); err != nil || summaryCount != 1000000 {
+			t.Fatal("large dataset lacks complete chart summaries", summaryCount, err)
+		}
 	}
 	var energy float64
 	if err := db.QueryRow(`SELECT SUM(energy_wh) FROM energy_ledger_entries WHERE asset_id='ev:stable'`).Scan(&energy); err != nil || energy != 300 {

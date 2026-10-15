@@ -3,7 +3,7 @@ import importlib.util
 import io
 import json
 from contextlib import redirect_stdout
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 import tarfile
@@ -45,6 +45,39 @@ class BackupAPI:
 
 
 class FTWCTLTests(unittest.TestCase):
+    def test_verified_backup_accepts_core_rfc3339_fraction_precision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'ftw-full-backup-test.ftwbak'
+            path.write_bytes(b'timestamp fixture')
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            seconds = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
+            for fraction in ['', '1', '12', '123', '1234', '12345', '123456',
+                             '1234567', '12345678', '123456789']:
+                created = seconds + ('.' + fraction if fraction else '') + 'Z'
+                api = FakeAPI({('GET', '/api/backups'): {
+                    'dir': '/data/backups', 'backups': [{
+                        'id': path.name, 'verified': True, 'sha256': digest,
+                        'size_bytes': path.stat().st_size, 'created_at': created}]}})
+                with self.subTest(created_at=created):
+                    self.assertEqual(ftwctl.verified_backup(api, path),
+                                     (path.name, digest, path.stat().st_size, '/data/backups'))
+
+    def test_verified_backup_still_rejects_invalid_or_old_creation_time(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'ftw-full-backup-test.ftwbak'
+            path.write_bytes(b'timestamp fixture')
+            now = datetime.now(timezone.utc)
+            for created in [None, '', 'invalid', now.replace(tzinfo=None).isoformat(),
+                            (now - timedelta(hours=25)).isoformat(),
+                            (now + timedelta(minutes=6)).isoformat()]:
+                api = FakeAPI({('GET', '/api/backups'): {'backups': [{
+                    'id': path.name, 'verified': True,
+                    'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                    'size_bytes': path.stat().st_size, 'created_at': created}]}})
+                with self.subTest(created_at=created):
+                    with self.assertRaises(ftwctl.FTWError):
+                        ftwctl.verified_backup(api, path)
+
     def test_restart_reset_is_an_api_error_not_a_crash(self):
         api = ftwctl.API("http://127.0.0.1:18080")
         with mock.patch.object(ftwctl.request, "urlopen", side_effect=ConnectionResetError(104, "Connection reset by peer")):

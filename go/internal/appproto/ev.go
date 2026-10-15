@@ -167,7 +167,7 @@ func (h *Handler) loadpointHold(cmd Cmd, uptimeMs int64) error {
 		Persistent:      persistent,
 	}
 
-	if _, err := h.acceptCmd(cmd, uptimeMs); err != nil {
+	if took, err := h.acceptCmd(cmd, uptimeMs); !took || err != nil {
 		return err
 	}
 
@@ -204,7 +204,7 @@ func (h *Handler) loadpointHold(cmd Cmd, uptimeMs int64) error {
 // ClearManualHold, never a zero setpoint — 0 W is itself a valid hold that
 // pauses the charger, and a release must not be spelled the same way.
 func (h *Handler) clearHold(lp Loadpoints, id string, cmd Cmd, uptimeMs int64) error {
-	if _, err := h.acceptCmd(cmd, uptimeMs); err != nil {
+	if took, err := h.acceptCmd(cmd, uptimeMs); !took || err != nil {
 		return err
 	}
 
@@ -279,7 +279,7 @@ func (h *Handler) loadpointBoost(cmd Cmd, uptimeMs int64) error {
 		return h.rejectArg(cmd, "lease", nil)
 	}
 
-	if _, err := h.acceptCmd(cmd, uptimeMs); err != nil {
+	if took, err := h.acceptCmd(cmd, uptimeMs); !took || err != nil {
 		return err
 	}
 
@@ -320,7 +320,7 @@ func (h *Handler) loadpointBoost(cmd Cmd, uptimeMs int64) error {
 // cancelBoost withdraws a boost the way the HTTP DELETE does: idempotent,
 // and reported from the read-back like everything else.
 func (h *Handler) cancelBoost(lp Loadpoints, id string, cmd Cmd, uptimeMs int64) error {
-	if _, err := h.acceptCmd(cmd, uptimeMs); err != nil {
+	if took, err := h.acceptCmd(cmd, uptimeMs); !took || err != nil {
 		return err
 	}
 
@@ -368,7 +368,7 @@ func (h *Handler) loadpointSoCSet(cmd Cmd, uptimeMs int64) error {
 		return h.rejectArg(cmd, "soc", cmd.Args["soc"])
 	}
 
-	if _, err := h.acceptCmd(cmd, uptimeMs); err != nil {
+	if took, err := h.acceptCmd(cmd, uptimeMs); !took || err != nil {
 		return err
 	}
 
@@ -447,7 +447,7 @@ func (h *Handler) loadpointSurplusOnlySet(cmd Cmd, uptimeMs int64) error {
 		return h.rejectArg(cmd, "surplus_only", cmd.Args["surplus_only"])
 	}
 
-	if _, err := h.acceptCmd(cmd, uptimeMs); err != nil {
+	if took, err := h.acceptCmd(cmd, uptimeMs); !took || err != nil {
 		return err
 	}
 

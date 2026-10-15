@@ -223,6 +223,9 @@ func (s *Store) addSummaryOnlySeriesBuckets(ctx context.Context, cold, driver, m
 		}
 		a := acc[key]
 		if a == nil {
+			if len(acc) >= maxRawSeriesPoints {
+				return ErrHistoryQueryLimit
+			}
 			a = &seriesBucketAcc{}
 			acc[key] = a
 		}

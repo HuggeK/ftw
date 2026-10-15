@@ -17,6 +17,7 @@ import (
 
 func main() {
 	statePath := flag.String("state", "", "path to state.db; Core must be stopped")
+	coldDir := flag.String("cold", "", "override the stopped source's cold directory on a copy or external mount")
 	flag.Parse()
 	if *statePath == "" {
 		fmt.Fprintln(os.Stderr, "usage: ftw-history-migrate -state /path/to/state.db (stop Core first)")
@@ -29,7 +30,7 @@ func main() {
 		defer db.Close()
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer cancel()
-		err = state.ConvertBetaHistory(ctx, *statePath, db, func(phase string) { fmt.Println(phase) })
+		err = state.ConvertBetaHistory(ctx, *statePath, db, func(phase string) { fmt.Println(phase) }, *coldDir)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

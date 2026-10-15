@@ -3,6 +3,8 @@ package appproto
 import (
 	"context"
 	"errors"
+	"maps"
+	"slices"
 	"testing"
 	"time"
 
@@ -44,9 +46,22 @@ type fakeLoadpoints struct {
 	surplusCalls   int
 	onSurplus      func()
 	persistenceErr error
+
+	// powerW is what Readings reports the charger drawing.
+	powerW float64
 }
 
 func (f *fakeLoadpoints) WaitForPersistence(context.Context) error { return f.persistenceErr }
+
+func (f *fakeLoadpoints) Readings() []LoadpointReading {
+	out := []LoadpointReading{}
+	for _, id := range slices.Sorted(maps.Keys(f.ids)) {
+		out = append(out, LoadpointReading{
+			ID: id, Plugged: f.plugged, SoC: f.soc, SoCKnown: f.plugged && f.socKnown, PowerW: f.powerW,
+		})
+	}
+	return out
+}
 
 func TestLoadpointWriteDoesNotConfirmUncommittedChoice(t *testing.T) {
 	h, lp, _, rec, _ := newEVRig(t)

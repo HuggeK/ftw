@@ -58,6 +58,17 @@ a reading after the observed connection and no measured charging. An ambiguous
 match cannot finish the goal. A charger declining current is reported as a refusal, never
 as an invented battery level or proof that the target was reached.
 
+### History measurement quality
+
+An offline flow leaves working devices recording. Missing inputs make their
+values and the derived household balance unknown. Separate additive schema-7
+tables preserve partial chart and energy rows, including missing-value evidence,
+through retention, downsampling and full backup. A recovered sample cannot fill
+an earlier gap. Older Cores see only complete rows in the original tables;
+their integration cursor cannot bridge a partial interval after rollback.
+Partial rows remain stored and become visible again on the newer Core.
+
+
 ### Control state and disk writes
 
 Core loads EV restart records before starting control. During operation, a
@@ -244,8 +255,13 @@ legacy forecast, weather, occupancy and saved model state. It calls the forecast
 worker once under a deadline, outside control and dispatch locks. Core accepts
 PV and load independently for each covered interval. If either signal is
 missing, late, partial or invalid, Core retains the matching legacy value.
-When a week of scored errors shows one source clearly better for a signal,
-Core uses that source; otherwise the worker's quality label decides. The
+When recent scored errors show one source clearly better for a signal,
+Core uses that source; otherwise the worker's quality label decides. Both
+signals choose sources within each lead bucket; PV uses daylight errors. A
+distant forecast cannot pick the next hour's source or replace its cold-start
+load prior. PV and net-load bands use separate day and night
+errors where the site's location is known. Each needs its own sample and day
+coverage before claiming empirical calibration. The
 resulting `champion` can therefore contain Energyplan PV with legacy load, or
 the reverse. Each slot's planning margin comes from the errors its own sources
 made on earlier issues. `legacy_shadow` keeps both legacy signals from the same frozen
@@ -346,8 +362,9 @@ from the same SQLite snapshot so older Core versions also read current settings.
 ## Remote access boundary
 
 Remote access is the FTW app and nothing else. The box holds one outbound WSS
-connection to `wss://relay.ftw.energy`; there is no inbound listener, no
-NAT-traversal layer, no cloud account and no browser-managed site directory.
+connection to `wss://relay.ftw.energy`, and beside it a second socket for a
+watch's one-shot exchanges; there is no inbound listener, no NAT-traversal
+layer, no cloud account and no browser-managed site directory.
 See [ADR 0006](adr/0006-app-uplink.md) for why Home Link was removed rather
 than kept alongside it.
 
@@ -391,13 +408,33 @@ The properties that matter:
   and dispatch. An unavailable relay leaves local control and local recovery
   intact.
 
+Proposed, not shipped: [ADR 0008](adr/0008-ftw-cloud.md) adds FTW Cloud, a
+second outbound connection for homes whose owner turns it on. It carries to
+`cloud.ftw.energy` a signed, readable copy of what the owner enabled, and it
+never carries control. Commands and long history stay on the relay path above.
+[protocol-cloud.md](protocol-cloud.md) specifies its wire format.
+
+[ADR 0009](adr/0009-watch-exchange.md) lets an Apple Watch work without the
+phone. watchOS allows no WebSocket, so each step is one HTTPS request. Commands
+go to the box through the relay's exchange: the box keeps a second socket,
+`/r/<epoch>/<handle>/exchange`, under the uplink's handle, and the relay hands
+it one Noise message per request behind an id of its own. The box holds those
+sessions in a table of eight, apart from the phones' four, so a watch never
+pushes a phone out; each ends after four exchanges, a minute idle or three
+minutes. Every frame on it is lane 0 apart from `hello_ok`, and every answer is
+two frames, so a read, a command and a refusal have one length. A command
+answers no sooner than 400 ms after it arrives, so an applied one and a refused
+one take the same time unless the EV save runs longer. Reads go to
+FTW Cloud in one request, which has not shipped. The watch is a device of its
+own and never holds more than the phone that added it.
+
 ### Who is let in, and as what
 
 An enrolment carries a role from `contract/registry.yaml`: `owner`, which may
-change things, or `viewer`, which may only look. It is stamped by the box when
-a pairing code is spent, and it is stamped from the role the box minted that
-code for — never from anything the app sends, because a role a holder can edit
-is not a role.
+change things, `viewer`, which may only look, or `watch`, below. It is stamped
+by the box when a pairing code is spent, and it is stamped from the role the
+box minted that code for — never from anything the app sends, because a role a
+holder can edit is not a role.
 
 An invite is therefore not a new cryptographic object. It is the same
 single-use pairing code with a different role behind it, so the QR payload does
@@ -422,6 +459,13 @@ row in the same device list, with the same Remove button: locking out a stray
 key and taking a guest's access away are one action, not two with two sets of
 bugs. Changing a role takes effect on a session that is already open, because
 both doors re-read the grant on every privileged request.
+
+A watch is a device of its own that an owner's phone added. Only an owner's
+session may ask for its code, and only with a passkey step-up on that request;
+the code binds to that phone and has a slot of its own, so it never cancels an
+invite. The watch holds the `watch` role's scopes that its phone holds at that
+moment, spends its phone's command ids, and is listed and removed with its
+phone. It reaches the box through the exchange and never through the stream.
 
 The routes behind that list have two doors, and what each one PROVES decides
 what it opens:

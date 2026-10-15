@@ -13,7 +13,7 @@
 
 .PHONY: help test compose-migration-test container-boundary-test release-workflow-test build build-arm64 build-amd64 release release-linux release-linux-arm64 release-linux-amd64 \
         run-sim sim-ocpp dev fmt vet clean e2e ci ci-ui ci-hw-pi docs \
-		verify verify-all install-hooks driver-repository-validate driver-versions \
+		verify verify-all install-hooks driver-repository-validate driver-versions protocol-boundary cloudlink-boundary \
         drivers drivers-present driver-versions-across-pin
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
@@ -47,6 +47,8 @@ help:
 	@echo "  ci-ui                browser smoke against FTW_BASE_URL"
 	@echo "  ci-hw-pi             deploy candidate to Pi CI slot + browser smoke"
 	@echo "  fmt vet              Go format + static checks"
+	@echo "  protocol-boundary    prove go/protocol imports nothing from the box"
+	@echo "  cloudlink-boundary   prove the FTW Cloud uplink reaches no control code"
 	@echo "  drivers              fetch drivers/ from the pinned device-drivers commit"
 	@echo "  clean                nuke build artifacts"
 
@@ -84,6 +86,7 @@ drivers-present:
 
 test: drivers-present
 	cd go && go test -tags=$(GO_TAGS) ./...
+	cd go/protocol && go test ./...
 
 compose-migration-test:
 	bash -n scripts/enable-modular-stack.sh scripts/migrate-legacy-compose.sh scripts/upgrade-paired-release.sh scripts/install-macos.sh scripts/sync-bundled-drivers.sh scripts/check-driver-versions.sh scripts/check-debian-base.sh
@@ -145,8 +148,9 @@ ci-hw-pi:
 #
 # verify-all checks both supported Linux targets on the developer host.
 
-verify: test compose-migration-test container-boundary-test release-workflow-test native-solver-test
+verify: test compose-migration-test container-boundary-test release-workflow-test native-solver-test protocol-boundary cloudlink-boundary
 	cd go && go vet -tags=$(GO_TAGS) ./...
+	cd go/protocol && go vet ./...
 	cd go && go build -tags=$(GO_TAGS) ./...
 	@echo "verify: vet + test + build clean"
 
@@ -233,9 +237,19 @@ dev: config.local.yaml
 
 fmt:
 	cd go && go fmt ./...
+	cd go/protocol && go fmt ./...
 
 vet:
 	cd go && go vet -tags=$(GO_TAGS) ./...
+	cd go/protocol && go vet ./...
+
+# go/protocol is the wire format FTW Cloud imports. It is its own module, so
+# ./... in go/ skips it, and it must build without the box.
+protocol-boundary:
+	bash .github/scripts/check-protocol-boundary.sh go/protocol
+
+cloudlink-boundary:
+	bash .github/scripts/check-cloudlink-imports.sh go
 
 clean:
 	rm -rf bin release

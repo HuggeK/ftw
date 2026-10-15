@@ -281,7 +281,7 @@ func (d *LuaDriver) pollLocked(ctx context.Context) (time.Duration, error) {
 	}
 	// Driver may return an int number of milliseconds.
 	if n, ok := ret.(lua.LNumber); ok && n > 0 {
-		return time.Duration(n) * time.Millisecond, nil
+		return returnedPollInterval(float64(n)), nil
 	}
 	return 0, nil
 }
