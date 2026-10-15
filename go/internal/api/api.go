@@ -3702,23 +3702,26 @@ func (s *Server) storedEVPasswordAllowed(cfg *config.EVCharger) bool {
 // Multi-vehicle households (one wallbox, multiple Teslas) are picked
 // among by charging_state ranking — see decorateWithVehicle.
 func (s *Server) handleLoadpoints(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.loadpointsPayload(time.Now()))
+}
+
+func (s *Server) loadpointsPayload(now time.Time) map[string]any {
 	if s.deps.Loadpoints == nil {
-		writeJSON(w, 200, map[string]any{"enabled": false, "loadpoints": []any{}, "vehicle_limit_goal_supported": true})
-		return
+		return map[string]any{"enabled": false, "loadpoints": []any{}, "vehicle_limit_goal_supported": true}
 	}
 	states := s.deps.Loadpoints.States()
 	if s.deps.Tel != nil {
 		decorateLoadpointsWithVehicle(states, s.deps.Tel)
 	}
-	s.applyPlanningSoC(states, time.Now())
+	s.applyPlanningSoC(states, now)
 	s.decorateLoadpointsWithManual(states)
 	s.decorateLoadpointsWithBatteryBoost(states)
 	s.decorateLoadpointsWithPlan(states)
-	writeJSON(w, 200, map[string]any{
+	return map[string]any{
 		"enabled":                      true,
 		"vehicle_limit_goal_supported": true,
 		"loadpoints":                   s.loadpointsWithFeedback(states),
-	})
+	}
 }
 
 // applyPlanningSoC records the SoC a new plan starts from. It uses the
