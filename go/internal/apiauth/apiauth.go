@@ -67,6 +67,9 @@ const (
 	// KindLAN is an unauthenticated request off the box's own LAN listener.
 	// Naming it is not a promotion: it writes down what the LAN already is.
 	KindLAN = "lan"
+	// KindAgent is an agent row (docs/agents.md): an assistant, Sourceful
+	// support or the release check, through FTW Cloud's tunnel only.
+	KindAgent = "agent"
 )
 
 // AgentRole reports whether a role is an agent's: a grant an owner gave to an

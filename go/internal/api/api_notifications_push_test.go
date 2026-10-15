@@ -386,9 +386,14 @@ func TestRulesPutSeedsDefaultsOnFirstTouch(t *testing.T) {
 	if notif == nil || len(notif.Events) < len(notifications.DefaultRules()) {
 		t.Fatalf("defaults not seeded: %+v", notif)
 	}
-	// Everything is opt-in except the FTW Cloud notices, which every owner
-	// should hear without having asked.
-	onByDefault := map[string]bool{notifications.PushCloudGranted: true, notifications.PushCloudRevoked: true}
+	// Everything is opt-in except the FTW Cloud and agent notices, which
+	// every owner should hear without having asked.
+	onByDefault := map[string]bool{
+		notifications.PushCloudGranted: true, notifications.PushCloudRevoked: true,
+		notifications.PushAgentAdded: true, notifications.PushAgentRequest: true,
+		notifications.PushAgentExpiring: true, notifications.PushApprovalKeySet: true,
+		notifications.PushOwnerAdded: true,
+	}
 	enabled := 0
 	for _, e := range notif.Events {
 		if e.Enabled && !onByDefault[e.Type] {

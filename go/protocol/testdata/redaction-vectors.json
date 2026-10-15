@@ -1,0 +1,181 @@
+{
+  "note": "docs/agents.md, Redaction on the box. Lines and a config in and out under keyHex and names.",
+  "keyHex": "726564616374696f6e20766563746f72206b6579",
+  "names": [
+    "Easee carport",
+    "sungrow",
+    "Storgatan 12",
+    "Volvo EX30"
+  ],
+  "lines": [
+    {
+      "in": {
+        "TsMs": 1,
+        "Level": "WARN",
+        "Msg": "connected to Easee carport at 192.168.1.40:502",
+        "Driver": "",
+        "Attrs": "power_w=3000 lat=59.33"
+      },
+      "out": {
+        "TsMs": 1,
+        "Level": "WARN",
+        "Src": "",
+        "Msg": "connected to [name] at [ip] power_w=3000"
+      }
+    },
+    {
+      "in": {
+        "TsMs": 2,
+        "Level": "ERROR",
+        "Msg": "serial A2234567890 at fritz.box said hi",
+        "Driver": "sungrow",
+        "Attrs": "err=timeout reg=13000"
+      },
+      "out": {
+        "TsMs": 2,
+        "Level": "ERROR",
+        "Src": "1xHM3dZpNCM",
+        "Msg": "err=timeout"
+      }
+    },
+    {
+      "in": {
+        "TsMs": 3,
+        "Level": "WARN",
+        "Msg": "token: abc123 for fredrik@example.com",
+        "Driver": "",
+        "Attrs": "mode=self_consumption took=250ms"
+      },
+      "out": {
+        "TsMs": 3,
+        "Level": "WARN",
+        "Src": "",
+        "Msg": "token: [secret] for [email] mode=self_consumption took=250ms"
+      }
+    },
+    {
+      "in": {
+        "TsMs": 4,
+        "Level": "INFO",
+        "Msg": "planner fell back to planner_passive_arbitrage at 12:34:56",
+        "Driver": "",
+        "Attrs": "slots=96 reason=timeout"
+      },
+      "out": {
+        "TsMs": 4,
+        "Level": "INFO",
+        "Src": "",
+        "Msg": "planner fell back to planner_passive_arbitrage at 12:34:56 slots=96 reason=timeout"
+      }
+    },
+    {
+      "in": {
+        "TsMs": 5,
+        "Level": "WARN",
+        "Msg": "vehicle VIN YV1XZK7V5P2012345 linked to Volvo EX30",
+        "Driver": "",
+        "Attrs": "soc=0.54 phone=46701234567"
+      },
+      "out": {
+        "TsMs": 5,
+        "Level": "WARN",
+        "Src": "",
+        "Msg": "vehicle VIN [id][number] linked to [name] soc=0.54"
+      }
+    },
+    {
+      "in": {
+        "TsMs": 6,
+        "Level": "WARN",
+        "Msg": "bridge at vw.fredrik.me, then my-home.xyz and solar.ai:8443 timed out in planner.prefs.set",
+        "Driver": "",
+        "Attrs": "op=planner.prefs.set"
+      },
+      "out": {
+        "TsMs": 6,
+        "Level": "WARN",
+        "Src": "",
+        "Msg": "bridge at [host], then [host] and [host] timed out in planner.prefs.set op=[omitted]"
+      }
+    }
+  ],
+  "config": {
+    "in": {
+      "site": {
+        "name": "Storgatan 12",
+        "latitude": 59.3,
+        "fuse": {
+          "max_amps": 25,
+          "phases": 3
+        }
+      },
+      "drivers": [
+        {
+          "name": "sungrow",
+          "capabilities": {
+            "modbus": {
+              "host": "192.168.1.40",
+              "port": 502,
+              "unit_id": 1
+            }
+          },
+          "config": {
+            "password": "hunter2",
+            "account": 5512345678,
+            "bridge": "vw.fredrik.me"
+          }
+        }
+      ],
+      "api": {
+        "token": "t",
+        "lan_auth": true
+      },
+      "planner": {
+        "mode": "planner_arbitrage",
+        "pv_forecast_safety_k": 0.3,
+        "slots": [
+          96,
+          48
+        ]
+      },
+      "battery": {
+        "battery_capacity_wh": 10000,
+        "min_reserve_soc_pct": 20
+      }
+    },
+    "out": {
+      "api": {
+        "lan_auth": true,
+        "token": "***"
+      },
+      "battery": {
+        "battery_capacity_wh": 10000,
+        "min_reserve_soc_pct": 20
+      },
+      "drivers": [
+        {
+          "capabilities": {
+            "modbus": {}
+          },
+          "config": {
+            "bridge": "[host]",
+            "password": "***"
+          },
+          "name": "1xHM3dZpNCM"
+        }
+      ],
+      "planner": {
+        "mode": "planner_arbitrage",
+        "pv_forecast_safety_k": 0.3,
+        "slots": []
+      },
+      "site": {
+        "fuse": {
+          "max_amps": 25,
+          "phases": 3
+        },
+        "name": "pBjkaVPvrCE"
+      }
+    }
+  }
+}

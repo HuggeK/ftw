@@ -7,6 +7,7 @@ import (
 
 	"github.com/srcfl/ftw/go/internal/loadpoint"
 	"github.com/srcfl/ftw/go/internal/units"
+	"github.com/srcfl/ftw/go/protocol"
 )
 
 // The EV loadpoint operations: loadpoint.hold pins the charger to a fixed
@@ -63,23 +64,33 @@ func (h *Handler) rejectArg(cmd Cmd, arg string, value any) error {
 // same questions the HTTP routes ask, in the same order. ok is false when a
 // refusal has already been sent; err is whatever sending it returned.
 func (h *Handler) loadpointFor(cmd Cmd) (Loadpoints, string, bool, error) {
-	lp := h.cfg.Loadpoints
-	if lp == nil {
-		return nil, "", false, h.sendCmdResult(CmdResult{
-			CmdID: cmd.CmdID,
-			State: CmdRejected,
-			Error: &ErrorBody{
-				Code:      ErrUnavailable,
-				Retryable: ErrorRetryable[ErrUnavailable],
-				Args:      map[string]any{"subsystem": "loadpoints"},
-			},
-		})
-	}
-	id, _ := cmd.Args["id"].(string)
-	if id == "" || !lp.Exists(id) {
-		return nil, "", false, h.rejectArg(cmd, "id", id)
+	lp, id, bad := h.loadpointArg(cmd.Op, cmd.Args)
+	if bad != nil {
+		return nil, "", false, h.rejectWith(cmd, bad)
 	}
 	return lp, id, true, nil
+}
+
+// loadpointArg is loadpointFor's check without the answer.
+func (h *Handler) loadpointArg(op string, args map[string]any) (Loadpoints, string, *ErrorBody) {
+	lp := h.cfg.Loadpoints
+	if lp == nil {
+		return nil, "", &ErrorBody{
+			Code:      ErrUnavailable,
+			Retryable: ErrorRetryable[ErrUnavailable],
+			Args:      map[string]any{"subsystem": "loadpoints"},
+		}
+	}
+	id, _ := args["id"].(string)
+	if id == "" || !lp.Exists(id) {
+		return nil, "", badArg(op, "id", id)
+	}
+	return lp, id, nil
+}
+
+// rejectWith refuses cmd before the box takes it.
+func (h *Handler) rejectWith(cmd Cmd, bad *ErrorBody) error {
+	return h.sendCmdResult(CmdResult{CmdID: cmd.CmdID, State: CmdRejected, Error: bad})
 }
 
 // loadpointHold is the manual hold through the door: charge the car now at a
@@ -165,13 +176,19 @@ func (h *Handler) loadpointHold(cmd Cmd, uptimeMs int64) error {
 		SitePhases:      int(sitePhases),
 		ExpiresAt:       expires,
 		Persistent:      persistent,
+		SetBy:           h.cfg.Caller.Subject,
 	}
 
 	if took, err := h.acceptCmd(cmd, uptimeMs); !took || err != nil {
 		return err
 	}
 
-	lp.Hold(id, hold)
+	if !h.isAgent() {
+		lp.Hold(id, hold)
+	} else if !lp.HoldIfOwn(id, hold, h.cfg.Clock.Now()) {
+		// An owner's hold landed after holdRules looked.
+		return h.settleAndReport(cmd.CmdID, needsOwner(cmd))
+	}
 	if err := h.waitForEVSave(lp); err != nil {
 		return h.reportEVSaveUnconfirmed(cmd)
 	}
@@ -208,7 +225,12 @@ func (h *Handler) clearHold(lp Loadpoints, id string, cmd Cmd, uptimeMs int64) e
 		return err
 	}
 
-	lp.ClearHold(id)
+	if !h.isAgent() {
+		lp.ClearHold(id)
+	} else if !lp.ClearHoldIfOwn(id, h.cfg.Caller.Subject, h.cfg.Clock.Now()) {
+		// The hold is no longer the agent's own.
+		return h.settleAndReport(cmd.CmdID, needsOwner(cmd))
+	}
 	if err := h.waitForEVSave(lp); err != nil {
 		return h.reportEVSaveUnconfirmed(cmd)
 	}
@@ -363,9 +385,9 @@ func (h *Handler) loadpointSoCSet(cmd Cmd, uptimeMs int64) error {
 		return err
 	}
 
-	soc, ok := argNum(cmd.Args, "soc")
-	if !ok || soc < 0 || soc > 1 {
-		return h.rejectArg(cmd, "soc", cmd.Args["soc"])
+	soc, bad := socArg(cmd.Op, cmd.Args)
+	if bad != nil {
+		return h.rejectWith(cmd, bad)
 	}
 
 	if took, err := h.acceptCmd(cmd, uptimeMs); !took || err != nil {
@@ -442,9 +464,9 @@ func (h *Handler) loadpointSurplusOnlySet(cmd Cmd, uptimeMs int64) error {
 		return err
 	}
 
-	want, ok := cmd.Args["surplus_only"].(bool)
-	if !ok {
-		return h.rejectArg(cmd, "surplus_only", cmd.Args["surplus_only"])
+	want, bad := surplusOnlyArg(cmd.Op, cmd.Args)
+	if bad != nil {
+		return h.rejectWith(cmd, bad)
 	}
 
 	if took, err := h.acceptCmd(cmd, uptimeMs); !took || err != nil {
@@ -493,4 +515,29 @@ func flagValue(v bool) float64 {
 		return 1
 	}
 	return 0
+}
+
+// socArg is a charge level as loadpoint.soc.set takes it: a fraction.
+func socArg(op string, args map[string]any) (float64, *ErrorBody) {
+	soc, ok := argNum(args, "soc")
+	if !ok || soc < 0 || soc > 1 {
+		return 0, badArg(op, "soc", args["soc"])
+	}
+	return soc, nil
+}
+
+// surplusOnlyArg is the flag loadpoint.surplus_only.set takes.
+func surplusOnlyArg(op string, args map[string]any) (bool, *ErrorBody) {
+	want, ok := args["surplus_only"].(bool)
+	if !ok {
+		return false, badArg(op, "surplus_only", args["surplus_only"])
+	}
+	return want, nil
+}
+
+// needsOwner refuses an agent's hold that met someone else's.
+func needsOwner(cmd Cmd) CmdResult {
+	return CmdResult{CmdID: cmd.CmdID, State: CmdRejected, Error: &ErrorBody{
+		Code: protocol.ErrNeedsOwner, Args: map[string]any{"op": cmd.Op, "reason": "hold"},
+	}}
 }

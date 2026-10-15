@@ -105,6 +105,7 @@ type noPhones struct{}
 func (noPhones) Devices() []cloudlink.RosterDevice { return nil }
 
 func (noPhones) Pending() ([]byte, time.Time, bool) { return nil, time.Time{}, false }
+func (noPhones) Noise() []byte                      { return make([]byte, 32) }
 
 func newTestCloudLink(t *testing.T, keys []*ecdsa.PublicKey) *cloudlink.Link {
 	t.Helper()

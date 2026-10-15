@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"errors"
 	"io"
 	"log/slog"
@@ -132,6 +133,8 @@ func (r fakeRoster) Devices() []RosterDevice {
 	return []RosterDevice{{ID: "q5Lw0Zb1", Key: bytes.Repeat([]byte{5}, 32), Role: "owner", Epoch: 1,
 		Scopes: []string{protocol.ScopeLiveRead, protocol.ScopeDispatchWrite, protocol.ScopeEventsRead}, Tun: tun}}
 }
+
+func (r fakeRoster) Noise() []byte { return make([]byte, 32) }
 
 func (r fakeRoster) Pending() ([]byte, time.Time, bool) {
 	if r.state == nil {
@@ -1129,5 +1132,20 @@ func TestABuildWithoutAServiceRefusesStatistics(t *testing.T) {
 	}
 	if err := link.Stats(StatsRequest{Policy: "p"}); !errors.Is(err, ErrNoService) {
 		t.Fatalf("statistics: %v", err)
+	}
+}
+
+// A pinned offer key counts only under the kid its key gives it.
+func TestOfferKeysPinOnlyUnderTheirOwnKid(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := elliptic.Marshal(elliptic.P256(), key.X, key.Y) //nolint:staticcheck // SEC1 is the pinned form.
+	b64 := base64.RawURLEncoding.EncodeToString(pub)
+	kid := protocol.OfferKid(pub)
+	got := ParseOfferKeys(kid + ":" + b64 + ", wrongkid:" + b64 + ", " + kid + ":not-base64!")
+	if len(got) != 1 || !bytes.Equal(got[kid], pub) {
+		t.Fatalf("pinned %v", got)
 	}
 }

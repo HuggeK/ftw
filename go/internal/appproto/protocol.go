@@ -228,6 +228,7 @@ const (
 	CapCloudLink          = protocol.CapCloudLink
 	CapCloudTun           = protocol.CapCloudTun
 	CapCmdExchange        = protocol.CapCmdExchange
+	CapAccessAgents       = protocol.CapAccessAgents
 	ScopeLiveRead         = protocol.ScopeLiveRead
 	ScopeHistoryRead      = protocol.ScopeHistoryRead
 	ScopePlanRead         = protocol.ScopePlanRead

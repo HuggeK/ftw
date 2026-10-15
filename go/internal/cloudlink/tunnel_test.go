@@ -41,7 +41,7 @@ func TestTheBoxLinksForItsPhonesAndSendsNoReadings(t *testing.T) {
 	if err := cloudwire.Unmarshal(env.B, &hello); err != nil {
 		t.Fatal(err)
 	}
-	if len(hello.GrantID) != 0 || !slices.Equal(hello.Caps, []string{cloudwire.MsgRoster, cloudwire.CapTun, cloudwire.CapShard}) {
+	if len(hello.GrantID) != 0 || !slices.Equal(hello.Caps, []string{cloudwire.MsgRoster, cloudwire.MsgNotice, cloudwire.CapTun, cloudwire.CapShard}) {
 		t.Fatalf("hello names grant %x and caps %v", hello.GrantID, hello.Caps)
 	}
 
@@ -514,5 +514,25 @@ func TestTheCopyFlowsPastTheTunnelBudget(t *testing.T) {
 	svc.waitFor(cloudwire.MsgLive, 7*time.Second)
 	if err := h.link.SendTun(cloudwire.Tun{Dev: "q5Lw0Zb1", Sid: 1, D: []byte{1}}, false); err == nil {
 		t.Fatal("tun went past its own budget")
+	}
+}
+
+// A security notice goes whenever the box is linked, with the readable copy
+// off, and carries the kind alone.
+func TestANoticeGoesWithTheCopyOff(t *testing.T) {
+	svc := newFakeService(t)
+	h := newHarness(t, svc)
+	h.setRoster(func(r *fakeRosterState) { r.tun = true })
+	h.nextRoster(t)
+	if h.link.Notice("cloud.granted") {
+		t.Fatal("a kind that is not a notice was queued")
+	}
+	if !h.link.Notice(protocol.PushAgentAdded) {
+		t.Fatal("the notice was refused")
+	}
+	env := svc.waitFor(cloudwire.MsgNotice, 3*time.Second)
+	var n cloudwire.Notice
+	if err := cloudwire.Unmarshal(env.B, &n); err != nil || n.Kind != protocol.PushAgentAdded {
+		t.Fatalf("notice %+v %v", n, err)
 	}
 }

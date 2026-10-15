@@ -1023,6 +1023,23 @@ func (s *Store) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_component_updates_component
 			ON component_updates(kind, component_id, started_at_ms DESC)`,
 
+		// Who did what through an agent grant, and every change to one
+		// (docs/agents.md, The audit log). An owner reads it. Folded reads
+		// (count > 0) and everything else each keep AgentAuditRowsKept
+		// rows, and both AgentAuditDaysKept days.
+		`CREATE TABLE IF NOT EXISTS agent_audit (
+			seq       INTEGER PRIMARY KEY AUTOINCREMENT,
+			at_ms     INTEGER NOT NULL,
+			actor     TEXT NOT NULL,
+			role      TEXT NOT NULL DEFAULT '',
+			principal TEXT NOT NULL DEFAULT '',
+			by_staff  TEXT NOT NULL DEFAULT '',
+			what      TEXT NOT NULL,
+			target    TEXT NOT NULL DEFAULT '',
+			result    TEXT NOT NULL,
+			count     INTEGER NOT NULL DEFAULT 0
+		) STRICT`,
+
 		`CREATE TABLE IF NOT EXISTS nova_ders (
 			device_id   TEXT NOT NULL,
 			der_type    TEXT NOT NULL,

@@ -25,6 +25,10 @@ const (
 	MsgHB     = "hb"
 	MsgRoster = "roster"
 	MsgBye    = "bye"
+	// MsgNotice tells the owners' phones that something changed who may
+	// reach the box (docs/agents.md, Push kinds). It carries the kind and
+	// nothing else, and the box sends it whenever it is linked, copy or not.
+	MsgNotice = "notice"
 )
 
 // Downlink is the closed set of types the service may send the box. None of
@@ -47,7 +51,7 @@ var ClassScope = map[string]string{
 }
 
 // ServiceOnly are box messages the service acts on and never forwards.
-var ServiceOnly = []string{MsgHello, MsgRoster, MsgBye}
+var ServiceOnly = []string{MsgHello, MsgRoster, MsgBye, MsgNotice}
 
 // Clock values for hello.clock and hb.clock.
 const (
@@ -327,6 +331,18 @@ type Grant struct {
 	Purposes   []string `cbor:"purposes"`
 	Controller string   `cbor:"controller"`
 }
+
+// Notice is a security notice for the owners: a push kind from the
+// catalogue, such as agent.added, and nothing that says more. The service
+// sends each owner device registered for alerts a push with no data.
+type Notice struct {
+	Header
+	Kind string `cbor:"kind"`
+}
+
+// NoticeKinds are the kinds a notice may carry.
+var NoticeKinds = []string{protocol.PushAgentAdded, protocol.PushAgentRequest, protocol.PushAgentExpiring,
+	protocol.PushApprovalKeySet, protocol.PushOwnerAdded}
 
 // Bye ends the uplink. Purge asks the service to delete the home.
 type Bye struct {

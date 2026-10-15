@@ -474,6 +474,11 @@ func main() {
 		slog.Error("http listener could not bind", "addr", httpSrv.Addr, "err", explainBindError(httpSrv.Addr, err))
 		os.Exit(1)
 	}
+	// A driver's request from inside the box would reach the API as the box
+	// itself, so drivers may not dial its port.
+	if tcp, ok := listener.Addr().(*net.TCPAddr); ok {
+		drivers.SetSelfAPIPorts(tcp.Port)
+	}
 	go func() {
 		slog.Info("HTTP API listening (boot phase)", "addr", httpSrv.Addr)
 		if err := httpSrv.Serve(listener); err != nil && err != http.ErrServerClosed {
@@ -2426,10 +2431,14 @@ func main() {
 	appAPI := &lateAPI{}
 	// FTW Cloud as app sessions see it, bound below once the link exists.
 	appCloud := &cloudSession{}
+	// Owners hear about agents through the notification service, bound
+	// below once it exists, as FTW Cloud's grant notices are.
+	cloudNotify := &cloudNotices{}
+	agents := &agentPorts{logs: logRing, cfg: cfg, cfgMu: cfgMu, st: st, notices: cloudNotify}
 	appEnroll, appUplink, appLinkEnabled, appLinkErr := startAppLink(
 		ctx, cfg, identityKeyPath, boxID, Version,
 		st, tel, mpcSvc, lpMgr, lpController, priceSvc, ctrl, ctrlMu, plannerPrefs,
-		controlRev, appLinkWatchdog, appAPI, webPush, appCloud,
+		controlRev, appLinkWatchdog, appAPI, webPush, appCloud, agents,
 	)
 	switch {
 	case appLinkErr != nil:
@@ -2449,10 +2458,13 @@ func main() {
 	if appUplink != nil {
 		appTunnel = appUplink.Tunnel()
 	}
-	cloudNotify := &cloudNotices{}
 	cloudLink := startCloudLink(ctx, statePath, Version, st, appEnroll,
 		tel, ctrl, ctrlMu, controlRev, appLinkWatchdog, priceSvc, appAPI, cloudNotify, appTunnel)
 	appCloud.bind(cloudLink)
+	if cloudLink != nil {
+		agents.home = cloudLink.Home
+		agents.notice = cloudLink.Notice
+	}
 
 	// The anonymous fleet ping: how many boxes, which versions, which drivers.
 	// Its separate relay HTTP door keeps daily totals; the encrypted app path
@@ -2485,7 +2497,8 @@ func main() {
 		State: st,
 		CapMu: capMu, Capacities: capacities, TelemetryCapacities: telemetryCapacities,
 		BatteryIdentity: batteryIdentity,
-		AppEnroll:       appEnrollForAPI(appEnroll, appUplink, st, appLinkEnabled),
+		AppEnroll:       appEnrollForAPI(appEnroll, appUplink, st, appLinkEnabled, agents),
+		Agents:          agentsForAPI(agents),
 		FleetPing:       fleetPinger,
 		Cloud:           cloudForAPI(cloudLink),
 		CfgMu:           cfgMu, Cfg: cfg, ConfigPath: *configPath,

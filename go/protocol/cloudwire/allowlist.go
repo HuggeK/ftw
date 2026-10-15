@@ -45,6 +45,9 @@ var Fields = map[string][]string{
 
 	MsgBye: {"why", "purge"},
 
+	// A kind and nothing else: no reading, no name, no id.
+	MsgNotice: {"kind"},
+
 	// tun carries no header and no signature: d is Noise ciphertext its two
 	// ends authenticate, and the service reads only dev and sid.
 	MsgTun: {"dev", "sid", "d"},
@@ -63,6 +66,7 @@ var Bodies = map[string]any{
 	MsgEvent:  Event{},
 	MsgRoster: Roster{},
 	MsgBye:    Bye{},
+	MsgNotice: Notice{},
 }
 
 // Unheaded are the box's messages without the common header.

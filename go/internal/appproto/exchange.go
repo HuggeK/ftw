@@ -21,7 +21,7 @@ func (h *Handler) dispatchExchange(ctx context.Context, env Envelope) error {
 	case MsgHello:
 		return h.onExchangeHello(env)
 	case MsgCmd:
-		return h.onCmd(ctx, env)
+		return h.onCmd(ctx, env, "")
 	case MsgNow:
 		return h.onNow()
 	default:

@@ -248,6 +248,15 @@ var (
 	ErrOfferShape     = errors.New("protocol: the offer is malformed")
 )
 
+// UnmarshalSigned decodes a body the box checks a signature on: a key it
+// does not know, or a key twice, is refused.
+func UnmarshalSigned(raw []byte, v any) error {
+	if err := strictDec.Unmarshal(raw, v); err != nil {
+		return fmt.Errorf("protocol: decode signed body: %w", err)
+	}
+	return nil
+}
+
 // OfferKid names an offer key: the first 16 characters of base64url, without
 // padding, of SHA-256 over its SEC1 point. FTW Cloud publishes kid and key at
 // /.well-known/ftw-offer-key; the box and the apps pin a list of them.

@@ -138,6 +138,12 @@ type storedApp struct {
 	// Parent is the full key of the phone that added this watch. Empty for a
 	// phone. A watch without its phone is removed with it, never left behind.
 	Parent string `json:"parent,omitempty"`
+	// Agent is an agent row's grant (agents.go). Nil for a phone or a watch.
+	Agent *storedAgent `json:"agent,omitempty"`
+	// ApprovalKey is an owner phone's P-256 approval key, SEC1 uncompressed
+	// in base64url, and ApprovalKeySetMs when it was registered.
+	ApprovalKey      string `json:"approvalKey,omitempty"`
+	ApprovalKeySetMs int64  `json:"approvalKeySetMs,omitempty"`
 }
 
 // UnmarshalJSON accepts the legacy bare-string form beside the current one.
@@ -218,6 +224,17 @@ type Identity struct {
 	// home is the home id at FTW Cloud, for a QR that names it. See
 	// SetHome.
 	home func() string
+	// wall is the wall clock and whether NTP has set it. Agent rows expire
+	// by it and may do nothing without it. See SetClock.
+	wall func() (time.Time, bool)
+	// seenApprovals remembers the SHA-256 of each signed array it took
+	// until the ms it maps to, so none is taken twice.
+	seenApprovals map[[32]byte]int64
+	// sinceMs is the earliest approval time this process takes: its first
+	// trusted wall time less the skew allowed.
+	sinceMs int64
+	// onOwnerAdded hears about a phone paired as an owner.
+	onOwnerAdded []func()
 }
 
 // appMeta is what the box remembers about one paired phone.
@@ -229,6 +246,11 @@ type appMeta struct {
 	// parent is the full key of the phone that added a watch, and empty for
 	// a phone.
 	parent string
+	// agent is an agent row's grant, nil for a phone or a watch.
+	agent *agentMeta
+	// approvalKey is an owner phone's approval key, empty when it has none.
+	approvalKey      []byte
+	approvalKeySetMs int64
 }
 
 // firstEpoch is where a fresh enrolment starts.
@@ -249,6 +271,10 @@ type Grant struct {
 	// viewer narrows its watch at once.
 	Parent     string
 	ParentRole string
+	// Agent is an agent row's grant now, nil for a phone or a watch. Its
+	// ParentRole is the role its approver holds now: owner for a grant
+	// made on the box page.
+	Agent *AgentGrant
 }
 
 type pairingCode struct {
@@ -349,19 +375,36 @@ func (i *Identity) load(raw []byte) error {
 		if epoch == 0 {
 			epoch = firstEpoch
 		}
-		i.authorised[app.Key] = &appMeta{
-			addedAtMs:  app.AddedAtMs,
-			lastSeenMs: app.LastSeenMs,
-			role:       role,
-			epoch:      epoch,
-			parent:     app.Parent,
+		meta := &appMeta{
+			addedAtMs:        app.AddedAtMs,
+			lastSeenMs:       app.LastSeenMs,
+			role:             role,
+			epoch:            epoch,
+			parent:           app.Parent,
+			agent:            app.Agent,
+			approvalKeySetMs: app.ApprovalKeySetMs,
 		}
+		if app.ApprovalKey != "" {
+			meta.approvalKey, _ = base64.RawURLEncoding.DecodeString(app.ApprovalKey)
+		}
+		i.authorised[app.Key] = meta
 	}
 	// A watch whose phone is missing from the file was left behind by a
 	// write that never finished. It holds nothing its phone could vouch for,
 	// so it goes rather than lingering as a device nobody can narrow.
 	for key, meta := range i.authorised {
 		if meta.role == apiauth.RoleWatch && i.authorised[meta.parent] == nil {
+			delete(i.authorised, key)
+		}
+	}
+	// The same for an agent whose approving phone is gone, and for a row
+	// whose role says agent and carries no grant.
+	for key, meta := range i.authorised {
+		agentRole := apiauth.AgentRole(meta.role)
+		switch {
+		case agentRole != (meta.agent != nil):
+			delete(i.authorised, key)
+		case meta.agent != nil && meta.agent.ApprovedBy != LANApprover && i.authorised[meta.agent.ApprovedBy] == nil:
 			delete(i.authorised, key)
 		}
 	}
@@ -402,10 +445,15 @@ func (i *Identity) save() error {
 		AuthorisedApps:   make([]storedApp, 0, len(i.authorised)),
 	}
 	for key, meta := range i.authorised {
-		s.AuthorisedApps = append(s.AuthorisedApps, storedApp{
+		app := storedApp{
 			Key: key, AddedAtMs: meta.addedAtMs, LastSeenMs: meta.lastSeenMs,
-			Role: meta.role, Epoch: meta.epoch, Parent: meta.parent,
-		})
+			Role: meta.role, Epoch: meta.epoch, Parent: meta.parent, Agent: meta.agent,
+			ApprovalKeySetMs: meta.approvalKeySetMs,
+		}
+		if len(meta.approvalKey) > 0 {
+			app.ApprovalKey = base64.RawURLEncoding.EncodeToString(meta.approvalKey)
+		}
+		s.AuthorisedApps = append(s.AuthorisedApps, app)
 	}
 	// Deterministic on disk, so two saves of the same state are the same
 	// bytes and a diff of applink.json says something.
@@ -625,6 +673,17 @@ func (i *Identity) Authorise(appStatic, payload []byte) (Grant, error) {
 // code and takes no device's place. commit returns the grant as it stands
 // then, and fails if a revoke, another pairing or the code's end came first.
 func (i *Identity) Check(appStatic, payload []byte) (Grant, func() (Grant, error), error) {
+	return i.check(appStatic, payload, false)
+}
+
+// CheckTunnel is Check for a session FTW Cloud carries. It also admits an
+// agent row that has a clock to run by and has not expired: an agent reaches
+// the box through the tunnel and nowhere else.
+func (i *Identity) CheckTunnel(appStatic, payload []byte) (Grant, func() (Grant, error), error) {
+	return i.check(appStatic, payload, true)
+}
+
+func (i *Identity) check(appStatic, payload []byte, tunnel bool) (Grant, func() (Grant, error), error) {
 	key := base64.RawURLEncoding.EncodeToString(appStatic)
 
 	i.mu.Lock()
@@ -635,6 +694,15 @@ func (i *Identity) Check(appStatic, payload []byte) (Grant, func() (Grant, error
 			// it answers here as a stranger would.
 			i.mu.Unlock()
 			return Grant{}, nil, ErrNoPairing
+		}
+		if meta.agent != nil {
+			// An agent comes only through the tunnel, only with a
+			// clock, and only before its grant runs out. Anywhere else
+			// it is a stranger.
+			if g, _, ok := i.agentGrantLocked(meta); !tunnel || !ok || g.Expired || g.NoClock {
+				i.mu.Unlock()
+				return Grant{}, nil, ErrNoPairing
+			}
 		}
 		grant := i.grantLocked(key, meta)
 		i.mu.Unlock()
@@ -720,8 +788,28 @@ func (i *Identity) Check(appStatic, payload []byte) (Grant, func() (Grant, error
 
 		err := i.save()
 		i.changed()
+		if role == apiauth.RoleOwner {
+			i.ownerAdded()
+		}
 		return Grant{DeviceID: deviceID(key), Role: role, Epoch: firstEpoch}, err
 	}, nil
+}
+
+// OnOwnerAdded registers fn to run after a phone pairs as an owner: every
+// owner hears of it.
+func (i *Identity) OnOwnerAdded(fn func()) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.onOwnerAdded = append(i.onOwnerAdded, fn)
+}
+
+func (i *Identity) ownerAdded() {
+	i.mu.Lock()
+	fns := append([]func(){}, i.onOwnerAdded...)
+	i.mu.Unlock()
+	for _, fn := range fns {
+		fn()
+	}
 }
 
 // pairingRoleLocked is the role a code stamps. The role travels with the code
@@ -806,7 +894,12 @@ func (i *Identity) GrantFor(id string) (Grant, bool) {
 		// guard: a watch never outlives the phone that vouches for it.
 		return Grant{}, false
 	}
-	return i.grantLocked(key, meta), true
+	grant := i.grantLocked(key, meta)
+	if meta.agent != nil && grant.Agent == nil {
+		// The same guard for an agent and the phone that approved it.
+		return Grant{}, false
+	}
+	return grant, true
 }
 
 // grantLocked is one enrolment as a Grant. The caller holds the mutex.
@@ -815,6 +908,12 @@ func (i *Identity) grantLocked(key string, meta *appMeta) Grant {
 	if parent := i.authorised[meta.parent]; meta.parent != "" && parent != nil {
 		grant.Parent = deviceID(meta.parent)
 		grant.ParentRole = parent.role
+	}
+	if meta.agent != nil {
+		if g, approverRole, ok := i.agentGrantLocked(meta); ok {
+			grant.Agent = &g
+			grant.ParentRole = approverRole
+		}
 	}
 	return grant
 }
@@ -853,6 +952,11 @@ func (i *Identity) SetRole(id, role string) error {
 		i.mu.Unlock()
 		return ErrWatchRole
 	}
+	if meta.agent != nil {
+		// An agent's grant changes only by agent.widen, with an approval.
+		i.mu.Unlock()
+		return ErrAgentRow
+	}
 	if meta.role == role {
 		// Nothing changed, so nothing is bumped. An epoch that moved for a
 		// write that changed nothing would make every live session re-read a
@@ -864,6 +968,7 @@ func (i *Identity) SetRole(id, role string) error {
 		i.mu.Unlock()
 		return ErrLastOwnerProtected
 	}
+	promoted := role == apiauth.RoleOwner
 	meta.role = role
 	meta.epoch++
 	// The phone's watches hold what it holds, so their grants changed too.
@@ -878,6 +983,11 @@ func (i *Identity) SetRole(id, role string) error {
 
 	err := i.save()
 	i.changed()
+	if promoted {
+		// A phone made an owner can do anything, give access away included:
+		// every owner hears of it, as of a new owner's pairing.
+		i.ownerAdded()
+	}
 	return err
 }
 
@@ -889,6 +999,10 @@ func (i *Identity) Devices() []DeviceInfo {
 	var phones []DeviceInfo
 	watches := map[string][]DeviceInfo{}
 	for key, meta := range i.authorised {
+		if meta.agent != nil {
+			// Agents have their own list. See Agents.
+			continue
+		}
 		d := DeviceInfo{
 			ID: deviceID(key), AddedAtMs: meta.addedAtMs, LastSeenMs: meta.lastSeenMs,
 			Role:      meta.role,
@@ -985,8 +1099,11 @@ func (i *Identity) Revoke(id string, from Presence) ([]Removed, error) {
 		return nil, ErrLastOwnerProtected
 	}
 	gone := []string{fullKey}
-	for key, watch := range i.authorised {
-		if watch.parent == fullKey {
+	for key, other := range i.authorised {
+		// A phone's watches go with it, and so do the agents it approved:
+		// neither may hold more than the phone that vouches for it, and a
+		// phone that is gone vouches for nothing.
+		if other.parent == fullKey || (other.agent != nil && other.agent.ApprovedBy == fullKey) {
 			gone = append(gone, key)
 		}
 	}
@@ -1028,7 +1145,10 @@ type RosterEntry struct {
 	Epoch uint64
 	// ParentRole is the role a watch's phone holds now, empty for a phone.
 	// The scopes the roster carries for a watch are those both roles share.
+	// For an agent row it is the role its approver holds now.
 	ParentRole string
+	// Agent is an agent row's grant, nil for a phone or a watch.
+	Agent *AgentGrant
 }
 
 // Roster lists every paired device, watches included, sorted by id.
@@ -1044,8 +1164,13 @@ func (i *Identity) Roster() []RosterEntry {
 		if meta.role == apiauth.RoleWatch && grant.Parent == "" {
 			continue
 		}
+		if meta.agent != nil && (grant.Agent == nil || grant.Agent.Expired) {
+			// FTW Cloud stops admitting an agent at its expiry by its
+			// own clock; a roster after that leaves it out as well.
+			continue
+		}
 		out = append(out, RosterEntry{ID: grant.DeviceID, Key: raw, Role: meta.role, Epoch: meta.epoch,
-			ParentRole: grant.ParentRole})
+			ParentRole: grant.ParentRole, Agent: grant.Agent})
 	}
 	i.mu.Unlock()
 	sort.Slice(out, func(a, b int) bool { return out[a].ID < out[b].ID })

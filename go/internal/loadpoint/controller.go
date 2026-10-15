@@ -288,6 +288,10 @@ type ManualHold struct {
 	StartedAt time.Time
 	// UpdatedAt identifies the latest choice, including a current change.
 	UpdatedAt time.Time `json:"updated_at,omitempty"`
+	// SetBy is who set the hold: an agent's subject, agent:<id>, for an
+	// agent's hold (docs/agents.md, Holds); a phone's or empty for an
+	// owner's. An agent may touch only a hold with its own subject.
+	SetBy string `json:"set_by,omitempty"`
 }
 
 // Directive is the loadpoint-relevant slice of mpc.SlotDirective.
@@ -1079,6 +1083,43 @@ func (c *Controller) SetManualHold(id string, h ManualHold) {
 	}
 	c.manualPersistMu.Lock()
 	defer c.manualPersistMu.Unlock()
+	c.setManualHoldLocked(id, h)
+}
+
+// SetManualHoldIfOwn sets h only while no live hold of someone other than
+// h.SetBy is in place, checked and written under one lock, so an owner's
+// hold that lands between an agent's check and its write still wins. It
+// reports whether it set h.
+func (c *Controller) SetManualHoldIfOwn(id string, h ManualHold, now time.Time) bool {
+	if c == nil {
+		return false
+	}
+	c.manualPersistMu.Lock()
+	defer c.manualPersistMu.Unlock()
+	if cur, held := c.GetManualHold(id, now); held && cur.SetBy != h.SetBy {
+		return false
+	}
+	c.setManualHoldLocked(id, h)
+	return true
+}
+
+// ClearManualHoldIfOwn clears the hold only while the live one is setBy's.
+// It reports whether it cleared one.
+func (c *Controller) ClearManualHoldIfOwn(id, setBy string, now time.Time) bool {
+	if c == nil {
+		return false
+	}
+	c.manualPersistMu.Lock()
+	defer c.manualPersistMu.Unlock()
+	if cur, held := c.GetManualHold(id, now); !held || cur.SetBy != setBy {
+		return false
+	}
+	c.clearManualHoldLocked(id)
+	return true
+}
+
+// setManualHoldLocked requires manualPersistMu.
+func (c *Controller) setManualHoldLocked(id string, h ManualHold) {
 	c.markManualExplicit(id)
 	if h.PowerW > 0 && c.manager != nil {
 		c.manager.RetryCharging(id)

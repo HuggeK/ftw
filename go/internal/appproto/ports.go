@@ -163,6 +163,12 @@ type Loadpoints interface {
 	ClearHold(id string)
 	// ObservedHold is the hold as the box holds it right now.
 	ObservedHold(id string, now time.Time) (loadpoint.ManualHold, bool)
+	// HoldIfOwn sets h only while no live hold of someone other than
+	// h.SetBy is in place, checked and written as one step. It reports
+	// whether it set h.
+	HoldIfOwn(id string, h loadpoint.ManualHold, now time.Time) bool
+	// ClearHoldIfOwn clears the hold only while the live one is setBy's.
+	ClearHoldIfOwn(id, setBy string, now time.Time) bool
 	// Boost installs a battery-boost lease, refusing when live state cannot
 	// safely honour it. The implementation carries whatever replan
 	// bookkeeping the HTTP enable route does.

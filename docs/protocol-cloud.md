@@ -531,6 +531,17 @@ record cannot turn a withdrawn consent back on.
 **`stats.withdraw`** `{statsId}`. The service deletes that id's rows within
 24 hours.
 
+**`notice`**, whenever the box is linked, with the readable copy on or off.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `kind` | text | One of `agent.added`, `agent.request`, `agent.expiring`, `approval.key.set`, `owner.added` |
+
+A security notice: someone gained access, asks for a change, is about to
+lose access, or can now approve access. The service sends each owner device
+registered for alerts a push with no data beyond the kind, which the phone
+words from its catalogue. See [Agents](agents.md).
+
 **`bye`** `{why, purge}`. `why` is `revoked`, `shutdown` or `update`.
 `purge: true` asks the service to delete the home. `why: "update"` holds
 back `box.unreachable` until the box returns or an hour passes.

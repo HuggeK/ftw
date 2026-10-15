@@ -1,30 +1,68 @@
 package notifications
 
-import "context"
+import (
+	"context"
+
+	"github.com/srcfl/ftw/go/internal/config"
+)
 
 // NotifyCloudGrant tells every owner that FTW Cloud was turned on or off,
 // with the catalogue's sentence for kind. The rule gates it like any other,
 // but a box whose stored rules predate these kinds still sends it: a missing
 // rule reads as the default, which is on.
 func (s *Service) NotifyCloudGrant(kind string) {
-	if s == nil || (kind != PushCloudGranted && kind != PushCloudRevoked) {
+	if kind != PushCloudGranted && kind != PushCloudRevoked {
+		return
+	}
+	s.notifyOwners(kind)
+}
+
+// NotifyAgents tells every owner about access to the box (docs/agents.md):
+// an agent given access, asking for a durable change or about to lose
+// access, a phone's new approval key, or a new owner. Each with the
+// catalogue's sentence for kind. These are security notices: they go
+// whether or not the owner turned notifications on, and whatever the rule
+// says, to every transport the box has.
+func (s *Service) NotifyAgents(kind string) {
+	switch kind {
+	case PushAgentAdded, PushAgentRequest, PushAgentExpiring, PushApprovalKeySet, PushOwnerAdded:
+	default:
+		return
+	}
+	s.notify(kind, true)
+}
+
+func (s *Service) notifyOwners(kind string) { s.notify(kind, false) }
+
+// notify sends kind to every owner. A security notice passes the master
+// switch and its rule.
+func (s *Service) notify(kind string, security bool) {
+	if s == nil {
 		return
 	}
 	s.mu.Lock()
-	if s.cfg == nil || !s.cfg.Enabled {
+	if !security && (s.cfg == nil || !s.cfg.Enabled) {
 		s.mu.Unlock()
 		return
 	}
-	rule, ok := findRule(s.cfg.Events, kind)
+	var events []config.NotificationRule
+	defaultPriority := 3
+	if s.cfg != nil {
+		events = s.cfg.Events
+		if s.cfg.DefaultPriority > 0 {
+			defaultPriority = s.cfg.DefaultPriority
+		}
+	}
+	rule, ok := findRule(events, kind)
 	if !ok {
 		rule, _ = findRule(DefaultRules(), kind)
 	}
 	prio := rule.Priority
 	if prio == 0 {
-		prio = s.cfg.DefaultPriority
+		prio = defaultPriority
 	}
 	s.mu.Unlock()
-	if !rule.Enabled {
+	if !rule.Enabled && !security {
 		return
 	}
 

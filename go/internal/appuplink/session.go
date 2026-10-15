@@ -282,13 +282,7 @@ func (s *sessions) promote(p *pending) (*session, error) {
 	// built. Everything the box later decides about this phone — which
 	// commands it may send, which routes it may reach — is decided from this
 	// value, and nothing the phone sends can add to it.
-	caller := apiauth.Caller{
-		Subject: subjectOf(grant.DeviceID),
-		Kind:    apiauth.KindApp,
-		Role:    grant.Role,
-		Scopes:  appproto.ScopesForGrant(grant.Role, grant.ParentRole),
-		Epoch:   grant.Epoch,
-	}
+	caller := callerOf(grant)
 	handler, err := s.build(
 		sender{transport: p.transport, write: s.write},
 		caller,
@@ -403,13 +397,35 @@ func (g liveGrant) Grant() (appproto.Enrolment, bool) {
 }
 
 // enrolmentOf is a grant as the message layer reads it. A watch spends its
-// parent phone's command ids, so one intent sent by both acts once.
+// parent phone's command ids, so one intent sent by both acts once. An agent
+// spends its own.
 func enrolmentOf(grant appenroll.Grant) appproto.Enrolment {
 	e := appproto.Enrolment{Role: grant.Role, Epoch: grant.Epoch, ParentRole: grant.ParentRole}
 	if grant.Parent != "" {
 		e.Root = subjectOf(grant.Parent)
 	}
+	if a := grant.Agent; a != nil {
+		e.Agent = &appproto.AgentGrant{Scopes: a.Scopes, Ops: a.Ops, Caps: a.Caps, ExpiresAtMs: a.ExpiresAtMs,
+			Principal: a.Principal, Expired: a.Expired, NoClock: a.NoClock}
+	}
 	return e
+}
+
+// callerOf is the caller a session carries. The grant becomes a caller here
+// and nowhere else: everything the box later decides about the session is
+// decided from this value, and nothing the device sends can add to it.
+func callerOf(grant appenroll.Grant) apiauth.Caller {
+	kind := apiauth.KindApp
+	if grant.Agent != nil {
+		kind = apiauth.KindAgent
+	}
+	return apiauth.Caller{
+		Subject: kind + ":" + grant.DeviceID,
+		Kind:    kind,
+		Role:    grant.Role,
+		Scopes:  appproto.ScopesForEnrolment(enrolmentOf(grant)),
+		Epoch:   grant.Epoch,
+	}
 }
 
 // subjectOf is the caller subject for a device id. Built here and nowhere

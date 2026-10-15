@@ -20,6 +20,11 @@ const (
 	PushFuseOverLimit           = protocol.PushFuseOverLimit
 	PushBoxUnreachable          = protocol.PushBoxUnreachable
 	PushCloudGranted            = protocol.PushCloudGranted
+	PushAgentAdded              = protocol.PushAgentAdded
+	PushAgentRequest            = protocol.PushAgentRequest
+	PushAgentExpiring           = protocol.PushAgentExpiring
+	PushApprovalKeySet          = protocol.PushApprovalKeySet
+	PushOwnerAdded              = protocol.PushOwnerAdded
 	PushCloudRevoked            = protocol.PushCloudRevoked
 )
 

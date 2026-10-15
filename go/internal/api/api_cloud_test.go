@@ -366,6 +366,7 @@ type cloudRosterStub struct{}
 func (cloudRosterStub) Devices() []cloudlink.RosterDevice { return nil }
 
 func (cloudRosterStub) Pending() ([]byte, time.Time, bool) { return nil, time.Time{}, false }
+func (cloudRosterStub) Noise() []byte                      { return make([]byte, 32) }
 
 type cloudKV struct {
 	mu sync.Mutex

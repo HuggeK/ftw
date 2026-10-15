@@ -524,7 +524,7 @@ func newLuaHTTPTransport(allowUnverifiedLocal bool, proxy func(*net_http.Request
 	}
 	transport.Proxy = proxyExceptLocal(proxy)
 	mdnsDialer := mdnsresolve.Dialer{AllowUnverifiedLocal: allowUnverifiedLocal}
-	transport.DialContext = mdnsDialer.DialContext
+	transport.DialContext = guardDial(mdnsDialer.DialContext)
 	return transport
 }
 

@@ -27,3 +27,20 @@ func TestCloudGrantNoticesAreOnUnlessTurnedOff(t *testing.T) {
 		t.Fatalf("an owner's off switch was ignored, or another kind went through: %d", n)
 	}
 }
+
+// A security notice goes whether or not the owner turned notifications on,
+// and whatever its rule says.
+func TestSecurityNoticesPassTheMasterSwitch(t *testing.T) {
+	pub := &fakePub{}
+	cfg := pushCfg(config.NotificationRule{Type: PushAgentAdded, Enabled: false})
+	cfg.Enabled = false
+	svc, _ := newSvc(cfg, pub)
+	svc.NotifyAgents(PushAgentAdded)
+	svc.NotifyAgents(PushOwnerAdded)
+	svc.NotifyAgents(PushChargingConnected)
+	settle(svc)
+	msgs := pub.Messages()
+	if len(msgs) != 2 || msgs[0].Kind != PushAgentAdded || msgs[1].Kind != PushOwnerAdded {
+		t.Fatalf("messages %+v", msgs)
+	}
+}

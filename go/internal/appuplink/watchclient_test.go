@@ -171,6 +171,14 @@ func (c *fakeCharger) ObservedHold(string, time.Time) (loadpoint.ManualHold, boo
 	defer c.mu.Unlock()
 	return c.hold, c.held
 }
+func (c *fakeCharger) HoldIfOwn(id string, h loadpoint.ManualHold, now time.Time) bool {
+	c.Hold(id, h)
+	return true
+}
+func (c *fakeCharger) ClearHoldIfOwn(id, _ string, _ time.Time) bool {
+	c.ClearHold(id)
+	return true
+}
 func (c *fakeCharger) Boost(string, loadpoint.BatteryBoostLease, time.Time) error { return nil }
 func (c *fakeCharger) CancelBoost(string, time.Time)                              {}
 func (c *fakeCharger) ObservedBoost(string, time.Time) loadpoint.BatteryBoostStatus {

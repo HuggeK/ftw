@@ -3,6 +3,7 @@ package cloudlink
 import (
 	"encoding/base64"
 	"errors"
+	"slices"
 	"time"
 
 	"github.com/srcfl/ftw/go/protocol"
@@ -193,4 +194,47 @@ func (w *writer) closeIfAsked(snap grantSnapshot) error {
 		return err
 	}
 	return errClosed
+}
+
+// noticeQueue bounds the notices waiting for the uplink.
+const noticeQueue = 16
+
+// Notice queues a security notice for the owners' phones (docs/agents.md,
+// Push kinds). Unlike an event it needs no grant: it says only that access
+// to the box changed, and goes whenever the box is linked. False means the
+// box is not linked or the kind is not a notice.
+func (l *Link) Notice(kind string) bool {
+	if !slices.Contains(cloudwire.NoticeKinds, kind) {
+		return false
+	}
+	l.mu.Lock()
+	if l.link == nil || l.link.Ending || l.closing {
+		l.mu.Unlock()
+		return false
+	}
+	if len(l.notices) >= noticeQueue {
+		l.notices = l.notices[1:]
+	}
+	l.notices = append(l.notices, kind)
+	l.mu.Unlock()
+	l.signal()
+	return true
+}
+
+// sendNotices sends what waits, oldest first.
+func (w *writer) sendNotices(snap grantSnapshot) error {
+	l := w.link
+	l.mu.Lock()
+	queued := l.notices
+	l.notices = nil
+	l.mu.Unlock()
+	for i, kind := range queued {
+		if _, err := w.sendBody(snap, cloudwire.MsgNotice, &cloudwire.Notice{Kind: kind}, true); err != nil {
+			l.mu.Lock()
+			l.notices = append(queued[i:len(queued):len(queued)], l.notices...)
+			l.mu.Unlock()
+			return err
+		}
+	}
+	return nil
 }

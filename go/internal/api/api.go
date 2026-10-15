@@ -102,6 +102,10 @@ type Deps struct {
 	// which the pairing routes report rather than hiding.
 	AppEnroll AppEnroller
 
+	// Agents is the box page's view of agent grants (docs/agents.md). Nil
+	// when the app link is off; the routes then answer 503.
+	Agents AgentAdmin
+
 	// FleetPing is the once-a-day anonymous count. Held so Settings can render
 	// the exact payload the sender would post, rather than a second rendering
 	// that could quietly disagree with it. Nil in tests and minimal
@@ -429,6 +433,7 @@ func (s *Server) routes() {
 	s.handle("PATCH  /api/app-link/devices/{id}", Configure, s.handleAppLinkDeviceRole)
 	s.handle("GET  /api/fleet-ping", Read, s.handleFleetPing)
 	s.cloudRoutes()
+	s.agentRoutes()
 	s.handle("POST /api/mode", Actuate, s.handleSetMode, Via(appproto.OpSetMode))
 	s.handle("GET  /api/planner/prefs", Read, s.handleGetPlannerPrefs)
 	s.handle("POST /api/planner/prefs", Actuate, s.handleSetPlannerPrefs, Via(appproto.OpPlannerPrefsSet))

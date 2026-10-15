@@ -8,7 +8,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/srcfl/ftw/go/internal/apiauth"
 	"github.com/srcfl/ftw/go/internal/appenroll"
 	"github.com/srcfl/ftw/go/internal/appproto"
 	"github.com/srcfl/ftw/go/protocol/appwire"
@@ -355,7 +354,9 @@ func (t *Tunnel) handshake(s *tunSession, message1 []byte) (*appwire.Transport, 
 		return nil, nil, err
 	}
 	transport := appwire.NewTransport(noise)
-	if _, commit, err := t.enroll.Check(noise.RemoteStatic, payload); err != nil {
+	// CheckTunnel and not Check: an agent reaches the box this way and no
+	// other (docs/agents.md).
+	if _, commit, err := t.enroll.CheckTunnel(noise.RemoteStatic, payload); err != nil {
 		transport.Close()
 		return nil, nil, err
 	} else {
@@ -378,13 +379,7 @@ func (t *Tunnel) promote(s *tunSession, transport *appwire.Transport, commit fun
 	if err != nil {
 		return err
 	}
-	caller := apiauth.Caller{
-		Subject: subjectOf(grant.DeviceID),
-		Kind:    apiauth.KindApp,
-		Role:    grant.Role,
-		Scopes:  appproto.ScopesForGrant(grant.Role, grant.ParentRole),
-		Epoch:   grant.Epoch,
-	}
+	caller := callerOf(grant)
 	send := func(msg []byte, bulk bool) error {
 		return t.sendTun(cloudwire.Tun{Dev: s.dev, Sid: s.sid, D: msg}, bulk)
 	}

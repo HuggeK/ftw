@@ -108,6 +108,9 @@ type Enrolment struct {
 	// phone, which spends its own, and the parent phone's for a watch. One
 	// intent sent by the watch and by its phone then acts once.
 	Root string
+	// Agent is an agent row's grant now, nil for a phone or a watch. For an
+	// agent, ParentRole is the role its approver holds now.
+	Agent *AgentGrant
 }
 
 // --------------------------------------------------------------------------

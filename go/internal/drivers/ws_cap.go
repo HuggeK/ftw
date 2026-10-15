@@ -53,7 +53,7 @@ func newGorillaWSDialer(allowUnverifiedLocal bool, proxy func(*net_http.Request)
 	}
 	dialer.Proxy = proxyExceptLocal(proxy)
 	mdnsDialer := mdnsresolve.Dialer{AllowUnverifiedLocal: allowUnverifiedLocal}
-	dialer.NetDialContext = mdnsDialer.DialContext
+	dialer.NetDialContext = guardDial(mdnsDialer.DialContext)
 	return dialer
 }
 

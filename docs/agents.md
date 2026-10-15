@@ -94,7 +94,7 @@ any other request from an agent with `E_SCOPE_DENIED`.
 
 | Message | Needs | Answer |
 |---|---|---|
-| `hello` | — | `hello_ok`, with the role and the scopes the agent holds now, and no `cloud` |
+| `hello` | — | `hello_ok`, with the role and the scopes the agent holds now, and no `cloud`. A `sub` in an agent's `hello` is ignored |
 | A read in the registry's `reads` | Its scope there | See [Reads](#reads) |
 | `cmd` | The op's agent scope, `ftw.dispatch.hold` | `cmd.ack`, `cmd.result` |
 | `agent.request` | The op's agent scope, `ftw.goals.request` | `agent.ok` |
@@ -106,6 +106,12 @@ any other request from an agent with `E_SCOPE_DENIED`.
 are priced for an owner. A box that lacks one of the reads answers
 `E_UNKNOWN_OP`, as it does for any message it does not know. A phone may
 send the reads too, under the same scopes.
+
+Every answer to an agent names things by agent id. An error's `args` keep
+only keys the box knows to be safe, such as `op`, `arg`, `cap` and `max`,
+with charger and source names turned into agent ids and any other text
+dropped: a handler written for a phone may name a device, and FTW Cloud
+reads every answer an agent gets.
 
 ## Operations
 
@@ -153,9 +159,17 @@ open to an agent.
 - **The owner's hold wins.** Every hold carries its setter. An agent's hold
   carries `agent:<id>`. While a hold an owner set is active on a charger,
   an agent's `loadpoint.hold` there gets `E_NEEDS_OWNER`, and an agent never
-  replaces or clears it. `clear` releases only a hold the same agent set.
-- **The box ends an agent's holds** when its grant is revoked or expires,
-  at once, whatever the hold had left.
+  replaces or clears it. `clear` releases only a hold the same agent set,
+  and with none to release gets `E_NOT_FOUND`. The charger's controller
+  checks the setter and writes in one step, so an owner's hold that lands
+  between the check and the write still wins.
+- **One hold per charger every 30 seconds.** An agent that sets holds on
+  one charger faster gets `E_RATE_LIMITED {reason: "hold_gap"}` with
+  `retryAfterMs`, so it cannot flap a charger between nothing and full
+  power.
+- **The box ends an agent's holds** when its grant is revoked, narrowed or
+  expires, and when the owner phone that approved it is removed or stops
+  being an owner, at once, whatever the hold had left.
 - **Renewal is a tool call.** FTW Cloud never renews a hold on its own; it
   sends one only in answer to the agent's tool call. Charging for longer than
   `holdS` is a durable goal: a `ftw.goals.request` op, such as the car's goal
@@ -191,8 +205,9 @@ open to an agent.
 4. An owner reads it with `agent.list`. The app shows the op and each
    argument by its label, and the agent's `why` as the agent's words. The
    owner answers with `agent.confirm`. Approving needs an approval signature
-   over the request id, the agent, the op and the hash of the args; declining
-   needs none.
+   over the request id, the agent, the op and the hash of the args, and a
+   wall clock the box trusts, or it gets `E_UNAVAILABLE {subsystem: clock}`;
+   declining needs neither.
 5. On approval the box runs the op on the confirming owner's session as a
    command with id `req:<reqId>`, under the owner's scopes and against fresh
    state, and sends that session `cmd.ack` and `cmd.result`. Nothing the
@@ -344,9 +359,9 @@ base64url.
 `actor` is the caller subject (`agent:<id>`, `app:<id>`, `lan:<address>` or
 `box`); `principal` is the client or ticket; `by` is who made a support call;
 `what` is the message type or op; `result` is `ok` or the error code.
-`count` folds an agent's reads: one row per agent, message and minute, with
-how many there were. Grants, keys, commands and requests get a row each,
-from a budget of their own.
+`count` folds an agent's reads and refusals: one row per agent, message,
+`by`, result and minute, with how many there were. Grants, keys, commands
+and requests get a row each, from a budget of their own.
 
 ### Reads
 
@@ -385,7 +400,11 @@ The registry's `reads` table names each read and the scope it needs.
   fallbacks, refusals and plan against actual join it when the box keeps
   them; a field the box cannot fill is absent.
 - The box answers `events.get` and `diag.run` with `E_UNKNOWN_OP` until it
-  builds them.
+  builds them, and `cars.get` until it has the car store. Until then
+  `loadpoints.get` carries no car id.
+- `logs.get` looks back over the box's whole log ring, its newest 2,000
+  lines. `beforeMs` and `afterMs` together pick the lines between them; an
+  `afterMs` at or past `beforeMs` gets `E_UNKNOWN_OP {field: "beforeMs"}`.
 
 ## Redaction on the box
 
@@ -395,12 +414,15 @@ unredacted, and nothing is stored in the cloud.
 - **Logs.** The box keeps the time, the level and the box's own message
   text, scrubbed. A driver's free text never leaves: its line keeps the
   level, the driver's agent id and the attributes the allowlist below
-  keeps. Text is scrubbed of every name the configuration and the car store
-  know (site, drivers, devices, chargers, cars, VINs, identifiers, sources),
-  IP and MAC addresses, host names, URLs, e-mail addresses, quoted text,
-  serial-like words (letters and digits mixed, six or more), runs of seven or
-  more digits, and anything that looks like a credential: bearer and basic
-  headers, secret-named keys and long tokens.
+  keeps. Text is scrubbed of every name the configuration knows (site,
+  drivers, chargers, vehicles and their identifiers; the car store's names
+  join when the box has one), IP and MAC addresses, host names, URLs,
+  e-mail addresses, quoted text, serial-like words (letters and digits
+  mixed, six or more), runs of seven or more digits, and anything that
+  looks like a credential: bearer and basic headers, secret-named keys and
+  long tokens. A host name is a dotted name that ends in any two-letter
+  label, as every country's does, or in a common longer one such as `.com`
+  or `.xyz`. A code word such as `planner.prefs.set` ends in neither.
 - **Attributes.** A line's attributes keep only keys on the box's
   allowlist. A value survives when its key is allowed and the value is a
   flag, a duration, a short lowercase code word, or a number for a key the
@@ -409,7 +431,10 @@ unredacted, and nothing is stored in the cloud.
 - **Config.** Every secret-named key is replaced by `***`. Names become
   agent ids. Location, addresses, host names, URLs, serials, MAC addresses,
   vehicle and car ids, VINs, e-mail addresses and notification targets are
-  removed.
+  removed. A number stays only under a key that ends in its unit (`_w`,
+  `_kwh`, `_s`, `_pct`, `_soc` and the like) or names a known setting such
+  as `phases`; any other number goes, so a port, a Modbus unit id or an
+  account number does not leave.
 - **Vectors.** `go/protocol/testdata/redaction-vectors.json` holds lines in
   and out, so a change to the rules shows.
 
@@ -533,9 +558,17 @@ above and its approval key, and an agent can never reach them.
 | `POST /api/agents/{id}/widen {epoch, scopes, ops, caps, ttlS}` | The same |
 | `POST /api/agent-requests/{reqId} {approve: true}` | The same |
 | `POST /api/agents/approval-key {deviceId, pub}` | The same: a phone that lost its key |
+| `POST /api/agents/clock-reset` | The same. Ends every agent's grant |
 | `POST /api/agent-requests/{reqId} {approve: false}` | A client on the LAN |
 | `DELETE /api/agents/{id}` | A client on the LAN |
 
+- A request that brings a house password, and a wrong one, is refused on
+  every route, the narrowing ones too.
+- `clock-reset` is for a clock that once ran ahead. The box never trusts a
+  wall time below the highest it has seen, so until the clock passes that
+  time again every agent is locked out. The reset makes now the mark and
+  ends every agent's grant, since a grant made while the clock ran ahead
+  would end years late.
 - `offer` is the [signed offer](#the-grant-offer), base64url. The box checks
   its signature against the offer keys built into it and refuses one that is
   unsigned, expired, or for another home. The page gets it from the owner:
@@ -546,8 +579,15 @@ above and its approval key, and an agent can never reach them.
 - **Every route that widens access needs the house password,** from any
   address, loopback included: a driver's Lua and the session passthrough can
   both reach the box from inside it.
-- **Drivers never reach the box.** A driver's HTTP request to a loopback
-  address, or to an address of the box itself, is refused.
+- **Drivers never reach the box's API.** A driver's HTTP, TCP or WebSocket
+  connection to a port the API listens on is refused, whether it goes to a
+  loopback address or to an address of the box. The check runs on the
+  address dialled, after any name lookup. Other ports stay open: a driver
+  may talk to a helper on the box that its configuration names, such as a
+  bridge on `127.0.0.1:8787`. A reverse proxy, or Home Assistant ingress,
+  that serves the API on another port is not covered by this check. There
+  the house password still guards every widening route, and the proxy's
+  forwarding headers make those routes refuse.
 
 What the sign-in is worth today:
 
@@ -567,7 +607,9 @@ What the sign-in is worth today:
   address.
 
 Narrowing stays open to any LAN client, as `DELETE /api/cloud/grant` does,
-because removing access is safe.
+because removing access is safe. With `api.lan_auth` on, every route here,
+the reads and the narrowing ones too, needs the sign-in, as every protected
+route on the box does.
 
 ## The grant offer
 
@@ -618,8 +660,10 @@ old one signed has expired.
   client at FTW Cloud. The app and the box refuse a support offer from any
   other client.
 - **The box** takes an offer whose `home` is empty or its own.
-- The owner may grant less than the offer asks. FTW Cloud learns the outcome
-  from the roster: the grant is whatever the roster lists for that key.
+- The owner may grant less than the offer asks, never more. The box page
+  refuses a scope, an op, a cap or a `ttlS` beyond the offer's. FTW Cloud
+  learns the outcome from the roster: the grant is whatever the roster lists
+  for that key.
 
 ## Push kinds
 
@@ -631,17 +675,21 @@ old one signed has expired.
   its approval key.
 - `owner.added` goes to every owner when a phone pairs as an owner.
 
-Today these travel as events, and with the readable copy off, or without
-events in it, FTW Cloud carries no events. `agent.added`,
-`approval.key.set` and `owner.added` are to go as notices that carry no data,
-whenever the link is up, copy or not; that is FTW Cloud protocol work still
-to come.
+These are security notices. They go whatever the owner's notification
+settings say, through the box's own transports, and to FTW Cloud as a
+`notice {kind}` that carries nothing but the kind, whenever the link is up,
+copy or not (docs/protocol-cloud.md). FTW Cloud turns a notice into a push
+to the home's phones; until it does, it drops the class, as it drops any
+box message it does not know.
 
 ## The audit log
 
 The box writes a row for every call an agent makes and for every change to
-an agent grant or an approval key, whoever makes it, and folds an agent's
-reads by the minute. Rows live in the box's state store, at most 10,000 and
+an agent grant or an approval key, whoever makes it. An agent's reads and
+refusals fold by the minute: one row per agent, message, `by` and result,
+with a count, so junk cannot crowd out the rows that matter. An agent's
+rows come from a budget of their own and never push out an owner's or the
+box's. Rows live in the box's state store, at most 10,000 and
 at most 90 days. An owner reads them with `audit.get` or on the box page.
 FTW Cloud keeps its own log of what it forwarded; neither replaces the other.
 

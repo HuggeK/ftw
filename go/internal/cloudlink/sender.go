@@ -133,6 +133,9 @@ func (w *writer) run(ctx context.Context, events <-chan cloudwire.Envelope) erro
 			if err := w.sendEvents(snap, now); err != nil {
 				return err
 			}
+			if err := w.sendNotices(snap); err != nil {
+				return err
+			}
 			if err := w.tick(snap, st, now); err != nil {
 				return err
 			}
@@ -387,7 +390,13 @@ func (l *Link) heartbeat(ages map[string]int64) cloudwire.HB {
 
 // project cuts opaque ids and ages from the box's names.
 func (l *Link) project(gk []byte, in Live) cloudwire.Live {
-	up := l.uptimeMs()
+	return ProjectLive(gk, l.uptimeMs(), in)
+}
+
+// ProjectLive cuts opaque ids under key, and ages at uptime up, from the
+// box's names: the live body as FTW Cloud's copy carries it, or, under the
+// box's agent key, as an agent reads it.
+func ProjectLive(gk []byte, up int64, in Live) cloudwire.Live {
 	out := cloudwire.Live{
 		Fields: in.Fields, Sources: map[string]cloudwire.Source{},
 		FieldSources: map[string][]string{}, Ages: map[string]int64{},
@@ -435,7 +444,11 @@ func ids(grantKey []byte, names []string) []string {
 
 // projectLP replaces loadpoint and driver names with opaque ids.
 func (l *Link) projectLP(snap grantSnapshot, in cloudwire.LP) cloudwire.LP {
-	gk := snap.g.GrantKey
+	return ProjectLP(snap.g.GrantKey, in)
+}
+
+// ProjectLP replaces loadpoint and driver names with opaque ids under gk.
+func ProjectLP(gk []byte, in cloudwire.LP) cloudwire.LP {
 	out := cloudwire.LP{ControlRev: in.ControlRev}
 	for _, lp := range in.Loadpoints {
 		lp.ID = cloudwire.LoadpointID(gk, lp.ID)
@@ -571,9 +584,10 @@ func (l *Link) rosterNumber(snap grantSnapshot) (uint64, cloudwire.Roster) {
 			}
 		}
 		r.Devices = append(r.Devices, cloudwire.Device{ID: d.ID, Key: d.Key, Role: d.Role, Scopes: scopes,
-			Epoch: d.Epoch, Tun: d.Tun})
+			Epoch: d.Epoch, Tun: d.Tun, Agent: d.Agent})
 	}
 	sort.Slice(r.Devices, func(a, b int) bool { return r.Devices[a].ID < r.Devices[b].ID })
+	r.Noise = l.opts.Roster.Noise()
 	if code, expires, ok := l.opts.Roster.Pending(); ok && snap.home != "" {
 		if left := time.Until(expires); left > 0 {
 			r.Pending = append(r.Pending, cloudwire.Pending{
@@ -588,7 +602,7 @@ func (l *Link) rosterNumber(snap grantSnapshot) (uint64, cloudwire.Roster) {
 	for _, p := range r.Pending {
 		pending = append(pending, p.Hash)
 	}
-	sum := digest([]any{r.Devices, r.Grant, pending})
+	sum := digest([]any{r.Devices, r.Grant, pending, r.Noise})
 
 	l.mu.Lock()
 	defer l.mu.Unlock()

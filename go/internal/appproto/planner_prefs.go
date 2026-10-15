@@ -22,27 +22,9 @@ func (h *Handler) setPlannerPrefs(cmd Cmd, uptimeMs int64) error {
 		})
 	}
 
-	var k *float64
-	if _, present := cmd.Args["safety_k"]; present {
-		value, ok := argNum(cmd.Args, "safety_k")
-		if !ok {
-			return h.rejectArg(cmd, "safety_k", cmd.Args["safety_k"])
-		}
-		k = &value
-	}
-	var export *string
-	if raw, present := cmd.Args["battery_export"]; present {
-		value, ok := raw.(string)
-		if !ok {
-			return h.rejectArg(cmd, "battery_export", raw)
-		}
-		if _, ok := config.ParseBatteryExport(value); !ok {
-			return h.rejectArg(cmd, "battery_export", raw)
-		}
-		export = &value
-	}
-	if k == nil && export == nil {
-		return h.rejectArg(cmd, "safety_k", nil)
+	k, export, bad := plannerPrefsArgs(cmd.Op, cmd.Args)
+	if bad != nil {
+		return h.rejectWith(cmd, bad)
 	}
 
 	if took, err := h.acceptCmd(cmd, uptimeMs); !took || err != nil {
@@ -72,4 +54,32 @@ func (h *Handler) setPlannerPrefs(cmd Cmd, uptimeMs int64) error {
 			UptimeMs: readAtMs,
 		},
 	})
+}
+
+// plannerPrefsArgs reads the prefs a planner.prefs.set carries: at least
+// one, each of its kind.
+func plannerPrefsArgs(op string, args map[string]any) (*float64, *string, *ErrorBody) {
+	var k *float64
+	if _, present := args["safety_k"]; present {
+		value, ok := argNum(args, "safety_k")
+		if !ok {
+			return nil, nil, badArg(op, "safety_k", args["safety_k"])
+		}
+		k = &value
+	}
+	var export *string
+	if raw, present := args["battery_export"]; present {
+		value, ok := raw.(string)
+		if !ok {
+			return nil, nil, badArg(op, "battery_export", raw)
+		}
+		if _, ok := config.ParseBatteryExport(value); !ok {
+			return nil, nil, badArg(op, "battery_export", raw)
+		}
+		export = &value
+	}
+	if k == nil && export == nil {
+		return nil, nil, badArg(op, "safety_k", nil)
+	}
+	return k, export, nil
 }

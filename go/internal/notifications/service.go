@@ -113,6 +113,13 @@ func DefaultRules() []config.NotificationRule {
 		// having opted in first. An owner may still turn them off.
 		{Type: PushCloudGranted, Enabled: true, Priority: 3},
 		{Type: PushCloudRevoked, Enabled: true, Priority: 3},
+		// Agents, on by default for the same reason: access from outside
+		// the house, and a change that waits for an owner's answer.
+		{Type: PushAgentAdded, Enabled: true, Priority: 3},
+		{Type: PushAgentRequest, Enabled: true, Priority: 4},
+		{Type: PushAgentExpiring, Enabled: true, Priority: 3},
+		{Type: PushApprovalKeySet, Enabled: true, Priority: 3},
+		{Type: PushOwnerAdded, Enabled: true, Priority: 3},
 	}
 }
 
@@ -127,7 +134,8 @@ func KnownRuleTypes() []string {
 		EventFuseOverLimit, EventConcurrentDriversOffline,
 		PushChargingConnected, PushChargingSessionComplete, PushChargingInterrupted,
 		PushChargingGoalAtRisk, PushUpdateInstalled, PushDriverOffline, PushFuseOverLimit,
-		PushCloudGranted, PushCloudRevoked,
+		PushCloudGranted, PushCloudRevoked, PushAgentAdded, PushAgentRequest,
+		PushAgentExpiring, PushApprovalKeySet, PushOwnerAdded,
 	}
 }
 

@@ -97,7 +97,7 @@ func (n *netTCP) Open(addr string) error {
 		return fmt.Errorf("tcp: %s", reason)
 	}
 
-	conn, err := mdnsresolve.DialTimeoutWithOptions("tcp", addr, 10*time.Second, n.allowUnverifiedLocal)
+	conn, err := refuseSelf(mdnsresolve.DialTimeoutWithOptions("tcp", addr, 10*time.Second, n.allowUnverifiedLocal))
 	if err != nil {
 		return fmt.Errorf("tcp dial: %w", err)
 	}

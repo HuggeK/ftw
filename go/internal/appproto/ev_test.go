@@ -103,6 +103,22 @@ func (f *fakeLoadpoints) ObservedHold(id string, _ time.Time) (loadpoint.ManualH
 	return f.hold, true
 }
 
+func (f *fakeLoadpoints) HoldIfOwn(id string, h loadpoint.ManualHold, now time.Time) bool {
+	if cur, held := f.ObservedHold(id, now); held && cur.SetBy != h.SetBy {
+		return false
+	}
+	f.Hold(id, h)
+	return true
+}
+
+func (f *fakeLoadpoints) ClearHoldIfOwn(id, setBy string, now time.Time) bool {
+	if cur, held := f.ObservedHold(id, now); !held || cur.SetBy != setBy {
+		return false
+	}
+	f.ClearHold(id)
+	return true
+}
+
 func (f *fakeLoadpoints) Boost(id string, lease loadpoint.BatteryBoostLease, _ time.Time) error {
 	f.boostCalls++
 	if f.boostErr != nil {
