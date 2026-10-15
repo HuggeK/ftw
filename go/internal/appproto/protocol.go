@@ -224,6 +224,7 @@ const (
 	CapPriceSpot          = protocol.CapPriceSpot
 	CapApiPassthrough     = protocol.CapApiPassthrough
 	CapCloudLink          = protocol.CapCloudLink
+	CapCloudTun           = protocol.CapCloudTun
 	CapCmdExchange        = protocol.CapCmdExchange
 	ScopeLiveRead         = protocol.ScopeLiveRead
 	ScopeHistoryRead      = protocol.ScopeHistoryRead

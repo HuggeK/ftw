@@ -1,16 +1,20 @@
-// Package cloudlink streams a signed, readable copy of the box's state to FTW
-// Cloud, when an owner has turned it on. docs/protocol-cloud.md is the wire
-// format and docs/adr/0008-ftw-cloud.md the decision.
+// Package cloudlink is the box's one link to FTW Cloud. It carries the
+// phones' own sessions with the box (the tunnel) and, when an owner has
+// turned it on, a signed, readable copy of the box's state.
+// docs/protocol-cloud.md is the wire format and docs/adr/0008-ftw-cloud.md
+// the decision.
 //
-// FTW Cloud reads and never controls. This package holds that line in its
-// build: it reaches the box only through the read-only ports below and may
-// import nothing from the box (imports_test.go and CI check it with go list
-// -deps). What the service may send back is a closed set of five messages,
-// and none of them asks the box to do anything but send sooner, send again or
-// forget a key.
+// FTW Cloud never chooses an action. This package holds that line in its
+// build: it reaches the box only through the read-only ports below and the
+// Tunnel port, and may import nothing from the box (CI checks it with go list
+// -deps). What the service may send back is a closed set of six messages.
+// Five ask the box for nothing but to send sooner, send again or forget a
+// key. The sixth, tun, carries a phone's Noise session, which this package
+// hands to the Tunnel unread.
 //
-// The link is off until an owner grants it. A missing grant, or one whose key
-// fingerprint does not match cloud.key, reads as off.
+// The box links when it first shows a pairing code, has a phone that may
+// open a tunnel, or an owner grants the readable copy. A link record or a
+// grant whose key fingerprint does not match cloud.key reads as off.
 package cloudlink
 
 import (
@@ -65,6 +69,10 @@ var ErrPurgePending = errors.New("cloudlink: FTW Cloud is still deleting the pre
 // ErrNotGranted is statistics asked for while FTW Cloud is off.
 var ErrNotGranted = errors.New("cloudlink: turn FTW Cloud on first")
 
+// ErrLinkEnding is a grant asked for while the service deletes the last
+// link's home. The next link comes once the receipt is in.
+var ErrLinkEnding = errors.New("cloudlink: FTW Cloud is still deleting the previous link")
+
 // statsIDBytes is the length of a statsId, which the protocol fixes at 16.
 const statsIDBytes = 16
 
@@ -112,11 +120,28 @@ type RosterDevice struct {
 	Epoch uint64
 	// Scopes are what the role carries, expanded by the box.
 	Scopes []string
+	// Tun says the device may open a session to the box through FTW Cloud.
+	Tun bool
 }
 
-// Roster lists the paired phones.
+// Roster lists the paired phones and the pairing code on the box's screen.
 type Roster interface {
 	Devices() []RosterDevice
+	// Pending is the QR pairing code the box shows now and when it stops
+	// working. ok is false when none is shown. A spoken code is never
+	// listed: its hash would let the service find it.
+	Pending() (code []byte, expires time.Time, ok bool)
+}
+
+// Tunnel serves the phones' sessions that FTW Cloud carries. The box's app
+// session table implements it; the link reaches it only through this port,
+// and hands it each tun from the service unread.
+type Tunnel interface {
+	// Deliver takes one tun from the service. It must not block: the link
+	// reads the service on the same goroutine.
+	Deliver(t cloudwire.Tun)
+	// Drop ends every session the uplink carried, when the uplink ends.
+	Drop()
 }
 
 // Options wires a link. Site, Roster, KV and KeyPath are required.
@@ -134,6 +159,9 @@ type Options struct {
 	// Notify tells owners the grant changed, with protocol.PushCloudGranted
 	// or PushCloudRevoked. Nil sends nothing.
 	Notify func(kind string)
+	// Tunnel serves the phones' sessions. Nil takes no tun: the box does not
+	// list tun in hello.caps, and the service sends it none.
+	Tunnel Tunnel
 	Logger *slog.Logger
 
 	// Seams for tests. Production leaves them zero.
@@ -158,21 +186,29 @@ type Link struct {
 	key       *ecdsa.PrivateKey
 	pk        []byte
 	home      string
+	link      *linkRecord
 	grant     *grantRecord
 	notice    string
 	connected bool
 	lastSend  time.Time
 	budget    budget
-	sent      map[string]sentFrame
-	srcRev    uint64
-	table     map[string]cloudwire.Source
-	tableKey  string
-	liveSeq   uint64
-	lpSeq     uint64
-	resyncAt  time.Time
-	attempt   int
-	purgedAt  int64
-	rosterDue bool
+	// tunOut and tunBulk carry framed tun messages, lane 0 and bulk, to
+	// the connection's tun writer. Nil while no uplink is up. tunBudget counts what left, apart from
+	// the readable copy's budget, and tunDropped what never did.
+	tunOut     chan []byte
+	tunBulk    chan []byte
+	tunBudget  budget
+	tunDropped int64
+	sent       map[string]sentFrame
+	srcRev     uint64
+	table      map[string]cloudwire.Source
+	tableKey   string
+	liveSeq    uint64
+	lpSeq      uint64
+	resyncAt   time.Time
+	attempt    int
+	purgedAt   int64
+	rosterDue  bool
 
 	// events wait for the writer; eventsDropped counts those that never
 	// left. closing is set by Bye, after which the link does not dial
@@ -259,37 +295,68 @@ func parseServiceKeys(list string) ([]*ecdsa.PublicKey, error) {
 	return keys, nil
 }
 
-// load reads the grant and the key. A grant without its key, or with another
-// key, reads as off and leaves a notice.
+// load reads the link, the grant and the key. A record without its key, or
+// with another key, reads as off and leaves a notice.
 func (l *Link) load() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.grant, l.key, l.pk, l.home, l.notice = nil, nil, nil, "", ""
+	l.link, l.grant, l.key, l.pk, l.home, l.notice = nil, nil, nil, nil, "", ""
 	if r, err := loadJSON[receipt](l.opts.KV, purgedKey); err == nil && r != nil {
 		l.purgedAt = r.AtMs
+	}
+	link, err := loadJSON[linkRecord](l.opts.KV, linkKey)
+	if err != nil {
+		l.notice = "link_unreadable"
+		l.log.Warn("FTW Cloud link unreadable; treating it as off", "err", err)
+		link = nil
 	}
 	g, err := loadJSON[grantRecord](l.opts.KV, grantKey)
 	if err != nil {
 		l.notice = "grant_unreadable"
 		l.log.Warn("FTW Cloud grant unreadable; treating it as off", "err", err)
-		return nil
+		g = nil
 	}
-	if g == nil {
+	if link == nil && g == nil {
 		return nil
 	}
 	key, err := loadKey(l.opts.KeyPath)
 	if err != nil {
 		l.notice = "key_missing"
-		l.log.Warn("FTW Cloud is off: the grant has no key on this box", "err", err)
+		l.log.Warn("FTW Cloud is off: the link has no key on this box", "err", err)
 		return nil
 	}
 	fp, pk, err := fingerprint(key)
-	if err != nil || fp != g.KeyFp {
+	if err != nil {
 		l.notice = "key_mismatch"
-		l.log.Warn("FTW Cloud is off: cloud.key is not the key the grant was made with")
 		return nil
 	}
-	l.grant, l.key, l.pk, l.home = g, key, pk, cloudwire.HomeID(pk)
+	if link == nil {
+		// A grant made before the link existed holds the key it was made
+		// with. That key becomes the link's, so the home id stays.
+		if g.KeyFp != fp {
+			l.notice = "key_mismatch"
+			l.log.Warn("FTW Cloud is off: cloud.key is not the key the grant was made with")
+			return nil
+		}
+		link = &linkRecord{KeyFp: fp}
+		if err := saveJSON(l.opts.KV, linkKey, link); err != nil {
+			return err
+		}
+	}
+	if link.KeyFp != fp {
+		l.notice = "key_mismatch"
+		l.log.Warn("FTW Cloud is off: cloud.key is not the key the link was made with")
+		return nil
+	}
+	l.link, l.key, l.pk, l.home = link, key, pk, cloudwire.HomeID(pk)
+	switch {
+	case g == nil:
+	case g.KeyFp != fp:
+		l.notice = "key_mismatch"
+		l.log.Warn("the FTW Cloud grant was made with another key; the readable copy is off")
+	default:
+		l.grant = g
+	}
 	return nil
 }
 
@@ -301,12 +368,102 @@ func (l *Link) signal() {
 	}
 }
 
-// RosterChanged is called by enrolment after a pair, role change or revoke.
+// RosterChanged is called by enrolment after a pair, role change, revoke or
+// a pairing code shown. A box that now has a phone to reach it, or a code on
+// its screen, links at once, so the code's home id exists before the code
+// is drawn.
 func (l *Link) RosterChanged() {
+	if l.wantsLink() {
+		l.mu.Lock()
+		if err := l.linkLocked(); err != nil && !errors.Is(err, ErrNoService) {
+			l.log.Warn("could not link to FTW Cloud", "err", err)
+		}
+		l.mu.Unlock()
+	}
 	l.mu.Lock()
 	l.rosterDue = true
 	l.mu.Unlock()
 	l.signal()
+}
+
+// wantsLink reports whether anything needs the link: a phone that may open a
+// tunnel, or a pairing code on the screen. A grant needs it too, and makes it
+// itself.
+func (l *Link) wantsLink() bool {
+	if _, _, ok := l.opts.Roster.Pending(); ok {
+		return true
+	}
+	for _, d := range l.opts.Roster.Devices() {
+		if d.Tun {
+			return true
+		}
+	}
+	return false
+}
+
+// linkLocked makes the link record when there is none, around the
+// cloud.key on disk if there is one, so its home id stays, or a new key. A
+// link waiting for its end to be confirmed stays as it is: the next one
+// comes after the receipt, under a new home id. The caller holds l.mu.
+func (l *Link) linkLocked() error {
+	if l.link != nil {
+		return nil
+	}
+	if len(l.opts.ServiceKeys) == 0 {
+		return ErrNoService
+	}
+	key, err := loadKey(l.opts.KeyPath)
+	switch {
+	case err == nil:
+		l.log.Info("FTW Cloud links with the cloud.key already on this box")
+	case errors.Is(err, os.ErrNotExist):
+		if key, err = createKey(l.opts.KeyPath); err != nil {
+			return err
+		}
+	default:
+		// A file that is not a key is not ours to replace.
+		return err
+	}
+	fp, pk, err := fingerprint(key)
+	if err != nil {
+		return err
+	}
+	rec := &linkRecord{KeyFp: fp}
+	if err := saveJSON(l.opts.KV, linkKey, rec); err != nil {
+		return err
+	}
+	// A grant on disk made with another key stays off; the grant load
+	// left it nil.
+	l.link, l.key, l.pk, l.home, l.notice = rec, key, pk, cloudwire.HomeID(pk), ""
+	l.table, l.tableKey, l.sent, l.rosterDue = nil, "", map[string]sentFrame{}, true
+	l.log.Info("audit: FTW Cloud linked", "home", l.home)
+	l.signal()
+	return nil
+}
+
+// endIfIdle starts the end of a link nothing needs any more: no phone may
+// open a tunnel, no code is shown and the readable copy is off. The box asks
+// the service to delete the home and keeps the key until the receipt.
+func (l *Link) endIfIdle() {
+	l.mu.Lock()
+	idle := l.link != nil && !l.link.Ending && l.grant == nil
+	l.mu.Unlock()
+	if !idle || l.wantsLink() {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.link == nil || l.link.Ending || l.grant != nil {
+		return
+	}
+	rec := *l.link
+	rec.Ending = true
+	if err := saveJSON(l.opts.KV, linkKey, rec); err != nil {
+		l.log.Warn("could not store the end of the FTW Cloud link", "err", err)
+		return
+	}
+	l.link = &rec
+	l.log.Info("audit: FTW Cloud link ending; nothing on the box needs it", "home", l.home)
 }
 
 // GrantRequest is an owner's request to turn FTW Cloud on.
@@ -318,7 +475,8 @@ type GrantRequest struct {
 	By string `json:"-"`
 }
 
-// Grant turns FTW Cloud on, or changes the scopes of a grant already on.
+// Grant turns the readable copy on, or changes the scopes of a grant already
+// on. It links the box first when it is not linked.
 func (l *Link) Grant(req GrantRequest) error {
 	if len(l.opts.ServiceKeys) == 0 {
 		return ErrNoService
@@ -336,6 +494,9 @@ func (l *Link) Grant(req GrantRequest) error {
 	case l.grant != nil && l.grant.Revoked:
 		l.mu.Unlock()
 		return ErrPurgePending
+	case l.link != nil && l.link.Ending:
+		l.mu.Unlock()
+		return ErrLinkEnding
 	case l.grant != nil:
 		g := *l.grant
 		g.Scopes, g.Policy, g.By = scopes, req.Policy, req.By
@@ -350,39 +511,33 @@ func (l *Link) Grant(req GrantRequest) error {
 		l.signal()
 		return nil
 	}
-	l.mu.Unlock()
-
-	key, err := createKey(l.opts.KeyPath)
-	if err != nil {
-		return err
-	}
-	fp, pk, err := fingerprint(key)
-	if err != nil {
+	if err := l.linkLocked(); err != nil {
+		l.mu.Unlock()
 		return err
 	}
 	id, err := randomBytes(cloudwire.GrantIDBytes)
 	if err != nil {
+		l.mu.Unlock()
 		return err
 	}
 	gk, err := randomBytes(cloudwire.GrantKeyBytes)
 	if err != nil {
+		l.mu.Unlock()
 		return err
 	}
 	g := grantRecord{
 		ID: id, Scopes: scopes, Purposes: []string{protocol.CloudPurposeServe},
-		KeyFp: fp, GrantKey: gk, By: req.By, Policy: req.Policy,
+		KeyFp: l.link.KeyFp, GrantKey: gk, By: req.By, Policy: req.Policy,
 		Controller: cloudwire.ControllerSourceful,
 	}
 	if l.clockSynced() {
 		g.AtMs = time.Now().UnixMilli()
 	}
 	if err := saveJSON(l.opts.KV, grantKey, g); err != nil {
-		_ = os.Remove(l.opts.KeyPath)
+		l.mu.Unlock()
 		return err
 	}
-
-	l.mu.Lock()
-	l.grant, l.key, l.pk, l.home, l.notice = &g, key, pk, cloudwire.HomeID(pk), ""
+	l.grant, l.notice = &g, ""
 	l.table, l.tableKey, l.sent, l.rosterDue = nil, "", map[string]sentFrame{}, true
 	l.mu.Unlock()
 
@@ -392,9 +547,10 @@ func (l *Link) Grant(req GrantRequest) error {
 	return nil
 }
 
-// Revoke turns FTW Cloud off. The box stops sending readings at once, asks
-// the service to delete the home, and keeps the key until the service's
-// signed receipt arrives.
+// Revoke turns the readable copy off. The box stops sending readings at
+// once, and its next roster asks the service to delete the copy. The grant
+// record stays until the service's signed receipt arrives. The link, the
+// home id and the tunnel stay.
 func (l *Link) Revoke(by string) error {
 	l.mu.Lock()
 	if l.grant == nil || l.grant.Revoked {
@@ -411,6 +567,7 @@ func (l *Link) Revoke(by string) error {
 		return err
 	}
 	l.grant = &g
+	l.rosterDue = true
 	l.mu.Unlock()
 
 	l.audit("revoked", &g)
@@ -498,28 +655,50 @@ func withPurpose(purposes []string, p string, on bool) []string {
 	return out
 }
 
-// finishPurge deletes the key and the grant once the service has confirmed
-// the deletion.
-func (l *Link) finishPurge(atMs int64) {
+// finishCopy forgets a revoked grant once the service has confirmed that its
+// copy is gone. It reports whether the receipt was the one the box waits for.
+func (l *Link) finishCopy(atMs int64, grantID []byte) bool {
 	l.mu.Lock()
 	g := l.grant
-	if g == nil || !g.Revoked {
+	if g == nil || !g.Revoked || !bytes.Equal(g.ID, grantID) {
 		l.mu.Unlock()
-		return
+		return false
 	}
-	if err := saveJSON(l.opts.KV, purgedKey, receipt{AtMs: atMs, GrantID: g.ID}); err != nil {
+	if err := saveJSON(l.opts.KV, purgedKey, receipt{What: cloudwire.PurgedCopy, AtMs: atMs, GrantID: g.ID}); err != nil {
 		l.log.Warn("could not store the FTW Cloud purge receipt", "err", err)
 	}
 	if err := saveJSON(l.opts.KV, grantKey, nil); err != nil {
 		l.log.Warn("could not clear the FTW Cloud grant", "err", err)
 	}
+	l.grant, l.purgedAt = nil, atMs
+	l.table, l.tableKey, l.sent, l.rosterDue = nil, "", map[string]sentFrame{}, true
+	l.mu.Unlock()
+	l.audit("purged", g)
+	l.signal()
+	return true
+}
+
+// finishLink deletes the key and the link once the service has confirmed
+// that the home is gone.
+func (l *Link) finishLink() {
+	l.mu.Lock()
+	if l.link == nil || !l.link.Ending {
+		l.mu.Unlock()
+		return
+	}
+	home := l.home
+	for _, key := range []string{linkKey, grantKey} {
+		if err := saveJSON(l.opts.KV, key, nil); err != nil {
+			l.log.Warn("could not clear the FTW Cloud link", "err", err)
+		}
+	}
 	if err := os.Remove(l.opts.KeyPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		l.log.Warn("could not delete cloud.key", "err", err)
 	}
-	l.grant, l.key, l.pk, l.home, l.purgedAt = nil, nil, nil, "", atMs
+	l.link, l.grant, l.key, l.pk, l.home = nil, nil, nil, nil, ""
 	l.table, l.tableKey, l.sent = nil, "", map[string]sentFrame{}
 	l.mu.Unlock()
-	l.audit("purged", g)
+	l.log.Info("audit: FTW Cloud link ended", "home", home)
 }
 
 // audit writes the line that records a grant change on the box.
@@ -541,10 +720,13 @@ func (l *Link) clockSynced() bool {
 
 // Status is what GET /api/cloud shows.
 type Status struct {
-	// State is off, on or revoking.
+	// State is the readable copy's: off, on or revoking.
 	State string `json:"state"`
-	// Notice says why a grant on disk reads as off: key_missing,
-	// key_mismatch or grant_unreadable.
+	// Link is off, on or ending: whether the box is linked, which the
+	// phones' tunnels need and the readable copy rides on.
+	Link string `json:"link"`
+	// Notice says why a link or grant on disk reads as off: key_missing,
+	// key_mismatch, link_unreadable or grant_unreadable.
 	Notice      string   `json:"notice,omitempty"`
 	Available   bool     `json:"available"`
 	Home        string   `json:"home,omitempty"`
@@ -566,6 +748,12 @@ type Status struct {
 	// the queue was full, or the uplink was down for longer than a phone
 	// would still act on them.
 	EventsDropped int64 `json:"eventsDropped"`
+	// TunBytesLast24h counts the tunnel's bytes, apart from the readable
+	// copy's, against TunBudgetBytes. TunDropped counts tun messages that
+	// never left: no uplink, a full queue or the budget reached.
+	TunBytesLast24h int64 `json:"tunBytesLast24h"`
+	TunBudgetBytes  int64 `json:"tunBudgetBytes"`
+	TunDropped      int64 `json:"tunDropped"`
 }
 
 // Status reports the grant and the link.
@@ -577,13 +765,21 @@ func (l *Link) Status() Status {
 		Scopes: []string{}, Purposes: []string{}, Connected: l.connected,
 		LastSendAgeMs: -1, PurgedAtMs: l.purgedAt, EventsDropped: l.eventsDropped,
 		BytesLast24h: l.budget.total(l.uptimeMs()), BudgetBytes: budgetBytes,
+		Link: "off", TunBytesLast24h: l.tunBudget.total(l.uptimeMs()), TunBudgetBytes: tunBudgetBytes,
+		TunDropped: l.tunDropped,
 	}
 	s.BudgetReached = s.BytesLast24h >= budgetBytes
 	if !l.lastSend.IsZero() {
 		s.LastSendAgeMs = time.Since(l.lastSend).Milliseconds()
 	}
+	if l.link != nil {
+		s.Link, s.Home = "on", l.home
+		if l.link.Ending {
+			s.Link = "ending"
+		}
+	}
 	if g := l.grant; g != nil {
-		s.State, s.Home, s.Scopes, s.Purposes = "on", l.home, g.Scopes, g.Purposes
+		s.State, s.Scopes, s.Purposes = "on", g.Scopes, g.Purposes
 		s.GrantedAtMs, s.GrantedBy, s.Policy = g.AtMs, g.By, g.Policy
 		if g.Revoked {
 			s.State = "revoking"
@@ -592,27 +788,46 @@ func (l *Link) Status() Status {
 	return s
 }
 
+// Home is the home id at FTW Cloud while the box is linked, and "" when it
+// is not or its link is ending. A pairing QR that names the home reads it.
+func (l *Link) Home() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.link == nil || l.link.Ending {
+		return ""
+	}
+	return l.home
+}
+
 // Available reports whether this build names a service, and so can run the
 // uplink at all. Release builds without service keys cannot.
 func (l *Link) Available() bool { return len(l.opts.ServiceKeys) > 0 }
 
+// TakesTun reports whether the link carries the phones' own sessions as tun,
+// so a phone that knows the home id can reach the box without the relay.
+func (l *Link) TakesTun() bool { return l.Available() && l.opts.Tunnel != nil }
+
 // SessionInfo is what a phone needs, over its Noise session with the box, to
-// read this home from FTW Cloud: the key that signs it, the home id, the boot
-// that anchors its times and names for the opaque ids. It is nil unless the
-// grant is on.
+// reach this home through FTW Cloud: the home id, the key that signs the
+// readable copy, the boot that anchors its times and names for the opaque
+// ids. It is nil while the box is not linked or its link is ending, and its
+// tables are empty while the readable copy is off.
 //
 // The tables name every driver and loadpoint the box knows now. One that
 // appears later has no name on a phone until its next session.
 func (l *Link) SessionInfo() *protocol.CloudSession {
 	snap := l.current()
-	if snap.g == nil || snap.g.Revoked || len(snap.pk) != cloudwire.PublicKeyBytes {
+	if snap.link == nil || snap.link.Ending || len(snap.pk) != cloudwire.PublicKeyBytes {
 		return nil
 	}
-	gk := snap.g.GrantKey
 	s := &protocol.CloudSession{
 		PK: bytes.Clone(snap.pk), Home: snap.home, Boot: bytes.Clone(l.boot),
 		Sources: map[string]string{}, Loadpoints: map[string]string{},
 	}
+	if !snap.copyOn() {
+		return s
+	}
+	gk := snap.g.GrantKey
 	source := func(name string) {
 		if name != "" {
 			s.Sources[cloudwire.SourceID(gk, name)] = name
@@ -655,8 +870,9 @@ func (l *Link) header() cloudwire.Header {
 	return h
 }
 
-// grantSnapshot is the grant and key as one consistent read.
+// grantSnapshot is the link, the grant and the key as one consistent read.
 type grantSnapshot struct {
+	link *linkRecord
 	g    *grantRecord
 	key  *ecdsa.PrivateKey
 	pk   []byte
@@ -666,17 +882,37 @@ type grantSnapshot struct {
 func (l *Link) current() grantSnapshot {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return grantSnapshot{g: l.grant, key: l.key, pk: l.pk, home: l.home}
+	return grantSnapshot{link: l.link, g: l.grant, key: l.key, pk: l.pk, home: l.home}
 }
 
-// Run keeps the uplink up while a grant is on, until ctx ends.
+// copyOn reports whether the readable copy is on and not being withdrawn.
+func (snap grantSnapshot) copyOn() bool { return snap.g != nil && !snap.g.Revoked }
+
+// grantID is the grant hello names: the readable copy's, or none.
+func (snap grantSnapshot) grantID() []byte {
+	if !snap.copyOn() {
+		return nil
+	}
+	return snap.g.ID
+}
+
+// Run keeps the uplink up while the box is linked, until ctx ends.
 func (l *Link) Run(ctx context.Context) error {
 	for {
 		if l.isClosing() {
 			return nil
 		}
 		snap := l.current()
-		if snap.g == nil || len(l.opts.ServiceKeys) == 0 {
+		if snap.link == nil && l.wantsLink() {
+			// The first link, or the next one after an end was confirmed.
+			l.mu.Lock()
+			if err := l.linkLocked(); err != nil && !errors.Is(err, ErrNoService) {
+				l.log.Warn("could not link to FTW Cloud", "err", err)
+			}
+			l.mu.Unlock()
+			snap = l.current()
+		}
+		if snap.link == nil || len(l.opts.ServiceKeys) == 0 {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -707,24 +943,30 @@ func (l *Link) isClosing() bool {
 	return l.closing
 }
 
-// allowed reports whether the grant lets a class leave the house.
+// allowed reports whether the grant lets a class leave the house. Nothing
+// readable leaves while the copy is off or being withdrawn.
 func (snap grantSnapshot) allowed(class string) bool {
 	scope, forwarded := cloudwire.ClassScope[class]
-	if !forwarded {
+	if !forwarded || !snap.copyOn() {
 		return false
 	}
 	return scope == "" || snap.g.has(scope)
 }
 
-// caps is the classes this box sends under the grant.
-func (snap grantSnapshot) caps() []string {
+// caps is the classes this box sends under the grant, the roster, and tun
+// when the box takes the tunnel.
+func (l *Link) caps(snap grantSnapshot) []string {
 	var out []string
 	for _, c := range []string{cloudwire.MsgLive, cloudwire.MsgLP, cloudwire.MsgPrices, cloudwire.MsgHB, cloudwire.MsgEvent} {
 		if snap.allowed(c) {
 			out = append(out, c)
 		}
 	}
-	return append(out, cloudwire.MsgRoster)
+	out = append(out, cloudwire.MsgRoster)
+	if l.opts.Tunnel != nil {
+		out = append(out, cloudwire.CapTun)
+	}
+	return out
 }
 
 // tlsConfig is TLS 1.3 only, with the system roots unless a test or a dev

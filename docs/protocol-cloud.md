@@ -4,7 +4,8 @@ Proposed with [ADR 0008](adr/0008-ftw-cloud.md). Nothing here has shipped.
 This document is normative: "must" is a requirement on the box, the service
 or the phone. The bytes live in `go/protocol/cloudwire`, with golden vectors
 in its `testdata`: `cloud-vectors.json` for the uplink,
-`cloud-app-vectors.json` for one whole app session and
+`cloud-app-vectors.json` for one whole app session, its
+[tunnel](#tunnel) messages and a pairing proof, and
 `cloud-once-vectors.json` for one [one-shot read](#one-shot-read).
 `srcfl/ftw-cloud`, the phone and the watch replay them. `cloudwire.View` is the phone's
 [freshness](#freshness) rules in Go, and the cases listed there are its tests.
@@ -21,7 +22,9 @@ for both live in `go/protocol`, under Apache-2.0
 
 ## Parties and connections
 
-- **Box:** FTW Core with an FTW Cloud grant.
+- **Box:** FTW Core linked to FTW Cloud. A box links when it first shows a
+  pairing code or an owner turns the readable copy on, and stays linked while
+  any phone may reach it (see [Link](#link)).
 - **Service:** `ftwcloudd`, at `cloud.ftw.energy`.
 - **Phone:** the iPhone app, paired with the box over Noise as today.
 - **Extension:** a widget, notification service extension or Live Activity
@@ -33,7 +36,7 @@ for both live in `go/protocol`, under Apache-2.0
 | Connection | Opened by | Transport | What protects it |
 |---|---|---|---|
 | Uplink | Box | `wss://cloud.ftw.energy/v1/box` | TLS 1.3, a handshake bound to the TLS session on both sides, every box message signed |
-| App session | Phone | `wss://cloud.ftw.energy/v1/app?home=<id>` | TLS 1.3, then Noise IK to the service's static key |
+| App session | Phone | `wss://cloud.ftw.energy/v1/app?home=<id>` | TLS 1.3, then Noise IK to the service's static key. Inside it, the phone's own Noise session with its box rides as [`tun`](#tunnel) |
 | One-shot read | Watch | `POST https://cloud.ftw.energy/v1/app/once?home=<id>` | TLS 1.3, then Noise IK to the service's static key, inside one request |
 | Extension read | Extension | `GET https://cloud.ftw.energy/v1/now` | TLS and an extension token; the data inside is box-signed |
 | Push | Service | APNs | Box-signed payloads where they carry data |
@@ -100,10 +103,11 @@ Envelope = { t: text, b: bstr, sig: bstr }
 - **Signed input:** the bytes `ftw.cloud.v1\0` (12 ASCII bytes and a zero
   byte), then the deterministic CBOR encoding of the array `[home, t, b]`,
   where `home` is the text home id.
-- The box signs with `cloud.key`. The service signs `hello_ok` and `purged`
-  with its service key, over the box's home id. Every other envelope the
-  service sends, and every envelope between phone and service, has an empty
-  `sig`.
+- The box signs with `cloud.key`, every envelope but `tun`. The service signs
+  `hello_ok` and `purged` with its service key, over the box's home id. Every
+  other envelope the service sends, `tun` in both directions, and every
+  envelope between phone and service has an empty `sig`. A `tun` needs none:
+  its `d` is Noise ciphertext that the phone and the box authenticate.
 - A receiver verifies over the bytes it received, never over a re-encoding.
 - The box's public key reaches phones over Noise, beside the tables of opaque
   ids, the home id and the box's current `boot`, in the
@@ -118,7 +122,7 @@ Envelope = { t: text, b: bstr, sig: bstr }
 
 | Name | What it is |
 |---|---|
-| `cloud.key` | ES256 (P-256) key the box makes when an owner grants FTW Cloud. The box never backs it up |
+| `cloud.key` | ES256 (P-256) key the box makes when it links (see [Link](#link)). The box never backs it up |
 | `pk` | Its public key as a 65-byte uncompressed SEC1 point |
 | `home` | Lowercase base32, no padding, of the first 16 bytes of SHA-256(`ftw.cloud.home.v1` ‖ `pk`). 26 characters |
 | Service key | P-256. Core carries up to two public halves, so the key can rotate across a release |
@@ -191,9 +195,9 @@ with two different values, so neither side's check passes through it.
    | `boxNonce` | bstr, 32 B | Random, for the service to sign |
    | `build` | text | Core version |
    | `clock` | text | `ntp` or `none` |
-   | `caps` | [text] | The classes this box sends under the grant, `roster` included |
+   | `caps` | [text] | The classes this box sends under the grant at connect, `roster` included, and `tun` when the box takes the [tunnel](#tunnel) |
    | `rosterSeq` | uint | The box's current roster number |
-   | `grantId` | bstr, 16 B | The grant this connection serves |
+   | `grantId` | bstr, 16 B or empty | The grant at connect. Empty while the readable copy is off or a revoke waits for its receipt |
 
 3. **Service → box: `hello_ok`**, signed by the service key over the box's
    home id.
@@ -205,6 +209,12 @@ with two different values, so neither side's check passes through it.
    | `have` | map text→text | Tile id to etag, for the tiles the service holds |
    | `rosterSeq` | uint | The roster number the service holds |
 
+   `caps` and `grantId` describe the connection as it starts. The readable
+   copy can turn on or off while the link stays up, so the service takes
+   what it may hold from the newest roster's grant, never from `hello`, and
+   enforces neither per connection; only `tun` in `caps` decides whether it
+   sends the box `tun`.
+
    The box checks the signature against a service key it carries, that
    `boxNonce` is its own and that `ekm` equals its own exporter value. If any
    check fails, the box closes and backs off. **It sends nothing but `hello`
@@ -212,8 +222,8 @@ with two different values, so neither side's check passes through it.
    public key and grant id, and cannot use them.
 4. **Box → service:** a `roster`, at every connect (see [Roster](#roster));
    then one full message of each class the grant allows; then the tiles
-   missing from `have`. While a purge is pending, the box sends only `bye`
-   instead (see [Revocation](#revocation-and-deletion)).
+   missing from `have`. While the link waits for a purge, the box sends only
+   `bye` instead (see [Revocation](#revocation-and-deletion)).
 5. After that the box sends on change, by the cadence rules.
 
 ## Classes
@@ -416,10 +426,11 @@ The service never forwards these to a phone.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `rosterSeq` | uint | Persisted on the box. Rises by 1 at each pair, role change, revoke or grant change |
+| `rosterSeq` | uint | Persisted on the box. Rises by 1 at each pair, role change, revoke, grant change or pairing code shown |
 | `ttlS` | uint | 86,400. Counted from when the service received the roster |
 | `devices` | [Device] | Every device paired with the box |
 | `grant` | Grant | What the owner granted |
+| `pending` | [Pending] | The pairing codes the box shows now, at most one |
 
 **Device**
 
@@ -430,15 +441,31 @@ The service never forwards these to a phone.
 | `role` | text | `owner`, `viewer` or `watch` |
 | `scopes` | [text] | Scopes the box derives from the role. For a watch, only those its phone's role also carries now. The service holds no role table |
 | `epoch` | uint | The device's epoch on the box |
+| `tun` | bool | The device may open a session to the box through the service. True for a phone, false for a watch. It needs no grant |
 
 **Grant**
 
 | Field | Type | Meaning |
 |---|---|---|
-| `id` | bstr, 16 B | Grant id |
-| `scopes` | [text] | A subset of `cloud_scopes` |
-| `purposes` | [text] | A subset of `cloud_purposes`: `serve` always, and `stats` while the owner contributes to statistics |
+| `id` | bstr, 16 B or empty | Grant id. Empty while the readable copy is off |
+| `scopes` | [text] | A subset of `cloud_scopes`. Empty while the copy is off or being withdrawn |
+| `purposes` | [text] | A subset of `cloud_purposes`: `serve` while the copy is on, and `stats` while the owner contributes to statistics. Empty while the copy is off or being withdrawn |
 | `controller` | text | The data controller: `sourceful` unless a partner pairing flow sets another. No such flow exists yet |
+
+A grant has three shapes. With an id and `serve`, the readable copy is on.
+With an id and no purposes, the owner has withdrawn that copy: the service
+deletes what it holds under the grant and answers `purged {what: "copy"}`,
+each time it receives such a roster. With no id, there is no copy.
+
+**Pending**
+
+| Field | Type | Meaning |
+|---|---|---|
+| `hash` | bstr, 32 B | SHA-256(`ftw.cloud.pair.v1\0` ‖ home id ‖ pairing code) |
+| `ttlS` | uint | Seconds the code has left, counted from when the service received the roster |
+
+Only a QR code is listed. A spoken code has 40 bits, and its hash would let
+the service find it offline; it pairs over the relay or the home network.
 
 **`stats`**, only while `grant.purposes` contains `stats`.
 
@@ -490,8 +517,9 @@ back `box.unreachable` until the box returns or an hour passes.
 
 ## Service to box
 
-The service may send the box only these. Anything else, a frame over 4 KiB,
-a text message or a lane 0 frame closes the uplink. A fuzz test covers it.
+The service may send the box only these. Anything else, a `tun` frame over
+`MaxTunFrame` (16,664 bytes), any other frame over 4 KiB, a text message or
+a lane 0 frame closes the uplink. A fuzz test covers it.
 
 | `t` | Body | Rule |
 |---|---|---|
@@ -499,10 +527,13 @@ a text message or a lane 0 frame closes the uplink. A fuzz test covers it.
 | `hello_ok` | See Handshake | Signed by the service key |
 | `watch` | `{hz: 1}` | Raises the period to 1 s for 60 s. While any phone of the home looks, the service sends it at once, every 50 s after that, and again when the box connects. Without it the box returns to 5 s. The box ignores any other `hz` |
 | `resync` | `{what, tiles}` | `what` holds `full`, `tiles` or `roster`; `tiles` lists tile ids. The box honours at most one per 5 minutes and ignores the rest |
-| `purged` | `{atMs, what, grantId, statsId}` | Signed by the service key. `what` is `home` or `stats`. Sent once every deletion it names is done |
+| `purged` | `{atMs, what, grantId, statsId}` | Signed by the service key. `what` is `home`, `copy` or `stats`. Sent once every deletion it names is done |
+| `tun` | `{dev, sid, d}` | A phone's own session with the box. See [Tunnel](#tunnel). Only to a box that lists `tun` in `hello.caps` |
 
 The box acts on none of these beyond what the table says. It takes no time,
-config, update or instruction from the service.
+config, update or instruction from the service. What a `tun` carries is the
+phone's, encrypted to the box's static key; the box decrypts it and decides
+as it decides for the same session over the relay.
 
 ## Backpressure and limits
 
@@ -517,6 +548,15 @@ config, update or instruction from the service.
   `roster`, `stats.withdraw` and `bye` until the count falls. It sends no
   `hb` then, so data on phones ages to stale rather than looking current.
   `GET /api/cloud` shows the count and whether the budget is reached.
+- **`tun` has its own queues and budget.** `tun` waits for the socket apart
+  from the readable copy, in two queues. A `tun` carrying a lane 0 frame (a
+  command, its answer, a tick) goes first and is never held; bulk is paced
+  to nine tenths of the service's [tunnel limits](#tunnel), so the service
+  never drops for this box, and waits its turn. The queues hold 64 and 256;
+  the newest is dropped when one is full. They do not count against the
+  20 MB, so a phone at work never stops `hb`. The box counts them against
+  250 MB per 24 hours of uptime, and past that sends no `tun` until the count
+  falls.
 
 ## Roster
 
@@ -532,7 +572,8 @@ config, update or instruction from the service.
   sessions with 4403 and refuses new sessions and token reads until a roster
   arrives.
 - **Effective scope** of a device is its `scopes` intersected with
-  `grant.scopes`.
+  `grant.scopes`. It is empty while the readable copy is off, and a device
+  with `tun` still opens a session for its [tunnel](#tunnel).
 - A device that leaves the roster loses its sessions (4403), tokens and APNs
   registrations within a second of the service receiving the roster, which
   needs the uplink to be up. A device whose `epoch`, `role` or effective scope
@@ -543,17 +584,25 @@ config, update or instruction from the service.
 ## App session
 
 1. The phone opens `wss://cloud.ftw.energy/v1/app?home=<id>` over TLS 1.3,
-   with no `Origin` header, and runs `Noise_IK_25519_ChaChaPoly_SHA256` as
+   with no `Origin` header (the web app's is `https://app.ftw.energy`, the one
+   origin the service accepts), and runs `Noise_IK_25519_ChaChaPoly_SHA256` as
    initiator. The responder's static key is a service Noise key built into
    the app. The prologue is `ftw.cloud.v1:` followed by the home id, which the
    phone learned from the box (see [Session information](#session-information)).
    The query only says which home to look in: the prologue binds it, so a
    query that names another home fails the handshake.
-2. Handshake message 1 carries an unsigned `now` envelope, `{hz}`: 1 while the
-   phone is looking at the home, 0 while it is not.
+2. Handshake message 1 carries an unsigned `now` envelope, `{hz, pair, tun}`:
+   `hz` is 1 while the phone is looking at the home, 0 while it is not. `pair`
+   is only for a new phone; see
+   [Pairing through the service](#pairing-through-the-service). `tun`, `{sid,
+   d}`, is optional and carries message 1 of the phone's session with its
+   box. The service forwards it as soon as it admits the phone, so that
+   session is up one round trip after TLS.
 3. The service admits the phone only if the static key that message 1 proved
-   is in the home's roster, the roster has not run out, and no owner has
-   suspended the device. Every refusal closes with 4403 before message 2.
+   is in the home's roster, with `tun` or while the readable copy is on, the
+   roster has not run out, and no owner has suspended the device; or if
+   `pair` matches a pending entry. Every refusal closes with 4403 before
+   message 2.
 4. Message 2 carries an unsigned `snapshot` envelope, below.
 5. After that the service forwards each new box envelope the device may read,
    unchanged and in the order the box sent them, one unpadded lane 1 frame per
@@ -564,7 +613,7 @@ config, update or instruction from the service.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `envelopes` | [Envelope] | Box envelopes in rising `seq`, each the box's own CBOR map, unchanged: for each class the device may read, the newest one the service holds; the newest `live` that carried `sources`; and the newest `hb`. Empty after an hour without the box |
+| `envelopes` | [Envelope] | Box envelopes in rising `seq`, each the box's own CBOR map, unchanged: for each class the device may read, the newest one the service holds; the newest `live` that carried `sources`; and the newest `hb`. Empty after an hour without the box, and while the readable copy is off |
 | `lastSeenMs` | int | Service wall time when it last heard from the box |
 | `online` | bool | The box's uplink is up now |
 | `more` | uint | How many envelopes did not fit in message 2. They follow it as ordinary frames, in rising `seq` |
@@ -585,6 +634,7 @@ the table.
 | `t` | Who | Effect |
 |---|---|---|
 | `watch` | Any device | `{hz}`: 1 when the phone looks at the home, 0 when it looks away. It holds until the next `watch` or the end of the session |
+| `tun` | A device with `tun` | `{sid, d}`. The phone's session with its box. See [Tunnel](#tunnel). The service answers `tun` the same way |
 | `tiles.get` | Devices with `ftw.history.read` | `{have}`, tile id to etag. The service answers with the `tiles` envelopes the phone lacks |
 | `token.get` | Any device | Answered with `token {token, expiresInS}`. A new token replaces the device's old one |
 | `push.register` | Any device | `{apnsToken, environment, kind, activityId, app}`. One registration per APNs token; a Live Activity and its push-to-start each register their own. `app` is `iphone`, the default when absent, or `watch`, and picks the APNs topic |
@@ -606,7 +656,7 @@ nothing about which check failed.
 | Code | Meaning | The phone |
 |---|---|---|
 | 4400 | The phone broke the protocol | Retries with backoff |
-| 4403 | Refused: no such home, a device not in the roster, a suspended device, a roster that ran out, a grant that is off, a purged home, or a handshake to another service key or home | Before message 2, tries the app's other service key once, at once. Otherwise asks again slowly |
+| 4403 | Refused: no such home, a device not in the roster, a suspended device, a roster that ran out, a device that may neither read nor open a tunnel, a purged home, or a handshake to another service key or home | Before message 2, tries the app's other service key once, at once. Otherwise asks again slowly |
 | 4408 | A newer session from the same device took over | Does not retry |
 | 4409 | The roster changed what this device may read | Reconnects at once, once; then retries with backoff |
 | 4429 | The home has as many sessions as the service allows, as at the relay | Retries with backoff |
@@ -623,11 +673,14 @@ nothing about which check failed.
 
 **Limits.** Per home, 16 sessions. Per device, one session; a newer one
 replaces the older with 4408. Per phone, 256 envelopes queued, past which the
-session closes with 1013. A phone message larger than 4 KiB, a text message,
-or more than 20 messages in a burst and then 2 a second closes the session
-with 4400. Message 1 must arrive within 10 s. Pings and deadlines are the
-uplink's. A restarted service refuses a home's phones with 4403 until that
-home's box has connected again (see [Service state](#service-state)).
+session closes with 1013. A `tun` message larger than `MaxTunFrame` and its
+Noise overhead, any other phone message larger than 4 KiB, a text message,
+or more than 20 messages other than `tun` in a burst and then 2 a second
+closes the session with 4400. `tun` has limits of its own (see
+[Tunnel](#tunnel)). Message 1 must arrive within 10 s. Pings and deadlines
+are the uplink's. A restarted service reads the rosters it holds back from
+its registry, so it admits a home's phones before the box has connected
+again (see [Service state](#service-state)).
 
 ### Session information
 
@@ -642,14 +695,126 @@ Noise session, in the app protocol's `hello_ok.cloud`.
 | `sources` | map text→text | Opaque source id to driver name |
 | `loadpoints` | map text→text | Opaque loadpoint id to loadpoint id |
 
-- The box sends `cloud` only while the grant is on. It leaves it out while
-  the grant is off or a revoke waits for its receipt, when it holds no
-  `cloud.key`, and in floor mode. Without it the phone reads through the
-  relay only.
+- The box sends `cloud` while it is linked. It leaves it out when it holds
+  no `cloud.key`, while the link waits for a purge, and in floor mode.
+  Without it the phone reaches the box through the relay only.
+- `sources` and `loadpoints` are cut with the grant's `grantKey`, so they are
+  empty while the readable copy is off.
 - The tables name the drivers and loadpoints the box knows at `hello`. One
   added later has no name on the phone until its next session with the box.
 - The box lists `cloud.link` in `hello_ok.caps` when its build can run the
   uplink. A build that names no service does not.
+- It also lists `cloud.tun` when its link carries the phones' own sessions
+  as [`tun`](#tunnel). A phone sends its box session through the service
+  only to a box that said so at its last hello, or to one it has never
+  reached when a v3 QR named the home. Otherwise it uses the relay.
+
+## Tunnel
+
+The phone's own session with its box, `ftw.session.v1` (Noise IK to the
+box's static key, as the app protocol specifies), rides inside the app
+session. Nothing in it changes: lane 0 keeps its buckets and its cadence, so
+the service sees when a message goes, not what it says or how large a command
+is.
+
+### `tun`
+
+| Field | Type | Meaning |
+|---|---|---|
+| `dev` | text | The roster device id whose session this is |
+| `sid` | uint | The phone's number for one session with the box, below 2³², drawn at random for each new session so that the late end of an older one never ends it |
+| `d` | bstr | One message of that session, byte for byte, or empty to end it |
+
+On the app session the phone and the service send `tun {sid, d}`, with no
+`dev`. On the uplink the service and the box send `tun {dev, sid, d}`.
+
+- **The service names the device.** It sets `dev` from the roster entry its
+  own handshake with the phone matched, and ignores a `dev` a phone adds. It
+  never forwards a phone's `tun` to another home or under another device.
+- **The box checks it again.** A session starts with handshake message 1 of
+  the box session under a new `sid`. The box runs the handshake and checks
+  the phone exactly as it checks one over the relay: a known key, or a live
+  pairing code in the payload. If the key the handshake proved is not the
+  device `dev` names, the box drops the message and answers nothing. A `d`
+  for a `(dev, sid)` the box does not hold that is not message 1 gets an empty
+  `d` back, so the phone starts again.
+- **A session proves itself first.** The service sees every message 1 and
+  could replay one under a new `sid`. So the box answers a message 1 but
+  holds the session as pending: it takes no device's place, stamps nothing
+  and spends no pairing code until its first transport message decrypts. A
+  replay never gets that far. The same holds over the relay.
+- **One session per device.** A session that proves itself, through the
+  service or the relay, ends the device's older one.
+- **Ends.** An empty `d` ends `(dev, sid)`. An end for a session a newer
+  one replaced looks the same as any other, so a phone ignores an end for
+  any `sid` but its current one and never restarts on it; if it did, it
+  would fight its own newer session. An end for its current `sid` means the
+  box dropped it, and the phone starts again with backoff. The box sends an
+  end when it drops a session; the service sends one to the box when the phone's app session
+  ends, and one to the phone when the box's uplink ends or is replaced by a
+  newer one, when the box does not take `tun`, or when the phone names a
+  session the box does not hold.
+  Every tunnel session ends with the uplink that carried it.
+- **What the service can do.** Drop or delay a `tun`. It cannot read or forge
+  `d`, and Noise transport refuses a replay. Every `cmd` carries its own
+  expiry.
+- **Order.** The service forwards a device's `tun` in the order it received
+  them.
+- **Limits.** `d` is at most 16,408 bytes, one transport message around the
+  largest bulk bucket; a phone that sends more is closed with 4400. Per home
+  and per direction the service passes 240 messages in a burst and then 60 a
+  second, and 4 MiB in a burst and then 512 KiB a second, the limits the
+  relay puts on a box's uplink. Past them it drops `tun` and counts the drop;
+  at twice them it closes the box's uplink, or the phone's session. `tun`
+  does not count against the uplink's own message rate. A box handshake
+  through the tunnel costs the box up to four X25519 operations, so the box
+  answers at most 12 a minute per device and 240 in all.
+
+### Pairing through the service
+
+A new phone is in no roster, so the service would refuse it. While the box
+shows a QR code, its roster lists the code's hash in `pending`. The phone
+scans the code, computes the same hash and puts it in `now.pair`. The service
+admits the handshake once for that hash, removes the entry and names the
+device by its device id: the first 8 characters of its static key in
+base64url, which is how the box names it too. The device may then send only
+`tun`. The box decides as over the relay: the code rides inside handshake
+message 1, encrypted to the box, so the service never sees it. When the
+roster that lists the new device arrives, the session takes that entry
+without closing. If the pairing fails, the session ends when the entry's
+`ttlS` runs out.
+
+**The QR, v3.** A phone that has never reached the box needs the home id
+before any session with it. Pairing payload `v3` is `v2` with a sixth segment:
+
+```
+https://app.ftw.energy/p#v3.<box_noise_pub>.<pairing_code>.<lan_hint>.<rendezvous_secret>.<home>
+```
+
+`<home>` is base64url, without padding, of the home id's 26 ASCII
+characters, like the hint. The other five segments are `v2`'s, byte for byte,
+and everything stays in the fragment. The box shows `v2` until one constant,
+`appenroll.QRNamesHome`, turns `v3` on. It stays off until the apps parse
+`v3` in builds people have: ftw-app's `Enrollment.swift` and `Enrollment.kt`
+and ftw-webapp's `enrollment.ts` each take exactly five `v2` segments today,
+so an earlier `v3` would stop pairing on every shipped app. Until then a new
+phone learns the home id from `hello_ok.cloud` on its first session with the
+box, which the box sends from its first pairing on.
+
+### Link
+
+- A box links when it first shows a QR pairing code, when a device that may
+  open a tunnel is paired, or when an owner turns the readable copy on. It
+  makes `cloud.key` then, and the home id with it.
+- A linked box sends its roster and takes `tun`. It sends no readings until
+  the owner turns the readable copy on.
+- The link ends when no paired device may open a tunnel, no code is shown
+  and the readable copy is off. The box then sends
+  `bye {why: "revoked", purge: true}` and deletes `cloud.key` on the
+  `purged {what: "home"}` receipt. The next link has a new home id.
+- A build that names no service never links.
+- For every linked home the service sees a stable home id, the box's address
+  and when traffic goes, with the readable copy off too.
 
 ## One-shot read
 
@@ -668,8 +833,8 @@ exactly as `/v1/app` admits a phone and keeps nothing after the answer.
    `push.register` or `push.unregister`. The service refuses any other type,
    an owner's `suspend` among them, with 400 before message 2.
 3. The service admits the watch by the rules of the app session: its key in
-   the home's roster, a roster that has not run out, no suspension, a grant
-   that is on. A refusal is 403 with an empty body, before message 2, and does
+   the home's roster, a roster that has not run out, no suspension, and a
+   non-empty effective scope, so the readable copy must be on. A refusal is 403 with an empty body, before message 2, and does
    not say which check failed.
 4. The answer is 200 with `content-type: application/octet-stream`. Its body
    is message 2 and then, for a `read`, the envelopes that did not fit, as
@@ -872,6 +1037,8 @@ consent text.
   a new home id and a new `grantKey`. The old home at the service ages out as
   under [Silence](#revocation-and-deletion).
 - A grant works with the relay off.
+- A grant uses the link's `cloud.key` and home id, and makes the link when
+  there is none. Withdrawing it keeps both.
 
 | Route | Who may call it |
 |---|---|
@@ -899,14 +1066,21 @@ app's, so the grant screen claims no more than an owner's session.
 ## Revocation and deletion
 
 - **Device revoke** on the box: a roster without the device. See Roster.
-- **Grant revoke:** the box sends `bye {why: "revoked", purge: true}`. The
+- **Grant revoke:** the box stops sending readings and sends a roster whose
+  grant keeps its id and has no scopes or purposes. The service deletes what
+  it holds under that grant (the live copy, events, tiles, extension tokens
+  and statistics rows) and answers `purged {what: "copy", grantId}`, which it
+  sends again for every such roster. The box shows the revoke as pending
+  until a valid receipt arrives, then deletes the grant and shows the receipt
+  time. The link, the home id and the tunnel stay.
+- **Link end:** the box sends `bye {why: "revoked", purge: true}`. The
   service deletes the home: registry row, tokens, APNs registrations, live
   copy, events, tiles and statistics rows. It keeps a tombstone of the home
   id until it has delivered `purged {what: "home"}`, which it sends once all
   of that is gone, statistics rows included. Until then the box keeps
-  `cloud.key`, sends only `hello` and `bye` on each connect, and shows the
-  revoke as pending. With a valid `purged` it deletes the key and the grant
-  and shows the receipt time.
+  `cloud.key` and sends only `hello` and `bye` on each connect. With a valid
+  `purged` it deletes the key. A box of an earlier release still ends its
+  grant this way.
 - **Statistics withdrawal:** `stats.withdraw`. The service deletes the rows
   within 24 hours and sends `purged {what: "stats"}` when done, on the same or
   a later connection.
@@ -925,9 +1099,12 @@ only readings it stores. Its registry holds the home id, the box key, the
 roster, suspensions, the current and deleted `statsId`s, APNs registrations
 and token hashes.
 
-A restarted service holds the registry but no readings and no rosters in
-memory. It admits a home's phones again once that home's box has connected
-and sent its roster.
+A restarted service holds the registry but no readings. At start it reads
+each home's signed roster back from the registry, checks its signature with
+the home's box key, and admits phones by it, counting `ttlS` from when the
+roster first arrived. It also starts the wait for `box.unreachable` again for
+each home, from when the box was last seen, so a restart neither forgets nor
+repeats one. Without a box, a phone's `tun` gets an empty `d` back.
 
 A rebuilt host starts with an empty registry. Boxes send their rosters again
 and phones register again at their next start. Suspensions are lost, so an
@@ -948,6 +1125,8 @@ to the app.
 | `cloud_purposes` | List: `serve`, `stats` | `registry.yaml`, new block |
 | `cloud.link` | Capability: the box can run the FTW Cloud uplink. Absent means the app uses the relay only and offers no FTW Cloud | `registry.yaml`, `capabilities` |
 | `cloud` | Carrier state, between `relay` and `cache` | `registry.yaml`, `carrier_states` |
+| `cloud.tun` | Capability: the box takes its app session through the service as `tun`. Absent means the phone uses the relay, even when it knows the home id | `registry.yaml`, `capabilities` |
+| `tunnel` | Carrier state, between `relay` and `cloud`: the box's own session, carried by the service | `registry.yaml`, `carrier_states` |
 | `cloud.granted`, `cloud.revoked` | Push kinds, sent to every owner when FTW Cloud is turned on or off | `push-catalogue.yaml` |
 
 Class names, field names, close codes and the signing tags are not registry
@@ -978,8 +1157,13 @@ the registry's roles would remove that copy.
 | `resync` honoured | At most one per 5 minutes |
 | Event ring on the box | 32 |
 | Byte budget | 20 MB per 24 hours of uptime |
-| Largest frame from the service to the box | 4 KiB |
-| Largest message from a phone | 4 KiB |
+| Largest frame from the service to the box | 4 KiB; a `tun` frame 16,664 bytes |
+| Largest message from a phone | 4 KiB; a `tun` message 16,664 bytes and Noise's 24 |
+| `tun` per home and direction | 240 messages, then 60 a second; 4 MiB, then 512 KiB a second |
+| `tun` queues and budget on the box | 64 lane 0, 256 bulk paced to 90 % of the limits; 250 MB per 24 hours of uptime |
+| Box handshakes through the tunnel | 12 a minute per device, 240 in all |
+| Pending pairing entry | One QR code, for its own ten minutes; admits one handshake |
+| Box session up after TLS | One round trip: its message 1 rides in `now.tun` |
 | Sessions | 16 per home; one per device |
 | Envelopes queued per phone | 256 |
 | Phone messages | 20 in a burst, then 2 a second |

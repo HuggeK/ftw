@@ -3,9 +3,11 @@
 // scope each class belongs to. docs/protocol-cloud.md is the normative text;
 // this package and its golden vectors hold the bytes.
 //
-// FTW Cloud reads what the box sends. It never controls. Nothing here can
-// express a command: the service may send the box five message types, none of
-// which asks for anything beyond a faster cadence, a resend or a receipt.
+// FTW Cloud reads what the box sends and never chooses an action. Of the six
+// message types the service may send the box, five ask for nothing beyond a
+// faster cadence, a resend or a receipt. The sixth, tun, carries a phone's own
+// Noise session with the box, which the service can neither read nor forge;
+// the box judges what is inside as it judges the same session over the relay.
 //
 // Like the rest of go/protocol, this package imports nothing from the box, so
 // the service that imports it links no control, planner or storage code.
@@ -41,8 +43,9 @@ const (
 	HeaderBytes = 6
 	// MaxPayload is what the u16 length field can describe.
 	MaxPayload = 0xffff
-	// MaxServiceFrame is the largest message the service may send the box.
-	// Anything larger closes the uplink.
+	// MaxServiceFrame is the largest message but tun the service may send
+	// the box, and MaxTunFrame bounds a tun. Anything larger closes the
+	// uplink.
 	MaxServiceFrame = 4096
 
 	// SignTag starts every signed input: "ftw.cloud.v1" and a zero byte.

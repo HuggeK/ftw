@@ -409,9 +409,13 @@ The properties that matter:
   intact.
 
 Proposed, not shipped: [ADR 0008](adr/0008-ftw-cloud.md) adds FTW Cloud, a
-second outbound connection for homes whose owner turns it on. It carries to
-`cloud.ftw.energy` a signed, readable copy of what the owner enabled, and it
-never carries control. Commands and long history stay on the relay path above.
+second outbound connection to `cloud.ftw.energy`. A box links when it is first
+paired. The link carries each phone's own session with the box as `tun`,
+ciphertext the service cannot read or forge, so a phone reaches the box with
+the relay unreachable; and, when an owner turns it on, a signed, readable copy
+of what the owner enabled. The box admits a session through the tunnel by the
+key its handshake proves, exactly as over the relay, and keeps one session per
+device across both. The relay path above stays while every client moves.
 [protocol-cloud.md](protocol-cloud.md) specifies its wire format.
 
 [ADR 0009](adr/0009-watch-exchange.md) lets an Apple Watch work without the
@@ -419,8 +423,8 @@ phone. watchOS allows no WebSocket, so each step is one HTTPS request. Commands
 go to the box through the relay's exchange: the box keeps a second socket,
 `/r/<epoch>/<handle>/exchange`, under the uplink's handle, and the relay hands
 it one Noise message per request behind an id of its own. The box holds those
-sessions in a table of eight, apart from the phones' four, so a watch never
-pushes a phone out; each ends after four exchanges, a minute idle or three
+sessions in a table of eight, apart from the phones' sessions, which hold one
+slot per device, so a watch never pushes a phone out; each ends after four exchanges, a minute idle or three
 minutes. Every frame on it is lane 0 apart from `hello_ok`, and every answer is
 two frames, so a read, a command and a refusal have one length. A command
 answers no sooner than 400 ms after it arrives, so an applied one and a refused

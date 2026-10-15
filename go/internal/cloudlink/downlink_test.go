@@ -40,6 +40,15 @@ func TestDownlinkIsAClosedSet(t *testing.T) {
 	if _, err := parseDownlink(websocket.BinaryMessage, big); err == nil {
 		t.Error("a frame over 4 KiB was accepted")
 	}
+	// A tun may carry the largest bulk frame, and no more.
+	full := frameOf(t, cloudwire.MsgTun, cloudwire.Tun{Dev: "q5Lw0Zb1", Sid: 1, D: make([]byte, cloudwire.TunDataMax)})
+	if _, err := parseDownlink(websocket.BinaryMessage, full); err != nil {
+		t.Errorf("a full tun was refused: %v", err)
+	}
+	over := frameOf(t, cloudwire.MsgTun, cloudwire.Tun{Dev: "q5Lw0Zb1", Sid: 1, D: make([]byte, cloudwire.MaxTunFrame)})
+	if _, err := parseDownlink(websocket.BinaryMessage, over); err == nil {
+		t.Error("a tun over MaxTunFrame was accepted")
+	}
 	lane0 := frameOf(t, cloudwire.MsgWatch, cloudwire.Watch{Hz: 1})
 	lane0[1] = 0
 	if _, err := parseDownlink(websocket.BinaryMessage, lane0); err == nil {
@@ -48,11 +57,12 @@ func TestDownlinkIsAClosedSet(t *testing.T) {
 }
 
 // Whatever the service sends, the box either refuses it or reads one of the
-// five types, and never panics.
+// six types within its size, and never panics.
 func FuzzDownlink(f *testing.F) {
 	for _, typ := range append(slices.Clone(cloudwire.Downlink), "cmd") {
 		f.Add(true, frameOf(f, typ, map[string]any{"hz": 1, "what": []string{"full"}}))
 	}
+	f.Add(true, frameOf(f, cloudwire.MsgTun, cloudwire.Tun{Dev: "q5Lw0Zb1", Sid: 7, D: []byte{1, 2, 3}}))
 	f.Add(false, []byte("ready"))
 	f.Fuzz(func(t *testing.T, binary bool, msg []byte) {
 		kind := websocket.TextMessage
@@ -63,12 +73,17 @@ func FuzzDownlink(f *testing.F) {
 		if err != nil {
 			return
 		}
-		if !slices.Contains(cloudwire.Downlink, env.T) || len(msg) > cloudwire.MaxServiceFrame {
+		limit := cloudwire.MaxServiceFrame
+		if env.T == cloudwire.MsgTun {
+			limit = cloudwire.MaxTunFrame
+		}
+		if !slices.Contains(cloudwire.Downlink, env.T) || len(msg) > limit {
 			t.Fatalf("accepted %q in %d bytes", env.T, len(msg))
 		}
-		// The bodies the sender reads must not panic either.
+		// The bodies the sender and the tunnel read must not panic either.
 		_ = cloudwire.Unmarshal(env.B, &cloudwire.Watch{})
 		_ = cloudwire.Unmarshal(env.B, &cloudwire.Resync{})
 		_ = cloudwire.Unmarshal(env.B, &cloudwire.Purged{})
+		_ = cloudwire.Unmarshal(env.B, &cloudwire.Tun{})
 	})
 }

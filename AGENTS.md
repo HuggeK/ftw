@@ -70,10 +70,13 @@ Read [docs/architecture.md](docs/architecture.md) for the system map and
 - Database queries stay in [`go/internal/state`](go/internal/state).
 - Lane 0 frames have a fixed length and cadence; the padding is a privacy
   control. The proposed FTW Cloud uplink is not padded, so it sends lane 1
-  frames without the bulk buckets and never lane 0.
-- FTW Cloud may hold a readable copy of what the owner enabled. It never sends
-  control and never chooses actions. See
-  [ADR 0008](docs/adr/0008-ftw-cloud.md), proposed.
+  frames without the bulk buckets and never lane 0. A phone's own session
+  rides inside it as `tun`, with its lane 0 padding intact.
+- FTW Cloud may hold a readable copy of what the owner enabled. It carries the
+  phones' sessions with the box as ciphertext it cannot read or forge, and it
+  never chooses actions; the box judges what arrives as it does over the
+  relay. See [ADR 0008](docs/adr/0008-ftw-cloud.md), proposed, and the
+  tunnel in [docs/protocol-cloud.md](docs/protocol-cloud.md).
 
 ## Drivers
 

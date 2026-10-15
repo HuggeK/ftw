@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# go/internal/cloudlink streams the box's state to FTW Cloud, and FTW Cloud
-# reads and never controls. This check keeps the uplink's build graph honest:
+# go/internal/cloudlink links the box to FTW Cloud, which never chooses an
+# action: it carries the phones' sessions unread and, when an owner allows
+# it, a readable copy. This check keeps the uplink's build graph honest:
 # it may import go/protocol and nothing else of the box's own, so no control,
 # API, loadpoint, planner or driver code can be reached from the code that
 # talks to the service. Its tests are held to the same rule.

@@ -37,8 +37,8 @@ type vectorFile struct {
 }
 
 type vectorKey struct {
-	D    string `json:"d"`
-	PK   string `json:"pk"`
+	D  string `json:"d"`
+	PK string `json:"pk"`
 	// Home is the box key's home id. The service signs over the box's home
 	// too, so its own key has none.
 	Home string `json:"home,omitempty"`
@@ -106,8 +106,8 @@ func vectorBodies(grantKey []byte, boxPK []byte) []struct {
 					Scopes: []string{protocol.ScopeLiveRead}, Epoch: 2},
 			},
 			Grant: Grant{ID: bytes.Repeat([]byte{0x44}, GrantIDBytes),
-				Scopes:     []string{protocol.ScopeLiveRead, protocol.ScopeEventsRead},
-				Purposes:   []string{protocol.CloudPurposeServe}, Controller: ControllerSourceful},
+				Scopes:   []string{protocol.ScopeLiveRead, protocol.ScopeEventsRead},
+				Purposes: []string{protocol.CloudPurposeServe}, Controller: ControllerSourceful},
 		}},
 		{"live full", "box", MsgLive, Live{
 			Header: h(3, 60_020),
@@ -174,6 +174,32 @@ func vectorBodies(grantKey []byte, boxPK []byte) []struct {
 			Kind: protocol.PushChargingSessionComplete, Severity: SeverityInfo,
 			Args: map[string]string{"kwh": "18.4"}, Src: charger, LP: garage,
 		}},
+		// The tunnel. A box linked at pairing, with the readable copy off:
+		// two phones that may open a session, one QR code on the screen.
+		{"roster tunnel only", "box", MsgRoster, Roster{
+			Header: h(12, 74_000), RosterSeq: 5, TTLS: 86_400,
+			Devices: []Device{
+				{ID: "q5Lw0Zb1", Key: bytes.Repeat([]byte{0x55}, 32), Role: "owner", Scopes: []string{}, Epoch: 1, Tun: true},
+				{ID: "Zf09xQ2a", Key: bytes.Repeat([]byte{0x66}, 32), Role: "viewer", Scopes: []string{}, Epoch: 2, Tun: true},
+			},
+			Grant:   Grant{Scopes: []string{}, Purposes: []string{}, Controller: ControllerSourceful},
+			Pending: []Pending{{Hash: PairingHash(HomeID(boxPK), bytes.Repeat([]byte{0x88}, 16)), TTLS: 600}},
+		}},
+		// A revoke that waits for its receipt: the grant keeps its id and
+		// loses its scopes and purposes.
+		{"roster revoking", "box", MsgRoster, Roster{
+			Header: h(13, 75_000), RosterSeq: 6, TTLS: 86_400,
+			Devices: []Device{
+				{ID: "q5Lw0Zb1", Key: bytes.Repeat([]byte{0x55}, 32), Role: "owner", Scopes: []string{}, Epoch: 1, Tun: true},
+			},
+			Grant: Grant{ID: bytes.Repeat([]byte{0x44}, GrantIDBytes), Scopes: []string{}, Purposes: []string{},
+				Controller: ControllerSourceful},
+		}},
+		{"purged copy", "service", MsgPurged, Purged{AtMs: 1_791_821_100_000, What: PurgedCopy,
+			GrantID: bytes.Repeat([]byte{0x44}, GrantIDBytes)}},
+		{"tun down", "", MsgTun, Tun{Dev: "q5Lw0Zb1", Sid: 7, D: bytes.Repeat([]byte{0x99}, 112)}},
+		{"tun up", "", MsgTun, Tun{Dev: "q5Lw0Zb1", Sid: 7, D: bytes.Repeat([]byte{0x9a}, 48)}},
+		{"tun end", "", MsgTun, Tun{Dev: "q5Lw0Zb1", Sid: 7, D: []byte{}}},
 	}
 }
 
@@ -185,14 +211,14 @@ func TestGoldenVectors(t *testing.T) {
 	grantKey := bytes.Repeat([]byte{0x77}, GrantKeyBytes)
 
 	var stored vectorFile
-	if !*update {
-		raw, err := os.ReadFile(vectorsPath)
-		if err != nil {
-			t.Fatalf("%v (run with -update to create it)", err)
-		}
+	raw, err := os.ReadFile(vectorsPath)
+	switch {
+	case err == nil:
 		if err := json.Unmarshal(raw, &stored); err != nil {
 			t.Fatal(err)
 		}
+	case !*update:
+		t.Fatalf("%v (run with -update to create it)", err)
 	}
 
 	out := vectorFile{
@@ -223,7 +249,14 @@ func TestGoldenVectors(t *testing.T) {
 			SignedInputSHA256: hex.EncodeToString(digest[:])}
 
 		var sig []byte
+		// A message whose signed input did not change keeps its stored
+		// signature under -update, so a new vector does not re-sign the
+		// rest of the file.
+		unchanged := i < len(stored.Messages) && stored.Messages[i].Name == v.name &&
+			stored.Messages[i].SignedInputSHA256 == vec.SignedInputSHA256
 		switch {
+		case v.signer != "" && *update && unchanged:
+			sig, _ = hex.DecodeString(stored.Messages[i].Sig)
 		case v.signer == "" || *update:
 			if v.signer != "" {
 				key := box

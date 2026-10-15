@@ -4,11 +4,17 @@ import (
 	"encoding/base64"
 	"fmt"
 	"strings"
+
+	"github.com/srcfl/ftw/go/protocol/cloudwire"
 )
 
 // The enrollment payload, printed as a QR code.
 //
 //	https://app.ftw.energy/p#v2.<box_noise_pub>.<pairing_code>.<lan_hint>.<rendezvous_secret>
+//	https://app.ftw.energy/p#v3.<box_noise_pub>.<pairing_code>.<lan_hint>.<rendezvous_secret>.<home>
+//
+// v3 adds the home id at FTW Cloud. The box shows v2 until QRNamesHome says
+// otherwise.
 //
 // Everything after the '#' is a URL fragment, and a fragment is never sent in
 // an HTTP request. That is the whole design: the app's trust anchor reaches it
@@ -25,6 +31,12 @@ const (
 	// payload rather than parse three quarters of it.
 	PayloadVersion = "v2"
 
+	// PayloadVersionHome is v2 with a sixth segment: the home id at FTW
+	// Cloud, base64url of its 26 ASCII characters, so a new phone knows
+	// where to dial before any session with the box. No shipped app reads
+	// it; each parser takes exactly five segments of v2.
+	PayloadVersionHome = "v3"
+
 	// PayloadOrigin is where the app is served. It is also the passkey RP
 	// ID, which is why it is one constant and not two.
 	PayloadOrigin = "https://app.ftw.energy"
@@ -35,12 +47,33 @@ const (
 	MaxLANHintChars = 64
 )
 
+// QRNamesHome is the one switch that puts the home id in the QR, as v3. It
+// stays false until the apps parse v3 and those builds are out: ftw-app's
+// Enrollment.swift and Enrollment.kt, and ftw-webapp's enrollment.ts. A v3
+// QR before then stops pairing on every shipped app. Until it flips, a new
+// phone learns the home id from hello_ok.cloud on its first session.
+const QRNamesHome = false
+
+// SetHome tells enrolment where to find the home id at FTW Cloud, for a QR
+// that names it. fn returns "" while the box is not linked.
+func (i *Identity) SetHome(fn func() string) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.home = fn
+}
+
 // EnrollmentURL builds the payload for the QR code.
 //
 // lanHint is where the box believes it can be reached on the local network,
 // and is allowed to be empty: a box that does not know its own address should
 // say nothing rather than guess, and the app falls back to the relay.
 func (i *Identity) EnrollmentURL(code []byte, lanHint string) (string, error) {
+	return i.enrollmentURL(code, lanHint, QRNamesHome)
+}
+
+// enrollmentURL builds v2, or v3 with the home id when withHome is set and
+// the box is linked.
+func (i *Identity) enrollmentURL(code []byte, lanHint string, withHome bool) (string, error) {
 	if len(code) != PairingCodeBytes {
 		return "", fmt.Errorf("appenroll: pairing code is %d bytes, need %d", len(code), PairingCodeBytes)
 	}
@@ -56,13 +89,26 @@ func (i *Identity) EnrollmentURL(code []byte, lanHint string) (string, error) {
 	}
 
 	enc := base64.RawURLEncoding
-	fragment := strings.Join([]string{
+	segments := []string{
 		PayloadVersion,
 		enc.EncodeToString(i.StaticKey().Public()),
 		enc.EncodeToString(code),
 		enc.EncodeToString([]byte(lanHint)),
 		enc.EncodeToString(i.RendezvousSecret()),
-	}, ".")
+	}
+	if home := i.homeID(); withHome && cloudwire.ValidHome(home) {
+		segments[0] = PayloadVersionHome
+		segments = append(segments, enc.EncodeToString([]byte(home)))
+	}
+	return PayloadOrigin + PayloadPath + "#" + strings.Join(segments, "."), nil
+}
 
-	return PayloadOrigin + PayloadPath + "#" + fragment, nil
+func (i *Identity) homeID() string {
+	i.mu.Lock()
+	fn := i.home
+	i.mu.Unlock()
+	if fn == nil {
+		return ""
+	}
+	return fn()
 }

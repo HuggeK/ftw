@@ -104,6 +104,8 @@ type noPhones struct{}
 
 func (noPhones) Devices() []cloudlink.RosterDevice { return nil }
 
+func (noPhones) Pending() ([]byte, time.Time, bool) { return nil, time.Time{}, false }
+
 func newTestCloudLink(t *testing.T, keys []*ecdsa.PublicKey) *cloudlink.Link {
 	t.Helper()
 	st, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
@@ -162,7 +164,52 @@ func TestAppSessionsHearOfFTWCloudOnlyWhenItCanRun(t *testing.T) {
 			t.Fatalf("source %q named %q", id, name)
 		}
 	}
+	if slices.Contains(caps, appproto.CapCloudTun) {
+		t.Fatalf("cloud.tun from a link that takes no tun: %v", caps)
+	}
 }
+
+// A phone hears cloud.tun only from a box whose link carries its session, so
+// a phone that knows the home id never waits on a tunnel the box cannot take.
+func TestAppSessionsHearOfTheTunnelOnlyWhenTheLinkTakesIt(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := []*ecdsa.PublicKey{&key.PublicKey}
+	open := func(tunnel cloudlink.Tunnel, keys []*ecdsa.PublicKey) []string {
+		st, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { st.Close() })
+		link, err := cloudlink.New(cloudlink.Options{
+			Site: quietCloudSite{}, Roster: noPhones{}, KV: st, Tunnel: tunnel,
+			KeyPath: filepath.Join(t.TempDir(), "cloud.key"), ServiceKeys: keys,
+			Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		c := &cloudSession{}
+		c.bind(link)
+		return c.caps(appproto.DefaultCaps())
+	}
+	if caps := open(nil, keys); slices.Contains(caps, appproto.CapCloudTun) {
+		t.Fatalf("no tunnel: %v", caps)
+	}
+	if caps := open(nopTunnel{}, []*ecdsa.PublicKey{}); slices.Contains(caps, appproto.CapCloudTun) || slices.Contains(caps, appproto.CapCloudLink) {
+		t.Fatalf("a build that names no service: %v", caps)
+	}
+	if caps := open(nopTunnel{}, keys); !slices.Contains(caps, appproto.CapCloudTun) || !slices.Contains(caps, appproto.CapCloudLink) {
+		t.Fatalf("a link with a tunnel: %v", caps)
+	}
+}
+
+type nopTunnel struct{}
+
+func (nopTunnel) Deliver(cloudwire.Tun) {}
+func (nopTunnel) Drop()                 {}
 
 // FTW Cloud's live body is the same field set the app session streams, and
 // each phase follows the site meter's freshness there too. The fuse is

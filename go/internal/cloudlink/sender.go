@@ -1,7 +1,6 @@
 package cloudlink
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -31,6 +30,10 @@ const (
 	rosterTTLS    = 86_400
 	budgetBytes   = 20_000_000
 	budgetMinutes = 24 * 60
+	// tunBudgetBytes bounds the tunnel apart from the readable copy. A phone
+	// holding a session open all day at 1 Hz sends about 50 MB; this is five
+	// of them, and stops a runaway before it eats a household's uplink.
+	tunBudgetBytes = 250_000_000
 )
 
 // sentFrame is the last frame of a class that left the house, exactly.
@@ -81,6 +84,9 @@ type cadence struct {
 	anyAt      time.Time // last live or hb
 	rosterAt   time.Time
 	watchUntil time.Time
+	// pendingUntil is when the pairing code the last roster listed runs
+	// out, zero when it listed none.
+	pendingUntil time.Time
 
 	// When each class was last composed, and whether a change it found is
 	// still waiting for its period. Composing reads the box, and on a Pi
@@ -94,7 +100,7 @@ type cadence struct {
 // change goes within a second whatever the period.
 const liveCheckEvery = time.Second
 
-// run sends until the connection or the grant ends.
+// run sends until the connection or the link ends.
 func (w *writer) run(ctx context.Context, events <-chan cloudwire.Envelope) error {
 	l := w.link
 	tick := time.NewTicker(l.opts.Tick)
@@ -107,11 +113,11 @@ func (w *writer) run(ctx context.Context, events <-chan cloudwire.Envelope) erro
 
 	for {
 		snap := l.current()
-		if snap.g == nil || snap.home != connHome {
-			return errors.New("cloudlink: the grant changed under the connection")
+		if snap.link == nil || snap.home != connHome {
+			return errors.New("cloudlink: the link changed under the connection")
 		}
 		now := time.Now()
-		if snap.g.Revoked {
+		if snap.link.Ending {
 			if purgeSince.IsZero() {
 				if err := w.bye(snap, cloudwire.ByeRevoked, true); err != nil {
 					return err
@@ -178,34 +184,60 @@ func (w *writer) downlink(snap grantSnapshot, st *cadence, env cloudwire.Envelop
 	return nil
 }
 
-// acceptPurged finishes a revoke on a valid receipt: signed by the service,
-// for this home and grant, while the grant is being revoked.
+// acceptPurged takes a valid receipt: signed by the service for this home.
+// A copy receipt for the grant being revoked forgets that grant; a home
+// receipt while the link ends ends it, and true says so, so the connection
+// closes.
 func (l *Link) acceptPurged(snap grantSnapshot, env cloudwire.Envelope) bool {
 	var b cloudwire.Purged
 	cur := l.current()
-	if cur.g == nil || !cur.g.Revoked || cur.home != snap.home || !l.verifiedByService(snap.home, env) ||
-		cloudwire.Unmarshal(env.B, &b) != nil || b.What != cloudwire.PurgedHome || !bytes.Equal(b.GrantID, cur.g.ID) {
+	if cur.link == nil || cur.home != snap.home || !l.verifiedByService(snap.home, env) ||
+		cloudwire.Unmarshal(env.B, &b) != nil {
 		return false
 	}
-	l.finishPurge(b.AtMs)
-	return true
+	switch b.What {
+	case cloudwire.PurgedCopy:
+		l.finishCopy(b.AtMs, b.GrantID)
+	case cloudwire.PurgedHome:
+		if cur.link.Ending {
+			l.finishLink()
+			return true
+		}
+	}
+	return false
 }
 
 // tick sends whatever is due.
 func (w *writer) tick(snap grantSnapshot, st *cadence, now time.Time) error {
 	l := w.link
 
+	// A pairing code that ran out unused changes the roster too, and may
+	// leave nothing that needs the link.
+	if !st.pendingUntil.IsZero() && !now.Before(st.pendingUntil) {
+		st.pendingUntil = time.Time{}
+		l.mu.Lock()
+		l.rosterDue = true
+		l.mu.Unlock()
+	}
 	l.mu.Lock()
-	due := l.rosterDue
-	l.rosterDue = false
 	h := time.Duration(cloudwire.Heartbeat(l.table)) * time.Millisecond
 	l.mu.Unlock()
-	if due || st.rosterAt.IsZero() || now.Sub(st.rosterAt) >= rosterRenew {
-		_, roster := l.rosterNumber(snap)
+	force := st.rosterAt.IsZero() || now.Sub(st.rosterAt) >= rosterRenew
+	if roster, ok := l.takeRoster(force); ok {
+		if cur := l.current(); cur.link == nil || cur.link.Ending {
+			// The end goes on the next pass, as bye.
+			return nil
+		}
+		// What follows reads the state the roster was built from, so a
+		// revoke that just landed sends no reading after it.
+		snap = l.current()
 		if _, err := w.sendBody(snap, cloudwire.MsgRoster, &roster, true); err != nil {
 			return err
 		}
 		st.rosterAt = now
+		if _, expires, ok := l.opts.Roster.Pending(); ok {
+			st.pendingUntil = expires
+		}
 	}
 
 	period := periodIdle
@@ -281,8 +313,9 @@ func (w *writer) tick(snap grantSnapshot, st *cadence, now time.Time) error {
 	}
 
 	// hb never vouches for a live or lp that waits for its period, and its
-	// ages were read on this tick.
-	if now.Sub(st.anyAt) >= h && !st.liveWaiting && !st.lpWaiting {
+	// ages were read on this tick. It names readings, so it goes only with
+	// the readable copy.
+	if snap.allowed(cloudwire.MsgHB) && now.Sub(st.anyAt) >= h && !st.liveWaiting && !st.lpWaiting {
 		hb := l.heartbeat(ages)
 		sent, err := w.sendBody(snap, cloudwire.MsgHB, &hb, false)
 		if err != nil {
@@ -293,6 +326,24 @@ func (w *writer) tick(snap grantSnapshot, st *cadence, now time.Time) error {
 		}
 	}
 	return nil
+}
+
+// takeRoster says whether a roster is due, and builds it from the link as it
+// is now, after reading that it is due: never from a snapshot taken before,
+// or a revoke that lands in between would wait six hours for the next
+// renewal while the service kept the copy. A roster about to go may leave
+// nothing that needs the link, which then starts to end.
+func (l *Link) takeRoster(force bool) (cloudwire.Roster, bool) {
+	l.mu.Lock()
+	due := l.rosterDue
+	l.rosterDue = false
+	l.mu.Unlock()
+	if !due && !force {
+		return cloudwire.Roster{}, false
+	}
+	l.endIfIdle()
+	_, roster := l.rosterNumber(l.current())
+	return roster, true
 }
 
 // sendBody stamps the header, sends, and records the seq of a live or lp so
@@ -497,11 +548,21 @@ func pricesKey(p cloudwire.Prices) string {
 }
 
 // rosterNumber builds the roster and its number. The number rises when the
-// devices or the grant differ from what it was last computed from.
+// devices, the grant or the pending code differ from what it was last
+// computed from.
+//
+// The grant has three shapes: the readable copy's while it is on; its id
+// alone while a revoke waits for the receipt, which asks the service to
+// delete the copy; and none while the copy is off.
 func (l *Link) rosterNumber(snap grantSnapshot) (uint64, cloudwire.Roster) {
-	r := cloudwire.Roster{TTLS: rosterTTLS, Grant: cloudwire.Grant{
-		ID: snap.g.ID, Scopes: snap.g.Scopes, Purposes: snap.g.Purposes, Controller: snap.g.Controller,
-	}}
+	r := cloudwire.Roster{TTLS: rosterTTLS, Grant: cloudwire.Grant{Controller: cloudwire.ControllerSourceful}}
+	switch g := snap.g; {
+	case g == nil:
+	case g.Revoked:
+		r.Grant.ID = g.ID
+	default:
+		r.Grant = cloudwire.Grant{ID: g.ID, Scopes: g.Scopes, Purposes: g.Purposes, Controller: g.Controller}
+	}
 	for _, d := range l.opts.Roster.Devices() {
 		var scopes []string
 		for _, s := range protocol.CloudScopes {
@@ -509,10 +570,25 @@ func (l *Link) rosterNumber(snap grantSnapshot) (uint64, cloudwire.Roster) {
 				scopes = append(scopes, s)
 			}
 		}
-		r.Devices = append(r.Devices, cloudwire.Device{ID: d.ID, Key: d.Key, Role: d.Role, Scopes: scopes, Epoch: d.Epoch})
+		r.Devices = append(r.Devices, cloudwire.Device{ID: d.ID, Key: d.Key, Role: d.Role, Scopes: scopes,
+			Epoch: d.Epoch, Tun: d.Tun})
 	}
 	sort.Slice(r.Devices, func(a, b int) bool { return r.Devices[a].ID < r.Devices[b].ID })
-	sum := digest([]any{r.Devices, r.Grant})
+	if code, expires, ok := l.opts.Roster.Pending(); ok && snap.home != "" {
+		if left := time.Until(expires); left > 0 {
+			r.Pending = append(r.Pending, cloudwire.Pending{
+				Hash: cloudwire.PairingHash(snap.home, code),
+				TTLS: int64((left + time.Second - 1) / time.Second),
+			})
+		}
+	}
+	// The number follows what the roster says, not how long a code has
+	// left, so it does not rise every second a code is shown.
+	var pending [][]byte
+	for _, p := range r.Pending {
+		pending = append(pending, p.Hash)
+	}
+	sum := digest([]any{r.Devices, r.Grant, pending})
 
 	l.mu.Lock()
 	defer l.mu.Unlock()

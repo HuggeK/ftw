@@ -74,6 +74,9 @@ func TestEveryFieldHasARow(t *testing.T) {
 	for class, body := range Bodies {
 		walk(class, reflect.TypeOf(body), true)
 	}
+	for t, body := range Unheaded {
+		walk(t, reflect.TypeOf(body), false)
+	}
 	header, _, _ := cborFields(t, reflect.TypeOf(Header{}))
 	if !slices.Equal(sorted(header), sorted(Fields["header"])) {
 		t.Errorf("header: fields %v, rows %v", header, Fields["header"])

@@ -15,7 +15,8 @@ import (
 // because the prologue binds it. Message 1 carries a now envelope, message 2
 // the snapshot, and after that each box envelope the device may read rides,
 // unchanged, in an unpadded lane 1 frame inside a Noise transport message,
-// exactly as appwire.Transport writes one.
+// exactly as appwire.Transport writes one. The phone's session with its box
+// rides the same transport as tun (tunnel.go).
 //
 // Every envelope between phone and service has an empty sig. Only box
 // envelopes carry signatures, and the phone checks them with the box key it
@@ -36,6 +37,8 @@ const (
 	MsgUnsuspend = "unsuspend"
 	// MsgWatch (shared with the downlink) changes whether this phone is
 	// looking: hz 1 while it can see the home, 0 when it cannot.
+	// MsgTun (shared with the uplink, tunnel.go) carries the phone's
+	// session with its box, as AppTun, both ways.
 )
 
 // Service to phone.
@@ -49,8 +52,8 @@ const (
 	// CloseProtocol: the phone sent something this protocol does not allow.
 	CloseProtocol = 4400
 	// CloseDenied is every refusal: no such home, a device not in the roster,
-	// a suspended device, an expired roster or a grant that is off. It does
-	// not say which.
+	// a suspended device, an expired roster, or a device that may neither
+	// read nor open a tunnel. It does not say which.
 	CloseDenied = 4403
 	// CloseReplaced: a newer session from the same device took over.
 	CloseReplaced = 4408
@@ -71,6 +74,14 @@ const (
 // Now is message 1: whether the phone is looking.
 type Now struct {
 	Hz int `cbor:"hz"`
+	// Pair is PairingHash of the code a new phone scanned. It admits a key
+	// the roster does not list yet, once, while the roster lists the hash.
+	Pair []byte `cbor:"pair,omitempty"`
+	// Tun is the first message of the phone's session with its box,
+	// handshake message 1. The service forwards it as soon as it has
+	// admitted the phone, so the box session is up one round trip after
+	// TLS rather than two.
+	Tun *AppTun `cbor:"tun,omitempty"`
 }
 
 // Suspend names the roster device an owner suspends or lifts a suspension

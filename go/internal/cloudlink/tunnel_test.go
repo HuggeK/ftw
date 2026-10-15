@@ -1,0 +1,509 @@
+package cloudlink
+
+import (
+	"bytes"
+	"crypto/ecdsa"
+	"errors"
+	"os"
+	"path/filepath"
+	"slices"
+	"testing"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/srcfl/ftw/go/protocol"
+	"github.com/srcfl/ftw/go/protocol/cloudwire"
+)
+
+// A box links when its first phone may open a tunnel, with the readable copy
+// off: it sends its roster and nothing to read.
+func TestTheBoxLinksForItsPhonesAndSendsNoReadings(t *testing.T) {
+	svc := newFakeService(t)
+	h := newHarness(t, svc)
+	if _, err := os.Stat(h.keyPath); !os.IsNotExist(err) {
+		t.Fatal("cloud.key exists before anything needs the link")
+	}
+	h.setRoster(func(r *fakeRosterState) { r.tun = true })
+
+	r := h.nextRoster(t)
+	if len(r.Devices) != 1 || !r.Devices[0].Tun {
+		t.Fatalf("roster devices %+v", r.Devices)
+	}
+	if len(r.Grant.ID) != 0 || len(r.Grant.Scopes) != 0 || len(r.Grant.Purposes) != 0 ||
+		r.Grant.Controller != cloudwire.ControllerSourceful {
+		t.Fatalf("a roster without a grant names %+v", r.Grant)
+	}
+	var hello cloudwire.Hello
+	svc.mu.Lock()
+	payload, _ := cloudwire.DecodeFrame(svc.hello)
+	svc.mu.Unlock()
+	env, _ := cloudwire.DecodeEnvelope(payload)
+	if err := cloudwire.Unmarshal(env.B, &hello); err != nil {
+		t.Fatal(err)
+	}
+	if len(hello.GrantID) != 0 || !slices.Equal(hello.Caps, []string{cloudwire.MsgRoster, cloudwire.CapTun}) {
+		t.Fatalf("hello names grant %x and caps %v", hello.GrantID, hello.Caps)
+	}
+
+	time.Sleep(2500 * time.Millisecond)
+	for _, env := range svc.received() {
+		if env.T != cloudwire.MsgRoster {
+			t.Fatalf("%s left a box whose readable copy is off", env.T)
+		}
+	}
+	st := h.link.Status()
+	if st.Link != "on" || st.State != "off" || st.Home != svc.home {
+		t.Fatalf("status %+v", st)
+	}
+	if s := h.link.SessionInfo(); s == nil || s.Home != svc.home || len(s.Sources) != 0 {
+		t.Fatalf("session information %+v", s)
+	}
+}
+
+// A QR code on the screen links the box and is listed by its hash, never by
+// the code.
+func TestAPendingCodeIsListedByItsHash(t *testing.T) {
+	svc := newFakeService(t)
+	h := newHarness(t, svc)
+	code := bytes.Repeat([]byte{0x42}, 16)
+	h.setRoster(func(r *fakeRosterState) {
+		r.gone, r.code, r.expires = true, code, time.Now().Add(10*time.Minute)
+	})
+	home := h.link.Status().Home
+	if home == "" {
+		t.Fatal("a code on the screen did not link the box at once")
+	}
+	r := h.nextRoster(t)
+	if len(r.Pending) != 1 || !bytes.Equal(r.Pending[0].Hash, cloudwire.PairingHash(home, code)) ||
+		r.Pending[0].TTLS < 590 || r.Pending[0].TTLS > 600 {
+		t.Fatalf("pending %+v", r.Pending)
+	}
+	svc.mu.Lock()
+	defer svc.mu.Unlock()
+	for _, raw := range svc.raw {
+		if bytes.Contains(raw, code) {
+			t.Fatal("the pairing code itself left the house")
+		}
+	}
+}
+
+// tun goes both ways unsigned, reaches the Tunnel unread, and counts against
+// its own budget: a readable copy past its budget does not stop it, and the
+// tunnel past its own does not stop the copy.
+func TestTunGoesBothWaysApartFromTheBudget(t *testing.T) {
+	svc := newFakeService(t)
+	svc.afterHello = func(conn *websocket.Conn, home string) {
+		svc.write(conn, nil, home, cloudwire.MsgTun, cloudwire.Tun{Dev: "q5Lw0Zb1", Sid: 9, D: []byte{1, 2, 3}})
+	}
+	h := newHarness(t, svc)
+	h.link.mu.Lock()
+	h.link.budget.add(h.link.uptimeMs(), budgetBytes)
+	h.link.mu.Unlock()
+	h.setRoster(func(r *fakeRosterState) { r.tun = true })
+
+	select {
+	case got := <-h.tunnel.ch:
+		if got.Dev != "q5Lw0Zb1" || got.Sid != 9 || !bytes.Equal(got.D, []byte{1, 2, 3}) {
+			t.Fatalf("the Tunnel got %+v", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no tun reached the Tunnel")
+	}
+	if h.link.SendTun(cloudwire.Tun{Dev: "q5Lw0Zb1", Sid: 9, D: []byte{4, 5}}, false) != nil {
+		t.Fatal("SendTun refused with the uplink up")
+	}
+	up := svc.waitFor(cloudwire.MsgTun, 3*time.Second)
+	var tun cloudwire.Tun
+	if err := cloudwire.Unmarshal(up.B, &tun); err != nil || tun.Sid != 9 || !bytes.Equal(tun.D, []byte{4, 5}) {
+		t.Fatalf("the service got %+v: %v", tun, err)
+	}
+	// The tun went although the copy's budget is spent, and it did not
+	// count against that budget: only the roster, sent past the budget on
+	// purpose, added to it.
+	// hello and the roster go past the budget on purpose; nothing else that
+	// left counts but them.
+	copyBytes := func() int64 {
+		svc.mu.Lock()
+		defer svc.mu.Unlock()
+		n := int64(len(svc.hello))
+		for i, env := range svc.got {
+			if env.T != cloudwire.MsgTun {
+				n += int64(len(svc.raw[i]))
+			}
+		}
+		return n
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		st := h.link.Status()
+		if st.TunBytesLast24h > 0 && st.BudgetReached && st.BytesLast24h == budgetBytes+copyBytes() {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("status %+v; the copy's own frames are %d bytes", st, copyBytes())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Past the tunnel's own budget, tun stops.
+	h.link.mu.Lock()
+	h.link.tunBudget.add(h.link.uptimeMs(), tunBudgetBytes)
+	h.link.mu.Unlock()
+	if h.link.SendTun(cloudwire.Tun{Dev: "q5Lw0Zb1", Sid: 9, D: []byte{6}}, false) == nil {
+		t.Fatal("SendTun took a message past the tunnel's budget")
+	}
+	if h.link.Status().TunDropped == 0 {
+		t.Fatal("the drop was not counted")
+	}
+}
+
+// The readable copy's budget does not count tun, so a phone at work never
+// stops hb.
+func TestTunDoesNotSpendTheCopysBudget(t *testing.T) {
+	svc := newFakeService(t)
+	h := newHarness(t, svc)
+	h.setRoster(func(r *fakeRosterState) { r.tun = true })
+	h.nextRoster(t)
+	before := h.link.Status().BytesLast24h
+	for range 10 {
+		if h.link.SendTun(cloudwire.Tun{Dev: "q5Lw0Zb1", Sid: 1, D: make([]byte, 4096)}, false) != nil {
+			t.Fatal("SendTun refused")
+		}
+		svc.waitFor(cloudwire.MsgTun, 3*time.Second)
+	}
+	st := h.link.Status()
+	if st.BytesLast24h != before || st.TunBytesLast24h < 40_960 {
+		t.Fatalf("copy %d → %d bytes, tunnel %d", before, st.BytesLast24h, st.TunBytesLast24h)
+	}
+}
+
+// Without an uplink nothing queues: a session the phone cannot reach is one
+// it starts again.
+func TestSendTunWithoutAnUplinkIsRefused(t *testing.T) {
+	svc := newFakeService(t)
+	h := newHarness(t, svc)
+	if h.link.SendTun(cloudwire.Tun{Dev: "x", Sid: 1, D: []byte{1}}, false) == nil {
+		t.Fatal("SendTun took a message with no uplink")
+	}
+	if h.link.SendTun(cloudwire.Tun{Dev: "x", Sid: 1, D: make([]byte, cloudwire.TunDataMax+1)}, false) == nil {
+		t.Fatal("SendTun took a d over the limit")
+	}
+}
+
+// Every session the uplink carried ends with it.
+func TestTheTunnelDropsWithTheUplink(t *testing.T) {
+	svc := newFakeService(t)
+	svc.afterHello = func(conn *websocket.Conn, _ string) {
+		time.Sleep(300 * time.Millisecond)
+		_ = conn.Close()
+	}
+	h := newHarness(t, svc)
+	h.setRoster(func(r *fakeRosterState) { r.tun = true })
+	deadline := time.Now().Add(5 * time.Second)
+	for h.tunnel.dropped() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the Tunnel was not told the uplink ended")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// When nothing needs the link any more, the box asks the service to delete
+// the home and deletes cloud.key on the receipt. The next link has a new home.
+func TestTheLinkEndsWhenNothingNeedsIt(t *testing.T) {
+	svc := newFakeService(t)
+	svc.purge = true
+	h := newHarness(t, svc)
+	h.setRoster(func(r *fakeRosterState) { r.tun = true })
+	h.nextRoster(t)
+	home := h.link.Status().Home
+
+	h.setRoster(func(r *fakeRosterState) { r.gone = true })
+	bye := svc.waitFor(cloudwire.MsgBye, 3*time.Second)
+	var b cloudwire.Bye
+	if cloudwire.Unmarshal(bye.B, &b) != nil || !b.Purge || b.Why != cloudwire.ByeRevoked {
+		t.Fatalf("bye %+v", b)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for h.link.Status().Link != "off" {
+		if time.Now().After(deadline) {
+			t.Fatalf("still %+v after the receipt", h.link.Status())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := os.Stat(h.keyPath); !os.IsNotExist(err) {
+		t.Fatal("cloud.key survived the end of the link")
+	}
+
+	h.setRoster(func(r *fakeRosterState) { r.gone, r.tun = false, true })
+	if next := h.link.Status().Home; next == "" || next == home {
+		t.Fatalf("the next link's home is %q after %q", next, home)
+	}
+}
+
+// A grant made before the link existed keeps its key and home id: the link
+// takes them over.
+func TestAGrantFromBeforeTheLinkKeepsItsHome(t *testing.T) {
+	kv := &memKV{}
+	keyPath := filepath.Join(t.TempDir(), "cloud.key")
+	key, err := createKey(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp, pk, _ := fingerprint(key)
+	if err := saveJSON(kv, grantKey, grantRecord{ID: bytes.Repeat([]byte{4}, 16), KeyFp: fp,
+		Scopes: []string{protocol.ScopeLiveRead}, Purposes: []string{protocol.CloudPurposeServe},
+		GrantKey: bytes.Repeat([]byte{7}, 32), Controller: cloudwire.ControllerSourceful}); err != nil {
+		t.Fatal(err)
+	}
+	svc := newFakeService(t)
+	link, err := New(Options{Site: &fakeSite{}, Roster: fakeRoster{}, KV: kv, KeyPath: keyPath,
+		ServiceKeys: []*ecdsa.PublicKey{&svc.key.PublicKey}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := link.Status()
+	if st.State != "on" || st.Link != "on" || st.Home != cloudwire.HomeID(pk) {
+		t.Fatalf("status %+v", st)
+	}
+	if rec, _ := loadJSON[linkRecord](kv, linkKey); rec == nil || rec.KeyFp != fp {
+		t.Fatalf("link record %+v", rec)
+	}
+}
+
+// A grant on a box whose link is ending waits for the receipt.
+func TestAGrantWaitsForAnEndingLink(t *testing.T) {
+	svc := newFakeService(t)
+	h := newHarness(t, svc)
+	h.setRoster(func(r *fakeRosterState) { r.tun = true })
+	h.nextRoster(t)
+	h.setRoster(func(r *fakeRosterState) { r.gone = true })
+	svc.waitFor(cloudwire.MsgBye, 3*time.Second)
+	if err := h.link.Grant(GrantRequest{Scopes: []string{protocol.ScopeLiveRead}, Policy: "p"}); !errors.Is(err, ErrLinkEnding) {
+		t.Fatalf("grant while the link ends: %v", err)
+	}
+}
+
+// A QR that names the home reads it here: empty until the box links, and
+// empty again while its link ends.
+func TestHomeIsSetOnlyWhileLinked(t *testing.T) {
+	svc := newFakeService(t)
+	h := newHarness(t, svc)
+	if h.link.Home() != "" {
+		t.Fatal("a home before the box linked")
+	}
+	h.setRoster(func(r *fakeRosterState) { r.tun = true })
+	if home := h.link.Home(); home == "" || home != h.link.Status().Home {
+		t.Fatalf("home %q, status %q", home, h.link.Status().Home)
+	}
+	h.nextRoster(t)
+	h.setRoster(func(r *fakeRosterState) { r.gone = true })
+	svc.waitFor(cloudwire.MsgBye, 3*time.Second)
+	if h.link.Home() != "" {
+		t.Fatal("a home while the link ends")
+	}
+}
+
+// Bulk is paced under the service's limits, and lane 0 never waits behind
+// it: a phone's command and its answer go first.
+func TestLaneZeroGoesAheadOfPacedBulk(t *testing.T) {
+	svc := newFakeService(t)
+	h := newHarness(t, svc)
+	h.setRoster(func(r *fakeRosterState) { r.tun = true })
+	h.nextRoster(t)
+	// More bulk than the pacer's burst lets through at once.
+	big := make([]byte, 16_384)
+	n := 0
+	for range 240 {
+		if h.link.SendTun(cloudwire.Tun{Dev: "q5Lw0Zb1", Sid: 1, D: big}, true) == nil {
+			n++
+		}
+	}
+	if n < 230 {
+		t.Fatalf("only %d of 240 bulk messages queued", n)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if h.link.SendTun(cloudwire.Tun{Dev: "q5Lw0Zb1", Sid: 2, D: []byte{1}}, false) != nil {
+		t.Fatal("lane 0 was refused")
+	}
+	start := time.Now()
+	for {
+		env := svc.waitFor(cloudwire.MsgTun, 5*time.Second)
+		var m cloudwire.Tun
+		_ = cloudwire.Unmarshal(env.B, &m)
+		if m.Sid == 2 {
+			break
+		}
+	}
+	if waited := time.Since(start); waited > 500*time.Millisecond {
+		t.Fatalf("lane 0 waited %s behind bulk", waited)
+	}
+}
+
+// The pacer lets a burst through and then holds bulk to nine tenths of the
+// service's rate.
+func TestThePacerKeepsBulkUnderTheServicesLimits(t *testing.T) {
+	now := time.Unix(1_791_820_800, 0)
+	q := newPacer(now)
+	sent, at := 0, now
+	for at.Sub(now) < 10*time.Second {
+		at = at.Add(q.take(16_384, at))
+		sent++
+	}
+	limit := cloudwire.TunMsgBurst + 10*cloudwire.TunMsgsPerSecond
+	byteLimit := (cloudwire.TunByteBurst + 10*cloudwire.TunBytesPerSecond) / 16_384
+	if sent > limit || sent > byteLimit {
+		t.Fatalf("%d bulk messages of 16 KiB in 10 s, over the service's %d messages or %d by bytes", sent, limit, byteLimit)
+	}
+}
+
+// A roster built after a revoke landed carries the revoke, whatever snapshot
+// the caller held from before.
+func TestTheRosterReadsTheLinkAsItIsWhenDue(t *testing.T) {
+	svc := newFakeService(t)
+	link, err := New(Options{Site: &fakeSite{}, Roster: fakeRoster{state: &fakeRosterState{tun: true}}, KV: &memKV{},
+		KeyPath: filepath.Join(t.TempDir(), "cloud.key"), ServiceKeys: []*ecdsa.PublicKey{&svc.key.PublicKey}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := link.Grant(GrantRequest{Scopes: []string{protocol.ScopeLiveRead}, Policy: "p"}); err != nil {
+		t.Fatal(err)
+	}
+	stale := link.current()
+	if _, ok := link.takeRoster(false); !ok {
+		t.Fatal("no roster due after a grant")
+	}
+	if err := link.Revoke("test"); err != nil {
+		t.Fatal(err)
+	}
+	r, ok := link.takeRoster(false)
+	if !ok || len(r.Grant.ID) == 0 || len(r.Grant.Purposes) != 0 {
+		t.Fatalf("the roster after a revoke is %+v", r.Grant)
+	}
+	if !stale.copyOn() || stale.allowed(cloudwire.MsgLive) == link.current().allowed(cloudwire.MsgLive) {
+		t.Fatal("the stale snapshot is not stale")
+	}
+}
+
+// A QR code shown and never used: when it runs out, nothing needs the link,
+// and the link ends.
+func TestAnUnusedCodeEndsTheLinkWhenItRunsOut(t *testing.T) {
+	svc := newFakeService(t)
+	svc.purge = true
+	h := newHarness(t, svc)
+	h.setRoster(func(r *fakeRosterState) {
+		r.gone, r.code, r.expires = true, bytes.Repeat([]byte{1}, 16), time.Now().Add(400*time.Millisecond)
+	})
+	if h.link.Status().Link != "on" {
+		t.Fatal("a code on the screen did not link the box")
+	}
+	h.nextRoster(t)
+	svc.waitFor(cloudwire.MsgBye, 3*time.Second)
+	deadline := time.Now().Add(3 * time.Second)
+	for h.link.Status().Link != "off" {
+		if time.Now().After(deadline) {
+			t.Fatalf("the link outlived its unused code: %+v", h.link.Status())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// A cloud.key already on disk is adopted, never replaced: its home id is
+// one phones may dial.
+func TestAKeyOnDiskIsAdoptedNeverReplaced(t *testing.T) {
+	svc := newFakeService(t)
+	keyPath := filepath.Join(t.TempDir(), "cloud.key")
+	key, err := createKey(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, pk, _ := fingerprint(key)
+	if _, err := createKey(keyPath); err == nil {
+		t.Fatal("createKey replaced an existing key")
+	}
+	link, err := New(Options{Site: &fakeSite{}, Roster: fakeRoster{state: &fakeRosterState{tun: true}}, KV: &memKV{},
+		KeyPath: keyPath, ServiceKeys: []*ecdsa.PublicKey{&svc.key.PublicKey}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	link.RosterChanged()
+	if home := link.Home(); home != cloudwire.HomeID(pk) {
+		t.Fatalf("linked as %q, the key on disk is %q", home, cloudwire.HomeID(pk))
+	}
+}
+
+// The readable copy turns on and off while the link stays up: readings start
+// with the grant on the same connection and stop with the revoke.
+func TestTheCopyTurnsOnAndOffOnALiveConnection(t *testing.T) {
+	svc := newFakeService(t)
+	h := newHarness(t, svc)
+	h.setRoster(func(r *fakeRosterState) { r.tun = true })
+	h.nextRoster(t)
+	time.Sleep(300 * time.Millisecond)
+	h.grant(t)
+	svc.waitFor(cloudwire.MsgLive, 5*time.Second)
+	if err := h.link.Revoke("test"); err != nil {
+		t.Fatal(err)
+	}
+	r := h.nextRoster(t)
+	for len(r.Grant.Purposes) != 0 {
+		r = h.nextRoster(t)
+	}
+	time.Sleep(2500 * time.Millisecond)
+	svc.mu.Lock()
+	conns := svc.conns
+	var order []string
+	for _, env := range svc.got {
+		order = append(order, env.T)
+	}
+	svc.mu.Unlock()
+	if conns != 1 {
+		t.Fatalf("the copy turning on and off took %d connections", conns)
+	}
+	// off: roster only; on: readings; off again: nothing readable after the
+	// withdrawing roster.
+	firstLive, withdrawn := -1, -1
+	rosters := 0
+	for i, typ := range order {
+		switch typ {
+		case cloudwire.MsgLive:
+			if firstLive < 0 {
+				firstLive = i
+			}
+			if withdrawn >= 0 {
+				t.Fatalf("live after the withdrawing roster: %v", order)
+			}
+		case cloudwire.MsgRoster:
+			rosters++
+			var ro cloudwire.Roster
+			_ = cloudwire.Unmarshal(svc.received()[i].B, &ro)
+			if len(ro.Grant.ID) > 0 && len(ro.Grant.Purposes) == 0 {
+				withdrawn = i
+			}
+		case cloudwire.MsgHB, cloudwire.MsgLP, cloudwire.MsgPrices:
+			if firstLive < 0 || withdrawn >= 0 {
+				t.Fatalf("%s outside the copy: %v", typ, order)
+			}
+		}
+	}
+	if firstLive <= 0 || withdrawn <= firstLive || rosters < 3 {
+		t.Fatalf("order %v", order)
+	}
+}
+
+// The copy keeps flowing when the tunnel's own budget is spent.
+func TestTheCopyFlowsPastTheTunnelBudget(t *testing.T) {
+	svc := newFakeService(t)
+	h := newHarness(t, svc)
+	h.link.mu.Lock()
+	h.link.tunBudget.add(h.link.uptimeMs(), tunBudgetBytes)
+	h.link.mu.Unlock()
+	h.setRoster(func(r *fakeRosterState) { r.tun = true })
+	h.grant(t)
+	svc.waitFor(cloudwire.MsgLive, 5*time.Second)
+	h.site.setGrid(4321)
+	svc.waitFor(cloudwire.MsgLive, 7*time.Second)
+	if err := h.link.SendTun(cloudwire.Tun{Dev: "q5Lw0Zb1", Sid: 1, D: []byte{1}}, false); err == nil {
+		t.Fatal("tun went past its own budget")
+	}
+}

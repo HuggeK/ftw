@@ -8,6 +8,7 @@ import (
 
 	"github.com/srcfl/ftw/go/internal/apiauth"
 	"github.com/srcfl/ftw/go/internal/appenroll"
+	"github.com/srcfl/ftw/go/internal/appuplink"
 )
 
 func rosterKey(t *testing.T) []byte {
@@ -32,7 +33,7 @@ func rosterPhone(t *testing.T, id *appenroll.Identity, role string) appenroll.Gr
 	return grant
 }
 
-func rosterScopes(t *testing.T, roster cloudRoster, deviceID string) []string {
+func rosterScopes(t *testing.T, roster appuplink.CloudRoster, deviceID string) []string {
 	t.Helper()
 	for _, d := range roster.Devices() {
 		if d.ID == deviceID {
@@ -60,7 +61,7 @@ func TestTheRosterNarrowsAWatchToWhatItsPhoneHolds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	roster := cloudRoster{enroll: id}
+	roster := appuplink.CloudRoster{Enroll: id}
 
 	if got := rosterScopes(t, roster, watch.DeviceID); !slices.Equal(got, apiauth.RoleScopes[apiauth.RoleWatch]) {
 		t.Fatalf("under an owner the roster gives the watch %v", got)

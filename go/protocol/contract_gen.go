@@ -125,6 +125,7 @@ const (
 	CapPriceSpot       = "price.spot"
 	CapApiPassthrough  = "api.passthrough"
 	CapCloudLink       = "cloud.link"
+	CapCloudTun        = "cloud.tun"
 	CapCmdExchange     = "cmd.exchange"
 )
 
@@ -147,6 +148,7 @@ var AllCapabilities = []string{
 	CapPriceSpot,
 	CapApiPassthrough,
 	CapCloudLink,
+	CapCloudTun,
 	CapCmdExchange,
 }
 

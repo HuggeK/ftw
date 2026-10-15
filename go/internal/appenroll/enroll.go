@@ -212,6 +212,12 @@ type Identity struct {
 	// onChange hears about every change to who is paired and what they
 	// may do, after it is saved. Not about lastSeen stamps.
 	onChange []func()
+	// onPairingCode hears about a phone's code minted, which puts a new
+	// code on the screen or takes one off it.
+	onPairingCode []func()
+	// home is the home id at FTW Cloud, for a QR that names it. See
+	// SetHome.
+	home func() string
 }
 
 // appMeta is what the box remembers about one paired phone.
@@ -496,6 +502,7 @@ func (i *Identity) MintPairingCode(role string, ttl time.Duration) ([]byte, time
 	i.mu.Lock()
 	i.pairing = &pairingCode{code: code, expiresAt: expires, role: role, kind: PairingKindQR}
 	i.mu.Unlock()
+	i.minted()
 
 	return append([]byte(nil), code...), expires, nil
 }
@@ -522,8 +529,42 @@ func (i *Identity) MintSpokenCode(role string) (string, time.Time, error) {
 	i.mu.Lock()
 	i.pairing = &pairingCode{code: code, expiresAt: expires, role: role, kind: PairingKindSpoken}
 	i.mu.Unlock()
+	i.minted()
 
 	return GroupSpokenCode(encodeSpoken(code)), expires, nil
+}
+
+// PendingCode is the QR code a phone may pair with now, for FTW Cloud's
+// roster to list by its hash, so the service admits that phone's first
+// session. A spoken code is never one: forty bits behind a hash are forty
+// bits the service could find. Nor is a watch code, an expired code or a
+// spent one.
+func (i *Identity) PendingCode() ([]byte, time.Time, bool) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	p := i.pairing
+	if p == nil || p.kind != PairingKindQR || !i.now().Before(p.expiresAt) {
+		return nil, time.Time{}, false
+	}
+	return append([]byte(nil), p.code...), p.expiresAt, true
+}
+
+// OnPairingCode registers fn to run after a phone's code is minted, which
+// shows a new one and takes any older one off the screen. A code spent is
+// a pairing, and OnChange hears about it.
+func (i *Identity) OnPairingCode(fn func()) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.onPairingCode = append(i.onPairingCode, fn)
+}
+
+func (i *Identity) minted() {
+	i.mu.Lock()
+	fns := append([]func(){}, i.onPairingCode...)
+	i.mu.Unlock()
+	for _, fn := range fns {
+		fn()
+	}
 }
 
 // knownRole refuses a role the registry does not define.
@@ -566,38 +607,62 @@ func phoneRole(role string) error {
 // authenticated; until now it threw that away and answered only yes or no,
 // which is why nothing downstream could tell two phones apart.
 func (i *Identity) Authorise(appStatic, payload []byte) (Grant, error) {
+	_, commit, err := i.Check(appStatic, payload)
+	if err != nil {
+		return Grant{}, err
+	}
+	return commit()
+}
+
+// Check is Authorise in two steps: it decides now, and changes nothing but a
+// wrong guess's count until commit runs. A carrier commits once the session
+// has proved itself with its first transport message, so a handshake message
+// replayed by whoever carries it costs a reconnect stamp nothing, spends no
+// code and takes no device's place. commit returns the grant as it stands
+// then, and fails if a revoke, another pairing or the code's end came first.
+func (i *Identity) Check(appStatic, payload []byte) (Grant, func() (Grant, error), error) {
 	key := base64.RawURLEncoding.EncodeToString(appStatic)
 
 	i.mu.Lock()
 	if meta := i.authorised[key]; meta != nil {
 		if meta.role == apiauth.RoleWatch {
 			// A watch has no stream. It reaches the box through the
-			// exchange, which never takes one of a phone's four places, and
+			// exchange, which never takes a phone's place, and
 			// it answers here as a stranger would.
 			i.mu.Unlock()
-			return Grant{}, ErrNoPairing
+			return Grant{}, nil, ErrNoPairing
 		}
+		grant := i.grantLocked(key, meta)
+		i.mu.Unlock()
 		// A reconnect. The stamp is what lets the settings page tell a
 		// phone in daily use from a key that paired once and vanished —
 		// which is exactly the row someone wants to revoke.
-		meta.lastSeenMs = i.now().UnixMilli()
-		grant := i.grantLocked(key, meta)
-		i.mu.Unlock()
-		// A stamp that could not be persisted must not block a session.
-		_ = i.save()
-		return grant, nil
+		return grant, func() (Grant, error) {
+			i.mu.Lock()
+			meta := i.authorised[key]
+			if meta == nil {
+				i.mu.Unlock()
+				return Grant{}, ErrNoPairing
+			}
+			meta.lastSeenMs = i.now().UnixMilli()
+			grant := i.grantLocked(key, meta)
+			i.mu.Unlock()
+			// A stamp that could not be persisted must not block a session.
+			_ = i.save()
+			return grant, nil
+		}, nil
 	}
 	// The rest happens under the lock, because counting a wrong guess is a
 	// read and a write of the same code and two handshakes racing must not
 	// each see four attempts and let a fifth and a sixth through.
 	if len(payload) == 0 {
 		i.mu.Unlock()
-		return Grant{}, ErrNoPairing
+		return Grant{}, nil, ErrNoPairing
 	}
 	pairing := i.pairing
 	if pairing == nil || !i.now().Before(pairing.expiresAt) {
 		i.mu.Unlock()
-		return Grant{}, ErrBadPairing
+		return Grant{}, nil, ErrBadPairing
 	}
 	// Constant time, because a byte-at-a-time comparison against a live code
 	// is exactly the oracle an attacker with a relay socket would want.
@@ -622,13 +687,43 @@ func (i *Identity) Authorise(appStatic, payload []byte) (Grant, error) {
 			i.pairing = nil
 		}
 		i.mu.Unlock()
-		return Grant{}, ErrBadPairing
+		return Grant{}, nil, ErrBadPairing
 	}
+	grant := Grant{DeviceID: deviceID(key), Role: i.pairingRoleLocked(pairing), Epoch: firstEpoch}
+	i.mu.Unlock()
 
-	now := i.now().UnixMilli()
-	// The role travels with the code rather than with the handshake, so a
-	// code minted for a viewer stamps a viewer here — and nothing the app
-	// sends can change it.
+	return grant, func() (Grant, error) {
+		i.mu.Lock()
+		if meta := i.authorised[key]; meta != nil {
+			// The same phone's other session committed first.
+			grant := i.grantLocked(key, meta)
+			i.mu.Unlock()
+			return grant, nil
+		}
+		// The code must still be the one this handshake carried: not spent
+		// by another phone, replaced or out of time.
+		if i.pairing != pairing || !i.now().Before(pairing.expiresAt) {
+			i.mu.Unlock()
+			return Grant{}, ErrBadPairing
+		}
+		now := i.now().UnixMilli()
+		role := i.pairingRoleLocked(pairing)
+		i.authorised[key] = &appMeta{addedAtMs: now, lastSeenMs: now, role: role, epoch: firstEpoch}
+		// Spent. A second phone offering the same photographed code now meets
+		// ErrBadPairing rather than a pairing.
+		i.pairing = nil
+		i.mu.Unlock()
+
+		err := i.save()
+		i.changed()
+		return Grant{DeviceID: deviceID(key), Role: role, Epoch: firstEpoch}, err
+	}, nil
+}
+
+// pairingRoleLocked is the role a code stamps. The role travels with the code
+// rather than with the handshake, so a code minted for a viewer stamps a
+// viewer, and nothing the app sends can change it. The caller holds i.mu.
+func (i *Identity) pairingRoleLocked(pairing *pairingCode) string {
 	role := pairing.role
 	if role == "" {
 		role = apiauth.RoleOwner
@@ -641,15 +736,7 @@ func (i *Identity) Authorise(appStatic, payload []byte) (Grant, error) {
 		// phone would have built exactly that.
 		role = apiauth.RoleOwner
 	}
-	i.authorised[key] = &appMeta{addedAtMs: now, lastSeenMs: now, role: role, epoch: firstEpoch}
-	// Spent. A second phone offering the same photographed code now meets
-	// ErrBadPairing rather than a pairing.
-	i.pairing = nil
-	i.mu.Unlock()
-
-	err := i.save()
-	i.changed()
-	return Grant{DeviceID: deviceID(key), Role: role, Epoch: firstEpoch}, err
+	return role
 }
 
 // hasOwnerLocked reports whether any enrolment can still administer this box.

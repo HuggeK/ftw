@@ -164,6 +164,14 @@ func (l *CmdLog) capRoot(fresh cmdKey) {
 	}
 }
 
+// forget drops a command id the box took but never acted on, so a retry
+// acts.
+func (l *CmdLog) forget(root, cmdID string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.entries, cmdKey{root, cmdID})
+}
+
 // settle attaches the outcome to a remembered command.
 func (l *CmdLog) settle(root, cmdID string, res CmdResult) {
 	l.mu.Lock()

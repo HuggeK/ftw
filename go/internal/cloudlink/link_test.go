@@ -105,11 +105,68 @@ func (s *fakeSite) Prices() (cloudwire.Prices, bool) {
 		SpotMinor: []*int64{&p}, TotalMinor: []*int64{&p}}, true
 }
 
-type fakeRoster struct{}
+// fakeRoster is one owner phone. Its zero value is a box from before the
+// tunnel, whose phone may not open one, so nothing links it but a grant.
+type fakeRoster struct {
+	state *fakeRosterState
+}
 
-func (fakeRoster) Devices() []RosterDevice {
+type fakeRosterState struct {
+	mu      sync.Mutex
+	tun     bool
+	gone    bool
+	code    []byte
+	expires time.Time
+}
+
+func (r fakeRoster) Devices() []RosterDevice {
+	tun := false
+	if r.state != nil {
+		r.state.mu.Lock()
+		defer r.state.mu.Unlock()
+		if r.state.gone {
+			return nil
+		}
+		tun = r.state.tun
+	}
 	return []RosterDevice{{ID: "q5Lw0Zb1", Key: bytes.Repeat([]byte{5}, 32), Role: "owner", Epoch: 1,
-		Scopes: []string{protocol.ScopeLiveRead, protocol.ScopeDispatchWrite, protocol.ScopeEventsRead}}}
+		Scopes: []string{protocol.ScopeLiveRead, protocol.ScopeDispatchWrite, protocol.ScopeEventsRead}, Tun: tun}}
+}
+
+func (r fakeRoster) Pending() ([]byte, time.Time, bool) {
+	if r.state == nil {
+		return nil, time.Time{}, false
+	}
+	r.state.mu.Lock()
+	defer r.state.mu.Unlock()
+	// As enrolment does, a code that ran out is none.
+	return r.state.code, r.state.expires, r.state.code != nil && time.Now().Before(r.state.expires)
+}
+
+// fakeTunnel is the box's session table, as the link sees it.
+type fakeTunnel struct {
+	ch    chan cloudwire.Tun
+	mu    sync.Mutex
+	drops int
+}
+
+func (f *fakeTunnel) Deliver(t cloudwire.Tun) {
+	select {
+	case f.ch <- t:
+	default:
+	}
+}
+
+func (f *fakeTunnel) Drop() {
+	f.mu.Lock()
+	f.drops++
+	f.mu.Unlock()
+}
+
+func (f *fakeTunnel) dropped() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.drops
 }
 
 // fakeService is ftwcloudd's half of the handshake, enough to test the box.
@@ -125,6 +182,7 @@ type fakeService struct {
 	afterHello  func(conn *websocket.Conn, home string)
 	rosterSeqOK uint64
 
+	wmu   sync.Mutex
 	mu    sync.Mutex
 	conns int
 	hello []byte
@@ -163,6 +221,8 @@ func (s *fakeService) write(conn *websocket.Conn, key *ecdsa.PrivateKey, home, t
 	}
 	raw, _ := env.Encode()
 	frame, _ := cloudwire.EncodeFrame(raw)
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
 	_ = conn.WriteMessage(websocket.BinaryMessage, frame)
 }
 
@@ -233,8 +293,17 @@ func (s *fakeService) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		env, err := cloudwire.DecodeEnvelope(payload)
-		if err != nil || cloudwire.Verify(pub, home, env) != nil {
-			s.t.Errorf("box envelope %q does not verify: %v", env.T, err)
+		switch {
+		case err != nil:
+			s.t.Errorf("box frame: %v", err)
+			return
+		case env.T == cloudwire.MsgTun:
+			// d is Noise ciphertext; the box signs no tun.
+			if len(env.Sig) != 0 {
+				s.t.Errorf("the box signed a tun")
+			}
+		case cloudwire.Verify(pub, home, env) != nil:
+			s.t.Errorf("box envelope %q does not verify", env.T)
 			return
 		}
 		s.mu.Lock()
@@ -242,19 +311,22 @@ func (s *fakeService) handle(w http.ResponseWriter, r *http.Request) {
 		s.raw = append(s.raw, msg)
 		s.mu.Unlock()
 		s.ch <- env
-		if env.T == cloudwire.MsgBye && s.purge {
+		if !s.purge {
+			continue
+		}
+		switch env.T {
+		case cloudwire.MsgBye:
 			var bye cloudwire.Bye
-			_ = cloudwire.Unmarshal(env.B, &bye)
-			var grantID []byte
-			for _, e := range s.received() {
-				var r cloudwire.Roster
-				if e.T == cloudwire.MsgRoster && cloudwire.Unmarshal(e.B, &r) == nil {
-					grantID = r.Grant.ID
-				}
-			}
-			if bye.Purge {
+			if cloudwire.Unmarshal(env.B, &bye) == nil && bye.Purge {
 				s.write(conn, s.key, home, cloudwire.MsgPurged, cloudwire.Purged{
-					AtMs: 1_791_821_000_000, What: cloudwire.PurgedHome, GrantID: grantID})
+					AtMs: 1_791_821_000_000, What: cloudwire.PurgedHome})
+			}
+		case cloudwire.MsgRoster:
+			// A grant with an id and no purposes asks for its copy to go.
+			var r cloudwire.Roster
+			if cloudwire.Unmarshal(env.B, &r) == nil && len(r.Grant.ID) > 0 && len(r.Grant.Purposes) == 0 {
+				s.write(conn, s.key, home, cloudwire.MsgPurged, cloudwire.Purged{
+					AtMs: 1_791_821_000_000, What: cloudwire.PurgedCopy, GrantID: r.Grant.ID})
 			}
 		}
 	}
@@ -287,6 +359,8 @@ type harness struct {
 	link    *Link
 	svc     *fakeService
 	site    *fakeSite
+	roster  *fakeRosterState
+	tunnel  *fakeTunnel
 	kv      *memKV
 	keyPath string
 	cancel  context.CancelFunc
@@ -304,11 +378,13 @@ func newHarness(t *testing.T, svc *fakeService) *harness {
 func newHarnessKeys(t *testing.T, svc *fakeService, keys []*ecdsa.PublicKey) *harness {
 	t.Helper()
 	h := &harness{svc: svc, site: &fakeSite{grid: 1200, state: protocol.SourceLive}, kv: &memKV{},
-		keyPath: filepath.Join(t.TempDir(), "cloud.key"), pushed: make(chan string, 8)}
+		keyPath: filepath.Join(t.TempDir(), "cloud.key"), pushed: make(chan string, 8),
+		roster: &fakeRosterState{}, tunnel: &fakeTunnel{ch: make(chan cloudwire.Tun, 64)}}
 	link, err := New(Options{
-		Site: h.site, Roster: fakeRoster{}, KV: h.kv, KeyPath: h.keyPath, Build: "test",
+		Site: h.site, Roster: fakeRoster{state: h.roster}, KV: h.kv, KeyPath: h.keyPath, Build: "test",
 		Started: time.Now().Add(-time.Minute), ClockSynced: func() bool { return true },
 		Notify:   func(kind string) { h.pushed <- kind },
+		Tunnel:   h.tunnel,
 		Endpoint: svc.endpoint(), ServiceKeys: keys,
 		RootCAs: svc.roots(), Tick: 20 * time.Millisecond,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -325,6 +401,14 @@ func newHarnessKeys(t *testing.T, svc *fakeService, keys []*ecdsa.PublicKey) *ha
 		<-h.done
 	})
 	return h
+}
+
+// setRoster changes the phones as enrolment would, and tells the link.
+func (h *harness) setRoster(change func(r *fakeRosterState)) {
+	h.roster.mu.Lock()
+	change(h.roster)
+	h.roster.mu.Unlock()
+	h.link.RosterChanged()
 }
 
 func (h *harness) grant(t *testing.T, scopes ...string) {
@@ -561,13 +645,18 @@ func TestATableChangeGoesAtOnceWithANewRevision(t *testing.T) {
 	}
 }
 
-func TestRevokeDeletesTheKeyOnlyAfterTheReceipt(t *testing.T) {
+// Turning the readable copy off stops readings at once, asks the service to
+// delete the copy, and forgets the grant on the receipt. The link stays, with
+// its key and home id, for the phones' tunnels.
+func TestRevokeDeletesTheCopyAndKeepsTheLink(t *testing.T) {
 	svc := newFakeService(t)
 	svc.purge = true
 	h := newHarness(t, svc)
+	h.setRoster(func(r *fakeRosterState) { r.tun = true })
 	h.grant(t)
 	<-h.pushed
 	svc.waitFor(cloudwire.MsgLive, 5*time.Second)
+	home := h.link.Status().Home
 
 	if err := h.link.Revoke("test"); err != nil {
 		t.Fatal(err)
@@ -575,10 +664,12 @@ func TestRevokeDeletesTheKeyOnlyAfterTheReceipt(t *testing.T) {
 	if kind := <-h.pushed; kind != protocol.PushCloudRevoked {
 		t.Fatalf("owners were told %q", kind)
 	}
-	bye := svc.waitFor(cloudwire.MsgBye, 3*time.Second)
-	var b cloudwire.Bye
-	if cloudwire.Unmarshal(bye.B, &b) != nil || !b.Purge || b.Why != cloudwire.ByeRevoked {
-		t.Fatalf("bye %+v", b)
+	r := h.nextRoster(t)
+	for len(r.Grant.Purposes) != 0 {
+		r = h.nextRoster(t)
+	}
+	if len(r.Grant.ID) != cloudwire.GrantIDBytes || len(r.Grant.Scopes) != 0 {
+		t.Fatalf("the revoking roster's grant is %+v", r.Grant)
 	}
 	deadline := time.Now().Add(3 * time.Second)
 	for h.link.Status().State != "off" {
@@ -587,22 +678,35 @@ func TestRevokeDeletesTheKeyOnlyAfterTheReceipt(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if _, err := os.Stat(h.keyPath); !os.IsNotExist(err) {
-		t.Fatal("cloud.key survived a confirmed purge")
+	st := h.link.Status()
+	if st.PurgedAtMs != 1_791_821_000_000 || st.Link != "on" || st.Home != home {
+		t.Fatalf("after the receipt: %+v", st)
 	}
-	if st := h.link.Status(); st.PurgedAtMs != 1_791_821_000_000 {
-		t.Fatalf("receipt time %d", st.PurgedAtMs)
+	if _, err := os.Stat(h.keyPath); err != nil {
+		t.Fatal("cloud.key went with the copy")
 	}
-	// After the bye, nothing but the receipt's ack: no readings.
-	got := svc.received()
-	for i, env := range got {
-		if env.T == cloudwire.MsgBye && i != len(got)-1 {
-			t.Fatalf("the box sent %s after bye", got[i+1].T)
+	if g, _ := loadJSON[grantRecord](h.kv, grantKey); g != nil {
+		t.Fatalf("the grant record survived its receipt: %+v", g)
+	}
+	// After the revoking roster, no reading left the house.
+	after := false
+	for _, env := range svc.received() {
+		switch {
+		case env.T == cloudwire.MsgRoster:
+			var r cloudwire.Roster
+			_ = cloudwire.Unmarshal(env.B, &r)
+			after = after || (len(r.Grant.ID) > 0 && len(r.Grant.Purposes) == 0)
+		case after && env.T != cloudwire.MsgTun:
+			t.Fatalf("the box sent %s after the revoke", env.T)
 		}
+	}
+	// The next roster has no grant at all.
+	if r := h.nextRoster(t); len(r.Grant.ID) != 0 || len(r.Grant.Purposes) != 0 {
+		t.Fatalf("the roster after the receipt still names a grant: %+v", r.Grant)
 	}
 }
 
-func TestRevokeWithoutAReceiptKeepsTheKey(t *testing.T) {
+func TestRevokeWithoutAReceiptKeepsTheGrantRevoking(t *testing.T) {
 	svc := newFakeService(t)
 	h := newHarness(t, svc)
 	h.grant(t)
@@ -610,10 +714,9 @@ func TestRevokeWithoutAReceiptKeepsTheKey(t *testing.T) {
 	if err := h.link.Revoke("test"); err != nil {
 		t.Fatal(err)
 	}
-	svc.waitFor(cloudwire.MsgBye, 3*time.Second)
 	time.Sleep(200 * time.Millisecond)
-	if _, err := os.Stat(h.keyPath); err != nil {
-		t.Fatal("cloud.key went before the service confirmed the purge")
+	if g, _ := loadJSON[grantRecord](h.kv, grantKey); g == nil || !g.Revoked {
+		t.Fatalf("grant record before the receipt: %+v", g)
 	}
 	if st := h.link.Status(); st.State != "revoking" {
 		t.Fatalf("state %s", st.State)
@@ -818,19 +921,21 @@ func TestSessionInfoLetsAPhoneCheckAndNameWhatTheServiceForwards(t *testing.T) {
 	}
 }
 
-// Turning FTW Cloud off withdraws the session information at once, before the
-// service confirms the deletion.
-func TestSessionInfoGoesWithTheGrant(t *testing.T) {
+// Turning the readable copy off withdraws the names at once, before the
+// service confirms the deletion. The home id stays, for the tunnel.
+func TestSessionInfoKeepsTheHomeWithoutTheGrant(t *testing.T) {
 	svc := newFakeService(t)
 	h := newHarness(t, svc)
 	h.grant(t)
-	if h.link.SessionInfo() == nil {
-		t.Fatal("no session information with FTW Cloud on")
+	if s := h.link.SessionInfo(); s == nil || len(s.Sources) == 0 {
+		t.Fatalf("session information with FTW Cloud on: %+v", s)
 	}
 	if err := h.link.Revoke("test"); err != nil {
 		t.Fatal(err)
 	}
-	if s := h.link.SessionInfo(); s != nil || h.link.Status().State != "revoking" {
+	s := h.link.SessionInfo()
+	if s == nil || s.Home != h.link.Status().Home || len(s.Sources) != 0 || len(s.Loadpoints) != 0 ||
+		h.link.Status().State != "revoking" {
 		t.Fatalf("while revoking: %+v", s)
 	}
 }

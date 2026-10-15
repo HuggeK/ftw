@@ -10,7 +10,7 @@ import (
 )
 
 // A watch reaches the box through the exchange and never through the stream,
-// so it can never take one of a phone's four places. Its key on the stream
+// so it can never take a phone's place. Its key on the stream
 // gets the silence a stranger gets.
 func TestAWatchKeyGetsNoStream(t *testing.T) {
 	r := newRig(t, 481234)

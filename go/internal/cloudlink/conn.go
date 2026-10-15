@@ -69,7 +69,7 @@ func (l *Link) once(ctx context.Context, snap grantSnapshot) (time.Duration, err
 		l.attempt = 0
 	}
 	l.mu.Unlock()
-	if errors.Is(err, errPurged) || errors.Is(err, errClosed) {
+	if errors.Is(err, errLinkEnded) || errors.Is(err, errClosed) {
 		return 0, nil
 	}
 	return l.backoff(), err
@@ -88,8 +88,22 @@ func (l *Link) backoff() time.Duration {
 	return time.Duration(n.Int64())
 }
 
-// errPurged ends a connection after the service confirmed a deletion.
-var errPurged = errors.New("cloudlink: purge confirmed")
+// errLinkEnded ends a connection after the service confirmed that the home
+// is gone.
+var errLinkEnded = errors.New("cloudlink: the end of the link is confirmed")
+
+// The tunnel's two queues, apart from the readable copy. Lane 0, a phone's
+// commands, their answers and the one-second ticks, goes first and is never
+// held. Bulk is paced under the service's limits and waits its turn. When a
+// queue is full the newest message is dropped: Noise transport carries its
+// own counter, so a lost message costs the phone one frame.
+const (
+	tunQueue     = 64
+	tunBulkQueue = 256
+	// tunPace is the share of the service's limits bulk is paced to, so
+	// the service never drops for a box that keeps to it.
+	tunPace = 0.9
+)
 
 // serve runs one connection: the handshake, then the reader here and the
 // sender on its own goroutine.
@@ -105,7 +119,7 @@ func (l *Link) serve(ctx context.Context, conn *websocket.Conn, snap grantSnapsh
 	if err != nil {
 		return err
 	}
-	conn.SetReadLimit(cloudwire.MaxServiceFrame)
+	conn.SetReadLimit(cloudwire.MaxTunFrame)
 
 	// 1. challenge
 	_ = conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
@@ -129,7 +143,7 @@ func (l *Link) serve(ctx context.Context, conn *websocket.Conn, snap grantSnapsh
 	hello := cloudwire.Hello{
 		Header: l.header(), V: cloudwire.Version, PK: snap.pk, Nonce: ch.Nonce, EKM: ekm,
 		BoxNonce: boxNonce, Build: l.opts.Build, Clock: l.clockName(),
-		Caps: snap.caps(), RosterSeq: rosterSeq, GrantID: snap.g.ID,
+		Caps: l.caps(snap), RosterSeq: rosterSeq, GrantID: snap.grantID(),
 	}
 	l.mu.Unlock()
 	w := &writer{conn: conn, link: l}
@@ -155,10 +169,24 @@ func (l *Link) serve(ctx context.Context, conn *websocket.Conn, snap grantSnapsh
 		l.bumpRoster(ok.RosterSeq)
 	}
 
+	tunOut, tunBulk := make(chan []byte, tunQueue), make(chan []byte, tunBulkQueue)
 	l.mu.Lock()
 	l.connected = true
+	if l.opts.Tunnel != nil {
+		l.tunOut, l.tunBulk = tunOut, tunBulk
+	}
 	l.mu.Unlock()
 	l.log.Info("FTW Cloud uplink connected", "home", snap.home)
+	defer func() {
+		l.mu.Lock()
+		l.tunOut, l.tunBulk = nil, nil
+		l.mu.Unlock()
+		// Every session the uplink carried ends with it. The phone starts
+		// again on the next one.
+		if l.opts.Tunnel != nil {
+			l.opts.Tunnel.Drop()
+		}
+	}()
 
 	events := make(chan cloudwire.Envelope, 4)
 	readErr := make(chan error, 1)
@@ -169,17 +197,27 @@ func (l *Link) serve(ctx context.Context, conn *websocket.Conn, snap grantSnapsh
 	go func() {
 		sendErr <- w.run(ctx, events)
 	}()
+	tunErr := make(chan error, 1)
+	go func() {
+		tunErr <- w.tunnel(ctx, tunOut, tunBulk)
+	}()
 
+	// The first to end ends the others: cancel closes the socket under the
+	// reader, and the writers stop on the context.
+	pending := []chan error{readErr, sendErr, tunErr}
 	select {
-	case err := <-readErr:
-		cancel()
-		<-sendErr
-		return err
-	case err := <-sendErr:
-		cancel()
-		<-readErr
-		return err
+	case err = <-readErr:
+		pending = pending[1:]
+	case err = <-sendErr:
+		pending = []chan error{readErr, tunErr}
+	case err = <-tunErr:
+		pending = pending[:2]
 	}
+	cancel()
+	for _, ch := range pending {
+		<-ch
+	}
+	return err
 }
 
 // exporterValue is the TLS 1.3 exporter value both ends bind the handshake to.
@@ -211,8 +249,9 @@ func (l *Link) clockName() string {
 	return cloudwire.ClockNone
 }
 
-// readEnvelope reads one binary frame. A text message, a lane 0 frame or a
-// frame over 4 KiB is the service breaking the protocol.
+// readEnvelope reads one binary frame. A text message, a lane 0 frame, a tun
+// frame over MaxTunFrame or any other over 4 KiB is the service breaking the
+// protocol.
 func readEnvelope(conn *websocket.Conn) (cloudwire.Envelope, error) {
 	kind, msg, err := conn.ReadMessage()
 	if err != nil {
@@ -225,7 +264,7 @@ func parseDownlink(kind int, msg []byte) (cloudwire.Envelope, error) {
 	if kind != websocket.BinaryMessage {
 		return cloudwire.Envelope{}, fmt.Errorf("%w: a text message", errService)
 	}
-	if len(msg) > cloudwire.MaxServiceFrame {
+	if len(msg) > cloudwire.MaxTunFrame {
 		return cloudwire.Envelope{}, fmt.Errorf("%w: %d bytes", errService, len(msg))
 	}
 	payload, err := cloudwire.DecodeFrame(msg)
@@ -239,14 +278,17 @@ func parseDownlink(kind int, msg []byte) (cloudwire.Envelope, error) {
 	if !slices.Contains(cloudwire.Downlink, env.T) {
 		return cloudwire.Envelope{}, fmt.Errorf("%w: %q is not a message the service may send", errService, env.T)
 	}
+	if env.T != cloudwire.MsgTun && len(msg) > cloudwire.MaxServiceFrame {
+		return cloudwire.Envelope{}, fmt.Errorf("%w: a %d-byte %s", errService, len(msg), env.T)
+	}
 	return env, nil
 }
 
 // read is the downlink. After the handshake the service may send watch,
-// resync and purged; challenge and hello_ok a second time are refused like
-// any stranger. watch and resync go to the sender, which owns the cadence.
-// A purge receipt is taken here, before the service hangs up, so the box
-// never misses one it was sent.
+// resync, purged and tun; challenge and hello_ok a second time are refused
+// like any stranger. watch and resync go to the sender, which owns the
+// cadence. A purge receipt is taken here, before the service hangs up, so the
+// box never misses one it was sent. A tun goes to the Tunnel unread.
 func (l *Link) read(conn *websocket.Conn, snap grantSnapshot, events chan<- cloudwire.Envelope) error {
 	_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
 	conn.SetPingHandler(func(data string) error {
@@ -262,7 +304,15 @@ func (l *Link) read(conn *websocket.Conn, snap grantSnapshot, events chan<- clou
 		switch env.T {
 		case cloudwire.MsgPurged:
 			if l.acceptPurged(snap, env) {
-				return errPurged
+				return errLinkEnded
+			}
+		case cloudwire.MsgTun:
+			var t cloudwire.Tun
+			if len(env.Sig) != 0 || cloudwire.Unmarshal(env.B, &t) != nil || len(t.D) > cloudwire.TunDataMax {
+				return fmt.Errorf("%w: a tun the box cannot read", errService)
+			}
+			if l.opts.Tunnel != nil {
+				l.opts.Tunnel.Deliver(t)
 			}
 		case cloudwire.MsgWatch, cloudwire.MsgResync:
 			events <- env
@@ -299,12 +349,7 @@ func (w *writer) send(snap grantSnapshot, t string, body any) error {
 		return err
 	}
 
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if err := w.conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
-		return err
-	}
-	if err := w.conn.WriteMessage(websocket.BinaryMessage, frame); err != nil {
+	if err := w.write(frame); err != nil {
 		return err
 	}
 	l := w.link
@@ -314,4 +359,155 @@ func (w *writer) send(snap grantSnapshot, t string, body any) error {
 	l.sent[t] = sentFrame{T: t, Frame: frame, AtMs: l.uptimeMs()}
 	l.mu.Unlock()
 	return nil
+}
+
+// Why a tun did not leave. ErrNoUplink means none will until the box
+// reconnects; ErrTunDropped means this one was lost, to a full queue or the
+// tunnel's own budget, and was counted. Noise transport survives a lost
+// message, so a session goes on after ErrTunDropped.
+var (
+	ErrNoUplink   = errors.New("cloudlink: no uplink to FTW Cloud")
+	ErrTunDropped error = tunDropped{}
+)
+
+// tunDropped says, through Dropped, that one message was lost and counted,
+// so a caller that may not import this package can tell it from a lost
+// uplink.
+type tunDropped struct{}
+
+func (tunDropped) Error() string { return "cloudlink: a tun was dropped" }
+func (tunDropped) Dropped() bool { return true }
+
+// SendTun queues one tun for the uplink. bulk says it carries a lane 1 frame,
+// which is paced; anything else goes first. It never blocks. nil means the
+// message is queued.
+func (l *Link) SendTun(t cloudwire.Tun, bulk bool) error {
+	frame, err := tunFrame(t)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	q := l.tunOut
+	if bulk {
+		q = l.tunBulk
+	}
+	switch {
+	case q == nil:
+		l.tunDropped++
+		return ErrNoUplink
+	case err != nil || l.tunBudget.total(l.uptimeMs()) >= tunBudgetBytes:
+		l.tunDropped++
+		return ErrTunDropped
+	}
+	select {
+	case q <- frame:
+		return nil
+	default:
+		l.tunDropped++
+		return ErrTunDropped
+	}
+}
+
+func tunFrame(t cloudwire.Tun) ([]byte, error) {
+	if len(t.D) > cloudwire.TunDataMax {
+		return nil, ErrTunDropped
+	}
+	body, err := cloudwire.Marshal(t)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := cloudwire.Envelope{T: cloudwire.MsgTun, B: body}.Encode()
+	if err != nil {
+		return nil, err
+	}
+	return cloudwire.EncodeFrame(raw)
+}
+
+// pacer keeps bulk under the service's tun limits: a message bucket and a
+// byte bucket at tunPace of them. Taking may leave either in debt; the wait
+// is how long until it is paid.
+type pacer struct {
+	msgs, bytes float64
+	at          time.Time
+}
+
+func newPacer(now time.Time) *pacer {
+	return &pacer{msgs: tunPace * cloudwire.TunMsgBurst, bytes: tunPace * cloudwire.TunByteBurst, at: now}
+}
+
+func (p *pacer) take(n int, now time.Time) time.Duration {
+	dt := now.Sub(p.at).Seconds()
+	p.at = now
+	p.msgs = min(tunPace*cloudwire.TunMsgBurst, p.msgs+dt*tunPace*cloudwire.TunMsgsPerSecond) - 1
+	p.bytes = min(tunPace*cloudwire.TunByteBurst, p.bytes+dt*tunPace*cloudwire.TunBytesPerSecond) - float64(n)
+	wait := max(-p.msgs/(tunPace*cloudwire.TunMsgsPerSecond), -p.bytes/(tunPace*cloudwire.TunBytesPerSecond), 0)
+	return time.Duration(wait * float64(time.Second))
+}
+
+// tunnel writes queued tun frames as they come, beside the readable copy,
+// so a phone's session never waits for the copy's cadence. Lane 0 goes
+// first and at once, even while bulk waits for the pacer. It counts both
+// against the tunnel's budget, never the copy's.
+func (w *writer) tunnel(ctx context.Context, out, bulk <-chan []byte) error {
+	l := w.link
+	pace := newPacer(time.Now())
+	send := func(frame []byte) error {
+		if err := w.write(frame); err != nil {
+			return err
+		}
+		l.mu.Lock()
+		l.tunBudget.add(l.uptimeMs(), int64(len(frame)))
+		l.mu.Unlock()
+		return nil
+	}
+	for {
+		select {
+		case frame := <-out:
+			pace.take(len(frame), time.Now())
+			if err := send(frame); err != nil {
+				return err
+			}
+			continue
+		default:
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case frame := <-out:
+			pace.take(len(frame), time.Now())
+			if err := send(frame); err != nil {
+				return err
+			}
+		case frame := <-bulk:
+			if wait := pace.take(len(frame), time.Now()); wait > 0 {
+				timer := time.NewTimer(wait)
+			held:
+				for {
+					select {
+					case <-ctx.Done():
+						timer.Stop()
+						return ctx.Err()
+					case urgent := <-out:
+						if err := send(urgent); err != nil {
+							timer.Stop()
+							return err
+						}
+					case <-timer.C:
+						break held
+					}
+				}
+			}
+			if err := send(frame); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// write sends one frame under the socket's one write lock.
+func (w *writer) write(frame []byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := w.conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+		return err
+	}
+	return w.conn.WriteMessage(websocket.BinaryMessage, frame)
 }

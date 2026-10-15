@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/srcfl/ftw/go/internal/apiauth"
 	"github.com/srcfl/ftw/go/internal/cloudlink"
@@ -164,6 +165,7 @@ func TestCloudGrantRefusalsKeepTheirMeaning(t *testing.T) {
 	for err, want := range map[error]int{
 		cloudlink.ErrGrantRequest: http.StatusBadRequest,
 		cloudlink.ErrPurgePending: http.StatusConflict,
+		cloudlink.ErrLinkEnding:   http.StatusConflict,
 		cloudlink.ErrNoService:    http.StatusServiceUnavailable,
 	} {
 		s := New(&Deps{Cloud: &stubCloud{err: err}})
@@ -362,6 +364,8 @@ func (cloudSiteStub) Prices() (cloudwire.Prices, bool) { return cloudwire.Prices
 type cloudRosterStub struct{}
 
 func (cloudRosterStub) Devices() []cloudlink.RosterDevice { return nil }
+
+func (cloudRosterStub) Pending() ([]byte, time.Time, bool) { return nil, time.Time{}, false }
 
 type cloudKV struct {
 	mu sync.Mutex

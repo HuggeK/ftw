@@ -189,6 +189,13 @@ type Uplink struct {
 	// watch's session survives the hour turning under it.
 	exchanges *exchanges
 
+	// slots holds each device's one session, across the relay's
+	// connections and the tunnel through FTW Cloud.
+	slots *slots
+	// tunnel is the table of sessions FTW Cloud carries. It runs whether or
+	// not the relay can be reached.
+	tunnel *Tunnel
+
 	// The dead man's switch bookkeeping: which row ids the relay holds,
 	// so a removed subscription's row is deleted rather than left armed.
 	deadmanMu      sync.Mutex
@@ -221,6 +228,7 @@ func (u *Uplink) DropSessionsByAppKey(pub []byte) int {
 	if u.exchanges != nil {
 		dropped += u.exchanges.dropByAppKey(pub)
 	}
+	dropped += u.tunnel.dropByAppKey(pub)
 	return dropped
 }
 
@@ -279,6 +287,8 @@ func New(opts Options) (*Uplink, error) {
 	if u.deadmanRefresh <= 0 {
 		u.deadmanRefresh = deadmanRefreshInterval
 	}
+	u.slots = &slots{}
+	u.tunnel = newTunnel(opts.Handler, opts.Enroll, u.slots, u.log)
 	if opts.ExchangeHandler != nil {
 		u.exchanges = &exchanges{
 			build:    opts.ExchangeHandler,
@@ -305,8 +315,11 @@ func productionDialer() *websocket.Dialer {
 	}
 }
 
-// Run keeps the uplink up until the context ends.
+// Run keeps the uplink up until the context ends. The tunnel's table runs
+// beside it, so a phone reaches the box through FTW Cloud while the relay
+// cannot be reached.
 func (u *Uplink) Run(ctx context.Context) error {
+	go u.tunnel.Run(ctx)
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -567,6 +580,7 @@ func (u *Uplink) serve(ctx context.Context, conn *websocket.Conn) (int, string, 
 	}
 
 	live := &sessions{
+		slots:  u.slots,
 		build:  u.opts.Handler,
 		enroll: u.opts.Enroll,
 		static: u.opts.Enroll.StaticKey(),

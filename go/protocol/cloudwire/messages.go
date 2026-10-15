@@ -2,8 +2,8 @@ package cloudwire
 
 import "github.com/srcfl/ftw/go/protocol"
 
-// Message types. The service sends exactly the first five; anything else from
-// it closes the uplink.
+// Message types. The service sends exactly the first five and tun; anything
+// else from it closes the uplink.
 const (
 	MsgChallenge = "challenge"
 	MsgHelloOK   = "hello_ok"
@@ -27,8 +27,10 @@ const (
 	MsgBye    = "bye"
 )
 
-// Downlink is the closed set of types the service may send the box.
-var Downlink = []string{MsgChallenge, MsgHelloOK, MsgWatch, MsgResync, MsgPurged}
+// Downlink is the closed set of types the service may send the box. None of
+// the first five asks the box to act. tun carries ciphertext the box decrypts
+// itself and judges as it judges the same session over the relay.
+var Downlink = []string{MsgChallenge, MsgHelloOK, MsgWatch, MsgResync, MsgPurged, MsgTun}
 
 // ClassScope is the scope a device needs to read each class the service
 // forwards. hb maps to "" because every device in the roster gets it: it
@@ -60,9 +62,11 @@ const (
 	ByeUpdate   = "update"
 )
 
-// What a purge receipt or a resync names.
+// What a purge receipt or a resync names. PurgedCopy confirms that the
+// readable copy of a grant is gone while the home stays, for its tunnel.
 const (
 	PurgedHome  = "home"
+	PurgedCopy  = "copy"
 	PurgedStats = "stats"
 
 	ResyncFull   = "full"
@@ -266,6 +270,10 @@ type Roster struct {
 	TTLS      int64    `cbor:"ttlS"`
 	Devices   []Device `cbor:"devices"`
 	Grant     Grant    `cbor:"grant"`
+	// Pending lists the pairing codes the box shows now. Each admits one
+	// first session through the service, for a phone the roster does not
+	// list yet.
+	Pending []Pending `cbor:"pending"`
 }
 
 // Device is one paired phone.
@@ -278,9 +286,22 @@ type Device struct {
 	// role table.
 	Scopes []string `cbor:"scopes"`
 	Epoch  uint64   `cbor:"epoch"`
+	// Tun says the device may open a session to the box through the
+	// service. It needs no grant: the readable copy is a purpose on top.
+	Tun bool `cbor:"tun"`
 }
 
-// Grant is what the owner turned on.
+// Pending is one pairing code on the box's screen, by its PairingHash.
+type Pending struct {
+	Hash []byte `cbor:"hash"`
+	// TTLS is how long the code has left, counted from when the service
+	// receives the roster.
+	TTLS int64 `cbor:"ttlS"`
+}
+
+// Grant is what the owner turned on. With the readable copy off it has no
+// id, scopes or purposes. While a revoke waits for its receipt it keeps the
+// id and has neither scopes nor purposes.
 type Grant struct {
 	ID         []byte   `cbor:"id"`
 	Scopes     []string `cbor:"scopes"`

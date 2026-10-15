@@ -623,15 +623,11 @@ func TestHandshakesAreRationed(t *testing.T) {
 // Isolation: eight watch sessions leave four phone sessions running, and a
 // ninth watch ends the oldest watch's session, never a phone's.
 func TestWatchesNeverTakeAPhonesPlace(t *testing.T) {
+	// The relay lets four streams into a room.
+	const phones = 4
 	r := newXRig(t)
-	streams := &sessions{
-		build:  handlerWith(false, r.charger, r.cmds),
-		enroll: r.enroll,
-		static: r.enroll.StaticKey(),
-		write:  func([]byte) error { return nil },
-		log:    slog.New(slog.DiscardHandler),
-	}
-	for i := 0; i < MaxSessions; i++ {
+	streams := relayTable(&slots{}, r.enroll)
+	for i := 0; i < phones; i++ {
 		code, _, err := r.enroll.MintPairingCode(apiauth.RoleOwner, appenroll.PairingTTL)
 		if err != nil {
 			t.Fatal(err)
@@ -640,26 +636,20 @@ func TestWatchesNeverTakeAPhonesPlace(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		message1, err := app.message1(r.enroll.StaticKey().Public(), code)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := streams.open(message1); err != nil {
-			t.Fatalf("phone %d: %v", i, err)
-		}
+		relayOpen(t, streams, r.enroll, app, code)
 	}
 
 	first, _ := r.addWatch(t)
 	for i := 1; i < MaxExchangeSessions; i++ {
 		r.addWatch(t)
 	}
-	if streams.count() != MaxSessions || r.x.count() != MaxExchangeSessions {
+	if streams.count() != phones || r.x.count() != MaxExchangeSessions {
 		t.Fatalf("%d phone and %d watch sessions, want %d and %d",
-			streams.count(), r.x.count(), MaxSessions, MaxExchangeSessions)
+			streams.count(), r.x.count(), phones, MaxExchangeSessions)
 	}
 
 	r.addWatch(t)
-	if streams.count() != MaxSessions {
+	if streams.count() != phones {
 		t.Fatalf("a ninth watch left %d phone sessions", streams.count())
 	}
 	if r.ask(t, first, appproto.MsgNow, struct{}{}) != nil {

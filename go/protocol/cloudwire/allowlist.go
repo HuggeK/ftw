@@ -33,16 +33,22 @@ var Fields = map[string][]string{
 
 	MsgEvent: {"eventId", "ts", "kind", "severity", "args", "src", "lp"},
 
-	MsgRoster: {"rosterSeq", "ttlS", "devices", "grant"},
-	"Device":  {"id", "key", "role", "scopes", "epoch"},
+	MsgRoster: {"rosterSeq", "ttlS", "devices", "grant", "pending"},
+	"Device":  {"id", "key", "role", "scopes", "epoch", "tun"},
 	"Grant":   {"id", "scopes", "purposes", "controller"},
+	"Pending": {"hash", "ttlS"},
 
 	MsgBye: {"why", "purge"},
+
+	// tun carries no header and no signature: d is Noise ciphertext its two
+	// ends authenticate, and the service reads only dev and sid.
+	MsgTun: {"dev", "sid", "d"},
 }
 
 // Bodies maps each class the box sends to its body type. Classes the box does
 // not send yet (plan, health, tiles) have no entry; the service treats their
-// bytes as opaque either way.
+// bytes as opaque either way. tun is not here: it has no header and is not a
+// class, and Unheaded holds it.
 var Bodies = map[string]any{
 	MsgHello:  Hello{},
 	MsgLive:   Live{},
@@ -52,4 +58,9 @@ var Bodies = map[string]any{
 	MsgEvent:  Event{},
 	MsgRoster: Roster{},
 	MsgBye:    Bye{},
+}
+
+// Unheaded are the box's messages without the common header.
+var Unheaded = map[string]any{
+	MsgTun: Tun{},
 }

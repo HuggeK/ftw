@@ -240,9 +240,13 @@ FTW Cloud is such an endpoint. It is proposed in
 the way into it, and it may become a paid service. When an owner turns it on,
 the box sends Sourceful a signed, readable copy of what the owner enabled, so
 the app starts fast and its alerts, widgets and Live Activities work while it
-is closed. FTW Cloud never sends control and never chooses which actions a
-user is offered; commands still go from the app to the box over the encrypted
-session. Statistics need their own consent, off by default. This turns away
+is closed. From the first pairing the box also links to FTW Cloud, so the
+phones reach it through one service: their encrypted session with the box
+rides through FTW Cloud as ciphertext it cannot read or forge, and the box
+judges every command as it does over the relay. For every linked home the
+service sees a stable home id, the box's address and when traffic goes, with
+the readable copy off too. FTW Cloud never chooses which actions a user is
+offered. Statistics need their own consent, off by default. This turns away
 from [#1323](https://github.com/srcfl/ftw/issues/1323), which asks that no
 feature need a Sourceful service: the iPhone app needs FTW Cloud, while the
 box does not. A household that does not want FTW Cloud runs the box itself,

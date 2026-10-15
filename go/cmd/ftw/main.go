@@ -2441,11 +2441,17 @@ func main() {
 		slog.Info("app link disabled — set app_link.enabled to turn it on")
 	}
 
-	// FTW Cloud: a signed, readable copy of the house for the owner's phones,
-	// off until an owner turns it on. It reads; it never controls.
+	// FTW Cloud: the phones' own sessions with the box, carried as
+	// ciphertext the service cannot read, from the first pairing on; and a
+	// signed, readable copy of the house, off until an owner turns it on.
+	// The relay keeps running beside it.
+	var appTunnel *appuplink.Tunnel
+	if appUplink != nil {
+		appTunnel = appUplink.Tunnel()
+	}
 	cloudNotify := &cloudNotices{}
 	cloudLink := startCloudLink(ctx, statePath, Version, st, appEnroll,
-		tel, ctrl, ctrlMu, controlRev, appLinkWatchdog, priceSvc, appAPI, cloudNotify)
+		tel, ctrl, ctrlMu, controlRev, appLinkWatchdog, priceSvc, appAPI, cloudNotify, appTunnel)
 	appCloud.bind(cloudLink)
 
 	// The anonymous fleet ping: how many boxes, which versions, which drivers.

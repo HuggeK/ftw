@@ -982,10 +982,17 @@ func (h *Handler) acceptCmd(cmd Cmd, uptimeMs int64) (took bool, err error) {
 		LeaseID:     h.cfg.NewLeaseID(),
 		ExpiresAtMs: uptimeMs + LeaseMs,
 	}
-	if rec, fresh := h.cfg.Commands.remember(h.cmdRoot(), cmd.CmdID, ack, uptimeMs); !fresh {
+	root := h.cmdRoot()
+	if rec, fresh := h.cfg.Commands.remember(root, cmd.CmdID, ack, uptimeMs); !fresh {
 		return false, h.replayCmd(rec)
 	}
-	return true, h.sendCmdAck(ack)
+	if err := h.sendCmdAck(ack); err != nil {
+		// The box has not acted, and the app never heard the ack. Keeping
+		// the id would answer its retry with an ack and no result.
+		h.cfg.Commands.forget(root, cmd.CmdID)
+		return false, err
+	}
+	return true, nil
 }
 
 // settleAndReport records the outcome, reports it, and pushes a fresh plan

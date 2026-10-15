@@ -629,3 +629,32 @@ func TestARevokedDevicesCommandIsRefusedAndTheSessionEnds(t *testing.T) {
 		t.Fatalf("termination reason %q, want %q", term.Reason, TerminateRevoked)
 	}
 }
+
+// An ack that cannot leave leaves the command untaken: the box does not act,
+// and the retry acts and gets its result, rather than an ack and silence.
+func TestAnAckThatCannotLeaveForgetsTheCommand(t *testing.T) {
+	h, box, rec, _ := newRig(t)
+	subscribe(t, h, rec)
+
+	rec.mu.Lock()
+	rec.fail = errors.New("no uplink")
+	rec.mu.Unlock()
+	cmd := cmdSetMode(string(control.ModeCharge), 7, 200_000, nil)
+	env, _ := newEnvelope(MsgCmd, nil, cmd)
+	frame, _ := testCodec{}.EncodeFrame(Frame{Lane: LaneControl, Bucket: 512, Envelope: env})
+	if err := h.Handle(t.Context(), frame); err == nil {
+		t.Fatal("a command whose ack could not leave reported nothing")
+	}
+	if box.mode == control.ModeCharge {
+		t.Fatal("the box acted on a command whose ack never left")
+	}
+
+	rec.mu.Lock()
+	rec.fail = nil
+	rec.mu.Unlock()
+	deliver(t, h, MsgCmd, nil, cmd)
+	rec.only(t, MsgCmdAck)
+	if res := body[CmdResult](t, rec.only(t, MsgCmdResult)); res.State != CmdApplied {
+		t.Fatalf("the retry got %q", res.State)
+	}
+}
