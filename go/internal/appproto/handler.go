@@ -54,6 +54,12 @@ type Config struct {
 	// window.
 	PlannerPrefs PlannerPrefs
 
+	// PlanChargers puts each charger's share on the plan, or nil on a box with
+	// no chargers. PlanFeed pushes the plan when the box replans, or nil for
+	// a box that pushes it only after a command.
+	PlanChargers PlanChargers
+	PlanFeed     *PlanFeed
+
 	// Caller is whose session this is. Required: a session always belongs to
 	// one enrolled device, and a handler that does not know which one cannot
 	// refuse anything.
@@ -156,6 +162,12 @@ type Handler struct {
 	lastSent    map[string]int64
 	lastSources map[string]SourceWire
 	lastBlocked []string
+	// planMu holds a plan from read to send, so a newer plan never lands
+	// before an older one. lastPlan is the hash of the plan this session
+	// last got, without its uptime, so a push repeats nothing.
+	planMu   sync.Mutex
+	lastPlan [sha256.Size]byte
+
 	// lastRev is the controlRev this client was last told. A command carries
 	// the rev it expected, so a client left holding a stale one would have
 	// every command refused with no way to find out the new number — the
@@ -229,7 +241,7 @@ func New(cfg Config) (*Handler, error) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Handler{
+	h := &Handler{
 		cfg:          cfg,
 		log:          cfg.Logger.With("component", "appproto"),
 		modes:        wireModes(control.ModeCatalog()),
@@ -242,7 +254,13 @@ func New(cfg Config) (*Handler, error) {
 		cadenceEvery: 1,
 		cadenceLeft:  1,
 		lastSent:     map[string]int64{},
-	}, nil
+	}
+	// An exchange sends nothing unasked; a watch reads the plan from FTW
+	// Cloud instead.
+	if cfg.PlanFeed != nil && !cfg.Exchange {
+		cfg.PlanFeed.join(h)
+	}
+	return h, nil
 }
 
 // Close ends the handler's own work when the session goes.
@@ -253,6 +271,9 @@ func New(cfg Config) (*Handler, error) {
 // passthrough.
 func (h *Handler) Close() {
 	h.cancel()
+	if h.cfg.PlanFeed != nil {
+		h.cfg.PlanFeed.leave(h)
+	}
 	h.histMu.Lock()
 	if h.histCancel != nil {
 		h.histCancel()
@@ -1100,7 +1121,13 @@ func (h *Handler) onPlanGet(id *uint32) error {
 	return h.sendPlan(id)
 }
 
-func (h *Handler) sendPlan(id *uint32) error {
+func (h *Handler) sendPlan(id *uint32) error { return h.writePlan(id, false) }
+
+// writePlan reads the plan and sends it. With skipSame it sends nothing when
+// this session already has this plan.
+func (h *Handler) writePlan(id *uint32, skipSame bool) error {
+	h.planMu.Lock()
+	defer h.planMu.Unlock()
 	body := planFrom(
 		h.cfg.Plans.Latest(),
 		h.cfg.Plans.Rev(),
@@ -1108,14 +1135,28 @@ func (h *Handler) sendPlan(id *uint32) error {
 		h.cfg.Clock.UptimeMs(),
 		h.cfg.Clock.Now(),
 	)
+	if h.cfg.PlanChargers != nil {
+		body.Chargers = h.cfg.PlanChargers.PlanChargers(h.cfg.Clock.Now())
+	}
+	same := body
+	same.UptimeMs = 0
+	raw, err := Marshal(same)
+	if err != nil {
+		return err
+	}
+	key := sha256.Sum256(raw)
+	if skipSame && key == h.lastPlan {
+		return nil
+	}
 
 	// The optimizer plans further than the wire carries: 193 fifteen-minute
 	// slots encode to ~17 kB and the largest bulk bucket is 16 kB. Send the
 	// nearest slots that fit and drop the far tail — the app shows twelve
-	// hours, and slots two days out are a guess about a guess. What must
-	// never happen is the alternative: an encode error here used to kill the
-	// whole session, which the app experienced as "the box hangs up whenever
-	// I open the plan".
+	// hours, and slots two days out are a guess about a guess. Then the far
+	// windows of each charger, for the same reason. What must never happen is
+	// the alternative: an encode error here used to kill the whole session,
+	// which the app experienced as "the box hangs up whenever I open the
+	// plan".
 	for {
 		env, err := newEnvelope(MsgPlan, id, body)
 		if err != nil {
@@ -1126,13 +1167,33 @@ func (h *Handler) sendPlan(id *uint32) error {
 			return err
 		}
 		if bulkBucketFor(len(raw)) != 0 {
-			return h.send(Frame{Lane: LaneBulk, Bucket: bulkBucketFor(len(raw)), Envelope: env})
+			if err := h.send(Frame{Lane: LaneBulk, Bucket: bulkBucketFor(len(raw)), Envelope: env}); err != nil {
+				return err
+			}
+			h.lastPlan = key
+			return nil
 		}
-		if len(body.Slots) <= 1 {
-			return fmt.Errorf("appproto: a single plan slot does not fit any bulk bucket")
+		switch {
+		case len(body.Slots) > 1:
+			body.Slots = body.Slots[:len(body.Slots)*3/4]
+		case trimWindows(body.Chargers):
+		default:
+			return fmt.Errorf("appproto: a plan of one slot and one window per charger does not fit any bulk bucket")
 		}
-		body.Slots = body.Slots[:len(body.Slots)*3/4]
 	}
+}
+
+// trimWindows drops the far quarter of each charger's windows, keeping the
+// next one, and reports whether anything went.
+func trimWindows(chargers []PlanCharger) bool {
+	trimmed := false
+	for i := range chargers {
+		if n := len(chargers[i].Windows); n > 1 {
+			chargers[i].Windows = chargers[i].Windows[:max(1, n*3/4)]
+			trimmed = true
+		}
+	}
+	return trimmed
 }
 
 // --------------------------------------------------------------------------

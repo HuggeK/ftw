@@ -239,6 +239,9 @@ type Service struct {
 	// decisionIDFactory is a test seam. Production uses a random UUID for every
 	// accepted plan. It is read only while mu is held at the publish gate.
 	decisionIDFactory func() string
+	// planChanged are told when what a plan reader sees moves. Guarded by
+	// mu; only ever appended to.
+	planChanged []func()
 
 	// MinArbitrageSpreadOreKwh flows in from config.Planner. Copied into
 	// Params so the DP applies the arbitrage cycle deadband. See
@@ -456,6 +459,25 @@ func (s *Service) UpdatePlannerScalars(p Params, baseLoad float64, horizon, inte
 	s.mu.Unlock()
 }
 
+// OnPlanChange adds fn to those called each time what a plan reader sees
+// moves: a replan starts and the plan becomes pending, a plan is published,
+// or the newest replan ends without one. fn runs on the replanning or
+// requesting goroutine without the service lock and must not block.
+func (s *Service) OnPlanChange(fn func()) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.planChanged = append(s.planChanged, fn)
+}
+
+func tell(fns []func()) {
+	for _, fn := range fns {
+		fn()
+	}
+}
+
 // Latest returns the most recently computed plan (nil before first run).
 func (s *Service) Latest() *Plan {
 	if s == nil {
@@ -469,11 +491,14 @@ func (s *Service) Latest() *Plan {
 // PlanSnapshot keeps the visible plan and its freshness in one read. Outdated
 // remains true if the latest request fails; Pending only describes active work.
 type PlanSnapshot struct {
-	Plan        *Plan
-	ReplanAt    time.Time
-	Reason      string
-	Pending     bool
-	Outdated    bool
+	Plan     *Plan
+	ReplanAt time.Time
+	Reason   string
+	Pending  bool
+	Outdated bool
+	// Unproven is set when the plan needs fresh physical inputs or PV
+	// control before the box may act on it. Outdated is set with it.
+	Unproven    bool
 	Error       string
 	Warnings    []string
 	loadpointID string
@@ -496,6 +521,7 @@ func (s *Service) PlanSnapshot() PlanSnapshot {
 	s.mu.RUnlock()
 	if !s.planExecutionAllowed(out.Plan, proof, currentContract) {
 		out.Outdated = true
+		out.Unproven = true
 		out.Reason = "Plan requires fresh physical inputs or PV control"
 	}
 	return out
@@ -1306,7 +1332,9 @@ func (s *Service) requestReplan(reason string, change func()) {
 	s.queuedReplan = &request
 	startWorker := !s.requestedReplanRunning
 	s.requestedReplanRunning = true
+	changed := s.planChanged
 	s.mu.Unlock()
+	tell(changed)
 	if previous != nil {
 		s.finishReplan(*previous)
 	}
@@ -1347,8 +1375,14 @@ func (s *Service) replan(ctx context.Context, reason string) *Plan {
 
 func (s *Service) beginReplan(ctx context.Context, reason string) replanRequest {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.beginReplanLocked(ctx, reason)
+	request := s.beginReplanLocked(ctx, reason)
+	var changed []func()
+	if request.accepted {
+		changed = s.planChanged
+	}
+	s.mu.Unlock()
+	tell(changed)
+	return request
 }
 
 // beginReplanLocked assigns the generation and snapshots the effective
@@ -1412,6 +1446,7 @@ func (s *Service) finishReplan(request replanRequest) {
 	defer s.replanWG.Done()
 	contextErr := request.ctx.Err()
 	request.cancel()
+	var changed []func()
 	s.mu.Lock()
 	if request.generation == s.latestReplanGeneration {
 		s.activeReplanCancel = nil
@@ -1427,9 +1462,11 @@ func (s *Service) finishReplan(request replanRequest) {
 			// it when the replacement fails. A later retry must publish a new
 			// plan before dispatch resumes; queuing work alone is not enough.
 			s.failedReplanGeneration = request.generation
+			changed = s.planChanged
 		}
 	}
 	s.mu.Unlock()
+	tell(changed)
 }
 
 func (s *Service) canceledReplan(request replanRequest, stage string) *Plan {
@@ -2072,7 +2109,9 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	reason := request.reason
 	replanAtMs := s.lastReplanAt.UnixMilli()
 	saveDiag := s.SaveDiag
+	changed := s.planChanged
 	s.mu.Unlock()
+	tell(changed)
 	if captured.Record != nil {
 		captured.Record(baseForecastSlots, fallbackSlots, plan.DecisionID, replanAtMs)
 	}

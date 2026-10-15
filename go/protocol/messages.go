@@ -492,6 +492,51 @@ type Plan struct {
 	Stale bool `cbor:"stale"`
 	// CeilingW is the import ceiling being defended, nil when there is none.
 	CeilingW *int64 `cbor:"ceilingW"`
+	// Chargers is each charger's share of this plan, as GET /api/loadpoints
+	// reports it, so a plan the box pushes redraws the charger without a
+	// read. Absent on a box with no chargers or no planner. An older app
+	// ignores it.
+	Chargers []PlanCharger `cbor:"chargers,omitempty"`
+}
+
+// PlanCharger is one charger's share of the plan. Keyed by the charger,
+// never by a car: a car visits chargers (docs/cars.md, srcfl/ftw#1647).
+type PlanCharger struct {
+	// ID is the charger's loadpoint id.
+	ID string `cbor:"id"`
+	// CarID is the session's car, empty while the box does not know which
+	// one is plugged in. Always empty until Core keeps cars. A change of
+	// it is a plan input: whatever applies session.car.set requests a
+	// replan, and the plan reaches the phone as every replan does.
+	CarID     string `cbor:"carId,omitempty"`
+	PluggedIn bool   `cbor:"pluggedIn"`
+	// Pending is set while a newer plan is being made; the windows are then
+	// the plan the box goes on acting on until the new one lands. Outdated
+	// is set with it, and alone when the plan is not one the box acts on;
+	// without Pending the windows are then empty.
+	Pending  bool `cbor:"pending"`
+	Outdated bool `cbor:"outdated"`
+	// GridDeferred says grid-funded charging waits for prices that reach
+	// the deadline, as grid_deferred on the HTTP route.
+	GridDeferred bool `cbor:"gridDeferred"`
+	// GoalRev changes when the charger's goal, ready time, schedule or
+	// solar-only choice changes, wherever that was done.
+	GoalRev uint32 `cbor:"goalRev"`
+	// Windows are the charging windows still ahead, the next one first.
+	Windows []PlanChargerWindow `cbor:"windows"`
+	// TotalWh is what the plan still means to deliver across its horizon.
+	TotalWh int64 `cbor:"totalWh"`
+	// ShortfallWh is how far short of the goal the plan leaves the car, in
+	// battery watt-hours. Absent when the plan has no goal for it.
+	ShortfallWh *int64 `cbor:"shortfallWh,omitempty"`
+}
+
+// PlanChargerWindow is one stretch the plan charges on a charger. Wall
+// clock.
+type PlanChargerWindow struct {
+	StartMs int64 `cbor:"startMs"`
+	EndMs   int64 `cbor:"endMs"`
+	Wh      int64 `cbor:"wh"`
 }
 
 // --------------------------------------------------------------------------

@@ -2689,6 +2689,7 @@ func main() {
 	if lpMgr != nil {
 		lpMgr.SetBus(bus)
 	}
+	replanOnPlugIn(bus, mpcSvc)
 	// Late-bind onto the Deps literal that was built earlier with a nil
 	// notifSvc (the deps struct is assembled before this block runs).
 	deps.Notifications = notifSvc

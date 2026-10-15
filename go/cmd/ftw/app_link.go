@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"hash/fnv"
 	"log/slog"
 	"math"
 	"net/http"
@@ -561,6 +562,68 @@ func (a *appPlans) CeilingW() *int64 {
 	return &ceiling
 }
 
+// appPlanChargers is each charger's share of the plan, read from the same plan
+// snapshot and the same windows GET /api/loadpoints serves. Keyed by the
+// charger; CarID stays empty until Core keeps cars.
+type appPlanChargers struct {
+	planner *mpc.Service
+	mgr     *loadpoint.Manager
+	ctrl    *loadpoint.Controller
+}
+
+func (a *appPlanChargers) PlanChargers(now time.Time) []appproto.PlanCharger {
+	snap := a.planner.PlanSnapshot()
+	// While a newer plan is being made the box goes on acting on the one it
+	// has, so its windows stay, marked pending. The HTTP route empties them.
+	acting := snap
+	if snap.Pending && !snap.Unproven {
+		acting.Outdated = false
+	}
+	states := a.mgr.States()
+	out := make([]appproto.PlanCharger, 0, len(states))
+	for _, st := range states {
+		ch := appproto.PlanCharger{
+			ID: st.ID, PluggedIn: st.PluggedIn,
+			Pending: snap.Pending, Outdated: snap.Outdated,
+			Windows: []appproto.PlanChargerWindow{},
+			GoalRev: goalRev(st),
+		}
+		if a.ctrl != nil && !acting.Outdated {
+			ch.GridDeferred = a.ctrl.GridDeferred(st.ID)
+		}
+		windows, totalWh := acting.LoadpointPlanWindows(st.ID, now, api.MaxPlanWindows)
+		for _, w := range windows {
+			ch.Windows = append(ch.Windows, appproto.PlanChargerWindow{
+				StartMs: w.Start.UnixMilli(), EndMs: w.End.UnixMilli(), Wh: int64(math.Round(w.EnergyWh)),
+			})
+		}
+		ch.TotalWh = int64(math.Round(totalWh))
+		if snap.Plan != nil && !snap.Pending && !snap.Outdated {
+			if wh, ok := snap.Plan.LoadpointShortfallWh[st.ID]; ok && !math.IsNaN(wh) && !math.IsInf(wh, 0) {
+				short := int64(math.Round(max(0, wh)))
+				ch.ShortfallWh = &short
+			}
+		}
+		out = append(out, ch)
+	}
+	return out
+}
+
+// goalRev changes when a charger's goal, ready time, schedule or solar-only
+// choice changes, wherever that was done, so a phone knows to read it again.
+func goalRev(st loadpoint.State) uint32 {
+	raw, _ := json.Marshal(struct {
+		Schedule      loadpoint.Schedule
+		TargetSoC     float64
+		TargetTimeMs  int64
+		SurplusOnly   bool
+		FinishAtLimit bool
+	}{st.Schedule, st.TargetSoC, st.TargetTime.UnixMilli(), st.SurplusOnly, st.FinishAtVehicleLimit})
+	h := fnv.New32a()
+	_, _ = h.Write(raw)
+	return h.Sum32()
+}
+
 // startAppLink connects the box to the app relay when its loaded config leaves
 // the link enabled. Config defaults an omitted app_link section on.
 //
@@ -630,6 +693,19 @@ func startAppLink(
 		caps = append(caps, appproto.CapDerEv)
 	}
 
+	// The plan reaches every streaming phone the moment the planner
+	// replaces it, with each charger's windows, so a car plugged in shows
+	// its plan without a read.
+	var planChargers appproto.PlanChargers
+	var planFeed *appproto.PlanFeed
+	if planner != nil {
+		planFeed = appproto.NewPlanFeed(appproto.PlanSettle)
+		planner.OnPlanChange(planFeed.Changed)
+		if lpMgr != nil {
+			planChargers = &appPlanChargers{planner: planner, mgr: lpMgr, ctrl: lpCtrl}
+		}
+	}
+
 	// Prices ride on the price service, and only when it has a zone and a
 	// store to have fetched into. With either missing there is nothing to
 	// serve, so the capability stays unsaid rather than advertised and empty.
@@ -682,6 +758,8 @@ func startAppLink(
 				History:      history,
 				Prices:       priceReader,
 				Loadpoints:   loadpoints,
+				PlanChargers: planChargers,
+				PlanFeed:     planFeed,
 				API:          gateway,
 				Caller:       caller,
 				Grants:       grants,

@@ -42,7 +42,7 @@ func (s *Server) decorateLoadpointsWithPlan(states []loadpoint.State) {
 		if s.deps.MPC == nil {
 			continue
 		}
-		windows, totalWh := snapshot.LoadpointPlanWindows(states[i].ID, now, maxPlanWindows)
+		windows, totalWh := snapshot.LoadpointPlanWindows(states[i].ID, now, MaxPlanWindows)
 		if len(windows) == 0 {
 			continue
 		}
@@ -61,7 +61,8 @@ func (s *Server) decorateLoadpointsWithPlan(states []loadpoint.State) {
 	}
 }
 
-// maxPlanWindows bounds the list a client gets. A 48 h horizon in 15 min
-// slots cannot produce more than a few dozen contiguous windows; the cap
-// keeps a pathological plan from bloating every /api/loadpoints poll.
-const maxPlanWindows = 32
+// MaxPlanWindows bounds the list a client gets, here and on the plan the app
+// session pushes. A 48 h horizon in 15 min slots cannot produce more than a
+// few dozen contiguous windows; the cap keeps a pathological plan from
+// bloating every /api/loadpoints poll.
+const MaxPlanWindows = 32
