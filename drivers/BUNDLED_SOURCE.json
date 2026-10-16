@@ -16,17 +16,17 @@
     "from the signed channel. Run scripts/sync-bundled-drivers.sh to update."
   ],
   "repository": "srcfl/device-drivers",
-  "commit": "76ddd5846f18cb1a0d53d85508904d4e953421b2",
+  "commit": "5cc7bb1a65fe41c4f2cb28a7f546875313b2df85",
   "source_dir": "drivers/lua",
   "drivers": [
     "ambibox_v2x", "ctek", "ctek_hybrid", "ctek_v2", "deye", "easee_cloud",
     "esphome_dsmr", "ferroamp", "ferroamp_dc2_v2x", "ferroamp_modbus",
     "foxess_h3_smart", "fronius", "fronius_smart_meter", "goodwe",
-    "growatt", "heishamon", "huawei", "kostal", "myuplink", "nibe_local",
-    "pixii", "pixii_pv",
+    "growatt", "heishamon", "home_assistant_vehicle", "huawei", "kostal",
+    "myuplink", "nibe_local", "pixii", "pixii_pv",
     "sdm630", "sma", "sma_pv", "sofar", "solaredge", "solaredge_legacy",
     "solaredge_pv", "solis", "solis_string", "sonnen", "sungrow",
-    "tesla_vehicle", "tesla_wall_connector", "tibber", "victron", "zap",
-    "zaptec_cloud", "zuidwijk_p1"
+    "tesla_cloud", "tesla_vehicle", "tesla_wall_connector", "teslamate_vehicle",
+    "tibber", "vag_vehicle", "victron", "zap", "zaptec_cloud", "zuidwijk_p1"
   ]
 }

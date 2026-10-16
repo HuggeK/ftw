@@ -14,13 +14,12 @@ import (
 )
 
 // The vehicle drivers that say where a car's cable and the car are, run in
-// this host through to the observations the cars runtime reads. testdata
-// holds copies of srcfl/device-drivers#182 (home_assistant_vehicle 0.1.0,
-// tesla_cloud 0.2.0, teslamate_vehicle 0.2.0) until the driver pin moves.
+// this host through to the observations the cars runtime reads. They are the
+// bundled copies (drivers/BUNDLED_SOURCE.json).
 
-func vehicleTestdata(name string) string {
+func bundledDriver(name string) string {
 	_, thisFile, _, _ := runtime.Caller(0)
-	return filepath.Join(filepath.Dir(thisFile), "testdata", name+".lua")
+	return filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "drivers", name+".lua")
 }
 
 // A signed vehicle driver's policy: host.site_location answers it.
@@ -76,7 +75,7 @@ func TestHomeAssistantVehicleSaysWhereTheCarIs(t *testing.T) {
 	env := vehicleEnv("tesla-ha")
 	mq := &fakeMQTT{}
 	env.WithMQTT(mq)
-	d, err := NewLuaDriver(vehicleTestdata("home_assistant_vehicle"), env)
+	d, err := NewLuaDriver(bundledDriver("home_assistant_vehicle"), env)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +110,7 @@ func TestTeslaMateVehicleSaysWhereTheCarIs(t *testing.T) {
 	mq := &fakeMQTT{}
 	env.WithMQTT(mq)
 	env.SiteLocation = uppsala
-	d, err := NewLuaDriverWithPolicy(vehicleTestdata("teslamate_vehicle"), env, signedVehicle("teslamate_vehicle"))
+	d, err := NewLuaDriverWithPolicy(bundledDriver("teslamate_vehicle"), env, signedVehicle("teslamate_vehicle"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +143,7 @@ func TestTeslaMateVehicleSaysWhereTheCarIs(t *testing.T) {
 }
 
 func TestTeslaCloudSaysWhereTheCarIs(t *testing.T) {
-	src, err := os.ReadFile(vehicleTestdata("tesla_cloud"))
+	src, err := os.ReadFile(bundledDriver("tesla_cloud"))
 	if err != nil {
 		t.Fatal(err)
 	}

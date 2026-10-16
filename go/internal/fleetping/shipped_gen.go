@@ -6,7 +6,7 @@ package fleetping
 //
 // An array rather than a slice, so it is fixed in every sense: the length
 // is part of the type and nothing can append to it at run time.
-var shippedDrivers = [40]string{
+var shippedDrivers = [44]string{
 	"ambibox_v2x",
 	"ctek",
 	"ctek_hybrid",
@@ -23,6 +23,7 @@ var shippedDrivers = [40]string{
 	"goodwe",
 	"growatt",
 	"heishamon",
+	"home_assistant_vehicle",
 	"huawei",
 	"kostal",
 	"myuplink",
@@ -40,9 +41,12 @@ var shippedDrivers = [40]string{
 	"solis_string",
 	"sonnen",
 	"sungrow",
+	"tesla_cloud",
 	"tesla_vehicle",
 	"tesla_wall_connector",
+	"teslamate_vehicle",
 	"tibber",
+	"vag_vehicle",
 	"victron",
 	"zap",
 	"zaptec_cloud",
