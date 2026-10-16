@@ -1,6 +1,15 @@
 package cloudwire
 
-import "github.com/srcfl/ftw/go/protocol"
+import (
+	"errors"
+	"slices"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/fxamacker/cbor/v2"
+
+	"github.com/srcfl/ftw/go/protocol"
+)
 
 // Message types. The service sends exactly the first five and tun; anything
 // else from it closes the uplink.
@@ -378,15 +387,71 @@ type Grant struct {
 
 // Notice is a security notice for the owners: a push kind from the
 // catalogue, such as agent.added, and nothing that says more. The service
-// sends each owner device registered for alerts a push with no data.
+// sends each owner device registered for alerts a push carrying the
+// notice, which the phone checks and words from its catalogue.
 type Notice struct {
 	Header
 	Kind string `cbor:"kind"`
+	// Client is the name of the client given access, as FTW Cloud's
+	// consent page showed it: only on agent.added, and only while the
+	// readable copy is on and carries events. Otherwise absent.
+	Client string `cbor:"client,omitempty"`
 }
 
 // NoticeKinds are the kinds a notice may carry.
 var NoticeKinds = []string{protocol.PushAgentAdded, protocol.PushAgentRequest, protocol.PushAgentExpiring,
 	protocol.PushApprovalKeySet, protocol.PushOwnerAdded}
+
+// NoticeClientMaxRunes bounds a notice's client name in characters: FTW
+// Cloud's consent page keeps at most 64 of a name and marks one it cut with
+// "…", so every name it shows fits.
+const NoticeClientMaxRunes = 65
+
+// NoticeMaxAgeMs is how old a notice may be and still get its words on the
+// phone, and how long Apple may keep trying to deliver it. A notice states
+// a lasting fact, such as a new owner, so it lasts longer than an event.
+const NoticeMaxAgeMs = 24 * 60 * 60 * 1000
+
+// NoticeClientOK reports whether a client name may go in a notice: valid
+// UTF-8, at most NoticeClientMaxRunes characters, and no control or format
+// character, which could reorder or hide what a lock screen shows.
+func NoticeClientOK(c string) bool {
+	if c == "" || !utf8.ValidString(c) || utf8.RuneCountInString(c) > NoticeClientMaxRunes {
+		return false
+	}
+	for _, r := range c {
+		if unicode.Is(unicode.Cc, r) || unicode.Is(unicode.Cf, r) {
+			return false
+		}
+	}
+	return true
+}
+
+// ErrNotice refuses a notice body that is not one: an unknown field, a
+// header out of shape, a kind outside NoticeKinds, or a client name where
+// none may be or that NoticeClientOK refuses.
+var ErrNotice = errors.New("cloudwire: not a notice")
+
+// ReadNotice decodes a notice body strictly. A body with any field beyond
+// the header, kind and client is refused, so a notice cannot carry a
+// reading, a name or an id to a phone or to Apple.
+func ReadNotice(body []byte) (Notice, error) {
+	var keys map[string]cbor.RawMessage
+	if Unmarshal(body, &keys) != nil {
+		return Notice{}, ErrNotice
+	}
+	for k := range keys {
+		if !slices.Contains(Fields["header"], k) && !slices.Contains(Fields[MsgNotice], k) {
+			return Notice{}, ErrNotice
+		}
+	}
+	var n Notice
+	if Unmarshal(body, &n) != nil || len(n.Boot) != BootBytes || n.UptimeMs < 0 || !slices.Contains(NoticeKinds, n.Kind) ||
+		(n.Client != "" && (n.Kind != protocol.PushAgentAdded || !NoticeClientOK(n.Client))) {
+		return Notice{}, ErrNotice
+	}
+	return n, nil
+}
 
 // Bye ends the uplink. Purge asks the service to delete the home.
 type Bye struct {

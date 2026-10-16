@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -523,15 +524,106 @@ func TestANoticeGoesWithTheCopyOff(t *testing.T) {
 	h := newHarness(t, svc)
 	h.setRoster(func(r *fakeRosterState) { r.tun = true })
 	h.nextRoster(t)
-	if h.link.Notice("cloud.granted") {
+	if h.link.Notice("cloud.granted", "") {
 		t.Fatal("a kind that is not a notice was queued")
 	}
-	if !h.link.Notice(protocol.PushAgentAdded) {
+	if !h.link.Notice(protocol.PushAgentAdded, "Claude") {
 		t.Fatal("the notice was refused")
 	}
 	env := svc.waitFor(cloudwire.MsgNotice, 3*time.Second)
-	var n cloudwire.Notice
-	if err := cloudwire.Unmarshal(env.B, &n); err != nil || n.Kind != protocol.PushAgentAdded {
-		t.Fatalf("notice %+v %v", n, err)
+	n, err := cloudwire.ReadNotice(env.B)
+	if err != nil || n.Kind != protocol.PushAgentAdded || n.Client != "" {
+		t.Fatalf("notice %+v %v: with the copy off it carries the kind alone", n, err)
 	}
+}
+
+// The client's name goes with agent.added only while the copy is on and
+// carries events, as an event's arguments would.
+func TestANoticeNamesTheClientOnlyWhenTheGrantCarriesEvents(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		scopes []string
+		kind   string
+		client string
+		want   string
+	}{
+		{"events granted", []string{protocol.ScopeLiveRead, protocol.ScopeEventsRead}, protocol.PushAgentAdded, "Claude", "Claude"},
+		{"the copy without events", []string{protocol.ScopeLiveRead}, protocol.PushAgentAdded, "Claude", ""},
+		{"another kind", []string{protocol.ScopeEventsRead}, protocol.PushAgentRequest, "Claude", ""},
+		{"a name too long", []string{protocol.ScopeEventsRead}, protocol.PushAgentAdded, strings.Repeat("c", cloudwire.NoticeClientMaxRunes+1), ""},
+		{"a name the consent page cut", []string{protocol.ScopeEventsRead}, protocol.PushAgentAdded, strings.Repeat("ö", 64) + "…", strings.Repeat("ö", 64) + "…"},
+		{"a format character", []string{protocol.ScopeEventsRead}, protocol.PushAgentAdded, "Claude\u202e", ""},
+		{"a line break", []string{protocol.ScopeEventsRead}, protocol.PushAgentAdded, "Claude\nPay here", ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			svc := newFakeService(t)
+			h := newHarness(t, svc)
+			h.grant(t, c.scopes...)
+			svc.waitFor(cloudwire.MsgRoster, 5*time.Second)
+			if !h.link.Notice(c.kind, c.client) {
+				t.Fatal("the notice was refused")
+			}
+			n, err := cloudwire.ReadNotice(svc.waitFor(cloudwire.MsgNotice, 3*time.Second).B)
+			if err != nil || n.Kind != c.kind || n.Client != c.want {
+				t.Fatalf("notice %+v %v, want client %q", n, err, c.want)
+			}
+		})
+	}
+}
+
+// A security notice's kind never goes as an event: the owners get it once,
+// as a notice, and a viewer reading events gets nothing of it.
+func TestANoticeKindIsNoEvent(t *testing.T) {
+	svc := newFakeService(t)
+	h := newHarness(t, svc)
+	h.grant(t, protocol.ScopeLiveRead, protocol.ScopeEventsRead)
+	svc.waitFor(cloudwire.MsgRoster, 5*time.Second)
+	for _, kind := range cloudwire.NoticeKinds {
+		if h.link.QueueEvent(EventIn{Kind: kind, Priority: 3}) {
+			t.Fatalf("%s was queued as an event", kind)
+		}
+	}
+	if !h.link.QueueEvent(EventIn{Kind: protocol.PushChargingConnected, Priority: 3}) {
+		t.Fatal("an ordinary event was refused")
+	}
+	svc.waitFor(cloudwire.MsgEvent, 3*time.Second)
+}
+
+// Notices wait for the uplink in a queue of 16. A seventeenth pushes the
+// oldest out, and the box counts it.
+func TestAFullNoticeQueueCountsWhatItDrops(t *testing.T) {
+	svc := newFakeService(t)
+	h := newHarness(t, svc)
+	h.grant(t)
+	svc.waitFor(cloudwire.MsgRoster, 5*time.Second)
+	// The same linked box, not running: nothing takes its notices.
+	idle, err := New(Options{Site: h.site, Roster: fakeRoster{}, KV: h.kv, KeyPath: h.keyPath,
+		ServiceKeys: h.link.opts.ServiceKeys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range noticeQueue + 1 {
+		if !idle.Notice(protocol.PushAgentRequest, "") {
+			t.Fatalf("notice %d was refused", i)
+		}
+	}
+	if st := idle.Status(); st.NoticesDropped != 1 {
+		t.Fatalf("dropped %d", st.NoticesDropped)
+	}
+}
+
+// A notice goes past the spent byte budget, as an event does: it is how an
+// owner hears that someone else can reach the box.
+func TestANoticeGoesPastTheBudget(t *testing.T) {
+	svc := newFakeService(t)
+	h := newHarness(t, svc)
+	h.link.mu.Lock()
+	h.link.budget.add(h.link.uptimeMs(), budgetBytes)
+	h.link.mu.Unlock()
+	h.grant(t)
+	svc.waitFor(cloudwire.MsgRoster, 5*time.Second)
+	if !h.link.Notice(protocol.PushOwnerAdded, "") {
+		t.Fatal("the notice was refused")
+	}
+	svc.waitFor(cloudwire.MsgNotice, 3*time.Second)
 }

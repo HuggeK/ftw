@@ -121,6 +121,29 @@ func TestPushVectors(t *testing.T) {
 	}
 	signedAsOther := connected
 	signedAsOther.Seq = 16
+	// Notices: a kind, and on agent.added the client's name, nothing else.
+	notice := func(seq uint64, kind, client string) *Notice {
+		return &Notice{Header: Header{Seq: seq, Boot: boot, UptimeMs: 75_000 + int64(seq), WallMs: at(75_000 + int64(seq))},
+			Kind: kind, Client: client}
+	}
+	agentAdded := notice(17, protocol.PushAgentAdded, "")
+	agentNamed := notice(18, protocol.PushAgentAdded, "Claude")
+	ownerAdded := notice(19, protocol.PushOwnerAdded, "")
+	notNotice := notice(20, protocol.PushChargingConnected, "")
+	nameElsewhere := notice(21, protocol.PushAgentRequest, "Claude")
+	withReading := notice(22, protocol.PushAgentRequest, "")
+	asEvent := func(n *Notice) Event {
+		return Event{Header: n.Header, Kind: n.Kind, Args: map[string]string{}}
+	}
+	named := asEvent(agentNamed)
+	named.Args = map[string]string{NoticeClientArg: "Claude"}
+	// A notice kind sent as an event, as a box on #1646 did: it could have
+	// reached a viewer, so it reads as nothing.
+	noticeAsEvent := Event{Header: Header{Seq: 23, Boot: boot, UptimeMs: 75_023, WallMs: at(75_023)},
+		EventID: "bm90aWNlZXYx", Kind: protocol.PushAgentAdded, Severity: SeverityInfo, Args: map[string]string{}}
+	dayOldNotice := notice(24, protocol.PushApprovalKeySet, "")
+	shortBoot := notice(25, protocol.PushOwnerAdded, "")
+	shortBoot.Boot = boot[:8]
 
 	// Rule U: the phone learned phone time minus box uptime an hour before
 	// the event, so the anchor carries 0.01 % of that hour as margin.
@@ -139,11 +162,14 @@ func TestPushVectors(t *testing.T) {
 		key     *ecdsa.PrivateKey // signer; nil for no event
 		signFor string            // home the box signs for
 		event   *Event
-		alert   Alert // Home and Kind; Event is filled in
-		mutate  func(env []byte) []byte
-		offset  *Offset // rule U's anchor the phone holds for home
-		nowMs   int64
-		want    pushVectorOut
+		notice  *Notice
+		// extra are fields a notice body should not carry.
+		extra  map[string]any
+		alert  Alert // Home and Kind; Event is filled in
+		mutate func(env []byte) []byte
+		offset *Offset // rule U's anchor the phone holds for home
+		nowMs  int64
+		want   pushVectorOut
 	}
 	fresh := fresh0
 	event := func(e Event) pushVectorOut {
@@ -205,6 +231,32 @@ func TestPushVectors(t *testing.T) {
 			alert: Alert{Home: home}, offset: otherBoot, nowMs: fresh(connected), want: generic},
 		{name: "rule U learned over a day ago", key: box, signFor: home, event: &noClock,
 			alert: Alert{Home: home}, offset: dayOld, nowMs: fresh(connected), want: generic},
+		{name: "notice: agent added", key: box, signFor: home, notice: agentAdded, alert: Alert{Home: home},
+			nowMs: fresh(asEvent(agentAdded)), want: event(asEvent(agentAdded))},
+		{name: "notice: agent added, with the client's name", key: box, signFor: home, notice: agentNamed,
+			alert: Alert{Home: home}, nowMs: fresh(named), want: event(named)},
+		{name: "notice: owner added", key: box, signFor: home, notice: ownerAdded, alert: Alert{Home: home},
+			nowMs: fresh(asEvent(ownerAdded)), want: event(asEvent(ownerAdded))},
+		{name: "notice of a kind that is not a notice", key: box, signFor: home, notice: notNotice,
+			alert: Alert{Home: home}, nowMs: fresh(asEvent(notNotice)), want: generic},
+		{name: "notice with a client's name on another kind", key: box, signFor: home, notice: nameElsewhere,
+			alert: Alert{Home: home}, nowMs: fresh(asEvent(nameElsewhere)), want: generic},
+		{name: "notice that carries a reading", key: box, signFor: home, notice: withReading,
+			extra: map[string]any{"fields": map[int]int64{1: 2400}}, alert: Alert{Home: home},
+			nowMs: fresh(asEvent(withReading)), want: generic},
+		{name: "a notice kind sent as an event", key: box, signFor: home, event: &noticeAsEvent, alert: Alert{Home: home},
+			nowMs: fresh(noticeAsEvent), want: generic},
+		{name: "notice: twenty hours old is still shown", key: box, signFor: home, notice: dayOldNotice, alert: Alert{Home: home},
+			nowMs: *dayOldNotice.WallMs + 20*60*60*1000,
+			want: func() pushVectorOut {
+				o := event(asEvent(dayOldNotice))
+				o.AtMs = *dayOldNotice.WallMs
+				return o
+			}()},
+		{name: "notice: over a day old", key: box, signFor: home, notice: dayOldNotice, alert: Alert{Home: home},
+			nowMs: *dayOldNotice.WallMs + NoticeMaxAgeMs + 1, want: generic},
+		{name: "notice with a short boot", key: box, signFor: home, notice: shortBoot, alert: Alert{Home: home},
+			nowMs: fresh(asEvent(shortBoot)), want: generic},
 	}
 
 	keys := map[string][]byte{home: boxPK, otherHome: otherPK}
@@ -215,21 +267,27 @@ func TestPushVectors(t *testing.T) {
 	for i, s := range specs {
 		a := s.alert
 		var sig []byte
-		if s.event != nil {
-			body, err := Marshal(*s.event)
+		if s.event != nil || s.notice != nil {
+			typ, body := MsgEvent, []byte(nil)
+			var err error
+			if s.event != nil {
+				body, err = Marshal(*s.event)
+			} else {
+				typ, body = MsgNotice, noticeBody(t, *s.notice, s.extra)
+			}
 			if err != nil {
 				t.Fatal(err)
 			}
 			sig = storedSig(i, s.name)
-			if *update && Verify(&s.key.PublicKey, s.signFor, Envelope{T: MsgEvent, B: body, Sig: sig}) != nil {
-				if sig, err = Sign(rand.Reader, s.key, s.signFor, MsgEvent, body); err != nil {
+			if *update && Verify(&s.key.PublicKey, s.signFor, Envelope{T: typ, B: body, Sig: sig}) != nil {
+				if sig, err = Sign(rand.Reader, s.key, s.signFor, typ, body); err != nil {
 					t.Fatal(err)
 				}
 			}
-			if err := Verify(&s.key.PublicKey, s.signFor, Envelope{T: MsgEvent, B: body, Sig: sig}); err != nil {
+			if err := Verify(&s.key.PublicKey, s.signFor, Envelope{T: typ, B: body, Sig: sig}); err != nil {
 				t.Fatalf("%s: stored signature does not verify: %v", s.name, err)
 			}
-			env, err := Envelope{T: MsgEvent, B: body, Sig: sig}.Encode()
+			env, err := Envelope{T: typ, B: body, Sig: sig}.Encode()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -285,6 +343,29 @@ func TestPushVectors(t *testing.T) {
 		t.Fatalf("the bytes no longer match %s. If the change is intended, regenerate with -update "+
 			"and pair it with srcfl/ftw-cloud and the app", pushVectorsPath)
 	}
+}
+
+// noticeBody is a notice's body with extra fields beside its own.
+func noticeBody(t *testing.T, n Notice, extra map[string]any) []byte {
+	t.Helper()
+	body, err := Marshal(n)
+	if err != nil || len(extra) == 0 {
+		if err != nil {
+			t.Fatal(err)
+		}
+		return body
+	}
+	var m map[string]any
+	if err := Unmarshal(body, &m); err != nil {
+		t.Fatal(err)
+	}
+	for k, v := range extra {
+		m[k] = v
+	}
+	if body, err = Marshal(m); err != nil {
+		t.Fatal(err)
+	}
+	return body
 }
 
 // fresh0 is a phone clock 1.2 s after the event's wallMs.

@@ -682,10 +682,17 @@ old one signed has expired.
 
 These are security notices. They go whatever the owner's notification
 settings say, through the box's own transports, and to FTW Cloud as a
-`notice {kind}` that carries nothing but the kind, whenever the link is up,
-copy or not (docs/protocol-cloud.md). FTW Cloud turns a notice into a push
-to the home's phones; until it does, it drops the class, as it drops any
-box message it does not know.
+`notice {kind}` whenever the link is up, copy or not (docs/protocol-cloud.md).
+A notice carries nothing but the kind, except that `agent.added` names the
+client while the readable copy is on and carries events. FTW Cloud sends
+each notice, as the box signed it, in an alert to the home's owner devices
+only, never to a viewer or a watch. These kinds never go to FTW Cloud as an
+`event`, so an owner hears of each change once through it.
+
+FTW Cloud knows each agent's client name whatever the copy: the roster lists
+it in the agent row (`principal.client`), and the name came from its own
+consent page. The copy decides only whether the name also goes to Apple in a
+notice.
 
 ## The audit log
 

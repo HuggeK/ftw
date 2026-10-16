@@ -43,8 +43,9 @@ type Access interface {
 	EndHolds(agentID string)
 	// Wall is the wall clock in ms, and whether NTP has set it.
 	Wall() (int64, bool)
-	// Notify pushes a catalogue kind to every owner.
-	Notify(kind string)
+	// Notify pushes a catalogue kind to every owner. client names the
+	// client given access, on agent.added, and is empty otherwise.
+	Notify(kind, client string)
 }
 
 // AgentViews builds the typed reads' bodies: FTW Cloud's class bodies, with
@@ -486,7 +487,7 @@ func (h *Handler) onAgentRequest(env Envelope, grant Enrolment) error {
 		return refuse(refusal.Code, refusal.Args)
 	}
 	h.audit(env.By, env.T, m.Op+" "+req.ReqID, "ok")
-	h.cfg.Access.Notify(protocol.PushAgentRequest)
+	h.cfg.Access.Notify(protocol.PushAgentRequest, "")
 	return h.agentOK(env.ID, map[string]any{"reqId": req.ReqID, "expiresAtMs": req.ExpiresAtMs})
 }
 
@@ -526,7 +527,7 @@ func (h *Handler) onApprovalKeySet(env Envelope) error {
 		return h.refuseErr(env.ID, err)
 	}
 	// A new key is a new way to let others in: every owner hears of it.
-	h.cfg.Access.Notify(protocol.PushApprovalKeySet)
+	h.cfg.Access.Notify(protocol.PushApprovalKeySet, "")
 	return h.agentOK(env.ID, map[string]any{"deviceId": h.selfID(), "setAtMs": setAt})
 }
 
@@ -570,7 +571,7 @@ func (h *Handler) onAgentWiden(env Envelope) error {
 	if !slices.Contains(row.Ops, OpLoadpointHold) || !slices.Contains(row.Scopes, protocol.ScopeDispatchHold) {
 		h.cfg.Access.EndHolds(row.ID)
 	}
-	h.cfg.Access.Notify(protocol.PushAgentAdded)
+	h.cfg.Access.Notify(protocol.PushAgentAdded, row.Principal.Client)
 	return h.agentOK(env.ID, map[string]any{"agent": row})
 }
 

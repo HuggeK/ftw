@@ -118,8 +118,9 @@ type agentPorts struct {
 	// home is FTW Cloud's home id for this box, bound once the link exists.
 	home func() string
 	// notice sends FTW Cloud a security notice for the owners' phones,
-	// bound once the link exists. It goes copy or not.
-	notice func(kind string) bool
+	// bound once the link exists. It goes copy or not; the link decides
+	// whether client goes with it.
+	notice func(kind, client string) bool
 
 	// Filled in by startAppLink.
 	access *appuplink.AgentAccess
@@ -138,10 +139,11 @@ type agentPorts struct {
 }
 
 // push tells every owner about a change to who may reach the box: through
-// the box's own transports, and as a data-free notice through FTW Cloud.
-func (p *agentPorts) push(kind string) {
+// the box's own transports, and as a notice through FTW Cloud. client names
+// the client given access, on agent.added.
+func (p *agentPorts) push(kind, client string) {
 	if p.notice != nil {
-		p.notice(kind)
+		p.notice(kind, client)
 	}
 	if p.notices == nil {
 		return
@@ -348,7 +350,7 @@ func (p *agentPorts) warnExpiring(nowMs int64) {
 		key := row.ID + ":" + strconv.FormatInt(row.ExpiresAtMs, 10)
 		if row.ExpiresAtMs-nowMs <= 24*60*60*1000 && !p.warned[key] {
 			p.warned[key] = true
-			p.push(protocol.PushAgentExpiring)
+			p.push(protocol.PushAgentExpiring, "")
 		}
 	}
 }
@@ -441,7 +443,7 @@ func (b boxPageAgents) ReplaceApprovalKey(by, deviceID string, pub []byte) error
 	_, err := b.p.access.Enroll.ReplaceApprovalKey(deviceID, pub)
 	b.record(by, protocol.MsgApprovalKeySet, deviceID, err)
 	if err == nil {
-		b.p.push(protocol.PushApprovalKeySet)
+		b.p.push(protocol.PushApprovalKeySet, "")
 	}
 	return err
 }
@@ -468,7 +470,7 @@ func (b boxPageAgents) AddAgent(by string, m protocol.AgentAdd) (protocol.AgentR
 	row, err := b.p.access.Enroll.AddAgent(appenroll.AtTheBoxPage, m)
 	b.record(by, protocol.MsgAgentAdd, row.ID, err)
 	if err == nil {
-		b.p.push(protocol.PushAgentAdded)
+		b.p.push(protocol.PushAgentAdded, row.Principal.Client)
 	}
 	return row, err
 }
@@ -480,7 +482,7 @@ func (b boxPageAgents) WidenAgent(by string, m protocol.AgentWiden) (protocol.Ag
 		if !slices.Contains(row.Ops, protocol.OpLoadpointHold) || !slices.Contains(row.Scopes, protocol.ScopeDispatchHold) {
 			b.p.access.EndHolds(row.ID)
 		}
-		b.p.push(protocol.PushAgentAdded)
+		b.p.push(protocol.PushAgentAdded, row.Principal.Client)
 	}
 	return row, err
 }

@@ -252,6 +252,125 @@
         "verdict": "generic",
         "home": "fjzyr67buzpyncqmjliwgezvde"
       }
+    },
+    {
+      "name": "notice: agent added",
+      "payload": "{\"aps\":{\"alert\":{\"title-loc-key\":\"push.title\",\"loc-key\":\"push.generic\"},\"mutable-content\":1,\"sound\":\"default\"},\"ftw\":{\"v\":1,\"home\":\"fjzyr67buzpyncqmjliwgezvde\",\"event\":\"o2FiWEulY3NlcRFkYm9vdFCwsLCwsLCwsLCwsLCwsLCwZGtpbmRrYWdlbnQuYWRkZWRmd2FsbE1zGwAAAaEw19qpaHVwdGltZU1zGgABJQlhdGZub3RpY2Vjc2lnWEAbAyFDum/1cvsa/UZ6W4Ycr9Vi0fi4Za3eybeuZVPnU2TKhbb8isxPSpwOBLfLQVgHhoY+bkI6oQUgQQ2R9+3v\"}}",
+      "sig": "1b032143ba6ff572fb1afd467a5b861cafd562d1f8b865addec9b7ae6553e75364ca85b6fc8acc4f4a9c0e04b7cb41580786863e6e423aa10520410d91f7edef",
+      "nowMs": 1791820816217,
+      "want": {
+        "verdict": "event",
+        "home": "fjzyr67buzpyncqmjliwgezvde",
+        "kind": "agent.added",
+        "boot": "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
+        "seq": 17,
+        "atMs": 1791820815017
+      }
+    },
+    {
+      "name": "notice: agent added, with the client's name",
+      "payload": "{\"aps\":{\"alert\":{\"title-loc-key\":\"push.title\",\"loc-key\":\"push.generic\"},\"mutable-content\":1,\"sound\":\"default\"},\"ftw\":{\"v\":1,\"home\":\"fjzyr67buzpyncqmjliwgezvde\",\"event\":\"o2FiWFmmY3NlcRJkYm9vdFCwsLCwsLCwsLCwsLCwsLCwZGtpbmRrYWdlbnQuYWRkZWRmY2xpZW50ZkNsYXVkZWZ3YWxsTXMbAAABoTDX2qpodXB0aW1lTXMaAAElCmF0Zm5vdGljZWNzaWdYQE4+GuWl/LzZJLZfra214MRS7FcNFraI3uxiFd8KifedDll34e209yxx4ShX4EnuMw3pZ/saTXZbanwGvvq7OwA=\"}}",
+      "sig": "4e3e1ae5a5fcbcd924b65fadadb5e0c452ec570d16b688deec6215df0a89f79d0e5977e1edb4f72c71e12857e049ee330de967fb1a4d765b6a7c06befabb3b00",
+      "nowMs": 1791820816218,
+      "want": {
+        "verdict": "event",
+        "home": "fjzyr67buzpyncqmjliwgezvde",
+        "kind": "agent.added",
+        "args": {
+          "client": "Claude"
+        },
+        "boot": "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
+        "seq": 18,
+        "atMs": 1791820815018
+      }
+    },
+    {
+      "name": "notice: owner added",
+      "payload": "{\"aps\":{\"alert\":{\"title-loc-key\":\"push.title\",\"loc-key\":\"push.generic\"},\"mutable-content\":1,\"sound\":\"default\"},\"ftw\":{\"v\":1,\"home\":\"fjzyr67buzpyncqmjliwgezvde\",\"event\":\"o2FiWEulY3NlcRNkYm9vdFCwsLCwsLCwsLCwsLCwsLCwZGtpbmRrb3duZXIuYWRkZWRmd2FsbE1zGwAAAaEw19qraHVwdGltZU1zGgABJQthdGZub3RpY2Vjc2lnWEA1UrmPsIrWKWG9fjxWr25VeJlNItvdxLisM+pnQm6hiBlJP04wSC+YWHHEc7ONCX7RaG9AuXgy9YYIC861ofPC\"}}",
+      "sig": "3552b98fb08ad62961bd7e3c56af6e5578994d22dbddc4b8ac33ea67426ea18819493f4e30482f985871c473b38d097ed1686f40b97832f586080bceb5a1f3c2",
+      "nowMs": 1791820816219,
+      "want": {
+        "verdict": "event",
+        "home": "fjzyr67buzpyncqmjliwgezvde",
+        "kind": "owner.added",
+        "boot": "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
+        "seq": 19,
+        "atMs": 1791820815019
+      }
+    },
+    {
+      "name": "notice of a kind that is not a notice",
+      "payload": "{\"aps\":{\"alert\":{\"title-loc-key\":\"push.title\",\"loc-key\":\"push.generic\"},\"mutable-content\":1,\"sound\":\"default\"},\"ftw\":{\"v\":1,\"home\":\"fjzyr67buzpyncqmjliwgezvde\",\"event\":\"o2FiWFKlY3NlcRRkYm9vdFCwsLCwsLCwsLCwsLCwsLCwZGtpbmRyY2hhcmdpbmcuY29ubmVjdGVkZndhbGxNcxsAAAGhMNfarGh1cHRpbWVNcxoAASUMYXRmbm90aWNlY3NpZ1hAEgkMM7TKQ7T+9OGA0ghvgzsbClOTmAZDKyjx5+2GbmhLfEnPDyrf8j7+/XJtPUpRAYtG08d0fJwFx4N25Fj7ig==\"}}",
+      "sig": "12090c33b4ca43b4fef4e180d2086f833b1b0a53939806432b28f1e7ed866e684b7c49cf0f2adff23efefd726d3d4a51018b46d3c7747c9c05c78376e458fb8a",
+      "nowMs": 1791820816220,
+      "want": {
+        "verdict": "generic",
+        "home": "fjzyr67buzpyncqmjliwgezvde"
+      }
+    },
+    {
+      "name": "notice with a client's name on another kind",
+      "payload": "{\"aps\":{\"alert\":{\"title-loc-key\":\"push.title\",\"loc-key\":\"push.generic\"},\"mutable-content\":1,\"sound\":\"default\"},\"ftw\":{\"v\":1,\"home\":\"fjzyr67buzpyncqmjliwgezvde\",\"event\":\"o2FiWFumY3NlcRVkYm9vdFCwsLCwsLCwsLCwsLCwsLCwZGtpbmRtYWdlbnQucmVxdWVzdGZjbGllbnRmQ2xhdWRlZndhbGxNcxsAAAGhMNfarWh1cHRpbWVNcxoAASUNYXRmbm90aWNlY3NpZ1hAs6NjZVEBVln2Oa0fswegEGi/WY4oZE+ttBlos/7klFaXvtNQ0LhlWjs1WsNg6F5A1SSN5nruJ1Djpl7T/SaG8w==\"}}",
+      "sig": "b3a3636551015659f639ad1fb307a01068bf598e28644fadb41968b3fee4945697bed350d0b8655a3b355ac360e85e40d5248de67aee2750e3a65ed3fd2686f3",
+      "nowMs": 1791820816221,
+      "want": {
+        "verdict": "generic",
+        "home": "fjzyr67buzpyncqmjliwgezvde"
+      }
+    },
+    {
+      "name": "notice that carries a reading",
+      "payload": "{\"aps\":{\"alert\":{\"title-loc-key\":\"push.title\",\"loc-key\":\"push.generic\"},\"mutable-content\":1,\"sound\":\"default\"},\"ftw\":{\"v\":1,\"home\":\"fjzyr67buzpyncqmjliwgezvde\",\"event\":\"o2FiWFmmY3NlcRZkYm9vdFCwsLCwsLCwsLCwsLCwsLCwZGtpbmRtYWdlbnQucmVxdWVzdGZmaWVsZHOhARkJYGZ3YWxsTXMbAAABoTDX2q5odXB0aW1lTXMaAAElDmF0Zm5vdGljZWNzaWdYQLAkL9JgkAuamo13qXA+F1jPe7kikT0U7zv65Audx/TaPylfZhJ+A5ozM0YLiSoi8bceFQJeYGVP9Qtl/y1WStM=\"}}",
+      "sig": "b0242fd260900b9a9a8d77a9703e1758cf7bb922913d14ef3bfae40b9dc7f4da3f295f66127e039a3333460b892a22f1b71e15025e60654ff50b65ff2d564ad3",
+      "nowMs": 1791820816222,
+      "want": {
+        "verdict": "generic",
+        "home": "fjzyr67buzpyncqmjliwgezvde"
+      }
+    },
+    {
+      "name": "a notice kind sent as an event",
+      "payload": "{\"aps\":{\"alert\":{\"title-loc-key\":\"push.title\",\"loc-key\":\"push.generic\"},\"mutable-content\":1,\"sound\":\"default\"},\"ftw\":{\"v\":1,\"home\":\"fjzyr67buzpyncqmjliwgezvde\",\"event\":\"o2FiWHSoY3NlcRdkYXJnc6BkYm9vdFCwsLCwsLCwsLCwsLCwsLCwZGtpbmRrYWdlbnQuYWRkZWRmd2FsbE1zGwAAAaEw19qvZ2V2ZW50SWRsYm05MGFXTmxaWFl4aHNldmVyaXR5ZGluZm9odXB0aW1lTXMaAAElD2F0ZWV2ZW50Y3NpZ1hAdYhzcPtaXW1REa8z71XlON6LANr0PDuWzx2axo7CkNzZSYNx4OF/juTHPf4LKSjQW+dwwkAeE2vIjFjpLhJjEw==\"}}",
+      "sig": "75887370fb5a5d6d5111af33ef55e538de8b00daf43c3b96cf1d9ac68ec290dcd9498371e0e17f8ee4c73dfe0b2928d05be770c2401e136bc88c58e92e126313",
+      "nowMs": 1791820816223,
+      "want": {
+        "verdict": "generic",
+        "home": "fjzyr67buzpyncqmjliwgezvde"
+      }
+    },
+    {
+      "name": "notice: twenty hours old is still shown",
+      "payload": "{\"aps\":{\"alert\":{\"title-loc-key\":\"push.title\",\"loc-key\":\"push.generic\"},\"mutable-content\":1,\"sound\":\"default\"},\"ftw\":{\"v\":1,\"home\":\"fjzyr67buzpyncqmjliwgezvde\",\"event\":\"o2FiWFGlY3NlcRgYZGJvb3RQsLCwsLCwsLCwsLCwsLCwsGRraW5kcGFwcHJvdmFsLmtleS5zZXRmd2FsbE1zGwAAAaEw19qwaHVwdGltZU1zGgABJRBhdGZub3RpY2Vjc2lnWEBslMBAqiznLiaedLlM28EGe661MxcbIVAadoY7xwF5cpHybeQU8pFgluWy6XoaOX7zvtEPOxBLFj0qzgfEaBLE\"}}",
+      "sig": "6c94c040aa2ce72e269e74b94cdbc1067baeb533171b21501a76863bc701797291f26de414f2916096e5b2e97a1a397ef3bed10f3b104b163d2ace07c46812c4",
+      "nowMs": 1791892815024,
+      "want": {
+        "verdict": "event",
+        "home": "fjzyr67buzpyncqmjliwgezvde",
+        "kind": "approval.key.set",
+        "boot": "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
+        "seq": 24,
+        "atMs": 1791820815024
+      }
+    },
+    {
+      "name": "notice: over a day old",
+      "payload": "{\"aps\":{\"alert\":{\"title-loc-key\":\"push.title\",\"loc-key\":\"push.generic\"},\"mutable-content\":1,\"sound\":\"default\"},\"ftw\":{\"v\":1,\"home\":\"fjzyr67buzpyncqmjliwgezvde\",\"event\":\"o2FiWFGlY3NlcRgYZGJvb3RQsLCwsLCwsLCwsLCwsLCwsGRraW5kcGFwcHJvdmFsLmtleS5zZXRmd2FsbE1zGwAAAaEw19qwaHVwdGltZU1zGgABJRBhdGZub3RpY2Vjc2lnWEDhgeh5sDs7qhAO/vie0bMhUWZJeajyBGqqql6TIH2c2i4nNqnWOFdaTnGigUzmM+Vvw13M9baTp+8wqH6gnRcg\"}}",
+      "sig": "e181e879b03b3baa100efef89ed1b32151664979a8f2046aaaaa5e93207d9cda2e2736a9d638575a4e71a2814ce633e56fc35dccf5b693a7ef30a87ea09d1720",
+      "nowMs": 1791907215025,
+      "want": {
+        "verdict": "generic",
+        "home": "fjzyr67buzpyncqmjliwgezvde"
+      }
+    },
+    {
+      "name": "notice with a short boot",
+      "payload": "{\"aps\":{\"alert\":{\"title-loc-key\":\"push.title\",\"loc-key\":\"push.generic\"},\"mutable-content\":1,\"sound\":\"default\"},\"ftw\":{\"v\":1,\"home\":\"fjzyr67buzpyncqmjliwgezvde\",\"event\":\"o2FiWESlY3NlcRgZZGJvb3RIsLCwsLCwsLBka2luZGtvd25lci5hZGRlZGZ3YWxsTXMbAAABoTDX2rFodXB0aW1lTXMaAAElEWF0Zm5vdGljZWNzaWdYQB0GZm45ROf59oQ4Kl/xD8+TQaF3B+mNoBN3uHrYHTvqGTD1378qCy/FI34or24G6uAl7HB4/RN3QQTNMdDU0KI=\"}}",
+      "sig": "1d06666e3944e7f9f684382a5ff10fcf9341a17707e98da01377b87ad81d3bea1930f5dfbf2a0b2fc5237e28af6e06eae025ec7078fd13774104cd31d0d4d0a2",
+      "nowMs": 1791820816225,
+      "want": {
+        "verdict": "generic",
+        "home": "fjzyr67buzpyncqmjliwgezvde"
+      }
     }
   ]
 }

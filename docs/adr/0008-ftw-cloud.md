@@ -289,7 +289,7 @@ rules, the app asks again. A public launch needs C2–C4 and the legal work.
 | Signatures cost data on a 4G box, about 150 MB a month | Measure in C2 |
 | The network sees message sizes and timing | The privacy notice |
 | With the copy off, the service sees from the tunnel's timing when the box reads its devices while a phone watches | The privacy notice; a frame goes on every poll whether or not a value moved, frames keep their size, and a hidden session keeps its 5 s |
-| Apple sees the home id, event codes and Live Activity state | The privacy notice; no names in arguments; the M7 spike |
+| Apple sees the home id, event codes and Live Activity state, and an agent's client name in `agent.added` while the copy carries events | The privacy notice; no device or person's names in event arguments; a notice carries only its kind and that name; the M7 spike |
 | Claims or defaults drift back | Claim tests; a missing grant reads as off |
 | A paid app meets App Store purchase rules | Decide the payment path before charging |
 | AGPL code in the App Store | An App Store exception in `ftw-app` before outside code arrives |

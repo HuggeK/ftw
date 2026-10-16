@@ -3,6 +3,7 @@ package cloudwire
 import (
 	"bytes"
 	"encoding/json"
+	"slices"
 
 	"github.com/srcfl/ftw/go/protocol"
 )
@@ -97,9 +98,14 @@ type PushUnregister struct {
 	APNsToken []byte `cbor:"apnsToken"`
 }
 
+// NoticeClientArg is the argument a notice's client name reads as, for the
+// phone's words.
+const NoticeClientArg = "client"
+
 // AlertMaxAgeMs is how old an event may be and still get its text and
-// buttons on the phone. An older one, or one the phone cannot anchor in
-// time, shows the generic line with no buttons.
+// buttons on the phone; a notice may be NoticeMaxAgeMs old. An older one,
+// or one the phone cannot anchor in time, shows the generic line with no
+// buttons.
 const AlertMaxAgeMs = 10 * 60 * 1000
 
 // UnreachableAfterMs is how long the service waits without the box's socket
@@ -111,8 +117,9 @@ const (
 )
 
 // Alert is the "ftw" member of an APNs alert payload. Event is the box's
-// envelope exactly as it arrived; Kind is set only on the alert the service
-// writes itself, box.unreachable, and a phone accepts no other kind there.
+// envelope exactly as it arrived, an event or a notice; Kind is set only on
+// the alert the service writes itself, box.unreachable, and a phone accepts
+// no other kind there.
 type Alert struct {
 	V     int    `json:"v"`
 	Home  string `json:"home"`
@@ -152,8 +159,9 @@ func AlertPayload(a Alert) ([]byte, error) {
 
 // What a phone makes of an alert.
 const (
-	// AlertEvent: a box-signed event, anchored and fresh, of a kind the
-	// catalogue has. The phone writes its text and offers its buttons.
+	// AlertEvent: a box-signed event or notice, anchored and fresh, of a
+	// kind the catalogue has. The phone writes its text and offers its
+	// buttons.
 	AlertEvent = "event"
 	// AlertUnreachable: the service's box.unreachable. Its own text, no
 	// buttons.
@@ -216,7 +224,7 @@ func ReadAlert(payload []byte, boxKey func(home string) []byte, offset func(home
 		return view
 	}
 	env, err := DecodeEnvelope(a.Event)
-	if err != nil || env.T != MsgEvent {
+	if err != nil || (env.T != MsgEvent && env.T != MsgNotice) {
 		return view
 	}
 	pk := boxKey(a.Home)
@@ -228,7 +236,22 @@ func ReadAlert(payload []byte, boxKey func(home string) []byte, offset func(home
 		return view
 	}
 	var ev Event
-	if Unmarshal(env.B, &ev) != nil {
+	maxAge := int64(AlertMaxAgeMs)
+	if env.T == MsgNotice {
+		maxAge = NoticeMaxAgeMs
+		// A notice reads as an event of its kind, with the client's name
+		// as its one argument when it carries one.
+		n, err := ReadNotice(env.B)
+		if err != nil {
+			return view
+		}
+		ev = Event{Header: n.Header, Kind: n.Kind, Args: map[string]string{}}
+		if n.Client != "" {
+			ev.Args[NoticeClientArg] = n.Client
+		}
+	} else if Unmarshal(env.B, &ev) != nil || slices.Contains(NoticeKinds, ev.Kind) {
+		// A notice's kind comes only as a notice, to the owners: as an
+		// event it could have reached a viewer.
 		return view
 	}
 	at, ok := alertSendTime(ev, offset(a.Home), nowMs)
@@ -239,7 +262,7 @@ func ReadAlert(payload []byte, boxKey func(home string) []byte, offset func(home
 		at = min(at, *ev.Ts)
 	}
 	_, known := protocol.PushSentences[ev.Kind]
-	if !known || ev.Kind == protocol.PushBoxUnreachable || nowMs-at > AlertMaxAgeMs {
+	if !known || ev.Kind == protocol.PushBoxUnreachable || nowMs-at > maxAge {
 		return view
 	}
 	return AlertView{Verdict: AlertEvent, Home: a.Home, Kind: ev.Kind, Args: ev.Args, Src: ev.Src, LP: ev.LP,

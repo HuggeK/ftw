@@ -51,9 +51,13 @@ var nameArgs = map[string]bool{"name": true}
 var errClosed = errors.New("cloudlink: the box is shutting down")
 
 // QueueEvent keeps an event for the uplink to sign and send. It never
-// blocks. False means FTW Cloud will not carry it: off, being revoked, or a
-// grant that leaves events out.
+// blocks. False means FTW Cloud will not carry it: off, being revoked, a
+// grant that leaves events out, or a security notice's kind, which goes to
+// the owners alone as a notice (Notice).
 func (l *Link) QueueEvent(e EventIn) bool {
+	if slices.Contains(cloudwire.NoticeKinds, e.Kind) {
+		return false
+	}
 	l.mu.Lock()
 	g := l.grant
 	if g == nil || g.Revoked || !g.has(protocol.ScopeEventsRead) || l.closing {
@@ -103,6 +107,17 @@ func (w *writer) sendEvents(snap grantSnapshot, now time.Time) error {
 		}
 	}
 	return nil
+}
+
+// noticeClient is the client name a notice may carry: on agent.added, while
+// the copy is on and its grant has events, as an event's arguments would,
+// and only a name cloudwire.NoticeClientOK takes, as the consent page cut it.
+func noticeClient(snap grantSnapshot, n notice) string {
+	if n.kind != protocol.PushAgentAdded || !snap.copyOn() || !snap.g.has(protocol.ScopeEventsRead) ||
+		!cloudwire.NoticeClientOK(n.client) {
+		return ""
+	}
+	return n.client
 }
 
 // projectEvent cuts opaque ids and drops names.
@@ -199,11 +214,16 @@ func (w *writer) closeIfAsked(snap grantSnapshot) error {
 // noticeQueue bounds the notices waiting for the uplink.
 const noticeQueue = 16
 
+// notice is one security notice waiting for the uplink.
+type notice struct{ kind, client string }
+
 // Notice queues a security notice for the owners' phones (docs/agents.md,
 // Push kinds). Unlike an event it needs no grant: it says only that access
-// to the box changed, and goes whenever the box is linked. False means the
-// box is not linked or the kind is not a notice.
-func (l *Link) Notice(kind string) bool {
+// to the box changed, and goes whenever the box is linked. client is the
+// name of the client given access, on agent.added; it leaves the box only
+// while the readable copy is on and carries events. False means the box is
+// not linked or the kind is not a notice.
+func (l *Link) Notice(kind, client string) bool {
 	if !slices.Contains(cloudwire.NoticeKinds, kind) {
 		return false
 	}
@@ -212,11 +232,18 @@ func (l *Link) Notice(kind string) bool {
 		l.mu.Unlock()
 		return false
 	}
+	dropped := ""
 	if len(l.notices) >= noticeQueue {
+		dropped = l.notices[0].kind
 		l.notices = l.notices[1:]
+		l.noticesDropped++
 	}
-	l.notices = append(l.notices, kind)
+	l.notices = append(l.notices, notice{kind, client})
 	l.mu.Unlock()
+	if dropped != "" {
+		// The box's own transports carried it; FTW Cloud never will.
+		l.log.Warn("cloudlink: the notice queue is full; the oldest notice was dropped", "kind", dropped, "queued", noticeQueue)
+	}
 	l.signal()
 	return true
 }
@@ -228,8 +255,9 @@ func (w *writer) sendNotices(snap grantSnapshot) error {
 	queued := l.notices
 	l.notices = nil
 	l.mu.Unlock()
-	for i, kind := range queued {
-		if _, err := w.sendBody(snap, cloudwire.MsgNotice, &cloudwire.Notice{Kind: kind}, true); err != nil {
+	for i, n := range queued {
+		body := cloudwire.Notice{Kind: n.kind, Client: noticeClient(snap, n)}
+		if _, err := w.sendBody(snap, cloudwire.MsgNotice, &body, true); err != nil {
 			l.mu.Lock()
 			l.notices = append(queued[i:len(queued):len(queued)], l.notices...)
 			l.mu.Unlock()

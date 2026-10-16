@@ -61,7 +61,7 @@ func (a *testAccess) SetApprovalKey(d string, m protocol.ApprovalKeySet) (int64,
 	return a.id.SetApprovalKey(d, m)
 }
 func (a *testAccess) Wall() (int64, bool) { return a.wall() }
-func (a *testAccess) Notify(kind string)  { a.notified = append(a.notified, kind) }
+func (a *testAccess) Notify(kind, _ string) { a.notified = append(a.notified, kind) }
 
 // enrolGrants reads one row the way appuplink's liveGrant does.
 type enrolGrants struct {

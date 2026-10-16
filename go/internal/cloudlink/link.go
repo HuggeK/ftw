@@ -278,8 +278,11 @@ type Link struct {
 	// again.
 	events        []EventIn
 	eventsDropped int64
-	// notices wait for the uplink; see Notice.
-	notices []string
+	// notices wait for the uplink; see Notice. noticesDropped counts those
+	// a full queue pushed out.
+	notices        []notice
+	noticesDropped int64
+
 	closing bool
 	byeWhy  string
 	byeDone chan struct{}
@@ -821,6 +824,9 @@ type Status struct {
 	// the queue was full, or the uplink was down for longer than a phone
 	// would still act on them.
 	EventsDropped int64 `json:"eventsDropped"`
+	// NoticesDropped counts security notices a full queue pushed out
+	// before the uplink took them. The box's own transports carried them.
+	NoticesDropped int64 `json:"noticesDropped"`
 	// TunBytesLast24h counts the tunnel's bytes, apart from the readable
 	// copy's, against TunBudgetBytes. TunDropped counts tun messages that
 	// never left: no uplink, a full queue or the budget reached.
@@ -836,7 +842,7 @@ func (l *Link) Status() Status {
 	s := Status{
 		State: "off", Notice: l.notice, Available: len(l.opts.ServiceKeys) > 0,
 		Scopes: []string{}, Purposes: []string{}, Connected: l.connected, Transport: l.transport,
-		LastSendAgeMs: -1, PurgedAtMs: l.purgedAt, EventsDropped: l.eventsDropped,
+		LastSendAgeMs: -1, PurgedAtMs: l.purgedAt, EventsDropped: l.eventsDropped, NoticesDropped: l.noticesDropped,
 		BytesLast24h: l.budget.total(l.uptimeMs()), BudgetBytes: budgetBytes,
 		Link: "off", TunBytesLast24h: l.tunBudget.total(l.uptimeMs()), TunBudgetBytes: tunBudgetBytes,
 		TunDropped: l.tunDropped,

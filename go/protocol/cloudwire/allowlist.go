@@ -53,8 +53,10 @@ var Fields = map[string][]string{
 
 	MsgBye: {"why", "purge"},
 
-	// A kind and nothing else: no reading, no name, no id.
-	MsgNotice: {"kind"},
+	// A kind and nothing else: no reading, no id. The one name is the
+	// client an owner gave access, on agent.added while the copy carries
+	// events, which FTW Cloud's own consent page showed.
+	MsgNotice: {"kind", "client"},
 
 	// tun carries no header and no signature: d is Noise ciphertext its two
 	// ends authenticate, and the service reads only dev and sid.

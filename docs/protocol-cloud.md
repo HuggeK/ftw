@@ -737,11 +737,21 @@ record cannot turn a withdrawn consent back on.
 | Field | Type | Meaning |
 |---|---|---|
 | `kind` | text | One of `agent.added`, `agent.request`, `agent.expiring`, `approval.key.set`, `owner.added` |
+| `client` | text, optional | On `agent.added` only, while the readable copy is on and its grant has `ftw.events.read`: the client's name as FTW Cloud's consent page showed it: at most 65 characters (the page keeps 64 and marks a cut name with "…"), and no control or format character. Absent otherwise |
 
 A security notice: someone gained access, asks for a change, is about to
-lose access, or can now approve access. The service sends each owner device
-registered for alerts a push with no data beyond the kind, which the phone
-words from its catalogue. See [Agents](agents.md).
+lose access, or can now approve access. The service checks that the body
+holds nothing beyond the header, `kind` and `client` (`cloudwire.ReadNotice`)
+and sends each owner device registered for alerts the notice as it arrived,
+in an `alert` (see [Push](#push)). The phone words it from its catalogue. A
+notice of these kinds never goes as an `event`, so an owner gets one alert,
+not two; a phone shows an event of these kinds as the generic line. A notice
+states a lasting fact, so Apple may hold it and the phone shows it for a day
+(`NoticeMaxAgeMs`), where an event lasts 10 minutes. The box keeps at most 16
+notices for the uplink and counts any it drops (`noticesDropped` in
+`GET /api/cloud`). The name in `client` is not new to the service: the
+roster's agent row carries it whatever the copy (`principal.client`); the
+copy decides only whether it also reaches Apple. See [Agents](agents.md).
 
 **`bye`** `{why, purge}`. `why` is `revoked`, `shutdown` or `update`.
 `purge: true` asks the service to delete the home. `why: "update"` holds
@@ -804,7 +814,7 @@ as it decides for the same session over the relay.
   `live`, `lp` or `event`.
 - **Byte budget.** The box counts the bytes it sent over a rolling 24 hours
   of uptime. Past 20 MB, four times the measured 5 MB, it sends only `event`,
-  `roster`, `stats.withdraw` and `bye` until the count falls. It sends no
+  `notice`, `roster`, `stats.withdraw` and `bye` until the count falls. It sends no
   `hb` then, so data on phones ages to stale rather than looking current.
   `GET /api/cloud` shows the count and whether the budget is reached.
 - **`tun` has its own queues and budget.** `tun` waits for the socket apart
@@ -1175,7 +1185,7 @@ through the relay instead, and prices and the plan wait for the phone.
 
 | Type | Payload | Phone behaviour |
 |---|---|---|
-| `alert` | `aps` with the generic title "FTW" and `mutable-content: 1`, plus `home` and the `event` envelope in base64 | The extension checks the signature and drops an already seen `(boot, seq)`. If the event is anchored and at most 10 minutes old, it renders text from the app's catalogue copy and picks the category, and so the buttons, from the verified `kind`. Otherwise it shows a generic line with no buttons |
+| `alert` | `aps` with the generic title "FTW" and `mutable-content: 1`, plus `home` and, in its `event` member, the box's `event` or `notice` envelope in base64 | The extension checks the signature and drops an already seen `(boot, seq)`. If the event is anchored and at most 10 minutes old, or the notice at most a day, it renders text from the app's catalogue copy and picks the category, and so the buttons, from the verified `kind`. A notice reads as an event of its kind, with `client` as its one argument. Otherwise it shows a generic line with no buttons |
 | `widgets` | Content changed, no data | Widgets fetch with their token |
 | `liveactivity` | `home`, the `lp` envelope and the newest `hb` envelope, in base64 | The view shows numbers only if both signatures check, the `hb` covers that `lp`, and the charger source grades `live` by the freshness rules; otherwise "Open FTW". `staleDate` is set to when that grade would lapse |
 | `box.unreachable` | Generic, from the service | Sent after 600 s without the box's socket. No box signature, no arguments, no buttons |
@@ -1185,15 +1195,21 @@ app's APNs topic. A watch and its phone get byte-identical alert payloads, so
 Apple shows one alert when both are near.
 
 Each push goes only to devices whose effective scope covers what it carries:
-`alert` needs `ftw.events.read`, and `widgets` and `liveactivity` need
-`ftw.live.read`. Viewers therefore get no alerts. `box.unreachable` goes to
-devices registered for `alert`. The service sends `widgets` when tomorrow's
+an event's `alert` needs `ftw.events.read`, and `widgets` and `liveactivity`
+need `ftw.live.read`. Viewers therefore get no alerts. `box.unreachable` goes
+where an event would. A notice's `alert` goes to every owner device
+registered for `alert`, with the readable copy on or off, and to no viewer
+and no watch token. An owner may therefore register for `alert` with the copy
+off; until the copy carries events, it gets notices only. Notices have their
+own hourly cap per home, apart from events, so neither crowds out the other. The service sends `widgets` when tomorrow's
 prices arrive and when a car is plugged in. It derives no category, collapse
 id or priority from an event's kind. How often a Live Activity can refresh
 within Apple's budget is the iOS plan's M7 spike.
 
 **What Apple sees.** Every alert payload carries the home id, the event kind,
-its arguments and the box's `boot`, `seq` and send time. A Live Activity
+its arguments and the box's `boot`, `seq` and send time. A notice's carries
+the home id, the notice kind and the same header, and on `agent.added` the
+client's name only while the copy carries events. A Live Activity
 payload carries the whole `lp` envelope: charge level, power, ready time and
 energy delivered. ADR 0008 lists this as a risk.
 

@@ -687,7 +687,7 @@ func startAppLink(
 	agentWall.load(st)
 	enroll.SetClock(agentClock)
 	agents.key = agentKey(enroll)
-	enroll.OnOwnerAdded(func() { agents.push(protocol.PushOwnerAdded) })
+	enroll.OnOwnerAdded(func() { agents.push(protocol.PushOwnerAdded, "") })
 	if !enabled {
 		return enroll, nil, false, nil
 	}

@@ -15,8 +15,9 @@ type AgentAccess struct {
 	Enroll *appenroll.Identity
 	// Drop ends every session a removed key holds. Nil ends none.
 	Drop func(key []byte)
-	// Push sends a catalogue kind to every owner. Nil sends nothing.
-	Push func(kind string)
+	// Push sends a catalogue kind to every owner, with the client given
+	// access on agent.added. Nil sends nothing.
+	Push func(kind, client string)
 	// Clock is the wall clock and whether NTP has set it. The same clock
 	// enrolment expires agent rows by.
 	Clock func() (time.Time, bool)
@@ -30,7 +31,7 @@ func approver(deviceID string) appenroll.Approver { return appenroll.Approver{De
 func (a *AgentAccess) AddAgent(deviceID string, m protocol.AgentAdd) (protocol.AgentRow, error) {
 	row, err := a.Enroll.AddAgent(approver(deviceID), m)
 	if err == nil {
-		a.notify(protocol.PushAgentAdded)
+		a.notify(protocol.PushAgentAdded, row.Principal.Client)
 	}
 	return row, err
 }
@@ -104,10 +105,10 @@ func (a *AgentAccess) Wall() (int64, bool) {
 	return now.UnixMilli(), ok
 }
 
-func (a *AgentAccess) Notify(kind string) { a.notify(kind) }
+func (a *AgentAccess) Notify(kind, client string) { a.notify(kind, client) }
 
-func (a *AgentAccess) notify(kind string) {
+func (a *AgentAccess) notify(kind, client string) {
 	if a.Push != nil {
-		a.Push(kind)
+		a.Push(kind, client)
 	}
 }

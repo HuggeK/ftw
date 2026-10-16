@@ -45,7 +45,7 @@ var PushSentences = map[string]PushSentence{
 	PushBoxUnreachable:          {Title: "Your box is out of reach", Body: "It stopped answering. Power cut, or the internet at home is down."},
 	PushCloudGranted:            {Title: "FTW Cloud is on", Body: "Your box now shares a copy of its readings with FTW Cloud. You can turn it off in the app or on the box."},
 	PushCloudRevoked:            {Title: "FTW Cloud is off", Body: "Your box stopped sharing with FTW Cloud and asked it to delete its copy."},
-	PushAgentAdded:              {Title: "New access to your box", Body: "You gave an assistant or Sourceful access. See who has access in the app."},
+	PushAgentAdded:              {Title: "New access to your box", Body: "An assistant or Sourceful was given access to your box. See who has access in the app."},
 	PushAgentRequest:            {Title: "Waiting for your answer", Body: "An assistant asks to change a setting. Open FTW to confirm or decline."},
 	PushAgentExpiring:           {Title: "Access ends tomorrow", Body: "An assistant's or Sourceful's access to your box runs out in a day. Renew it in the app if it should go on."},
 	PushApprovalKeySet:          {Title: "A phone can now approve access", Body: "A phone set up the key it uses to approve access to your box. If that was not you, remove the phone in the app."},
