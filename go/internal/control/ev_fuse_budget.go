@@ -1,7 +1,9 @@
 package control
 
 import (
+	"context"
 	"encoding/json"
+	"log/slog"
 	"math"
 	"sort"
 	"time"
@@ -24,6 +26,7 @@ func finiteFuseValue(w float64) bool { return !math.IsNaN(w) && !math.IsInf(w, 0
 type evFuseBalance struct {
 	gridW, poolW, pendingW      float64
 	latestPoolW, latestPendingW float64
+	siteAt                      time.Time
 }
 
 // EVFuseBudget refreshes the common EV cap before a charger command, also
@@ -43,12 +46,29 @@ func EVFuseBudget(store *telemetry.Store, state *State, points []loadpoint.State
 	// The common balance includes later observed DER increases. Keep the
 	// newest site/phase read as an independent bound so the same increase is
 	// not counted once in its grid watts and again as a pending command.
-	cap := evHeadroomW(state.effectiveImportCeilingW(fuseMaxW), balance.gridW+balance.pendingW, balance.poolW)
-	latestCap := evHeadroomW(state.phaseImportCeilingW(fuseMaxW, meter), meter.RawW+balance.latestPendingW, balance.latestPoolW)
+	commonCeiling := state.effectiveImportCeilingW(fuseMaxW)
+	latestCeiling := state.phaseImportCeilingW(fuseMaxW, meter)
+	cap := evHeadroomW(commonCeiling, balance.gridW+balance.pendingW, balance.poolW)
+	latestCap := evHeadroomW(latestCeiling, meter.RawW+balance.latestPendingW, balance.latestPoolW)
+	// Keep the arithmetic and guard order unchanged. Evidence belongs to this
+	// exact decision, rather than a later status snapshot with different polls.
+	phaseCap := latestCap
+	phaseKnown := false
 	if phaseW, known := evPhaseIncreaseW(meter, state, configs, balance.latestPoolW); known {
-		latestCap = math.Min(latestCap, math.Max(0, balance.latestPoolW+phaseW-balance.latestPendingW))
+		phaseKnown = true
+		phaseCap = math.Max(0, balance.latestPoolW+phaseW-balance.latestPendingW)
 	}
-	return math.Min(cap, latestCap), true
+	finalCap := math.Min(cap, math.Min(latestCap, phaseCap))
+	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
+		slog.Debug("EV fuse budget evidence",
+			"common_site_at_ms", balance.siteAt.UnixMilli(), "latest_site_received_at_ms", meter.UpdatedAt.UnixMilli(),
+			"physical_fuse_w", fuseMaxW, "configured_import_ceiling_w", state.PeakImportCeilingW,
+			"common_ceiling_w", commonCeiling, "latest_ceiling_w", latestCeiling,
+			"common_grid_w", balance.gridW, "common_ev_credit_w", balance.poolW, "common_pending_battery_w", balance.pendingW,
+			"latest_grid_w", meter.RawW, "latest_ev_credit_w", balance.latestPoolW, "latest_pending_battery_w", balance.latestPendingW,
+			"common_cap_w", cap, "latest_site_cap_w", latestCap, "phase_bound_known", phaseKnown, "phase_cap_w", phaseCap, "final_cap_w", finalCap)
+	}
+	return finalCap, true
 }
 
 // A managed EV earns replacement credit only across a site observation that
@@ -57,7 +77,7 @@ func EVFuseBudget(store *telemetry.Store, state *State, points []loadpoint.State
 // The existing bounded telemetry ring owns the samples; no second cache or
 // filtered load estimate participates in the hard limit.
 func coherentEVBalance(store *telemetry.Store, state *State, meter *telemetry.DerReading, points []loadpoint.State, now time.Time) evFuseBalance {
-	balance := evFuseBalance{gridW: meter.RawW}
+	balance := evFuseBalance{gridW: meter.RawW, siteAt: meter.UpdatedAt}
 	siteAt := meter.UpdatedAt
 	from := now.Add(-telemetry.ControlWindowDuration)
 	windows := store.ControlWindows(from, now)
@@ -112,7 +132,7 @@ func coherentEVBalance(store *telemetry.Store, state *State, meter *telemetry.De
 			balance.pendingW, coherent = pendingBatteryIncreaseAt(batteries, site.At)
 		}
 		if coherent {
-			balance.gridW, balance.poolW = site.PowerW, credit
+			balance.gridW, balance.poolW, balance.siteAt = site.PowerW, credit, site.At
 			return balance
 		}
 	}
