@@ -1609,12 +1609,20 @@ func main() {
 		mpcSvc.SiteMeter = cfg.SiteMeterDriver()
 		// The mathematical planner co-optimizes every scheduled loadpoint.
 		// The service retains the first entry for its Go-DP emergency fallback.
+		mpcSvc.LoadpointStates = func() []loadpoint.State {
+			states := lpMgr.States()
+			if lpController != nil {
+				for i := range states {
+					if hold, ok := lpController.GetManualHold(states[i].ID, time.Now()); ok {
+						states[i].ManualActive, states[i].ManualChargeW = true, hold.PowerW
+					}
+				}
+			}
+			return states
+		}
 		mpcSvc.Loadpoints = func(slotLenMin int) []*mpc.LoadpointSpec {
 			specs := make([]*mpc.LoadpointSpec, 0)
 			for _, st := range lpMgr.States() {
-				if lpController != nil {
-					lpController.SetGridDeferred(st.ID, false)
-				}
 				if !st.PluggedIn || st.ChargingDeclined {
 					continue
 				}
@@ -1711,60 +1719,11 @@ func main() {
 				if initSoC > maxSoC {
 					maxSoC = initSoC
 				}
-				// Defer grid-funded EV planning when the deadline lies
-				// past the last published price slot AND is more than ~3 h
-				// out. Without this, MPC commits today's afternoon grid
-				// (today's prices are confirmed) instead of waiting for
-				// tomorrow's pre-dawn slots (typically published ~13:00 UTC
-				// for next-day Nordpool). The user-facing intent is "burn
-				// surplus PV during day, only plan grid at night when the
-				// real cheap window is known". Setting LoadpointSpec.SurplusOnly
-				// makes MPC's DP refuse grid-import EV actions; the runtime
-				// loadpoint controller still grabs PV via the bat-SoC unlock
-				// path. Once tomorrow's prices land, MPC's next replan
-				// rebuilds the spec without this guard and proper grid
-				// planning kicks in.
-				deferGridPlan := false
-				if priceSvc != nil {
-					end := time.Now().Add(72 * time.Hour)
-					pts, _ := priceSvc.Load(time.Now().UnixMilli(), end.UnixMilli())
-					var latestEnd time.Time
-					for _, p := range pts {
-						slotEnd := time.UnixMilli(p.SlotTsMs).Add(time.Duration(p.SlotLenMin) * time.Minute)
-						if slotEnd.After(latestEnd) {
-							latestEnd = slotEnd
-						}
-					}
-					if !latestEnd.IsZero() &&
-						effectiveTargetTime.After(latestEnd) &&
-						time.Until(effectiveTargetTime) > 3*time.Hour {
-						deferGridPlan = true
-					}
-				}
-				slog.Debug("mpc: loadpoint spec",
-					"id", st.ID, "soc", initSoC, "soc_source", socSource,
-					"target", effectiveTarget, "target_slot", targetSlot,
-					"max_soc", maxSoC, "vehicle_limit", vehicleChargeLimit,
-					"defer_grid_plan", deferGridPlan)
-				if deferGridPlan {
-					slog.Info("mpc: LP grid-funded planning deferred — target past published prices",
-						"lp", st.ID, "target", effectiveTargetTime, "hours_to_target", time.Until(effectiveTargetTime).Hours())
-				}
-				// Mirror the deferral into the runtime controller so live
-				// dispatch enforces "no grid import" too. Without this,
-				// MPC's plan would still record a small EV budget per slot
-				// (snapped to forecast surplus); when forecast PV
-				// undershoots reality, the runtime controller would
-				// happily import grid to fulfil the cached plan budget.
-				if lpController != nil {
-					lpController.SetGridDeferred(st.ID, deferGridPlan)
-				}
-				// Surplus-only on the 48 h spec is the operator flag or
-				// the "deadline is past published prices" deferral.
-				// The bat-SoC unlock is a this-tick opportunistic clamp
-				// and must not poison night-time grid EV in a plan
-				// computed while the sun is still up. Battery→EV is
-				// already blocked by NoBatteryToEV below.
+				// Published prices choose among feasible times. Missing later
+				// prices never turn a saved deadline into a surplus-only goal.
+				slog.Debug("mpc: loadpoint spec", "id", st.ID, "soc", initSoC,
+					"soc_source", socSource, "target", effectiveTarget, "target_slot", targetSlot,
+					"max_soc", maxSoC, "vehicle_limit", vehicleChargeLimit)
 				ctrlMu.Lock()
 				noBatteryToEV := !(ctrl.BatteryCoversEV || boostActive)
 				ctrlMu.Unlock()
@@ -1783,7 +1742,7 @@ func main() {
 					MaxChargeW:       st.MaxChargeW,
 					AllowedStepsW:    planningStepsForLoadpoint(st, cfg),
 					ChargeEfficiency: loadpoint.DefaultChargeEfficiency,
-					SurplusOnly:      loadpoint.PlannerTreatsLoadpointAsSurplusOnly(st.SurplusOnly, deferGridPlan),
+					SurplusOnly:      st.SurplusOnly,
 					NoBatteryToEV:    noBatteryToEV,
 					Charging:         mpc.DefaultChargingPeriods(charging, chargeDuration.Seconds()),
 				})
@@ -1965,10 +1924,7 @@ func main() {
 		lpController.SetFuseEVMax(func() (float64, bool) {
 			ctrlMu.Lock()
 			defer ctrlMu.Unlock()
-			if !ctrl.FuseSaturated {
-				return 0, false
-			}
-			return ctrl.FuseEVMaxW, true
+			return control.EVFuseBudget(tel, ctrl, lpMgr.States(), lpMgr.Configs(), ctrl.SiteFuseAmps*ctrl.SiteFuseVoltage*float64(ctrl.SiteFusePhases))
 		})
 		// Every lease is preflighted and re-evaluated on each loadpoint tick.
 		// This closure owns site/battery health because those concepts belong
@@ -3085,6 +3041,7 @@ func main() {
 			ctrl.EVCurtailHeadroomW = evCurtailHeadroomW
 			ctrl.BatteryBoostEVChargingW = boostEVW
 			ctrl.BatteryBoostReserveSoC = boostReserveSoC
+			ctrl.EVCommandedW = loadpoint.CommandedEVPowerW(lpStatesSnapshot)
 			fuseMaxW := ctrl.SiteFuseAmps * ctrl.SiteFuseVoltage * float64(ctrl.SiteFusePhases)
 			targets := control.ComputeDispatch(tel, ctrl, capsSnap, fuseMaxW)
 			planMissingNow := ctrl.Mode.IsPlannerMode() && ctrl.PlanStale

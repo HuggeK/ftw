@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/srcfl/ftw/go/internal/loadpoint"
 	"github.com/srcfl/ftw/go/internal/state"
 	"github.com/srcfl/ftw/go/internal/telemetry"
 )
@@ -156,6 +157,9 @@ type Service struct {
 	PVForecastSafetyK float64
 	Loadpoint         LoadpointProbe // optional — when non-nil, the DP extends its state with EV dimensions
 	Loadpoints        LoadpointsProbe
+	// LoadpointStates supplies current saved goals without taking the control
+	// lock. It is independent of forecasts, prices and battery qualification.
+	LoadpointStates func() []loadpoint.State
 
 	// SaveDiag is called synchronously after every successful replan that
 	// remains the newest request, with the same Diagnostic the
@@ -620,6 +624,8 @@ type SlotDirective struct {
 	// remaining_s` formula it uses for the battery.
 	LoadpointEnergyWh  map[string]float64
 	LoadpointMaxPowerW map[string]float64
+	LoadpointFallback  map[string]bool
+	EVOnly             bool // Current goal reserve; never an accepted battery plan.
 
 	// LoadpointSoCTarget is the plan's EV SoC at SlotEnd per
 	// loadpoint. Used by the per-loadpoint divergence check.
@@ -644,10 +650,10 @@ func (s *Service) SlotDirectiveAt(now time.Time) (SlotDirective, bool) {
 	params := s.directiveParamsLocked(s.lastParams)
 	s.mu.RUnlock()
 	if p == nil || failedReplacement || !s.planExecutionAllowed(p, params.PVCurtailment, currentContract) {
-		return SlotDirective{}, false
+		return s.withDeadlineReserve(now, SlotDirective{}, false)
 	}
 	if time.Since(time.UnixMilli(p.GeneratedAtMs)) > MaxPlanAge {
-		return SlotDirective{}, false
+		return s.withDeadlineReserve(now, SlotDirective{}, false)
 	}
 	nowMs := now.UnixMilli()
 	for _, a := range p.Actions {
@@ -686,7 +692,7 @@ func (s *Service) SlotDirectiveAt(now time.Time) (SlotDirective, bool) {
 				d.LoadpointEnergyWh[id] = powerW * a.DurationHours()
 				d.LoadpointSoCTarget[id] = a.LoadpointSoCByID[id]
 			}
-		} else if a.LoadpointW > 0 && lpID != "" {
+		} else if lpID != "" {
 			lpEnergyWh := a.LoadpointW * a.DurationHours()
 			d.LoadpointEnergyWh = map[string]float64{
 				lpID: lpEnergyWh,
@@ -695,9 +701,9 @@ func (s *Service) SlotDirectiveAt(now time.Time) (SlotDirective, bool) {
 				lpID: a.LoadpointSoC,
 			}
 		}
-		return d, true
+		return s.withDeadlineReserve(now, d, true)
 	}
-	return SlotDirective{}, false
+	return s.withDeadlineReserve(now, SlotDirective{}, false)
 }
 
 // PlanWindow is one contiguous run of plan slots in which the active

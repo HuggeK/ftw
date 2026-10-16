@@ -26,5 +26,6 @@ func SlotDirectiveFromMPC(d mpc.SlotDirective) SlotDirective {
 		LivePVSurplusSoCCap: d.LivePVSurplusSoCCap,
 		LoadpointEnergyWh:   maps.Clone(d.LoadpointEnergyWh),
 		LoadpointMaxPowerW:  maps.Clone(d.LoadpointMaxPowerW),
+		EVOnly:              d.EVOnly,
 	}
 }

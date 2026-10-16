@@ -263,24 +263,6 @@ func TestPlannedPVSoakWIgnoresGridFundedCharge(t *testing.T) {
 	}
 }
 
-func TestPlannerTreatsLoadpointAsSurplusOnly(t *testing.T) {
-	if !PlannerTreatsLoadpointAsSurplusOnly(true, false) {
-		t.Fatal("operator surplus_only")
-	}
-	if !PlannerTreatsLoadpointAsSurplusOnly(false, true) {
-		t.Fatal("deadline past published prices")
-	}
-	if PlannerTreatsLoadpointAsSurplusOnly(false, false) {
-		t.Fatal("plain loadpoint")
-	}
-	// Bat-SoC unlock is this-tick only and must not appear here.
-}
-
-// Manual/schedule override: a force-charging (manual hold) surplus_only EV
-// must contribute NO reserve — the battery is meant to cover it, and a
-// non-zero reserve arms the dispatch no-discharge floor which flaps the
-// battery support 0↔full (Stefan 2026-06-11 manual charge). surplus_only
-// stays on so automatic surplus charging resumes when the hold ends.
 func TestSurplusReserveWManualActiveSkipped(t *testing.T) {
 	// Drawing 6.2 kW under a manual hold → would normally reserve
 	// current+headroom; with ManualActive it must reserve 0.

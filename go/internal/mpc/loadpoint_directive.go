@@ -15,6 +15,7 @@ func (d SlotDirective) LoadpointDirective() loadpoint.Directive {
 		SlotEnd:            d.SlotEnd,
 		LoadpointEnergyWh:  d.LoadpointEnergyWh,
 		LoadpointMaxPowerW: d.LoadpointMaxPowerW,
+		LoadpointFallback:  d.LoadpointFallback,
 	}
 }
 

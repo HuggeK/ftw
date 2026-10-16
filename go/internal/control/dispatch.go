@@ -126,6 +126,7 @@ type SlotDirective struct {
 	// slot-average Wh/time, or a short pulse can share the fuse with a
 	// battery charge that no longer fits when the charger actually turns on.
 	LoadpointMaxPowerW map[string]float64
+	EVOnly             bool // Goal reserve; no accepted battery allocation.
 }
 
 // SlotDirectiveFunc returns the plan's energy-allocation directive for
@@ -362,6 +363,10 @@ type State struct {
 	// main.go refreshes both from loadpoint.Controller every dispatch tick.
 	BatteryBoostEVChargingW float64
 	BatteryBoostReserveSoC  float64
+	// EVCommandedW is the frozen sum of final charger offers from this tick.
+	// It reserves site capacity before optional battery charging, even before
+	// an EV ramps up and in modes without an accepted optimizer plan.
+	EVCommandedW float64
 
 	// PI controller (outer, site-level)
 	PI *PIController
@@ -871,6 +876,7 @@ func preparePlannerSelf(state *State, now time.Time) plannerSelfDecision {
 	resetEnergyDispatchBookkeeping(state)
 
 	dir, planFresh := plannerSelfDirectiveAt(state, now)
+	planFresh = planFresh && !dir.EVOnly
 	if !planFresh {
 		if !state.PlanStale {
 			slog.Warn("planner_self: plan stale — discharge-only self_consumption (no self-charge until fresh plan)")
@@ -1260,7 +1266,7 @@ func ComputeDispatch(
 	case state.Mode.IsPlannerMode():
 		// planner_cheap / planner_arbitrage.
 		if state.UseEnergyDispatch && state.SlotDirective != nil {
-			if dir, ok := plannerSelfDirectiveAt(state, state.now()); ok {
+			if dir, ok := plannerSelfDirectiveAt(state, state.now()); ok && !dir.EVOnly {
 				state.controlSlotDecisionID = dir.DecisionID
 				state.controlPlanSnapshot.source = controlPlanDirective
 				currentDirective = dir
@@ -1484,6 +1490,7 @@ func ComputeDispatch(
 		}
 	}
 	if len(onlineBats) == 0 {
+		publishBatterylessEVFuseBudget(store, state, fuseMaxW)
 		state.LastTargets = nil
 		return nil
 	}
@@ -2034,7 +2041,7 @@ func ComputeDispatch(
 		if projectedGrid > ceilingW && (B+E) > 0 {
 			if plannedEVW > 0 {
 				// A timed EV goal takes its share before optional battery charge.
-				available := math.Max(0, ceilingW-H-Bn)
+				available := evHeadroomW(ceilingW, rawGridW-currentTotal+Bn, state.EVChargingW)
 				state.FuseEVMaxW = math.Min(E, available)
 				newBattery := Bn + math.Min(B, math.Max(0, available-state.FuseEVMaxW))
 				totalCorrection = newBattery - currentTotal

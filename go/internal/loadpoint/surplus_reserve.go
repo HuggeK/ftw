@@ -120,15 +120,6 @@ func SurplusPotentialW(states []State) float64 {
 	return sum
 }
 
-// PlannerTreatsLoadpointAsSurplusOnly is the SurplusOnly flag the MPC spec
-// should carry. The bat-SoC unlock is a this-tick opportunistic clamp;
-// putting it on the 48 h spec forbids night-time grid EV in a plan that
-// was computed while the sun was still up. Battery→EV is already blocked
-// by NoBatteryToEV.
-func PlannerTreatsLoadpointAsSurplusOnly(operatorSurplusOnly, deferGridPlan bool) bool {
-	return operatorSurplusOnly || deferGridPlan
-}
-
 // SurplusAvailableForEVW is the PV leftover the surplus-only clamp may
 // offer this tick. -gridW + batW + evW is house leftover. The EV tick
 // runs before battery dispatch, so a battery still soaking PV is not

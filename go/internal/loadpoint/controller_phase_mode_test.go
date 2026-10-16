@@ -47,24 +47,17 @@ func TestResolvePhaseMode(t *testing.T) {
 	}
 }
 
-// TestSurplusActive_ScheduleOverridesRuntimeClamp verifies that a committed
-// charge schedule (with surplus_only OFF) disables the RUNTIME surplus clamp
-// (the MPC grid-deferral guard), so the schedule's planned grid charge isn't
-// throttled to live PV surplus. The explicit SurplusOnly config still wins.
-// Operator directive 2026-05-30.
-func TestSurplusActive_ScheduleOverridesRuntimeClamp(t *testing.T) {
+func TestSurplusActiveKeepsOnlyExplicitSolarPermission(t *testing.T) {
 	c := NewController(NewManager(), nil, nil, nil)
-	cfg := Config{ID: "lp1"} // SurplusOnly: false
-	c.SetGridDeferred("lp1", true)
-
-	if !c.surplusActive(cfg, Schedule{}) {
-		t.Fatal("grid-deferred + no schedule should be surplus-active")
+	cfg := Config{ID: "lp1"}
+	if c.surplusActive(cfg, Schedule{}) || c.GridDeferred(cfg.ID) {
+		t.Fatal("missing prices must not invent a solar-only choice")
 	}
-	if c.surplusActive(cfg, Schedule{SoC: 0.5}) {
-		t.Error("active schedule (surplus_only off) must disable the runtime surplus clamp")
+	if c.surplusActive(cfg, Schedule{SoC: .5}) {
+		t.Fatal("saved goal must permit its grid budget")
 	}
 	cfg.SurplusOnly = true
-	if !c.surplusActive(cfg, Schedule{SoC: 0.5}) {
-		t.Error("explicit SurplusOnly config must stay surplus-active even with a schedule")
+	if !c.surplusActive(cfg, Schedule{SoC: .5}) {
+		t.Fatal("explicit solar-only permission must remain")
 	}
 }

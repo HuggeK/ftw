@@ -53,6 +53,11 @@ type Controller struct {
 	// fusePhaseCapA holds the per-loadpoint per-phase EV current cap carried
 	// between ticks by the reactive per-phase fuse clamp (tickOne goroutine).
 	fusePhaseCapA map[string]float64
+	// tickFuseCaps belongs to the serial tick, after one shared budget read.
+	tickFuseCaps        map[string]float64
+	tickDirectiveActive bool
+	tickDirectiveOK     bool
+	tickDirective       Directive
 
 	// siteSurplusForEVW is live PV left after house load and battery soak.
 	// A false reading pauses surplus_only rather than guessing an import.
@@ -149,12 +154,6 @@ type Controller struct {
 	// fraction) for the bat-SoC surplus-unlock feature. nil disables
 	// the feature entirely — the LP behaves exactly as today.
 	batSoC func() (float64, bool)
-
-	// gridDeferredMu guards loadpoints whose deadline sits past published
-	// prices. Those ticks follow surplus, so a sunny plan cannot import
-	// after the forecast misses.
-	gridDeferredMu sync.Mutex
-	gridDeferred   map[string]bool
 
 	// batSoCArmed is the surplus-unlock hysteresis. batSoCNoPV counts
 	// ticks with no live PV so a full battery does not kick the EV
@@ -303,6 +302,7 @@ type Directive struct {
 	SlotEnd            time.Time
 	LoadpointEnergyWh  map[string]float64
 	LoadpointMaxPowerW map[string]float64
+	LoadpointFallback  map[string]bool
 }
 
 // EVSample is the loadpoint-relevant slice of telemetry.DerReading
@@ -672,7 +672,7 @@ func (c *Controller) applyFuseClampAndCooldown(now time.Time, lpCfg Config, want
 	if c.fuseEVMax == nil {
 		return wantW, ""
 	}
-	cap, ok := c.fuseEVMax()
+	cap, ok := c.fuseCapFor(lpCfg.ID)
 	if !ok || cap < 0 {
 		return wantW, ""
 	}
@@ -782,50 +782,12 @@ func (c *Controller) evalBatSoCArm(lpID string, threshold float64) bool {
 	return armed
 }
 
-// SetGridDeferred records that MPC has suppressed grid-funded EV
-// planning for this LP (because the deadline lies past published
-// prices). Surplus dispatch semantics apply at runtime too: the EV's
-// commanded W is snapped to live surplus only, with no grid import,
-// regardless of what the cached MPC plan budget says. Cleared when
-// MPC's next replan finds prices for the deadline window. Safe to
-// call concurrently with the dispatch tick.
-func (c *Controller) SetGridDeferred(lpID string, deferred bool) {
-	if c == nil {
-		return
-	}
-	c.gridDeferredMu.Lock()
-	defer c.gridDeferredMu.Unlock()
-	if c.gridDeferred == nil {
-		c.gridDeferred = map[string]bool{}
-	}
-	if deferred {
-		c.gridDeferred[lpID] = true
-	} else {
-		delete(c.gridDeferred, lpID)
-	}
-}
-
-// GridDeferred reports whether MPC has deferred grid-funded planning
-// for this loadpoint (target deadline past the published price
-// horizon). Read by the API layer so the deferral is visible to the
-// operator instead of looking like a PV-only mode nobody chose.
-func (c *Controller) GridDeferred(lpID string) bool {
-	return c.gridDeferredFor(lpID)
-}
-
-// gridDeferredFor reads the per-LP deferral flag set by main.go's MPC
-// spec builder. Read-only accessor used inside surplusActive.
-func (c *Controller) gridDeferredFor(lpID string) bool {
-	if c == nil {
-		return false
-	}
-	c.gridDeferredMu.Lock()
-	defer c.gridDeferredMu.Unlock()
-	return c.gridDeferred[lpID]
-}
+// GridDeferred remains for clients that read the existing field. Saved
+// deadlines no longer defer grid charging solely for unpublished prices.
+func (c *Controller) GridDeferred(string) bool { return false }
 
 // surplusActive is true when live surplus replaces the plan: SurplusOnly,
-// a grid-deferred loadpoint, or an armed bat-SoC unlock. A schedule
+// or an armed bat-SoC unlock. A schedule
 // target is a floor instead. See surplusAddsToPlan.
 func (c *Controller) surplusActive(lpCfg Config, sched Schedule) bool {
 	if lpCfg.SurplusOnly {
@@ -835,8 +797,8 @@ func (c *Controller) surplusActive(lpCfg Config, sched Schedule) bool {
 	if sched.HasTarget() {
 		return false
 	}
-	if c.gridDeferredFor(lpCfg.ID) {
-		return true
+	if c.tickDirectiveActive && c.tickDirectiveOK && c.tickDirective.LoadpointFallback[lpCfg.ID] {
+		return false // A one-off saved deadline has the same grid floor.
 	}
 	return c.evalBatSoCArm(lpCfg.ID, sched.SurplusUnlockBatSoC)
 }
@@ -861,7 +823,7 @@ func (c *Controller) surplusAddsToPlan(lpCfg Config, sched Schedule) bool {
 
 // AnyLoadpointSurplusActive reports whether any configured loadpoint
 // is currently treating PV surplus as priority — via the configured
-// SurplusOnly flag, the MPC grid-deferral flag, or a runtime-armed
+// SurplusOnly flag or a runtime-armed
 // bat-SoC unlock. main.go's siteSurplusForEVW reader uses this to
 // zero out the home-battery's PV-charge contribution from the EV's
 // apparent surplus, which prevents the EV from stealing PV that the
@@ -874,9 +836,6 @@ func (c *Controller) AnyLoadpointSurplusActive() bool {
 	}
 	for _, cfg := range c.manager.Configs() {
 		if cfg.SurplusOnly {
-			return true
-		}
-		if c.gridDeferredFor(cfg.ID) {
 			return true
 		}
 		sched, _ := c.manager.GetSchedule(cfg.ID)
@@ -1285,12 +1244,14 @@ func (c *Controller) TickWithDispatch(ctx context.Context, now time.Time, dispat
 		sample EVSample
 	}
 	var observations []observation
+	samples := map[string]EVSample{}
 	for _, cfg := range c.manager.Configs() {
 		sample, observed := c.tel(cfg.DriverName)
 		if !observed {
 			continue
 		}
 		observations = append(observations, observation{cfg, sample})
+		samples[cfg.DriverName] = sample
 		// Only a stale site meter stands chargers down. An old charger power
 		// reading from a live driver is not a hardware risk: the fuse clamps
 		// work from the site meter, and energy accounting already treats the
@@ -1303,6 +1264,12 @@ func (c *Controller) TickWithDispatch(ctx context.Context, now time.Time, dispat
 	}
 	if c.plan == nil && dispatchAllowed {
 		return
+	}
+	if dispatchAllowed {
+		c.tickDirective, c.tickDirectiveOK = c.currentDirective(now)
+		c.tickDirectiveActive = true
+		c.freezeFuseBudget(now, samples)
+		defer func() { c.tickFuseCaps = nil; c.tickDirectiveActive = false }()
 	}
 	for _, observed := range observations {
 		c.tickOne(ctx, now, observed.config, observed.sample, dispatchAllowed)
@@ -1531,6 +1498,14 @@ func (c *Controller) tickOne(ctx context.Context, now time.Time, lpCfg Config, s
 	} else {
 		cmdW, planReady, fuseCapped := c.computeCommand(now, lpCfg, sample.PowerW)
 		cmdReason = "plan"
+		if c.plan != nil {
+			if d, ok := c.currentDirective(now); ok && d.LoadpointFallback[lpCfg.ID] {
+				cmdReason = "EV deadline reserve"
+				if sample.PowerUnavailable {
+					cmdW = 0
+				}
+			}
+		}
 		if fuseCapped {
 			cmdReason = "fuse_limit"
 		}
@@ -1583,6 +1558,9 @@ func (c *Controller) tickOne(ctx context.Context, now time.Time, lpCfg Config, s
 			if state, ok := c.manager.State(lpCfg.ID); ok && state.GoalComplete {
 				cmdReason = "vehicle_complete"
 			}
+		}
+		if d, ok := c.currentDirective(now); ok && d.LoadpointFallback[lpCfg.ID] && sample.PowerUnavailable {
+			cmdW = 0
 		}
 		// Fuse protection: applied LAST (after MPC budget, surplus
 		// clamp, wake-kick) so all upstream sources see their nominal
@@ -2430,10 +2408,14 @@ func (c *Controller) setSurplusStepW(id string, w float64) {
 // commanded reason so a fuse-starved 0 W never reads as "the plan
 // chose 0" (#1009).
 func (c *Controller) computeCommand(now time.Time, lpCfg Config, currentPowerW float64) (float64, bool, bool) {
+	return c.computeCommandForBudget(now, lpCfg, currentPowerW, true)
+}
+
+func (c *Controller) computeCommandForBudget(now time.Time, lpCfg Config, currentPowerW float64, clampFuse bool) (float64, bool, bool) {
 	if c.plan == nil {
 		return 0, false, false
 	}
-	d, ok := c.plan(now)
+	d, ok := c.currentDirective(now)
 	if !ok {
 		return 0, false, false
 	}
@@ -2441,8 +2423,25 @@ func (c *Controller) computeCommand(now time.Time, lpCfg Config, currentPowerW f
 	if !hasBudget {
 		return 0, false, false
 	}
+	if d.LoadpointFallback[lpCfg.ID] && c.fuseEVMax == nil {
+		return 0, true, false
+	}
+	if d.LoadpointFallback[lpCfg.ID] && clampFuse {
+		if cap, known := c.fuseCapFor(lpCfg.ID); !known || !finite(cap) || cap < 0 {
+			return 0, true, false
+		}
+	}
+	if d.LoadpointFallback[lpCfg.ID] {
+		st, known := c.manager.State(lpCfg.ID)
+		if _, _, needed := DeadlineNeed(st); !known || !needed {
+			return 0, true, false
+		}
+	}
 	remainingS := d.SlotEnd.Sub(now).Seconds()
 	alreadyWh, unmeasuredS := c.energySince(lpCfg.ID, d.SlotStart, now)
+	if d.LoadpointFallback[lpCfg.ID] {
+		alreadyWh, unmeasuredS = 0, 0 // Fresh goal energy already includes delivery.
+	}
 	if durationS := d.SlotEnd.Sub(d.SlotStart).Seconds(); durationS > 0 {
 		alreadyWh += budgetWh * unmeasuredS / durationS
 	}
@@ -2461,8 +2460,8 @@ func (c *Controller) computeCommand(now time.Time, lpCfg Config, currentPowerW f
 	// would together bust the fuse. Honour it before snapping to the
 	// charger's discrete steps so the snap chooses a level under the cap.
 	fuseCapped := false
-	if c.fuseEVMax != nil {
-		if cap, ok := c.fuseEVMax(); ok && cap >= 0 && wantW > cap {
+	if clampFuse && c.fuseEVMax != nil {
+		if cap, ok := c.fuseCapFor(lpCfg.ID); ok && cap >= 0 && wantW > cap {
 			wantW = cap
 			fuseCapped = true
 		}

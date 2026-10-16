@@ -31,6 +31,24 @@ func TestControlWindowsAreBoundedAndMissingDataBreaksProof(t *testing.T) {
 	}
 }
 
+func TestControlEVHistoryKeepsStopsWithinOneSecondAndStaysBounded(t *testing.T) {
+	s := NewStore()
+	at := time.Now().Truncate(time.Second)
+	for i, w := range []float64{11000, 0, 11000} {
+		s.recordControlObservation("car", DerEV, w, nil, at.Add(time.Duration(i)*100*time.Millisecond))
+	}
+	points := s.controlObservations["car:ev"]
+	if len(points) != 3 || points[1].PowerW != 0 {
+		t.Fatalf("observed stop disappeared: %+v", points)
+	}
+	for i := 3; i < 1000; i++ {
+		s.recordControlObservation("car", DerEV, 11000, nil, at.Add(time.Duration(i)*100*time.Millisecond))
+	}
+	if n := len(s.controlObservations["car:ev"]); n != 64 {
+		t.Fatalf("EV history unbounded: %v", n)
+	}
+}
+
 func TestProofDoesNotDependOnStatusPolling(t *testing.T) {
 	s := NewStore()
 	start := time.Now()
