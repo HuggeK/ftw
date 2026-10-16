@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -31,7 +32,12 @@ import (
 // box answers it, but the replay never proves itself, so it takes no
 // device's place, stamps nothing and spends no code. Each new session runs
 // its handshake on a goroutine of its own, so a slow disk under the
-// enrolment write never holds up routing or the one-second tick.
+// enrolment write never holds up routing or the stream.
+//
+// Lane 0 goes on each finished driver poll, not on the relay's one-second
+// pulse, and a beat goes when no frame has gone for the subscribed period.
+// Frames keep their fixed size. What the service learns from their timing
+// is written in docs/protocol-cloud.md, "Lane 0 through the tunnel".
 
 // TunSender sends one tun up the box's link to FTW Cloud. cloudlink.Link is
 // one. bulk says the message carries a lane 1 frame, which the link paces;
@@ -65,6 +71,28 @@ const (
 	// tunPendingPerDevice is how many unproved sessions a device may hold,
 	// and pendingWait (session.go) how long one waits to prove itself.
 	tunPendingPerDevice = 4
+
+	// tunGather is how long an arrival waits for polls that finish with it,
+	// so drivers that read together go in one frame. One driver's poll is
+	// one arrival already.
+	tunGather = 5 * time.Millisecond
+	// tunRate and tunBurst bound the frames arrivals push: five a second on
+	// average, three at once. A few drivers that each read once a second
+	// seldom wait; one that reads ten times a second costs each phone five
+	// frames a second, and four phones stay well under the service's 60 tun
+	// a second per home.
+	tunRate  = 5
+	tunBurst = 3
+	// tunPushUntil and tunBeatUntil are the shares of the tunnel's 24-hour
+	// budget past which readings stop: pushes at 60 %, so a display left on
+	// all day falls back to a frame a second, and beats at 90 %, so the
+	// last tenth is left for handshakes, command answers and ends.
+	tunPushUntil = 0.6
+	tunBeatUntil = 0.9
+	// tunBeat is how often each session is asked whether it has been quiet
+	// for its subscribed period. Silence on the phone is at most the period
+	// plus this.
+	tunBeat = 250 * time.Millisecond
 )
 
 // Tunnel is the box's table of sessions that FTW Cloud carries: one live per
@@ -79,6 +107,11 @@ type Tunnel struct {
 	now    func() time.Time
 
 	inbox chan tunIn
+	// arrivals hears each finished driver poll; nil sends on Beat alone.
+	arrivals <-chan struct{}
+	// kick tells Run a session went live or ended, so it beats and hears
+	// arrivals only while one is live.
+	kick chan struct{}
 
 	mu     sync.Mutex
 	sender TunSender
@@ -118,11 +151,11 @@ type tunSession struct {
 // to deliver to. Its sessions take the same slots as the relay's.
 func (u *Uplink) Tunnel() *Tunnel { return u.tunnel }
 
-func newTunnel(build HandlerBuilder, enroll *appenroll.Identity, slots *slots, log *slog.Logger) *Tunnel {
+func newTunnel(build HandlerBuilder, enroll *appenroll.Identity, slots *slots, arrivals <-chan struct{}, log *slog.Logger) *Tunnel {
 	return &Tunnel{
 		build: build, enroll: enroll, static: enroll.StaticKey(), slots: slots, log: log, now: time.Now,
-		inbox: make(chan tunIn, tunInbox), live: map[string]*tunSession{}, pending: map[tunKey]*tunSession{},
-		opens: map[string][]time.Time{},
+		inbox: make(chan tunIn, tunInbox), arrivals: arrivals, kick: make(chan struct{}, 1),
+		live: map[string]*tunSession{}, pending: map[tunKey]*tunSession{}, opens: map[string][]time.Time{},
 	}
 }
 
@@ -165,20 +198,88 @@ func (t *Tunnel) Drop() {
 }
 
 // Run serves the table until ctx ends: the messages the service delivers,
-// and the one-second pulse lane 0 needs.
+// each arrival's frame, and the beat that keeps a quiet session heard.
 func (t *Tunnel) Run(ctx context.Context) {
-	tick := time.NewTicker(tickInterval)
-	defer tick.Stop()
 	defer t.Drop()
+	// The beat runs, and arrivals are heard, only while a session is live:
+	// a box nobody watches wakes for nothing.
+	var beat *time.Ticker
+	defer func() {
+		if beat != nil {
+			beat.Stop()
+		}
+	}()
+	// flush is armed by an arrival and fires once its round is in and the
+	// pace allows a frame. Nil while nothing waits.
+	var flush <-chan time.Time
+	p := pace{tokens: tunBurst, at: time.Now()}
 	for {
+		var beats <-chan time.Time
+		var arrivals <-chan struct{}
+		switch live := t.count() > 0; {
+		case live && beat == nil:
+			beat = time.NewTicker(tunBeat)
+		case !live && beat != nil:
+			beat.Stop()
+			beat = nil
+		}
+		if beat != nil {
+			beats, arrivals = beat.C, t.arrivals
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case m := <-t.inbox:
 			t.route(ctx, m)
-		case <-tick.C:
-			t.tick()
+		case <-t.kick:
+		case <-arrivals:
+			if flush == nil {
+				flush = time.After(max(tunGather, p.wait(time.Now())))
+			}
+		case <-flush:
+			flush = nil
+			// A frame spends the pace; a poll nobody sees spends nothing.
+			if t.budgetUsed() < tunPushUntil && t.anyVisible() {
+				p.take(time.Now())
+				t.each("push", (*appproto.Handler).Push)
+			}
+		case <-beats:
+			if t.budgetUsed() < tunBeatUntil {
+				t.each("beat", (*appproto.Handler).Beat)
+			}
 		}
+	}
+}
+
+// anyVisible says a live session would take a push.
+func (t *Tunnel) anyVisible() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, s := range t.live {
+		if s.session.handler.Visible() {
+			return true
+		}
+	}
+	return false
+}
+
+// budgetUsed is the share of the link's tunnel budget spent in the last 24
+// hours, or 0 from a link that does not say.
+func (t *Tunnel) budgetUsed() float64 {
+	t.mu.Lock()
+	s := t.sender
+	t.mu.Unlock()
+	if b, ok := s.(interface{ TunBudgetUsed() float64 }); ok {
+		return b.TunBudgetUsed()
+	}
+	return 0
+}
+
+// kicked tells Run the live sessions changed. It never blocks.
+func (t *Tunnel) kicked() {
+	select {
+	case t.kick <- struct{}{}:
+	default:
 	}
 }
 
@@ -381,7 +482,7 @@ func (t *Tunnel) promote(s *tunSession, transport *appwire.Transport, commit fun
 	}
 	caller := callerOf(grant)
 	send := func(msg []byte, bulk bool) error {
-		return t.sendTun(cloudwire.Tun{Dev: s.dev, Sid: s.sid, D: msg}, bulk)
+		return t.sendFrame(cloudwire.Tun{Dev: s.dev, Sid: s.sid, D: msg}, bulk)
 	}
 	handler, err := t.build(tunSender{transport: transport, send: send}, caller,
 		liveGrant{enroll: t.enroll, deviceID: grant.DeviceID})
@@ -409,13 +510,14 @@ func (t *Tunnel) promote(s *tunSession, transport *appwire.Transport, commit fun
 	// The device's one slot, whichever carrier held it before. Claiming it
 	// ends the older session, through the relay or through here.
 	sess.setRelease(t.slots.claim(grant.DeviceID, func() { t.remove(s, true) }))
+	t.kicked()
 	t.log.Info("app session open through FTW Cloud")
 	return nil
 }
 
 // tunSender encrypts one session's frames for the tunnel and says which are
 // bulk, so the link paces those and sends lane 0 (commands, their answers
-// and the ticks) first. A message the link dropped and counted is gone like
+// and the readings) first. A message the link dropped and counted is gone like
 // any lost frame, and the session goes on; only a lost uplink fails it.
 type tunSender struct {
 	transport *appwire.Transport
@@ -428,6 +530,16 @@ func (s tunSender) Send(frame []byte) error {
 		return err
 	}
 	return s.send(msg, len(frame) > 1 && frame[1] == appwire.LaneBulk)
+}
+
+// SendInLine sends a bulk frame with lane 0, in order: the snapshot, which a
+// reading sent after it must not overtake.
+func (s tunSender) SendInLine(frame []byte) error {
+	msg, err := s.transport.Encrypt(frame)
+	if err != nil {
+		return err
+	}
+	return s.send(msg, false)
 }
 
 // end closes the session once and frees its slot. It reports whether this
@@ -450,6 +562,7 @@ func (t *Tunnel) remove(s *tunSession, tell bool) {
 	t.mu.Lock()
 	if t.live[s.dev] == s {
 		delete(t.live, s.dev)
+		defer t.kicked()
 	}
 	if t.pending[tunKey{s.dev, s.sid}] == s {
 		delete(t.pending, tunKey{s.dev, s.sid})
@@ -465,9 +578,26 @@ func (t *Tunnel) remove(s *tunSession, tell bool) {
 // an end. False means it did not leave.
 func (t *Tunnel) send(m cloudwire.Tun) bool { return t.sendTun(m, false) == nil }
 
-// sendTun hands a session's message to the link. A counted drop is not an
-// error: Noise transport survives it, and failing the session would lose a
-// command id it holds. A lost uplink is.
+// sendFrame hands a session's frame to the link. A frame the link dropped
+// and counted comes back as appproto.ErrDropped: the session goes on, and
+// its handler sends what the frame carried again.
+func (t *Tunnel) sendFrame(m cloudwire.Tun, bulk bool) error {
+	t.mu.Lock()
+	s := t.sender
+	t.mu.Unlock()
+	if s == nil {
+		return errTunGone
+	}
+	err := s.SendTun(m, bulk)
+	if dropped(err) {
+		return fmt.Errorf("%w: %w", appproto.ErrDropped, err)
+	}
+	return err
+}
+
+// sendTun hands the table's own message to the link: a handshake's answer
+// or an end. A counted drop is not an error: the phone starts again. A lost
+// uplink is.
 func (t *Tunnel) sendTun(m cloudwire.Tun, bulk bool) error {
 	t.mu.Lock()
 	s := t.sender
@@ -508,8 +638,34 @@ func (t *Tunnel) allowOpenLocked(dev string) bool {
 	return true
 }
 
-// tick sends the one-second pulse to every live session.
-func (t *Tunnel) tick() {
+// pace is a token bucket: tunRate frames a second, tunBurst at once.
+type pace struct {
+	tokens float64
+	at     time.Time
+}
+
+func (p *pace) fill(now time.Time) {
+	p.tokens = min(tunBurst, p.tokens+now.Sub(p.at).Seconds()*tunRate)
+	p.at = now
+}
+
+// wait is how long until a frame may go.
+func (p *pace) wait(now time.Time) time.Duration {
+	p.fill(now)
+	if p.tokens >= 1 {
+		return 0
+	}
+	return time.Duration((1 - p.tokens) / tunRate * float64(time.Second))
+}
+
+// take spends one frame.
+func (p *pace) take(now time.Time) {
+	p.fill(now)
+	p.tokens--
+}
+
+// each runs one lane 0 step on every live session: Push or Beat.
+func (t *Tunnel) each(what string, step func(*appproto.Handler) error) {
 	t.mu.Lock()
 	live := make([]*tunSession, 0, len(t.live))
 	for _, s := range t.live {
@@ -517,8 +673,8 @@ func (t *Tunnel) tick() {
 	}
 	t.mu.Unlock()
 	for _, s := range live {
-		if err := s.session.handler.Tick(); err != nil {
-			t.log.Warn("app session failed on a tick", "err", err)
+		if err := step(s.session.handler); err != nil {
+			t.log.Warn("app session failed on a "+what, "err", err)
 			t.remove(s, true)
 		}
 	}

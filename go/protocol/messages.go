@@ -313,9 +313,11 @@ type Delta struct {
 
 // Tick says nothing changed.
 //
-// Sent anyway, on the same cadence and in the same bucket. Silence would
-// itself be information: it would tell the relay operator that nothing
-// happened in the house that second.
+// Sent anyway, in the same bucket. Over the relay it goes on every pulse:
+// silence would tell the relay operator that nothing happened in the house
+// that second. Through FTW Cloud it is the beat that goes when nothing has
+// moved for the subscribed period, so the phone can tell a quiet house from
+// a lost session.
 type Tick struct {
 	Seq      uint64 `cbor:"seq"`
 	UptimeMs int64  `cbor:"uptimeMs"`

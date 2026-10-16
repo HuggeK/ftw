@@ -46,7 +46,7 @@ func newTunRig(t *testing.T) *tunRig {
 	}
 	r := &tunRig{enroll: enroll, slots: &slots{}, out: &capturedTun{ch: make(chan cloudwire.Tun, 64)},
 		modes: &countingModes{}}
-	r.tunnel = newTunnel(handlerOver(r.modes, appproto.NewCmdLog()), enroll, r.slots, slog.New(slog.DiscardHandler))
+	r.tunnel = newTunnel(handlerOver(r.modes, appproto.NewCmdLog()), enroll, r.slots, nil, slog.New(slog.DiscardHandler))
 	r.tunnel.Attach(r.out)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)

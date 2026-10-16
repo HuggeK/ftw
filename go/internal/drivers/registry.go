@@ -1073,6 +1073,11 @@ func (r *Registry) runLoop(rd *runningDriver) {
 				// re-stamps LastSuccess every tick from cached values.
 				r.tel.RecordDriverTick(rd.cfg.Name)
 			}
+			if r.tel != nil {
+				// The poll's readings are in the store: whoever streams
+				// them sends now, not on its next pulse.
+				r.tel.Arrived()
+			}
 			// Re-arm at the interval the poll returned, or the standing one.
 			interval = rd.env.nextPollInterval(returned)
 			timer.Reset(interval)

@@ -327,7 +327,7 @@ func TestUnchangedSourcesAreNotResent(t *testing.T) {
 
 // The bucket never grows and the frame never fragments, because both would
 // make frame size a function of what happened in the house.
-func TestAnOversizedDeltaTruncatesInsteadOfGrowing(t *testing.T) {
+func TestAnOversizedDeltaGoesAsASnapshotNotALargerFrame(t *testing.T) {
 	h, box, rec, clock := newRig(t)
 
 	// A site with many devices, so the source table alone overruns lane 0.
@@ -349,50 +349,16 @@ func TestAnOversizedDeltaTruncatesInsteadOfGrowing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	f := rec.only(t, MsgDelta)
-	if f.size != 512 {
-		t.Fatalf("truncated delta is %d bytes, want the 512-byte bucket", f.size)
+	// Lane 0 keeps its bucket; the table and the reading go in a snapshot.
+	if got := rec.types(); got != "[snap tick]" {
+		t.Fatalf("got %s, want a snapshot and lane 0's tick", got)
 	}
-	if f.flags&FlagTrunc == 0 {
-		t.Fatal("a delta that did not fit was sent without TRUNC")
+	if f := rec.only(t, MsgTick); f.size != 512 {
+		t.Fatalf("lane 0's frame is %d bytes, want the 512-byte bucket", f.size)
 	}
-	d := body[Delta](t, f)
-	if d.Sources != nil {
-		t.Fatal("the source table survived truncation; readings should have won the space")
-	}
-	if d.Fields[fidKey(FidGridW)] != 4321 {
-		t.Fatalf("the reading that changed did not survive truncation: %v", d.Fields)
-	}
-}
-
-// A field dropped to fit the bucket was never sent, so it is still different
-// on the next tick and goes then.
-func TestTruncatedSourcesAreRetriedOnTheNextTick(t *testing.T) {
-	h, box, rec, clock := newRig(t)
-	box.snap.Sources = nil
-	for i := 0; i < 24; i++ {
-		box.snap.Sources = append(box.snap.Sources, Source{
-			ID:             "driver.long.identifier." + string(rune('a'+i)),
-			Kind:           "inverter",
-			Name:           "A device with a comfortably long display name",
-			LastOkUptimeMs: 60_000,
-			StaleAfterMs:   15_000,
-		})
-	}
-	subscribe(t, h, rec)
-
-	clock.uptimeMs += 60_000
-	if err := h.Tick(); err != nil {
-		t.Fatal(err)
-	}
-	rec.reset()
-
-	if err := h.Tick(); err != nil {
-		t.Fatal(err)
-	}
-	f := rec.last(t, MsgDelta)
-	if f.flags&FlagTrunc == 0 {
-		t.Fatal("the retry did not report itself truncated either")
+	snap := body[Snap](t, rec.only(t, MsgSnap))
+	if snap.Fields[fidKey(FidGridW)] != 4321 || len(snap.Sources) != 24 {
+		t.Fatalf("the snapshot carries grid_w %d and %d sources", snap.Fields[fidKey(FidGridW)], len(snap.Sources))
 	}
 }
 

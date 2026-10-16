@@ -176,7 +176,12 @@ type Handler struct {
 	// one hertz while visible, 0.2 hertz while hidden.
 	cadenceEvery uint8
 	cadenceLeft  uint8
-	seq          uint64
+	// lastFrameMs is the box uptime when this session's last reading
+	// left: a snapshot, a delta or a tick. Beat measures silence from it.
+	lastFrameMs int64
+	// resync says a snapshot never left: the next frame sends one.
+	resync bool
+	seq    uint64
 	// lastSent is the value the client was last told for each field. Only
 	// fields actually put on the wire are recorded, so anything dropped to
 	// fit a bucket is simply still different next tick and goes then.
@@ -410,7 +415,16 @@ func (h *Handler) Handle(ctx context.Context, frame []byte) error {
 		h.log.Warn("undecodable frame dropped", "err", err)
 		return nil
 	}
-	return h.dispatch(ctx, f.Envelope)
+	return dropped(h.dispatch(ctx, f.Envelope))
+}
+
+// dropped is err, unless it says only that the carrier lost one frame: the
+// session goes on after that.
+func dropped(err error) error {
+	if errors.Is(err, ErrDropped) {
+		return nil
+	}
+	return err
 }
 
 func (h *Handler) dispatch(ctx context.Context, env Envelope) error {
@@ -647,9 +661,10 @@ func (h *Handler) applySub(sub Sub) error {
 	h.mu.Unlock()
 
 	// Keep subscribed false until the full snapshot is on the wire. Otherwise
-	// the one-second ticker can race ahead and send a delta before the snapshot
-	// that gives it meaning.
-	if err := h.sendSnapshot(); err != nil {
+	// the pulse or an arrival can race ahead and send a delta before the
+	// snapshot that gives it meaning. A snapshot the carrier dropped is sent
+	// again with the first frame.
+	if err := h.sendSnapshot(); err != nil && !errors.Is(err, ErrDropped) {
 		return err
 	}
 	h.mu.Lock()
@@ -658,8 +673,8 @@ func (h *Handler) applySub(sub Sub) error {
 	return nil
 }
 
-// sendSnapshot puts the full site state on the bulk lane and records what the
-// client now knows.
+// sendSnapshot puts the full site state on the bulk lane, in line with lane
+// 0, and records what the client now knows once it has left.
 func (h *Handler) sendSnapshot() error {
 	uptimeMs := h.cfg.Clock.UptimeMs()
 	snap := h.cfg.Site.Snapshot()
@@ -670,17 +685,7 @@ func (h *Handler) sendSnapshot() error {
 		blocked = []string{}
 	}
 
-	h.mu.Lock()
-	h.lastSent = make(map[string]int64, len(fields))
-	for k, v := range fields {
-		h.lastSent[k] = v
-	}
-	h.lastSources = sources
-	h.lastBlocked = blocked
-	h.lastRev = snap.ControlRev
-	h.mu.Unlock()
-
-	return h.sendBulk(MsgSnap, nil, Snap{
+	f, err := h.bulkFrame(MsgSnap, nil, Snap{
 		UptimeMs:          uptimeMs,
 		ControlRev:        snap.ControlRev,
 		Dict:              h.dict,
@@ -688,12 +693,35 @@ func (h *Handler) sendSnapshot() error {
 		Sources:           sources,
 		DispatchBlockedBy: blocked,
 	})
+	if err == nil {
+		err = h.sendInLine(f)
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if err != nil {
+		h.resync = true
+		return err
+	}
+	h.resync = false
+	h.lastSent = make(map[string]int64, len(fields))
+	for k, v := range fields {
+		h.lastSent[k] = v
+	}
+	h.lastSources = sources
+	h.lastBlocked = blocked
+	h.lastRev = snap.ControlRev
+	h.lastFrameMs = uptimeMs
+	return nil
 }
 
 // Tick consumes one global one-second pulse. The handler gates that pulse to
 // this subscription's 1 Hz or 0.2 Hz cadence. On each due pulse it emits a
 // frame even when nothing changed, so the relay cannot distinguish an idle
 // house from an active one within the chosen cadence.
+//
+// Only a session over the relay ticks. A session that FTW Cloud carries is
+// streamed with Push and Beat instead (docs/protocol-cloud.md, "Tunnel").
 func (h *Handler) Tick() error {
 	if h.isAgent() {
 		if err := h.agentTick(); err != nil {
@@ -711,6 +739,53 @@ func (h *Handler) Tick() error {
 		return nil
 	}
 	h.cadenceLeft = h.cadenceEvery
+	h.mu.Unlock()
+	return h.stream()
+}
+
+// Visible says Push would send: the session streams and someone sees it.
+func (h *Handler) Visible() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.subscribed && h.cadenceEvery == 1
+}
+
+// Push sends a frame now: a driver has just finished a poll. A delta of
+// what changed, or a tick when nothing did, so a frame's timing shows when
+// the box read its devices and never which reading moved. Nothing while
+// hidden, where the session asked for one frame in five seconds and Beat
+// sends it.
+func (h *Handler) Push() error {
+	if !h.Visible() {
+		return nil
+	}
+	return h.stream()
+}
+
+// Beat sends a frame when none has left for the subscribed period, so the
+// phone hears the session is alive while nothing in the house moves, and
+// the hidden session gets its one frame in five seconds. Call it more often
+// than the period; it decides.
+func (h *Handler) Beat() error {
+	h.mu.Lock()
+	if !h.subscribed {
+		h.mu.Unlock()
+		return nil
+	}
+	period := int64(h.cadenceEvery) * 1000
+	quiet := h.cfg.Clock.UptimeMs() - h.lastFrameMs
+	h.mu.Unlock()
+	if quiet < period {
+		return nil
+	}
+	return h.stream()
+}
+
+// stream sends one lane 0 frame: a delta of what changed since the client
+// was last told, or a tick when nothing did. A frame the carrier dropped is
+// not recorded as sent, so the next one carries the same news.
+func (h *Handler) stream() error {
+	h.mu.Lock()
 	bucket := h.bucket
 	h.mu.Unlock()
 
@@ -732,11 +807,11 @@ func (h *Handler) Tick() error {
 	// whole set instead.
 	fields := fieldValues(snap, h.modes)
 	h.mu.Lock()
-	stale := snap.ControlRev != h.lastRev || anyGone(h.lastSent, fields)
+	stale := h.resync || snap.ControlRev != h.lastRev || anyGone(h.lastSent, fields)
 	h.mu.Unlock()
 	if stale {
 		if err := h.sendSnapshot(); err != nil {
-			return err
+			return dropped(err)
 		}
 	}
 
@@ -759,7 +834,7 @@ func (h *Handler) Tick() error {
 	h.mu.Unlock()
 
 	if len(changed) == 0 && !sourcesMoved {
-		return h.sendControl(MsgTick, nil, Tick{Seq: seq, UptimeMs: uptimeMs}, 0, bucket)
+		return h.sendTick(seq, uptimeMs, bucket)
 	}
 
 	body := Delta{Seq: seq, UptimeMs: uptimeMs, Fields: changed}
@@ -776,9 +851,19 @@ func (h *Handler) Tick() error {
 	if err != nil {
 		return err
 	}
+	if sourcesMoved && body.Sources == nil {
+		// The source table did not fit the bucket, and a source going
+		// stale is the news the freshness model exists to show. The
+		// snapshot carries it, with every reading; lane 0 still gets its
+		// frame.
+		if err := h.sendSnapshot(); err != nil {
+			return dropped(err)
+		}
+		return h.sendTick(seq, uptimeMs, bucket)
+	}
 
 	if err := h.sendControl(MsgDelta, nil, body, flags, bucket); err != nil {
-		return err
+		return dropped(err)
 	}
 
 	h.mu.Lock()
@@ -789,6 +874,18 @@ func (h *Handler) Tick() error {
 		h.lastSources = sources
 		h.lastBlocked = blocked
 	}
+	h.lastFrameMs = uptimeMs
+	h.mu.Unlock()
+	return nil
+}
+
+// sendTick sends lane 0's frame when nothing changed.
+func (h *Handler) sendTick(seq uint64, uptimeMs int64, bucket int) error {
+	if err := h.sendControl(MsgTick, nil, Tick{Seq: seq, UptimeMs: uptimeMs}, 0, bucket); err != nil {
+		return dropped(err)
+	}
+	h.mu.Lock()
+	h.lastFrameMs = uptimeMs
 	h.mu.Unlock()
 	return nil
 }
@@ -799,7 +896,8 @@ func (h *Handler) Tick() error {
 // The bucket never grows and the frame never fragments, because both would
 // make frame size a function of what happened in the house — which is the one
 // thing lane 0's constancy exists to hide. Dropped fields are simply not
-// recorded as sent, so they are still different on the next tick and go then.
+// recorded as sent, so they are still different on the next frame and go
+// then. A source table that does not fit goes in a snapshot (stream).
 // Field ids ascend by importance: 1-9 are the frozen core view.
 func (h *Handler) fitDelta(body *Delta, bucket int) (map[string]int64, uint8, error) {
 	const headerBytes = 6
@@ -1092,12 +1190,14 @@ func (h *Handler) acceptCmd(cmd Cmd, uptimeMs int64) (took bool, err error) {
 	if rec, fresh := h.cfg.Commands.remember(root, cmd.CmdID, ack, uptimeMs); !fresh {
 		return false, h.replayCmd(rec)
 	}
-	if err := h.sendCmdAck(ack); err != nil {
+	if err := h.sendCmdAck(ack); err != nil && !errors.Is(err, ErrDropped) {
 		// The box has not acted, and the app never heard the ack. Keeping
 		// the id would answer its retry with an ack and no result.
 		h.cfg.Commands.forget(root, cmd.CmdID)
 		return false, err
 	}
+	// An ack the carrier dropped is one lost frame: the box acts, and the
+	// result tells the app.
 	return true, nil
 }
 
@@ -1290,7 +1390,7 @@ func (h *Handler) Terminate(reason string) error {
 	h.subscribed = false
 	bucket := h.bucket
 	h.mu.Unlock()
-	return h.sendControl(MsgSessionTerminate, nil, SessionTerminate{Reason: reason}, 0, bucket)
+	return dropped(h.sendControl(MsgSessionTerminate, nil, SessionTerminate{Reason: reason}, 0, bucket))
 }
 
 // --------------------------------------------------------------------------
@@ -1341,19 +1441,27 @@ func (h *Handler) sendControl(t string, id *uint32, body any, flags uint8, bucke
 // sendBulk sizes the bucket from the encoded body rather than a guess, so a
 // long mode catalogue or a wide source table cannot silently overrun.
 func (h *Handler) sendBulk(t string, id *uint32, body any) error {
-	env, err := newEnvelope(t, id, body)
+	f, err := h.bulkFrame(t, id, body)
 	if err != nil {
 		return err
+	}
+	return h.send(f)
+}
+
+func (h *Handler) bulkFrame(t string, id *uint32, body any) (Frame, error) {
+	env, err := newEnvelope(t, id, body)
+	if err != nil {
+		return Frame{}, err
 	}
 	raw, err := EncodeEnvelope(env)
 	if err != nil {
-		return err
+		return Frame{}, err
 	}
 	bucket := bulkBucketFor(len(raw))
 	if bucket == 0 {
-		return fmt.Errorf("appproto: %s is %d bytes, larger than the biggest bulk bucket", t, len(raw))
+		return Frame{}, fmt.Errorf("appproto: %s is %d bytes, larger than the biggest bulk bucket", t, len(raw))
 	}
-	return h.send(Frame{Lane: LaneBulk, Bucket: bucket, Envelope: env})
+	return Frame{Lane: LaneBulk, Bucket: bucket, Envelope: env}, nil
 }
 
 func (h *Handler) send(f Frame) error {
@@ -1362,4 +1470,18 @@ func (h *Handler) send(f Frame) error {
 		return fmt.Errorf("appproto: encode %s: %w", f.Envelope.T, err)
 	}
 	return h.cfg.Sender.Send(bytes)
+}
+
+// sendInLine sends a bulk frame in line with lane 0 where the carrier can
+// (InLineSender), and as any other frame where it cannot.
+func (h *Handler) sendInLine(f Frame) error {
+	s, ok := h.cfg.Sender.(InLineSender)
+	if !ok {
+		return h.send(f)
+	}
+	bytes, err := h.cfg.Codec.EncodeFrame(f)
+	if err != nil {
+		return fmt.Errorf("appproto: encode %s: %w", f.Envelope.T, err)
+	}
+	return s.SendInLine(bytes)
 }

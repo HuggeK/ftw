@@ -314,6 +314,10 @@ type Store struct {
 	// waiting for the control loop to flush it to the TS DB.
 	latestMu     sync.RWMutex
 	latestMetric map[string]metricSnap
+
+	// arrivals hear of each finished poll (see Arrived).
+	arrivalsMu sync.Mutex
+	arrivals   map[chan struct{}]struct{}
 }
 
 type metricSnap struct {

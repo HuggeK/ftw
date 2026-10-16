@@ -320,6 +320,7 @@ func startCloudLink(
 		Started:     processStarted,
 		ClockSynced: cloudlink.ClockSynced,
 		Notify:      notices.notify,
+		Arrivals:    arrivalsFor(ctx, tel),
 	}
 	// Set only with a table: a typed nil would read as a tunnel.
 	if tunnel != nil {

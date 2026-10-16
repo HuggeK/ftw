@@ -68,8 +68,12 @@ Read [docs/architecture.md](docs/architecture.md) for the system map and
 - Every clamp protects a quantified hardware or control risk.
 - Persistent device state is keyed by stable hardware identity, not a YAML name.
 - Database queries stay in [`go/internal/state`](go/internal/state).
-- Lane 0 frames have a fixed length and cadence; the padding is a privacy
-  control. The proposed FTW Cloud uplink is not padded, so it sends lane 1
+- Lane 0 frames have a fixed length; the padding is a privacy control. Over
+  the relay they keep a fixed cadence. Through FTW Cloud a frame goes on
+  every arrival, each finished driver poll whether or not a value moved,
+  plus a beat when none has gone for the subscribed period, so the timing
+  shows the poll rhythm and never which reading moved (Fredrik, 16 October
+  2026). The proposed FTW Cloud uplink is not padded, so it sends lane 1
   frames without the bulk buckets and never lane 0. A phone's own session
   rides inside it as `tun`, with its lane 0 padding intact.
 - FTW Cloud may hold a readable copy of what the owner enabled. It carries the

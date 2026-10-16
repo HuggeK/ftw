@@ -223,8 +223,8 @@ func (l *Link) backoff() time.Duration {
 var errLinkEnded = errors.New("cloudlink: the end of the link is confirmed")
 
 // The tunnel's two queues, apart from the readable copy. Lane 0, a phone's
-// commands, their answers and the one-second ticks, goes first and is never
-// held. Bulk is paced under the service's limits and waits its turn. When a
+// commands, their answers, its readings and its snapshot, goes first and is
+// never held. Bulk is paced under the service's limits and waits its turn. When a
 // queue is full the newest message is dropped: Noise transport carries its
 // own counter, so a lost message costs the phone one frame.
 const (
@@ -550,6 +550,24 @@ func tunFrame(t cloudwire.Tun) ([]byte, error) {
 		return nil, err
 	}
 	return cloudwire.EncodeFrame(raw)
+}
+
+// MaxBulkWait is the longest a bulk tun can wait behind the pacer: a full
+// bulk queue of the largest messages, paced to tunPace of the service's byte
+// limit. A phone's Noise transport takes a message at most
+// appwire.ReplayWindow behind the newest, so a session must send fewer lane
+// 0 frames than that while one bulk message waits.
+func MaxBulkWait() time.Duration {
+	seconds := float64(tunBulkQueue*cloudwire.MaxTunFrame) / (tunPace * cloudwire.TunBytesPerSecond)
+	return time.Duration(seconds * float64(time.Second))
+}
+
+// TunBudgetUsed is the share of the tunnel's 24-hour budget spent, from 0
+// to 1 and past it when the budget is gone.
+func (l *Link) TunBudgetUsed() float64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return float64(l.tunBudget.total(l.uptimeMs())) / tunBudgetBytes
 }
 
 // pacer keeps bulk under the service's tun limits: a message bucket and a

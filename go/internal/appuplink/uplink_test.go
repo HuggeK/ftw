@@ -120,6 +120,12 @@ func newRig(t *testing.T, epoch int64) *rig {
 // gateway it can hold open, so a revoke can land while a call is running.
 func newRigWith(t *testing.T, epoch int64, build HandlerBuilder) *rig {
 	t.Helper()
+	return newRigOpts(t, epoch, func(o *Options) { o.Handler = build })
+}
+
+// newRigOpts is newRig with the options set changes.
+func newRigOpts(t *testing.T, epoch int64, set func(*Options)) *rig {
+	t.Helper()
 
 	relay := newFakeRelay(epoch)
 	t.Cleanup(relay.close)
@@ -130,14 +136,15 @@ func newRigWith(t *testing.T, epoch int64, build HandlerBuilder) *rig {
 	}
 
 	now := time.UnixMilli(epoch * EpochMs)
-	uplink, err := New(Options{
+	opts := Options{
 		Endpoint: relay.url(),
 		Enroll:   enroll,
-		Handler:  build,
 		Logger:   slog.New(slog.DiscardHandler),
 		Now:      func() time.Time { return now },
 		Random:   func() float64 { return 0 },
-	})
+	}
+	set(&opts)
+	uplink, err := New(opts)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

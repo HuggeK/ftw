@@ -394,6 +394,8 @@ type harness struct {
 	cancel  context.CancelFunc
 	done    chan error
 	pushed  chan string
+	// arrivals is the driver registry's signal that a poll finished.
+	arrivals chan struct{}
 }
 
 func newHarness(t *testing.T, svc *fakeService) *harness {
@@ -416,12 +418,13 @@ func newHarnessWith(t *testing.T, svc *fakeService, keys []*ecdsa.PublicKey, kv 
 	}
 	h := &harness{svc: svc, site: &fakeSite{grid: 1200, state: protocol.SourceLive}, kv: kv,
 		keyPath: filepath.Join(t.TempDir(), "cloud.key"), pushed: make(chan string, 8),
-		roster: &fakeRosterState{}, tunnel: &fakeTunnel{ch: make(chan cloudwire.Tun, 64)}}
+		roster: &fakeRosterState{}, tunnel: &fakeTunnel{ch: make(chan cloudwire.Tun, 64)},
+		arrivals: make(chan struct{}, 1)}
 	opts := Options{
 		Site: h.site, Roster: fakeRoster{state: h.roster}, KV: h.kv, KeyPath: h.keyPath, Build: "test",
 		Started: time.Now().Add(-time.Minute), ClockSynced: func() bool { return true },
-		Notify:   func(kind string) { h.pushed <- kind },
-		Tunnel:   h.tunnel,
+		Notify: func(kind string) { h.pushed <- kind },
+		Tunnel: h.tunnel, Arrivals: h.arrivals,
 		Endpoint: svc.endpoint(), ServiceKeys: keys,
 		RootCAs: svc.roots(), Tick: 20 * time.Millisecond,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -666,6 +669,37 @@ func TestWatchRaisesTheCadence(t *testing.T) {
 	svc.waitFor(cloudwire.MsgLive, 3*time.Second)
 	if d := time.Since(start); d > 1500*time.Millisecond {
 		t.Fatalf("a watched change took %s", d)
+	}
+}
+
+// While a phone watches, a reading goes when its poll lands rather than on
+// the next look at the box, and never sooner than a period after the last.
+func TestAWatchedReadingGoesAsItsPollLands(t *testing.T) {
+	svc := newFakeService(t)
+	svc.afterHello = func(conn *websocket.Conn, home string) {
+		svc.write(conn, nil, home, cloudwire.MsgWatch, cloudwire.Watch{Hz: 1})
+	}
+	h := newHarness(t, svc)
+	h.grant(t)
+	svc.waitFor(cloudwire.MsgLive, 5*time.Second)
+	for i := range 3 {
+		time.Sleep(time.Duration(1100+150*i) * time.Millisecond)
+		h.site.setGrid(int64(2000 + i))
+		start := time.Now()
+		h.arrivals <- struct{}{}
+		svc.waitFor(cloudwire.MsgLive, 2*time.Second)
+		if d := time.Since(start); d > 200*time.Millisecond {
+			t.Fatalf("a watched reading took %s after its poll", d)
+		}
+	}
+
+	// A second poll right after: its live waits out the period.
+	h.site.setGrid(3000)
+	start := time.Now()
+	h.arrivals <- struct{}{}
+	svc.waitFor(cloudwire.MsgLive, 3*time.Second)
+	if d := time.Since(start); d < 900*time.Millisecond || d > 1300*time.Millisecond {
+		t.Fatalf("the next live went %s after the last, want one period", d)
 	}
 }
 

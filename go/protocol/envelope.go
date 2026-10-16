@@ -36,10 +36,12 @@ const (
 	ProtoFloor = 0
 )
 
-// Lanes. Lane 0 is one fixed bucket at a fixed cadence for the life of a
-// session, because a frame size that varies with what happened in the house
-// leaks the household's load pattern through otherwise perfect encryption.
-// Anything whose size depends on what the box supports goes on lane 1.
+// Lanes. Lane 0 is one fixed bucket for the life of a session, because a
+// frame size that varies with what happened in the house leaks the
+// household's load pattern through otherwise perfect encryption. Over the
+// relay it also goes at a fixed cadence; through FTW Cloud each reading goes
+// as it lands (docs/protocol-cloud.md, "Tunnel"). Anything whose size
+// depends on what the box supports goes on lane 1.
 const (
 	LaneControl uint8 = 0
 	LaneBulk    uint8 = 1

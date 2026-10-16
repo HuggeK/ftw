@@ -29,9 +29,10 @@ const (
 	TransportOverhead = SeqBytes + TagBytes
 
 	// ReplayWindow is how far out of order a frame may arrive and still be
-	// accepted. At 1 Hz on lane 0 that is a minute of tolerance, far beyond
-	// any reordering a DataChannel produces, and small enough that the window
-	// is one machine word.
+	// accepted: one machine word. Over the relay lane 0 goes once a second,
+	// so that is a minute. Through FTW Cloud it goes up to five times a
+	// second, about 13 s, while a bulk frame the link paces waits at most
+	// cloudlink.MaxBulkWait, about 9 s (appuplink tests the two).
 	ReplayWindow = 64
 )
 

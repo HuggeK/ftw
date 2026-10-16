@@ -94,6 +94,9 @@ type cadence struct {
 	// message could go.
 	liveCheckedAt, lpCheckedAt time.Time
 	liveWaiting, lpWaiting     bool
+	// arrived says a driver finished a poll since live was last composed,
+	// while a phone watches.
+	arrived bool
 }
 
 // liveCheckEvery is how often the source table is looked at, so a table
@@ -110,6 +113,8 @@ func (w *writer) run(ctx context.Context, events <-chan cloudwire.Envelope) erro
 	// service counts that from when it received the last one.
 	st := &cadence{full: true}
 	var purgeSince time.Time
+	// slot fires when an arrival waits for the watched live's period.
+	var slot <-chan time.Time
 
 	for {
 		snap := l.current()
@@ -139,13 +144,26 @@ func (w *writer) run(ctx context.Context, events <-chan cloudwire.Envelope) erro
 			if err := w.tick(snap, st, now); err != nil {
 				return err
 			}
+			if wait := st.liveAt.Add(periodWatched).Sub(now); st.arrived && slot == nil && wait > 0 {
+				slot = time.After(wait)
+			}
 		}
 
+		// Polls are heard only while a phone watches; otherwise the copy
+		// keeps its period and a poll needs no wakeup.
+		var arrivals <-chan struct{}
+		if time.Now().Before(st.watchUntil) {
+			arrivals = l.opts.Arrivals
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-tick.C:
 		case <-l.wake:
+		case <-arrivals:
+			st.arrived = true
+		case <-slot:
+			slot = nil
 		case env := <-events:
 			if err := w.downlink(snap, st, env); err != nil {
 				return err
@@ -251,9 +269,13 @@ func (w *writer) tick(snap grantSnapshot, st *cadence, now time.Time) error {
 	full := st.full || now.Sub(st.lastFull) >= fullEvery
 	hbDue := now.Sub(st.anyAt) >= h
 
+	// While a phone watches, a poll's readings go as they land, one period
+	// after the last live at the soonest, so the copy costs what it did.
+	arrival := st.arrived && now.Before(st.watchUntil) && now.Sub(st.liveAt) >= period
+
 	var ages map[string]int64
-	if snap.allowed(cloudwire.MsgLive) && (full || hbDue || now.Sub(st.liveCheckedAt) >= liveCheckEvery) {
-		st.liveCheckedAt = now
+	if snap.allowed(cloudwire.MsgLive) && (full || hbDue || arrival || now.Sub(st.liveCheckedAt) >= liveCheckEvery) {
+		st.liveCheckedAt, st.arrived = now, false
 		live, tableChanged := l.projectLive(snap, l.opts.Site.Live())
 		ages = live.Ages
 		key := liveKey(live)

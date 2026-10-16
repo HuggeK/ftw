@@ -38,7 +38,7 @@ func agentTunRig(t *testing.T, now *time.Time) (*tunRig, *AgentAccess) {
 			SrcGrid: "meter", SrcPV: "meter", SrcBattery: "meter", Logger: slog.New(slog.DiscardHandler),
 		})
 	}
-	r.tunnel = newTunnel(build, enroll, r.slots, slog.New(slog.DiscardHandler))
+	r.tunnel = newTunnel(build, enroll, r.slots, nil, slog.New(slog.DiscardHandler))
 	r.tunnel.Attach(r.out)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)

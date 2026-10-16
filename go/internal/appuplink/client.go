@@ -110,7 +110,8 @@ const (
 	// refused there anyway; refusing it here keeps the memory bound local.
 	maxFrameBytes = 65536
 
-	// tickInterval is lane 0's cadence, fixed for the life of a session.
+	// tickInterval is lane 0's cadence over the relay, fixed for the life
+	// of a session.
 	tickInterval = time.Second
 )
 
@@ -134,6 +135,11 @@ type Options struct {
 	ExchangeHandler HandlerBuilder
 
 	Logger *slog.Logger
+
+	// Arrivals hears each finished driver poll (telemetry.Store.Arrivals).
+	// Sessions through FTW Cloud send on it; nil leaves them on the beat
+	// alone, one frame per subscribed period. Relay sessions never use it.
+	Arrivals <-chan struct{}
 
 	// Deadman, when set, arms the dead man's switch: rows posted to the
 	// relay's HTTPS side, claims spoken on every connection. Nil leaves
@@ -288,7 +294,7 @@ func New(opts Options) (*Uplink, error) {
 		u.deadmanRefresh = deadmanRefreshInterval
 	}
 	u.slots = &slots{}
-	u.tunnel = newTunnel(opts.Handler, opts.Enroll, u.slots, u.log)
+	u.tunnel = newTunnel(opts.Handler, opts.Enroll, u.slots, opts.Arrivals, u.log)
 	if opts.ExchangeHandler != nil {
 		u.exchanges = &exchanges{
 			build:    opts.ExchangeHandler,

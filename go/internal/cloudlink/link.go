@@ -194,7 +194,11 @@ type Options struct {
 	// Tunnel serves the phones' sessions. Nil takes no tun: the box does not
 	// list tun in hello.caps, and the service sends it none.
 	Tunnel Tunnel
-	Logger *slog.Logger
+	// Arrivals hears each finished driver poll (telemetry.Store.Arrivals).
+	// While a phone watches, live goes when a poll lands rather than on the
+	// next check. Nil leaves live on its checks alone.
+	Arrivals <-chan struct{}
+	Logger   *slog.Logger
 
 	// Seams for tests. Production leaves them zero.
 	Endpoint    string

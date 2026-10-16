@@ -2,6 +2,7 @@ package appproto
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/srcfl/ftw/go/internal/control"
@@ -284,6 +285,21 @@ type PriceReader interface {
 }
 
 // Sender delivers an encoded frame to the carrier.
+//
+// Send returns ErrDropped, or an error wrapping it, when the carrier lost
+// that one frame and counted it. The session goes on: what the frame carried
+// is not recorded as sent, so the next frame carries it again.
 type Sender interface {
 	Send(frame []byte) error
+}
+
+// ErrDropped is one frame the carrier lost and counted. See Sender.
+var ErrDropped = errors.New("appproto: the carrier dropped a frame")
+
+// InLineSender is a Sender whose carrier sends bulk after lane 0. SendInLine
+// keeps one bulk frame in line with lane 0 instead, so a reading sent after
+// it never reaches the phone first. The snapshot goes this way: a delta that
+// overtook it would be applied and then overwritten with older values.
+type InLineSender interface {
+	SendInLine(frame []byte) error
 }

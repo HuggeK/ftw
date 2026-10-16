@@ -824,6 +824,7 @@ func startAppLink(
 		Deadman:         deadman,
 		Handler:         handlerFor(false),
 		ExchangeHandler: handlerFor(true),
+		Arrivals:        arrivalsFor(ctx, tel),
 	})
 	if err != nil {
 		return enroll, nil, enabled, err
@@ -841,6 +842,17 @@ func startAppLink(
 	}()
 
 	return enroll, uplink, true, nil
+}
+
+// arrivalsFor hears each finished driver poll until ctx ends, or nothing
+// without a store.
+func arrivalsFor(ctx context.Context, tel *telemetry.Store) <-chan struct{} {
+	if tel == nil {
+		return nil
+	}
+	arrivals, stop := tel.Arrivals()
+	context.AfterFunc(ctx, stop)
+	return arrivals
 }
 
 func siteMeterName(ctrl *control.State, ctrlMu *sync.Mutex) string {

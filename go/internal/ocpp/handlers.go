@@ -177,6 +177,9 @@ func (h *Handler) SetApprovedIDs(ids []string) {
 		blob, _ := json.Marshal(map[string]any{"type": "ev", "w": 0.0, "forecast_power": telemetry.ForecastPowerSample{Version: 1}})
 		h.tel.Update(id, telemetry.DerEV, 0, nil, blob)
 	}
+	if len(revoked) > 0 {
+		h.tel.Arrived()
+	}
 }
 
 // IsApproved reports whether a charger id is on the site allowlist and may
@@ -663,6 +666,8 @@ func (h *Handler) pushReading(id string, s *chargerState) {
 	}
 	blob, _ := json.Marshal(data)
 	h.tel.Update(id, telemetry.DerEV, w, nil, blob)
+	// A charger sends its readings unpolled; this is its poll's end.
+	h.tel.Arrived()
 }
 
 // powerSample is one Power.Active.Import after unit conversion. An empty phase

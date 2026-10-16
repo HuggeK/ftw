@@ -817,10 +817,12 @@ func (h *HostEnv) standingPollIntervalLocked() time.Duration {
 	return time.Duration(h.PollIntervalMS) * time.Millisecond
 }
 
-// Bounds for an interval a driver returns from driver_poll. Lane 0 frames
-// leave once a second and the control loop ticks every two seconds by
-// default, so a faster read reaches nothing but the device's bus; some
-// catalog drivers return 200 ms or 50 ms. The ceiling is half the default
+// Bounds for an interval a driver returns from driver_poll. The control
+// loop ticks every two seconds by default, and a phone sees a reading once a
+// second over the relay, so a read faster than a second mostly costs the
+// device's bus; some catalog drivers return 200 ms or 50 ms. Through FTW
+// Cloud each poll reaches the phone as it lands, up to five a second, so a
+// driver that sets a faster interval is seen at that rate. The ceiling is half the default
 // 60 s watchdog window, so a returned wait cannot make a driver stale by
 // itself: myuplink returns 60 s after a good read. A driver that needs longer
 // sets it with host.set_poll_interval, as the vehicle drivers do.
