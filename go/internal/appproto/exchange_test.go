@@ -1,8 +1,12 @@
 package appproto
 
 import (
+	"encoding/hex"
 	"fmt"
 	"testing"
+
+	"github.com/fxamacker/cbor/v2"
+	"github.com/srcfl/ftw/go/protocol"
 )
 
 // newExchangeRig is a watch's exchange session over the EV rig's box.
@@ -20,7 +24,9 @@ func newExchangeRig(t *testing.T) (*Handler, *fakeLoadpoints, *fakeBox, *recorde
 // carries the controlRev a command expects.
 func TestAnExchangeHelloNamesTheRevAndNoCatalogue(t *testing.T) {
 	h, _, box, rec := newExchangeRig(t)
-	h.cfg.Cloud = func() *CloudSession { return &CloudSession{Home: "home-1", PK: make([]byte, 65), Boot: make([]byte, 16)} }
+	h.cfg.Cloud = func() *CloudSession {
+		return &CloudSession{Home: "home-1", PK: make([]byte, 65), Boot: make([]byte, 16)}
+	}
 
 	deliver(t, h, MsgHello, nil, Hello{Proto: ProtoRange{Min: ProtoMin, Max: ProtoMax}})
 	frame := rec.only(t, MsgHelloOK)
@@ -106,6 +112,51 @@ func TestNowFitsLaneZeroOrSaysWhatItLeftOut(t *testing.T) {
 	}
 }
 
+// A watch shows the car on each charger and offers the tap when the box
+// does not know it (docs/cars.md). One charger asking with four cars to
+// choose from, the most it carries, still fits lane 0 beside a second
+// charger. Two chargers asking at once with four cars each do not; the box
+// then leaves the last charger out and flags TRUNC, as for any now.
+func TestNowNamesTheCarOnEachCharger(t *testing.T) {
+	h, lp, _, rec := newExchangeRig(t)
+	ids := []string{"5f0c1e2d3a4b5c6d7e8f90a1b2c3d4e5", "0123456789abcdef0123456789abcdef",
+		"89abcdef0123456789abcdef01234567", "fedcba9876543210fedcba9876543210"}
+	lp.car = protocol.ChargerCar{Session: "7d1f0c2a9b3e4f50", CarIdentifiedBy: protocol.CarIdentifiedByAsking,
+		CarCorrected: true, CarCorrectedFrom: ids[1], Choose: ids}
+	lp.socSource, lp.socEstimate = protocol.CarSoCVehicle, true
+	deliver(t, h, MsgNow, nil, struct{}{})
+	frame := rec.only(t, MsgNow)
+	if frame.size != 512 || frame.flags&FlagTrunc != 0 {
+		t.Fatalf("now with an asking charger went in %d B with flags %d", frame.size, frame.flags)
+	}
+	now := body[Now](t, frame)
+	got := now.Loadpoints[0]
+	if got.Session != lp.car.Session || got.CarIdentifiedBy != protocol.CarIdentifiedByAsking || len(got.Choose) != 4 ||
+		hex.EncodeToString(got.Choose[3]) != ids[3] || !got.CarCorrected || got.SocSource != protocol.CarSoCVehicle || !got.SocEstimate {
+		t.Fatalf("charger %+v", got)
+	}
+	raw := body[map[string]any](t, frame)
+	lps, _ := raw["loadpoints"].([]any)
+	first := stringKeys(lps[0])
+	if _, has := first["carCorrectedFrom"]; has {
+		t.Fatal("now carries carCorrectedFrom, which has no room in 512 B")
+	}
+	one, err := cborBytes(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("an asking charger with four cars takes %d B of now", one)
+
+	// A second charger with its car fits beside it.
+	rec.reset()
+	lp.ids["lp2"] = true
+	lp.carByID = map[string]protocol.ChargerCar{"lp2": {Session: "0a1b2c3d4e5f6071", CarID: ids[0], CarIdentifiedBy: protocol.CarIdentifiedByTap}}
+	deliver(t, h, MsgNow, nil, struct{}{})
+	if frame := rec.only(t, MsgNow); frame.flags&FlagTrunc != 0 || len(body[Now](t, frame).Loadpoints) != 2 {
+		t.Fatalf("two chargers with their cars did not fit: flags %d", frame.flags)
+	}
+}
+
 // A removed watch's read is refused and its session ended, as a command is.
 func TestARemovedWatchReadsNothing(t *testing.T) {
 	h, _, _, rec := newExchangeRig(t)
@@ -137,4 +188,9 @@ func TestThePadIsALaneZeroTick(t *testing.T) {
 	if len(raw) != 512 || f.Lane != LaneControl || f.Envelope.T != MsgTick {
 		t.Fatalf("the pad is %d B, lane %d, %q", len(raw), f.Lane, f.Envelope.T)
 	}
+}
+
+func cborBytes(v any) (int, error) {
+	b, err := cbor.Marshal(v)
+	return len(b), err
 }

@@ -177,11 +177,23 @@ func (c *cloudSite) loadpoint(st loadpoint.State, now time.Time) cloudwire.Loadp
 		ID: st.ID, Src: st.DriverName, Plugged: st.PluggedIn,
 		SocSource: st.SoCSource, Recurring: !st.Schedule.Empty(),
 		PowerW: roundW(st.CurrentPowerW), SessionWh: roundW(st.DeliveredWhSession),
-		Session:         c.session(st.ID, st.PluggedIn),
+		Session:         st.Session,
 		CommandedReason: st.CommandedReason, SurplusOnly: st.SurplusOnly,
 		GridDeferred: st.GridDeferred, PlanPending: st.PlanPending, Boost: st.BatteryBoost.Active,
 	}
+	if lp.Session == "" {
+		// No car runtime has named this plug-in: the count of plug-ins
+		// since the box started, as before cars.
+		lp.Session = c.session(st.ID, st.PluggedIn)
+	}
 	if st.PluggedIn {
+		// The session's car by the box's id; the link cuts it per grant
+		// (cloudlink.ProjectLP), and an agent's read under the agent key.
+		lp.CarID, lp.CarIdentifiedBy = st.CarID, st.CarIdentifiedBy
+		lp.CarCorrected, lp.CarCorrectedFrom, lp.Choose = st.CarCorrected, st.CarCorrectedFrom, st.Choose
+	}
+	if st.PluggedIn && !st.SoCUnknown {
+		// A visitor's car has no level; its delivered energy is not one.
 		lp.SocPermille = ptr(units.PermilleFromFraction(st.CurrentSoC))
 		if st.SoCSource == "vehicle" {
 			lp.SocAgeS = ptr(st.VehicleSoCAgeS)

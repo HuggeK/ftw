@@ -2,6 +2,8 @@ package appproto
 
 import (
 	"context"
+	"encoding/hex"
+	"github.com/srcfl/ftw/go/protocol"
 	"sort"
 
 	"github.com/srcfl/ftw/go/internal/units"
@@ -201,10 +203,22 @@ func (h *Handler) nowLoadpoints() []NowLoadpoint {
 		return out
 	}
 	for _, r := range h.cfg.Loadpoints.Readings() {
-		lp := NowLoadpoint{ID: r.ID, Plugged: r.Plugged, PowerW: roundW(r.PowerW)}
+		lp := NowLoadpoint{ID: r.ID, Plugged: r.Plugged, PowerW: roundW(r.PowerW),
+			CarID: rawCarID(r.Car.CarID), CarIdentifiedBy: r.Car.CarIdentifiedBy, CarCorrected: r.Car.CarCorrected}
+		for _, id := range r.Car.Choose {
+			if raw := rawCarID(id); raw != nil {
+				lp.Choose = append(lp.Choose, raw)
+			}
+		}
+		if r.Car.CarIdentifiedBy == protocol.CarIdentifiedByAsking {
+			// A watch taps only while the box asks; the session costs
+			// lane 0 bytes on every other charger.
+			lp.Session = r.Car.Session
+		}
 		if r.SoCKnown {
 			soc := units.PermilleFromFraction(r.SoC)
 			lp.SocPermille = &soc
+			lp.SocSource, lp.SocAgeS, lp.SocEstimate = r.SoCSource, r.SoCAgeS, r.SoCEstimate
 		}
 		out = append(out, lp)
 	}
@@ -279,4 +293,14 @@ func (h *Handler) PadFrame() ([]byte, error) {
 		return nil, err
 	}
 	return h.cfg.Codec.EncodeFrame(Frame{Lane: LaneControl, Bucket: bucket, Envelope: env})
+}
+
+// rawCarID is a car id as the watch's now carries it: its 16 bytes. Nil for
+// none, or for an id that is not 32 hex digits.
+func rawCarID(id string) []byte {
+	raw, err := hex.DecodeString(id)
+	if err != nil || len(raw) != 16 {
+		return nil
+	}
+	return raw
 }

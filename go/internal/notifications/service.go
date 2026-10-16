@@ -120,6 +120,10 @@ func DefaultRules() []config.NotificationRule {
 		{Type: PushAgentExpiring, Enabled: true, Priority: 3},
 		{Type: PushApprovalKeySet, Enabled: true, Priority: 3},
 		{Type: PushOwnerAdded, Enabled: true, Priority: 3},
+		// Which car is plugged in. On by default: with several cars and no
+		// answer from the charger or the car, the box plans for a visitor
+		// until someone taps, and only this asks. Once per plug-in.
+		{Type: PushCarWhich, Enabled: true, Priority: 3},
 	}
 }
 
@@ -135,7 +139,7 @@ func KnownRuleTypes() []string {
 		PushChargingConnected, PushChargingSessionComplete, PushChargingInterrupted,
 		PushChargingGoalAtRisk, PushUpdateInstalled, PushDriverOffline, PushFuseOverLimit,
 		PushCloudGranted, PushCloudRevoked, PushAgentAdded, PushAgentRequest,
-		PushAgentExpiring, PushApprovalKeySet, PushOwnerAdded,
+		PushAgentExpiring, PushApprovalKeySet, PushOwnerAdded, PushCarWhich,
 	}
 }
 
@@ -442,6 +446,14 @@ func (s *Service) Subscribe(bus *events.Bus) {
 		go s.handleCatalogued(PushChargingSessionComplete, ev.LoadpointID,
 			map[string]string{"kwh": strconv.FormatFloat(ev.KWh, 'f', 1, 64)})
 	})
+	bus.Subscribe(events.KindCarWhich, func(e events.Event) {
+		if ev, ok := e.(events.CarWhich); ok {
+			// The session names the plug-in the tap answers. The cars go
+			// with the event to FTW Cloud once the uplink cuts their
+			// opaque ids (docs/cars.md).
+			go s.handleCatalogued(PushCarWhich, ev.LoadpointID, map[string]string{"session": ev.Session})
+		}
+	})
 	bus.Subscribe(events.KindChargingInterrupted, func(e events.Event) {
 		ev, ok := e.(events.ChargingInterrupted)
 		if !ok {
@@ -501,7 +513,8 @@ func (s *Service) handleCatalogued(kind, device string, args map[string]string) 
 		return
 	}
 	loadpointID := ""
-	if strings.HasPrefix(kind, "charging.") {
+	if strings.HasPrefix(kind, "charging.") || kind == PushCarWhich {
+		// car.which names the charger whose car it asks about.
 		loadpointID = device
 	}
 	s.deliver(kind, device, Message{

@@ -5,9 +5,11 @@ import (
 	"errors"
 	"time"
 
+	"github.com/srcfl/ftw/go/internal/cars"
 	"github.com/srcfl/ftw/go/internal/control"
 	"github.com/srcfl/ftw/go/internal/loadpoint"
 	"github.com/srcfl/ftw/go/internal/mpc"
+	"github.com/srcfl/ftw/go/protocol"
 )
 
 // UptimeClock is the only clock this protocol trusts for ages.
@@ -201,10 +203,33 @@ type Loadpoints interface {
 	Readings() []LoadpointReading
 }
 
+// Cars is the box's cars (docs/cars.md): the car ops, behind the same calls
+// GET /api/cars reads.
+type Cars interface {
+	// Cars is every car, as GET /api/cars carries it.
+	Cars() []protocol.Car
+	Add(c protocol.Car) (protocol.Car, error)
+	UpdateCar(id string, u cars.Update) (protocol.Car, error)
+	Remove(id string) error
+	SetGoal(id string, goal *protocol.CarGoal, clear bool, surplusOnly *bool) (protocol.Car, error)
+	SetLevel(id string, soc float64) (protocol.Car, error)
+	// SetSessionGoal and SetSessionLevel act on a charger's session: its
+	// car, or the session itself while its car is unknown.
+	SetSessionGoal(chargerID string, goal *protocol.CarGoal, clear bool, surplusOnly *bool) (protocol.ChargerCar, error)
+	SetSessionLevel(chargerID string, soc float64) (protocol.ChargerCar, error)
+	SetSessionCar(chargerID, session, carID string) (protocol.ChargerCar, error)
+}
+
 // LoadpointReading is one charger as the box holds it now.
 type LoadpointReading struct {
 	ID      string
 	Plugged bool
+	// Car names the car on the charger, and SoCSource, SoCAgeS and
+	// SoCEstimate say where its level came from (docs/cars.md).
+	Car         protocol.ChargerCar
+	SoCSource   string
+	SoCAgeS     *int64
+	SoCEstimate bool
 	// SoC is the car's level as a fraction in [0,1], meaningful only while
 	// SoCKnown.
 	SoC      float64

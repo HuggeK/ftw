@@ -16,22 +16,23 @@ func TestCachedVAGSoCReplacesManualPlanningAnchor(t *testing.T) {
 	tel.EmitMetric("vag", "vehicle_soc_age_s", 34*60, "s", "", "")
 	tel.DriverHealthMut("vag").RecordSuccess()
 	_, receivedAt, _ := tel.LatestMetric("vag", "vehicle_soc_age_s")
-	pick := telemetry.PickVehicleForAnchor(tel, false, receivedAt.Add(time.Second))
-	if pick.Driver == "" {
-		t.Fatal("timestamped VAG observation did not reach anchoring")
+	obs := telemetry.VehicleObservations(tel)
+	if len(obs) != 1 || obs[0].Driver != "vag" || !obs[0].At.Equal(receivedAt.Add(-34*time.Minute)) {
+		t.Fatalf("timestamped VAG observation did not reach the cars: %+v", obs)
 	}
+	pick := obs[0]
 	m := NewManager()
 	m.Load([]Config{{ID: "easee", VehicleCapacityWh: 95000, PluginSoC: .27}})
-	now := pick.UpdatedAt.Add(-time.Minute)
+	now := pick.At.Add(-time.Minute)
 	m.SetNowFn(func() time.Time { return now })
 	m.Observe("easee", true, 0, 0, true)
-	now = pick.UpdatedAt
+	now = pick.At
 	m.Observe("easee", true, 0, 0, true)
 	now = receivedAt
 	m.Observe("easee", true, 0, 2000, true)
 	m.SetCurrentSoC("easee", .27)
 	for range 3 {
-		if !m.AnchorVehicleSoCAt("easee", pick.SoC, pick.UpdatedAt) {
+		if !m.AnchorVehicleSoCAt("easee", pick.SoC, pick.At) {
 			t.Fatal("same-session VAG anchor refused")
 		}
 		st, _ := m.State("easee")

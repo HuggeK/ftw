@@ -58,6 +58,16 @@ func defaultOps() map[string]opSpec {
 		// the plan wrong for exactly as long as the box cannot act on it.
 		OpLoadpointSoCSet:         {scope: ScopeDispatchWrite, dispatchWrite: false},
 		OpLoadpointSurplusOnlySet: {scope: ScopeDispatchWrite, dispatchWrite: false},
+		// Cars (docs/cars.md). A car's goal, its level and which car is on a
+		// charger are a phone's to set, as the charger settings above are,
+		// and for the same reason none waits for the dispatch gate. The list
+		// of cars is the owner's alone: ftw.cars.write is in no other role.
+		OpCarGoalSet:    {scope: ScopeDispatchWrite, dispatchWrite: false},
+		OpCarSoCSet:     {scope: ScopeDispatchWrite, dispatchWrite: false},
+		OpSessionCarSet: {scope: ScopeDispatchWrite, dispatchWrite: false},
+		OpCarAdd:        {scope: ScopeCarsWrite, dispatchWrite: false},
+		OpCarUpdate:     {scope: ScopeCarsWrite, dispatchWrite: false},
+		OpCarRemove:     {scope: ScopeCarsWrite, dispatchWrite: false},
 	}
 }
 

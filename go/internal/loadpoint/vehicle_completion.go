@@ -11,21 +11,14 @@ type VehicleChargeState struct {
 }
 
 // VehicleObservationApplies rejects a reading from before this connection,
-// including the first connection seen after restart. With several connected
-// loadpoints, completion needs a car-to-charger binding that we do not have.
+// including the first connection seen after restart. The caller passes only
+// the session car's own reading (docs/cars.md), so several connected
+// loadpoints no longer make the reading ambiguous.
 func (m *Manager) VehicleObservationApplies(id string, observedAt time.Time) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	lp := m.byID[id]
-	if lp == nil || !lp.pluggedIn || observedAt.IsZero() || observedAt.Before(lp.connectionObservedAt) {
-		return false
-	}
-	for otherID, other := range m.byID {
-		if otherID != id && other.pluggedIn {
-			return false
-		}
-	}
-	return true
+	return lp != nil && lp.pluggedIn && !observedAt.IsZero() && !observedAt.Before(lp.connectionObservedAt)
 }
 
 func (c *Controller) SetVehicleChargeState(read func(string) (VehicleChargeState, bool)) {

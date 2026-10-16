@@ -133,6 +133,10 @@ type agentRig struct {
 	owner  appenroll.Grant
 	signer *approvaltest.Signer
 	logs   []redact.Line
+	// cars and chargers, when a test sets them, are the box's car store
+	// and the plan's chargers.
+	cars     *fakeCars
+	chargers PlanChargers
 }
 
 func (r *agentRig) ms() int64 { return r.now.UnixMilli() }
@@ -189,6 +193,11 @@ func (testViews) Loadpoints(key []byte) (cloudwire.LP, bool) {
 	return cloudwire.LP{Loadpoints: []cloudwire.Loadpoint{{ID: cloudwire.LoadpointID(key, "lp1")}}}, true
 }
 
+func (testViews) Cars(key []byte) (cloudwire.Cars, bool) {
+	soc := int64(140)
+	return cloudwire.Cars{Cars: []cloudwire.Car{{ID: cloudwire.CarID(key, "c1"), SocPermille: &soc, SocSource: protocol.CarSoCVehicle}}}, true
+}
+
 // handler builds a session for one enrolled row, as the uplink would.
 func (r *agentRig) handler(kind, dev, role string) (*Handler, *recorder) {
 	r.t.Helper()
@@ -196,7 +205,12 @@ func (r *agentRig) handler(kind, dev, role string) (*Handler, *recorder) {
 	grants := enrolGrants{id: r.id, dev: dev}
 	g, _ := grants.Grant()
 	caller := apiauth.Caller{Subject: kind + ":" + dev, Kind: kind, Role: role, Scopes: ScopesForEnrolment(g)}
+	var carPort Cars
+	if r.cars != nil {
+		carPort = r.cars
+	}
 	h, err := New(Config{
+		Cars: carPort, PlanChargers: r.chargers,
 		Clock: r.clock, Site: r.box, Info: r.box, Modes: r.box, Plans: r.box,
 		Codec: testCodec{}, Sender: rec, Caller: caller, Grants: grants, Commands: NewCmdLog(),
 		Loadpoints: r.lp, Access: r.access, Agents: r.agents, Audit: r.audit,
@@ -747,8 +761,8 @@ func TestAPhoneReadsTheTypedReads(t *testing.T) {
 		t.Errorf("drivers %+v", d)
 	}
 	deliver(t, owner, protocol.MsgCarsGet, ptrU32(3), struct{}{})
-	if got := errCode(t, rec); got != ErrUnknownOp {
-		t.Errorf("cars.get before the car store: %s", got)
+	if c := body[cloudwire.Cars](t, rec.last(t, protocol.MsgCars)); len(c.Cars) != 1 || c.Cars[0].ID != carOf("c1") {
+		t.Errorf("cars %+v", c)
 	}
 }
 

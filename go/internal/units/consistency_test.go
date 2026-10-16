@@ -168,11 +168,11 @@ func TestLoadpointConfigHasNoPluginSoCPct(t *testing.T) {
 	}
 }
 
-func TestVehiclePickSoCIsFraction(t *testing.T) {
-	typ := reflect.TypeOf(telemetry.VehiclePick{})
+func TestVehicleObservationSoCIsFraction(t *testing.T) {
+	typ := reflect.TypeOf(telemetry.VehicleObservation{})
 	for _, banned := range []string{"SoCPct", "ChargeLimitPct"} {
 		if _, ok := typ.FieldByName(banned); ok {
-			t.Fatalf("telemetry.VehiclePick.%s must not exist; use SoC/ChargeLimit 0–1", banned)
+			t.Fatalf("telemetry.VehicleObservation.%s must not exist; use SoC/ChargeLimit 0–1", banned)
 		}
 	}
 }

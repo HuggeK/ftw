@@ -41,6 +41,15 @@ type Schedule struct {
 	clockSet bool
 }
 
+// NewSchedule is a goal on the household clock: soc is a fraction, readyBy
+// minutes after midnight in the box's zone, days an ISO weekday mask with 0
+// for every day of a recurring goal.
+func NewSchedule(soc float64, readyByMin int, recurring bool, days uint8, finishAtLimit bool) Schedule {
+	s := Schedule{SoC: units.ClampFraction(soc), Recurring: recurring, Days: days & 0x7F,
+		FinishAtVehicleLimit: finishAtLimit, clock: readyByMin, clockSet: true}
+	return s
+}
+
 // BatSoCUnlockHyst is the fraction gap between arm and release for the
 // bat-SoC surplus unlock. Armed at threshold, released at threshold −
 // 0.05. Tuned to swallow normal Kalman noise on bat SoC (~0.005–0.01)

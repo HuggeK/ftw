@@ -53,10 +53,18 @@ session checkpoint failed. Neither means the saved schedule disappeared.
 Core assigns each saved vehicle-limit goal an `intent_id` and a one-shot
 `first_deadline_ms`; clients send user choices, not those bookkeeping fields.
 A fresh vehicle Complete can finish a one-shot goal across restart and later
-plug sessions. Completion requires one vehicle source, one connected loadpoint,
-a reading after the observed connection and no measured charging. An ambiguous
-match cannot finish the goal. A charger declining current is reported as a refusal, never
+plug sessions. Completion requires a live report from the session car's own
+source, made after the observed connection, and no measured charging. A car
+the box has not named cannot finish the goal. A charger declining current is reported as a refusal, never
 as an invented battery level or proof that the target was reached.
+
+### Cars
+
+A car belongs to its owner and visits chargers. [`go/internal/cars`](../go/internal/cars)
+keeps the owners' cars, decides which car each charging session is, and
+hands that car's capacity, goal, surplus choice and level to the loadpoint,
+which keeps the session's energy and the estimate the planner reads. A car's
+reading stays exact until 1 kWh has reached the car. See [cars.md](cars.md).
 
 ### History measurement quality
 

@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-func TestVehicleRefreshSelectsOnlyUnambiguousAuthorizedConfiguration(t *testing.T) {
+func TestVehicleRefreshUsesTheSessionCarsOwnSource(t *testing.T) {
 	dir := t.TempDir()
 	vehicle := func(name string, readOnly, wake bool) config.Driver {
 		path := filepath.Join(dir, name+".lua")
@@ -35,24 +35,29 @@ func TestVehicleRefreshSelectsOnlyUnambiguousAuthorizedConfiguration(t *testing.
 	}
 	tesla := vehicle("tesla", false, true)
 	other := vehicle("other", true, false)
+	// Before cars, two vehicles or two connected chargers refused the
+	// refresh: nothing said which car was on which charger. Now the session's
+	// car names its own sources, and only those are candidates.
 	cases := []struct {
-		name      string
-		drivers   []config.Driver
-		connected int
-		want      string
-		wantErr   bool
+		name    string
+		drivers []config.Driver
+		sources []string
+		want    string
+		wantErr bool
 	}{
-		{"missing or stale soc", []config.Driver{tesla}, 1, "tesla", false},
-		{"two vehicles", []config.Driver{tesla, other}, 1, "", true},
-		{"two chargers", []config.Driver{tesla}, 2, "", true},
-		{"read only", []config.Driver{other}, 1, "", false},
-		{"no wake declaration", []config.Driver{vehicle("legacy", false, false)}, 1, "", false},
-		{"disabled other", []config.Driver{tesla, {Name: other.Name, Lua: other.Lua, Disabled: true}}, 1, "tesla", false},
-		{"observe only", []config.Driver{{Name: tesla.Name, Lua: tesla.Lua, ObserveOnly: true}}, 1, "", false},
+		{"missing or stale soc", []config.Driver{tesla}, []string{"tesla"}, "tesla", false},
+		{"another car's vehicle beside it", []config.Driver{tesla, other}, []string{"tesla"}, "tesla", false},
+		{"the session's car has no source", []config.Driver{tesla}, nil, "", false},
+		{"a visitor's session", []config.Driver{tesla, other}, []string{}, "", false},
+		{"read only", []config.Driver{other}, []string{"other"}, "", false},
+		{"no wake declaration", []config.Driver{vehicle("legacy", false, false)}, []string{"legacy"}, "", false},
+		{"disabled", []config.Driver{{Name: tesla.Name, Lua: tesla.Lua, Disabled: true}}, []string{"tesla"}, "", false},
+		{"observe only", []config.Driver{{Name: tesla.Name, Lua: tesla.Lua, ObserveOnly: true}}, []string{"tesla"}, "", false},
+		{"unreadable metadata", []config.Driver{{Name: "gone", Lua: filepath.Join(dir, "gone.lua")}}, []string{"gone"}, "", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := configuredVehicleRefreshDriver(tc.drivers, tc.connected)
+			got, err := configuredVehicleRefreshDriver(tc.drivers, tc.sources)
 			if got != tc.want || (err != nil) != tc.wantErr {
 				t.Fatalf("got=%q err=%v", got, err)
 			}

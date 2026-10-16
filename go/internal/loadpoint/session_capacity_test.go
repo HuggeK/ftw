@@ -44,47 +44,47 @@ func TestSetSessionCapacitySessionScoped(t *testing.T) {
 	}
 }
 
-// Measured outranks configured, whichever order the two arrive in: a vehicle
-// profile is an operator's estimate of the car that usually parks here, the
-// NotifyEVChargingNeeds figure is the car that is actually plugged in.
-func TestReportedCapacityOutranksProfile(t *testing.T) {
-	t.Run("profile first", func(t *testing.T) {
-		m := NewManager()
-		m.Load([]Config{{ID: "a", VehicleCapacityWh: 60000, PluginSoC: 0.30}})
-		m.Observe("a", true, 7000, 0, true)
-
-		m.ApplyVehicleProfile("a", "Leaf", 40000)
-		m.SetSessionCapacityWh("a", 77000)
-
-		if got := m.Configs()[0].VehicleCapacityWh; got != 77000 {
-			t.Fatalf("the car's own capacity should win, got %v", got)
-		}
-		// Plug-out still restores the configured value, not the profile's.
-		m.Observe("a", false, 0, 0, false)
-		if got := m.Configs()[0].VehicleCapacityWh; got != 60000 {
-			t.Fatalf("plug-out should restore the configured 60000, got %v", got)
-		}
-	})
-
+// Measured outranks configured, whichever order the two arrive in: the
+// session car's capacity is its owner's estimate, the NotifyEVChargingNeeds
+// figure is the car that is actually plugged in. Plug-out restores the car's.
+func TestReportedCapacityOutranksTheCars(t *testing.T) {
+	leaf := CarBinding{ID: "c1", Name: "Leaf", CapacityWh: 40000}
 	t.Run("car first", func(t *testing.T) {
 		m := NewManager()
 		m.Load([]Config{{ID: "a", VehicleCapacityWh: 60000, PluginSoC: 0.30}})
 		m.Observe("a", true, 7000, 0, true)
 
+		m.SetCarBinding("a", leaf)
 		m.SetSessionCapacityWh("a", 77000)
-		m.ApplyVehicleProfile("a", "Leaf", 40000)
 
 		if got := m.Configs()[0].VehicleCapacityWh; got != 77000 {
-			t.Fatalf("a later profile must not overwrite the car's own capacity, got %v", got)
-		}
-		// The profile still names the car for the UI.
-		st, _ := m.State("a")
-		if st.VehicleName != "Leaf" {
-			t.Fatalf("vehicle name should still apply, got %+v", st)
+			t.Fatalf("the car's own capacity should win, got %v", got)
 		}
 		m.Observe("a", false, 0, 0, false)
-		if got := m.Configs()[0].VehicleCapacityWh; got != 60000 {
-			t.Fatalf("plug-out should restore the configured 60000, got %v", got)
+		if got := m.Configs()[0].VehicleCapacityWh; got != 40000 {
+			t.Fatalf("plug-out should restore the car's 40000, got %v", got)
+		}
+	})
+
+	t.Run("reported first", func(t *testing.T) {
+		m := NewManager()
+		m.Load([]Config{{ID: "a", VehicleCapacityWh: 60000, PluginSoC: 0.30}})
+		m.Observe("a", true, 7000, 0, true)
+
+		m.SetSessionCapacityWh("a", 77000)
+		m.SetCarBinding("a", leaf)
+
+		if got := m.Configs()[0].VehicleCapacityWh; got != 77000 {
+			t.Fatalf("a later binding must not overwrite the car's own capacity, got %v", got)
+		}
+		// The binding still names the car for the UI.
+		st, _ := m.State("a")
+		if st.VehicleName != "Leaf" || st.CarID != "c1" {
+			t.Fatalf("the car should still be named, got %+v", st)
+		}
+		m.Observe("a", false, 0, 0, false)
+		if got := m.Configs()[0].VehicleCapacityWh; got != 40000 {
+			t.Fatalf("plug-out should restore the car's 40000, got %v", got)
 		}
 	})
 }

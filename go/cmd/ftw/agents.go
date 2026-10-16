@@ -23,6 +23,7 @@ import (
 	"github.com/srcfl/ftw/go/internal/appenroll"
 	"github.com/srcfl/ftw/go/internal/appproto"
 	"github.com/srcfl/ftw/go/internal/appuplink"
+	"github.com/srcfl/ftw/go/internal/cars"
 	"github.com/srcfl/ftw/go/internal/cloudlink"
 	"github.com/srcfl/ftw/go/internal/config"
 	"github.com/srcfl/ftw/go/internal/redact"
@@ -128,6 +129,9 @@ type agentPorts struct {
 	boxPage func(by string) (*appproto.Handler, error)
 	// key cuts every id an agent sees, and the redactor's.
 	key []byte
+	// cars are the owners' cars, whose names, VINs, identifiers and
+	// sources the redactor takes out. Nil on a box that keeps none.
+	cars *cars.Runtime
 	// warned holds the rows already told they expire within a day.
 	warnMu sync.Mutex
 	warned map[string]bool
@@ -160,12 +164,22 @@ func (p *agentPorts) redactor() *redact.Redactor {
 
 // names is everything the configuration calls something.
 func (p *agentPorts) names() []string {
+	var out []string
+	if p.cars != nil {
+		// The cars an owner named on the box or in the app: what names
+		// them, and the drivers that report them.
+		for _, c := range p.cars.Cars() {
+			out = append(out, c.Name, c.VIN)
+			out = append(out, c.Identifiers...)
+			out = append(out, c.Sources...)
+		}
+	}
 	if p.cfg == nil {
-		return nil
+		return out
 	}
 	p.cfgMu.RLock()
 	defer p.cfgMu.RUnlock()
-	out := []string{p.cfg.Site.Name}
+	out = append(out, p.cfg.Site.Name)
 	for _, d := range p.cfg.Drivers {
 		out = append(out, d.Name)
 	}
@@ -341,7 +355,10 @@ func (p *agentPorts) warnExpiring(nowMs int64) {
 
 // views builds the typed reads' bodies from the same source as FTW Cloud's
 // copy, with the agent key's ids.
-type agentViews struct{ site *cloudSite }
+type agentViews struct {
+	site *cloudSite
+	cars *cars.Runtime
+}
 
 func (v agentViews) Live(key []byte) cloudwire.Live {
 	return cloudlink.ProjectLive(key, time.Since(v.site.site.started).Milliseconds(), v.site.Live())
@@ -353,6 +370,13 @@ func (v agentViews) Loadpoints(key []byte) (cloudwire.LP, bool) {
 		return cloudwire.LP{}, false
 	}
 	return cloudlink.ProjectLP(key, lp), true
+}
+
+func (v agentViews) Cars(key []byte) (cloudwire.Cars, bool) {
+	if v.cars == nil {
+		return cloudwire.Cars{}, false
+	}
+	return cloudlink.ProjectCars(key, v.cars.Cars()), true
 }
 
 // endAgentHolds releases every hold an agent set, by its subject.

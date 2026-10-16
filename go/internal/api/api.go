@@ -33,6 +33,7 @@ import (
 	// this package through an interface and must never import it.
 	"github.com/srcfl/ftw/go/internal/appproto"
 	"github.com/srcfl/ftw/go/internal/battery"
+	"github.com/srcfl/ftw/go/internal/cars"
 	"github.com/srcfl/ftw/go/internal/components"
 	"github.com/srcfl/ftw/go/internal/config"
 	"github.com/srcfl/ftw/go/internal/configreload"
@@ -60,6 +61,7 @@ import (
 	"github.com/srcfl/ftw/go/internal/telemetry"
 	"github.com/srcfl/ftw/go/internal/units"
 	v2xpolicy "github.com/srcfl/ftw/go/internal/v2x"
+	"github.com/srcfl/ftw/go/protocol"
 )
 
 const (
@@ -166,6 +168,10 @@ type Deps struct {
 
 	// Optional: EV loadpoint state consumed by the API and MPC.
 	Loadpoints *loadpoint.Manager
+
+	// Cars are the owners' cars apart from the chargers (docs/cars.md).
+	// Nil on a box without them: the charger routes then show no car.
+	Cars CarViews
 
 	// LoadpointCtrl is the dispatch controller. The diagnostics
 	// endpoint POST /api/loadpoints/{id}/manual_hold uses it to
@@ -521,6 +527,7 @@ func (s *Server) routes() {
 	s.handle("POST /api/ev/chargers", Configure, s.handleEVChargers)
 	s.handle("GET  /api/ev/providers", Read, s.handleEVProviders)
 	s.handle("GET  /api/loadpoints", Read, s.handleLoadpoints)
+	s.handle("GET  /api/cars", Read, s.handleCars)
 	// Via names the one field of this body the session can set. The target
 	// level and its deadline still have no command; the passthrough refuses
 	// the whole route either way.
@@ -3715,9 +3722,7 @@ func (s *Server) loadpointsPayload(now time.Time) map[string]any {
 		return map[string]any{"enabled": false, "loadpoints": []any{}, "vehicle_limit_goal_supported": true}
 	}
 	states := s.deps.Loadpoints.States()
-	if s.deps.Tel != nil {
-		decorateLoadpointsWithVehicle(states, s.deps.Tel)
-	}
+	decorateLoadpointsWithCar(states, s.deps.Cars, now)
 	s.applyPlanningSoC(states, now)
 	s.decorateLoadpointsWithManual(states)
 	s.decorateLoadpointsWithBatteryBoost(states)
@@ -3729,95 +3734,100 @@ func (s *Server) loadpointsPayload(now time.Time) map[string]any {
 	}
 }
 
-// applyPlanningSoC records the SoC a new plan starts from. It uses the
-// same picker and timestamp rule as the MPC loadpoint spec, so the
-// charging view's "Planning from" line matches the planner even when the
-// displayed car reading is older than the live-control window.
+// applyPlanningSoC records the level a new plan starts from: the session
+// car's level, which the planner reads from the same loadpoint state. A
+// visitor's session has none.
 func (s *Server) applyPlanningSoC(states []loadpoint.State, now time.Time) {
-	if s.deps == nil || s.deps.Loadpoints == nil {
-		return
-	}
 	for i := range states {
-		if !states[i].PluggedIn {
+		if !states[i].PluggedIn || states[i].SoCUnknown {
 			continue
 		}
-		var pick telemetry.VehiclePick
-		if s.deps.Tel != nil {
-			delivering := states[i].CurrentPowerW > loadpoint.DeliveringW
-			pick = telemetry.PlanningVehiclePick(s.deps.Tel, delivering, now)
-		}
-		soc, fromVehicle := s.deps.Loadpoints.PlanningStartSoC(states[i].ID, pick.SoC, pick.UpdatedAt, pick.Driver != "")
+		// decorateLoadpointsWithCar has already put the level the car
+		// shows into CurrentSoC: the planner starts from the same number.
+		soc := states[i].CurrentSoC
 		states[i].PlanningSoC = &soc
-		states[i].PlanningFromVehicle = fromVehicle
+		if s.deps != nil && s.deps.Cars != nil {
+			if v, ok := s.deps.Cars.Session(states[i].ID); ok {
+				states[i].PlanningFromVehicle = v.Source == protocol.CarSoCVehicle
+			}
+		}
 	}
 }
 
-// decorateLoadpointsWithVehicle overlays the best-matching DerVehicle
-// reading onto each plugged-in loadpoint state. Mutates the input
-// slice in place. Picker (rank + freshness + bounds) lives in
-// telemetry.PickBestVehicleForLoadpoint so main.go's MPC plumbing and
-// this presentation path agree on which vehicle is "the one".
-//
-// Pairing is decided per loadpoint: when a loadpoint is currently
-// delivering power, the pick is gated on charging_state ∈
-// {Charging, Starting}. That prevents a second vehicle (parked at
-// home, returning SoC, but not on this charger) from winning the
-// pick on freshness alone and flipping the loadpoint's SoC source
-// every tick — the failure mode observed with two Teslas in the same
-// household.
-//
-// CurrentSoC is intentionally NOT overwritten with the BMS reading.
-// The loadpoint controller uses CurrentSoC as its inference state;
-// overlaying it from the BMS would mean the UI shows BMS truth while
-// the controller's plan was computed from the inferred value the
-// previous tick — a presentation lie. VehicleSoC exposes the BMS
-// value separately; the frontend renders both and labels which one
-// the controller used.
-func decorateLoadpointsWithVehicle(states []loadpoint.State, tel *telemetry.Store) {
-	if len(tel.ReadingsByType(telemetry.DerVehicle)) == 0 {
-		// No vehicle drivers — mark every plugged-in lp as inferred,
-		// unless the manager already says why the estimate is where it
-		// is ("completed": pinned to target after the car declined).
-		for i := range states {
-			if states[i].PluggedIn && states[i].SoCSource == "" {
-				states[i].SoCSource = "inferred"
-			}
-		}
-		return
+// CarViews is the cars runtime as the routes need it.
+type CarViews interface {
+	Cars() []protocol.Car
+	Removed() []cars.Tombstone
+	Session(lpID string) (cars.SessionView, bool)
+	SetViewCarCapacity(lpID string, capacityWh float64) error
+}
+
+// handleCars is GET /api/cars: every car the box keeps, in the registry's
+// names spelled in snake_case, and the ids an owner removed. A caller
+// without ftw.cars.read (a viewer, a watch) sees each car's id, name, level,
+// goal and surplus choice, and nothing that says which car it is.
+func (s *Server) handleCars(w http.ResponseWriter, r *http.Request) {
+	list, removed := []protocol.Car{}, []cars.Tombstone{}
+	if s.deps.Cars != nil {
+		list, removed = s.deps.Cars.Cars(), s.deps.Cars.Removed()
 	}
-	now := time.Now()
+	if caller, ok := apiauth.FromRequest(r); !ok || !caller.Scopes.Has(protocol.ScopeCarsRead) {
+		for i, c := range list {
+			list[i] = protocol.Car{ID: c.ID, Name: c.Name, SocPermille: c.SocPermille, SocSource: c.SocSource,
+				SocAgeS: c.SocAgeS, EnergySinceWh: c.EnergySinceWh, SocEstimate: c.SocEstimate,
+				ChargeLimitPermille: c.ChargeLimitPermille, Goal: c.Goal, SurplusOnly: c.SurplusOnly}
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"cars": list, "removed": removed})
+}
+
+// decorateLoadpointsWithCar shows each plugged-in charger's level as its
+// session's car has it. The car's own reading counts as the car's
+// ("vehicle") until more than 1 kWh has flowed since it, however old it is;
+// past that, or from a level someone set, the level is "inferred". A
+// visitor's session stays "unknown", and a level the manager pinned at
+// completion stays "completed". CurrentSoC becomes the level the car shows,
+// which the planner starts from too; the loadpoint keeps its own estimate
+// for the controller.
+func decorateLoadpointsWithCar(states []loadpoint.State, views CarViews, now time.Time) {
 	for i := range states {
-		if !states[i].PluggedIn {
+		st := &states[i]
+		if !st.PluggedIn || st.SoCUnknown || st.SoCSource == "completed" {
 			continue
 		}
-		delivering := states[i].CurrentPowerW > loadpoint.DeliveringW
-		pick := telemetry.PickBestVehicleForLoadpoint(tel, delivering, now)
-		freshVehicle := pick.Driver != ""
-		if !freshVehicle {
-			pick = telemetry.PickBestVehicleForDisplay(tel, delivering, now)
-			if pick.Driver == "" {
-				if states[i].SoCSource == "" {
-					states[i].SoCSource = "inferred"
-				}
-				continue
-			}
+		var v cars.SessionView
+		ok := false
+		if views != nil {
+			v, ok = views.Session(st.ID)
 		}
-		states[i].VehicleDriver = pick.Driver
-		states[i].VehicleSoC = pick.SoC
-		states[i].VehicleChargeLimit = pick.ChargeLimit
-		states[i].VehicleChargingState = pick.ChargingState
-		states[i].VehicleStale = pick.Stale
-		if !pick.UpdatedAt.IsZero() {
-			age := now.Sub(pick.UpdatedAt)
-			if age < 0 {
-				age = 0
+		if !ok || v.Source == "" {
+			if st.SoCSource == "" {
+				st.SoCSource = "inferred"
 			}
-			states[i].VehicleSoCAgeS = int64(age / time.Second)
+			continue
 		}
-		if freshVehicle {
-			states[i].SoCSource = "vehicle"
-		} else if states[i].SoCSource == "" {
-			states[i].SoCSource = "inferred"
+		// The mapping in docs/cars.md: a shipped app reads "vehicle" as the
+		// car's own number, so an estimate is "inferred", and the level is
+		// the one the car shows and the planner starts from.
+		st.CurrentSoC = v.Shown
+		switch {
+		case v.Source == protocol.CarSoCVehicle && !v.Estimate:
+			st.SoCSource = "vehicle"
+		case v.Source == protocol.CarSoCAssumed:
+			st.SoCSource = "assumed"
+		default:
+			st.SoCSource = "inferred"
+		}
+		if v.Source != protocol.CarSoCVehicle {
+			continue
+		}
+		st.VehicleDriver = v.Driver
+		st.VehicleSoC = v.SoC
+		st.VehicleChargeLimit = v.ChargeLimit
+		st.VehicleChargingState = v.ChargingState
+		st.VehicleStale = v.Estimate
+		if !v.At.IsZero() {
+			st.VehicleSoCAgeS = int64(max(0, now.Sub(v.At)) / time.Second)
 		}
 	}
 }

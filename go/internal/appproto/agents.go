@@ -52,6 +52,9 @@ type Access interface {
 type AgentViews interface {
 	Live(key []byte) cloudwire.Live
 	Loadpoints(key []byte) (cloudwire.LP, bool)
+	// Cars is the car class under key: opaque ids, levels and goals, and
+	// nothing that names a car. False on a box that keeps no cars.
+	Cars(key []byte) (cloudwire.Cars, bool)
 }
 
 // AuditLog keeps the box's audit rows.
@@ -793,9 +796,10 @@ func (h *Handler) onRead(env Envelope) error {
 		return h.onLogsGet(env)
 	case protocol.MsgConfigGet:
 		return h.onConfigGet(env)
+	case protocol.MsgCarsGet:
+		return h.onCarsGet(env)
 	default:
-		// events.get, diag.run and cars.get are in the contract and not
-		// built yet; cars.get waits for the car contract.
+		// events.get and diag.run are in the contract and not built yet.
 		return h.refuse(env.ID, ErrUnknownOp, map[string]any{"t": env.T})
 	}
 }
@@ -819,6 +823,20 @@ func (h *Handler) onLoadpointsGet(env Envelope) error {
 		lp = cloudwire.LP{}
 	}
 	return h.sendBulk(protocol.MsgLoadpoints, env.ID, lp)
+}
+
+// onCarsGet is each car's level and goal by an id cut with the key: the same
+// projection as FTW Cloud's car class. Names, makes, VINs, identifiers and
+// sources stay home.
+func (h *Handler) onCarsGet(env Envelope) error {
+	if h.cfg.Views == nil {
+		return h.refuse(env.ID, ErrUnavailable, map[string]any{"subsystem": "cars"})
+	}
+	cars, ok := h.cfg.Views.Cars(h.cfg.AgentKey)
+	if !ok {
+		return h.refuse(env.ID, ErrUnavailable, map[string]any{"subsystem": "cars"})
+	}
+	return h.sendBulk(protocol.MsgCars, env.ID, cars)
 }
 
 func (h *Handler) onDriversGet(env Envelope) error {

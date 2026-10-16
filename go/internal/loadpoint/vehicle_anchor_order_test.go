@@ -7,7 +7,10 @@ import (
 )
 
 // Cloud delivery order must not replace the car's measurement times. Both
-// readings arrive late; the second was measured after the first.
+// readings arrive late; the second was measured after the first. The plan
+// starts from the loadpoint's level, which the cars runtime anchors only
+// with a reading that supersedes it (docs/cars.md), so the level is what
+// these hold.
 func TestDelayedVehicleSoCUsesMeasurementOrder(t *testing.T) {
 	m := NewManager()
 	m.Load([]Config{{ID: "car", VehicleCapacityWh: 86500, PluginSoC: .60}})
@@ -33,9 +36,6 @@ func TestDelayedVehicleSoCUsesMeasurementOrder(t *testing.T) {
 		t.Fatal("newer car measurement lost to the first reading's receipt time")
 	}
 	want := .68 + 2500*DefaultChargeEfficiency/86500
-	if got, fromVehicle := m.PlanningStartSoC("car", .68, second, true); !fromVehicle || math.Abs(got-want) > 1e-9 {
-		t.Fatalf("planner start %.12f fromVehicle=%t, want %.12f", got, fromVehicle, want)
-	}
 	if !m.AnchorVehicleSoCAt("car", .68, second) {
 		t.Fatal("second delayed car reading refused")
 	}
@@ -47,9 +47,9 @@ func TestDelayedVehicleSoCUsesMeasurementOrder(t *testing.T) {
 		if m.VehicleSoCSupersedes("car", observed) {
 			t.Fatalf("old or repeated measurement became newer: %v", observed)
 		}
-		if got, fromVehicle := m.PlanningStartSoC("car", .68, observed, true); fromVehicle || math.Abs(got-want) > 1e-9 {
-			t.Fatalf("old reading changed the estimate or counted energy twice: %.12f, %t", got, fromVehicle)
-		}
+	}
+	if st, _ := m.State("car"); math.Abs(st.CurrentSoC-want) > 1e-9 {
+		t.Fatalf("old readings changed the estimate or counted energy twice: %.12f", st.CurrentSoC)
 	}
 	// A later explicit user correction still takes precedence over a car
 	// measurement taken before it, even when that reading arrives afterwards.
@@ -61,8 +61,8 @@ func TestDelayedVehicleSoCUsesMeasurementOrder(t *testing.T) {
 	if m.VehicleSoCSupersedes("car", olderThanManual) {
 		t.Fatal("a delayed car reading replaced a newer manual correction")
 	}
-	if got, fromVehicle := m.PlanningStartSoC("car", .68, olderThanManual, true); fromVehicle || math.Abs(got-.71) > 1e-9 {
-		t.Fatalf("manual correction lost: %.12f, %t", got, fromVehicle)
+	if st, _ := m.State("car"); math.Abs(st.CurrentSoC-.71) > 1e-9 {
+		t.Fatalf("manual correction lost: %.12f", st.CurrentSoC)
 	}
 	now = now.Add(2 * time.Minute)
 	if !m.VehicleSoCSupersedes("car", now.Add(-time.Minute)) {
@@ -88,9 +88,6 @@ func TestDelayedVehicleSoCWithoutHistoryKeepsMeasurementOrder(t *testing.T) {
 			m.Observe("car", true, 6000, 4500, true)
 			if !m.VehicleSoCSupersedes("car", second) {
 				t.Fatal("newer car measurement lost to raw fallback receipt time")
-			}
-			if got, fromVehicle := m.PlanningStartSoC("car", .68, second, true); !fromVehicle || math.Abs(got-.68) > 1e-9 {
-				t.Fatalf("unknown earlier energy changed planning SoC: %.12f, %t", got, fromVehicle)
 			}
 			if !m.AnchorVehicleSoCAt("car", .68, second) {
 				t.Fatal("newer delayed reading refused")

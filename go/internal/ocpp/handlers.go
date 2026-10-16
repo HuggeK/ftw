@@ -274,10 +274,12 @@ func (h *Handler) probeFinished(id string) {
 }
 
 // noteVehicleID records the identity a transaction presented and fires the
-// vehicleIdentified callback when it is new for this charger. Quarantine
-// applies: a pending charger's identity is stored (the UI shows it so the
-// operator can build a profile from it) but never fires the callback.
-func (h *Handler) noteVehicleID(id, vehicleID, source string) {
+// vehicleIdentified callback when it is new for this charger, and at the
+// start of every transaction: the same card on the next plug-in names the
+// car of that plug-in (docs/cars.md). Quarantine applies: a pending
+// charger's identity is stored (the UI shows it so the operator can build a
+// profile from it) but never fires the callback.
+func (h *Handler) noteVehicleID(id, vehicleID, source string, started bool) {
 	if vehicleID == "" {
 		return
 	}
@@ -289,7 +291,7 @@ func (h *Handler) noteVehicleID(id, vehicleID, source string) {
 	fn := h.vehicleIdentified
 	approved := h.approved[id]
 	h.mu.Unlock()
-	if changed && approved && fn != nil {
+	if (changed || started) && approved && fn != nil {
 		fn(id, vehicleID, source)
 	}
 }
@@ -595,7 +597,7 @@ func (h *Handler) OnStartTransaction(id string, req *core.StartTransactionReques
 		"charger", id, "txid", txID, "tag", req.IdTag, "meter_start_wh", req.MeterStart)
 	// The 1.6 idTag names the RFID card that started the session — the
 	// closest thing to a vehicle identity this dialect has.
-	h.noteVehicleID(id, req.IdTag, "rfid")
+	h.noteVehicleID(id, req.IdTag, "rfid", true)
 	h.pushReading(id, s)
 	h.telSuccess(id)
 	return core.NewStartTransactionConfirmation(

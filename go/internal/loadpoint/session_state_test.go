@@ -173,9 +173,9 @@ func TestCapacityChangeKeepsCurrentLevelAndConfidence(t *testing.T) {
 func TestNewSessionAfterOutageDropsPriorCarCapacity(t *testing.T) {
 	m := sessionManager(nil, "garage", "charger")
 	m.ObserveSession("garage", true, 4300, 1000, true, "easee:ABC", "session-1")
-	m.ApplyVehicleProfile("garage", "Old car", 100000)
+	m.SetSessionCapacityWh("garage", 100000)
 	m.ObserveSession("garage", true, 4300, 2000, true, "easee:ABC", "session-2")
-	if s, _ := m.State("garage"); s.VehicleName != "" || s.VehicleCapacityWh != 60000 {
+	if s, _ := m.State("garage"); s.VehicleCapacityWh != 60000 {
 		t.Fatalf("prior car leaked after an unseen reconnect: %+v", s)
 	}
 }

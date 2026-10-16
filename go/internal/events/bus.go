@@ -72,6 +72,8 @@ const (
 	KindChargingSessionComplete = "charging.session_complete"
 	KindChargingInterrupted     = "charging.interrupted"
 	KindChargingGoalAtRisk      = "charging.goal_at_risk"
+	// KindCarWhich asks which car is on a charger (docs/cars.md).
+	KindCarWhich = "car.which"
 )
 
 // HealthTick is fired every control-loop tick with the current telemetry
@@ -203,3 +205,16 @@ type ChargingGoalAtRisk struct {
 }
 
 func (ChargingGoalAtRisk) Kind() string { return KindChargingGoalAtRisk }
+
+// CarWhich is emitted once per plug-in when the box cannot tell which of its
+// cars is on a charger. Session names the plug-in a tap answers, and CarIDs
+// are the cars a tap may pick, in the box's order: at most four, empty when
+// there are more.
+type CarWhich struct {
+	LoadpointID string
+	Session     string
+	CarIDs      []string
+	At          time.Time
+}
+
+func (CarWhich) Kind() string { return KindCarWhich }

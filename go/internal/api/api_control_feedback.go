@@ -533,6 +533,9 @@ func batteryChargeLevelLimit(f *ControlFeedback) string {
 // evidence to the existing endpoint without changing stored loadpoint state.
 type loadpointFeedbackView struct {
 	loadpoint.State
+	// Level is current_soc, left out for a visitor's car: nobody knows its
+	// level, and the box does not guess one (docs/cars.md).
+	Level           *float64         `json:"current_soc,omitempty"`
 	ControlFeedback *ControlFeedback `json:"control_feedback,omitempty"`
 }
 
@@ -546,7 +549,12 @@ func (s *Server) loadpointsWithFeedback(states []loadpoint.State) []loadpointFee
 	}
 	out := make([]loadpointFeedbackView, 0, len(states))
 	for _, st := range states {
-		out = append(out, loadpointFeedbackView{st, byDriver[st.DriverName]})
+		view := loadpointFeedbackView{State: st, ControlFeedback: byDriver[st.DriverName]}
+		if !st.SoCUnknown {
+			level := st.CurrentSoC
+			view.Level = &level
+		}
+		out = append(out, view)
 	}
 	return out
 }

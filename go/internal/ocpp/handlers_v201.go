@@ -194,7 +194,8 @@ func (h *handlerV201) OnTransactionEvent(id string, req *transactions.Transactio
 	// eMAID is ISO 15118 Plug & Charge. Cards (ISO14443/ISO15693) still
 	// only name the card. The token may ride on any event type.
 	if req.IDToken != nil {
-		h.noteVehicleID(id, req.IDToken.IdToken, string(req.IDToken.Type))
+		h.noteVehicleID(id, req.IDToken.IdToken, string(req.IDToken.Type),
+			req.EventType == transactions.TransactionEventStarted)
 	}
 	h.pushReading(id, s)
 	if ended {

@@ -220,9 +220,7 @@ func (s *Server) CloudLoadpoints(now time.Time) (states []loadpoint.State, feedb
 		return nil, nil, false
 	}
 	states = s.deps.Loadpoints.States()
-	if s.deps.Tel != nil {
-		decorateLoadpointsWithVehicle(states, s.deps.Tel)
-	}
+	decorateLoadpointsWithCar(states, s.deps.Cars, now)
 	s.applyPlanningSoC(states, now)
 	s.decorateLoadpointsWithManual(states)
 	s.decorateLoadpointsWithBatteryBoost(states)

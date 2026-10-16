@@ -3,6 +3,7 @@ package appproto
 import (
 	"context"
 	"errors"
+	"github.com/srcfl/ftw/go/protocol"
 	"maps"
 	"slices"
 	"testing"
@@ -49,15 +50,29 @@ type fakeLoadpoints struct {
 
 	// powerW is what Readings reports the charger drawing.
 	powerW float64
+	// car is what each charger carries about its car, and socSource and
+	// socEstimate where its level came from.
+	car         protocol.ChargerCar
+	carByID     map[string]protocol.ChargerCar
+	socSource   string
+	socEstimate bool
 }
 
 func (f *fakeLoadpoints) WaitForPersistence(context.Context) error { return f.persistenceErr }
+
+func (f *fakeLoadpoints) carOn(id string) protocol.ChargerCar {
+	if c, ok := f.carByID[id]; ok {
+		return c
+	}
+	return f.car
+}
 
 func (f *fakeLoadpoints) Readings() []LoadpointReading {
 	out := []LoadpointReading{}
 	for _, id := range slices.Sorted(maps.Keys(f.ids)) {
 		out = append(out, LoadpointReading{
-			ID: id, Plugged: f.plugged, SoC: f.soc, SoCKnown: f.plugged && f.socKnown, PowerW: f.powerW,
+			ID: id, Plugged: f.plugged, SoC: f.soc, SoCKnown: f.plugged && f.socKnown, PowerW: f.powerW, Car: f.carOn(id),
+			SoCSource: f.socSource, SoCEstimate: f.socEstimate,
 		})
 	}
 	return out

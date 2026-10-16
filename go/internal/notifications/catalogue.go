@@ -26,6 +26,7 @@ const (
 	PushApprovalKeySet          = protocol.PushApprovalKeySet
 	PushOwnerAdded              = protocol.PushOwnerAdded
 	PushCloudRevoked            = protocol.PushCloudRevoked
+	PushCarWhich                = protocol.PushCarWhich
 )
 
 // PushSentence is one lock-screen sentence, exactly as the app wrote it.

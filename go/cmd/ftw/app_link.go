@@ -17,6 +17,7 @@ import (
 	"github.com/srcfl/ftw/go/internal/appenroll"
 	"github.com/srcfl/ftw/go/internal/appproto"
 	"github.com/srcfl/ftw/go/internal/appuplink"
+	"github.com/srcfl/ftw/go/internal/cars"
 	"github.com/srcfl/ftw/go/internal/config"
 	"github.com/srcfl/ftw/go/internal/control"
 	"github.com/srcfl/ftw/go/internal/loadpoint"
@@ -418,6 +419,7 @@ type appLoadpoints struct {
 	mgr  *loadpoint.Manager
 	ctrl *loadpoint.Controller
 	mpc  *mpc.Service
+	cars *cars.Runtime
 }
 
 func (a *appLoadpoints) WaitForPersistence(ctx context.Context) error {
@@ -485,16 +487,28 @@ func (a *appLoadpoints) SetSoC(id string, soc float64) bool {
 
 // Readings is every charger as the manager holds it. The car's level counts
 // only while it is plugged in: unplugged, the manager's number is the last
-// session's, and a watch would draw it as now.
+// session's, and a watch would draw it as now. A visitor's car has none.
 func (a *appLoadpoints) Readings() []appproto.LoadpointReading {
 	states := a.mgr.States()
 	out := make([]appproto.LoadpointReading, 0, len(states))
 	for _, st := range states {
-		out = append(out, appproto.LoadpointReading{
+		r := appproto.LoadpointReading{
 			ID: st.ID, Plugged: st.PluggedIn,
-			SoC: st.CurrentSoC, SoCKnown: st.PluggedIn,
+			SoC: st.CurrentSoC, SoCKnown: st.PluggedIn && !st.SoCUnknown,
 			PowerW: st.CurrentPowerW,
-		})
+		}
+		if a.cars != nil {
+			r.Car = a.cars.ChargerCar(st.ID)
+			if v, ok := a.cars.Session(st.ID); ok && v.Source != "" && r.SoCKnown {
+				// The level the car shows, and where it came from.
+				r.SoC, r.SoCSource, r.SoCEstimate = v.Shown, v.Source, v.Estimate
+				if !v.At.IsZero() {
+					age := max(0, int64(time.Since(v.At)/time.Second))
+					r.SoCAgeS = &age
+				}
+			}
+		}
+		out = append(out, r)
 	}
 	return out
 }
@@ -573,7 +587,7 @@ func (a *appPlans) CeilingW() *int64 {
 
 // appPlanChargers is each charger's share of the plan, read from the same plan
 // snapshot and the same windows GET /api/loadpoints serves. Keyed by the
-// charger; CarID stays empty until Core keeps cars.
+// charger, with the session's car while the box knows it.
 type appPlanChargers struct {
 	planner *mpc.Service
 	mgr     *loadpoint.Manager
@@ -592,7 +606,7 @@ func (a *appPlanChargers) PlanChargers(now time.Time) []appproto.PlanCharger {
 	out := make([]appproto.PlanCharger, 0, len(states))
 	for _, st := range states {
 		ch := appproto.PlanCharger{
-			ID: st.ID, PluggedIn: st.PluggedIn,
+			ID: st.ID, CarID: st.CarID, PluggedIn: st.PluggedIn,
 			Pending: snap.Pending, Outdated: snap.Outdated,
 			Windows: []appproto.PlanChargerWindow{},
 			GoalRev: goalRev(st),
@@ -650,6 +664,7 @@ func startAppLink(
 	planner *mpc.Service,
 	lpMgr *loadpoint.Manager,
 	lpCtrl *loadpoint.Controller,
+	carsRT *cars.Runtime,
 	priceSvc *prices.Service,
 	ctrl *control.State,
 	ctrlMu *sync.Mutex,
@@ -705,8 +720,15 @@ func startAppLink(
 	// hides the buttons rather than drawing dead ones.
 	var loadpoints appproto.Loadpoints
 	if lpMgr != nil && lpCtrl != nil {
-		loadpoints = &appLoadpoints{mgr: lpMgr, ctrl: lpCtrl, mpc: planner}
+		loadpoints = &appLoadpoints{mgr: lpMgr, ctrl: lpCtrl, mpc: planner, cars: carsRT}
 		caps = append(caps, appproto.CapDerEv)
+	}
+	// Cars ride with the chargers (docs/cars.md). The box says der.car when
+	// it keeps them, and the car ops answer.
+	var carPort appproto.Cars
+	if carsRT != nil && loadpoints != nil {
+		carPort = carsRT
+		caps = append(caps, appproto.CapDerCar)
 	}
 
 	// The plan reaches every streaming phone the moment the planner
@@ -766,7 +788,7 @@ func startAppLink(
 	caps = append(caps, appproto.CapAccessAgents)
 	// One view for every agent session, so a charger's plug-in count is
 	// the same whichever session reads it.
-	views := agentViews{site: &cloudSite{site: site, api: gateway}}
+	views := agentViews{site: &cloudSite{site: site, api: gateway}, cars: carsRT}
 
 	// handlerFor builds one handler for one session: a phone's stream, or a
 	// watch's exchange. They share the ports above, which are read-only
@@ -790,6 +812,7 @@ func startAppLink(
 				Loadpoints:   loadpoints,
 				PlanChargers: planChargers,
 				PlanFeed:     planFeed,
+				Cars:         carPort,
 				API:          gateway,
 				Caller:       caller,
 				Grants:       grants,

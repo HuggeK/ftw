@@ -62,6 +62,15 @@ func (s *Server) handleLoadpointVehicle(w http.ResponseWriter, r *http.Request) 
 		}
 		s.deps.Loadpoints.Load(points)
 	}
+	if s.deps.Cars != nil {
+		// The size is the car's (docs/cars.md). The config keeps it too, so
+		// a box rolled back to before cars finds it where it was; the car
+		// changes only once the config holds it.
+		if err := s.deps.Cars.SetViewCarCapacity(id, body.CapacityWh); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Battery size was saved for the charger but not for its car. Try again."})
+			return
+		}
+	}
 	s.replanForScheduleChange(id)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "vehicle_capacity_wh": body.CapacityWh, "capacity_source": "configured"})
 }

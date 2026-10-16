@@ -192,7 +192,11 @@ func TestVehicleLimitReadsCompleteAfterChargerDecline(t *testing.T) {
 	}
 }
 
-func TestVehicleLimitRejectsPreviousConnectionAndAmbiguousLoadpoint(t *testing.T) {
+// Before cars, a second connected loadpoint made every car reading ambiguous
+// and completion refused it. The cars runtime now hands over only the
+// session car's own reading, so the second charger changes nothing; a
+// reading from before this connection is still refused.
+func TestVehicleLimitRejectsPreviousConnectionNotASecondCharger(t *testing.T) {
 	m := NewManager()
 	now := time.Now().UTC()
 	m.SetNowFn(func() time.Time { return now })
@@ -205,8 +209,8 @@ func TestVehicleLimitRejectsPreviousConnectionAndAmbiguousLoadpoint(t *testing.T
 		t.Fatal("fresh reading for only connected loadpoint rejected")
 	}
 	m.ObserveSession("two", true, 0, 0, true, "device-two", "session-b")
-	if m.VehicleObservationApplies("one", now) {
-		t.Fatal("several connected loadpoints cannot share completion proof")
+	if !m.VehicleObservationApplies("one", now) {
+		t.Fatal("the session car's reading was refused because another charger is connected")
 	}
 	m.ObserveSession("two", false, 0, 0, false, "device-two", "")
 	now = now.Add(time.Minute)

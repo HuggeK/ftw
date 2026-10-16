@@ -125,6 +125,7 @@ open to an agent.
 | `planner.prefs.set` | `ftw.goals.request` | `agent.request` only |
 | `loadpoint.soc.set` | `ftw.goals.request` | `agent.request` only |
 | `loadpoint.surplus_only.set` | `ftw.goals.request` | `agent.request` only |
+| `car.goal.set`, `car.soc.set` | `ftw.goals.request` | `agent.request` only, naming the car by its agent id or the charger by `charger_id` ([cars.md](cars.md)) |
 | `battery.hold`, `loadpoint.boost` | none | Never. They return when the box can bound them: `battery.hold` has no handler, and a boost has no power of its own to hold to `maxW` |
 
 - **A per-grant allowlist.** A grant lists `ops`, a subset of the ops whose
@@ -139,9 +140,11 @@ open to an agent.
   `clear`; `voltage`, `max_amps_per_phase`, `site_phases`, `phase_split_w`
   and `min_phase_hold_s` stay with owners.
 - **Ids are the agent's.** A `loadpoint` argument is the opaque charger id
-  the agent read from `loadpoints.get`. The box resolves it with its own
-  agent key, so an id from another box, or from the readable copy, names
-  nothing (`E_UNKNOWN_OP {arg: "id"}`).
+  the agent read from `loadpoints.get`, and a `car` argument the car id it
+  read from `cars.get`. The box resolves each with its own agent key, so an
+  id from another box, or from the readable copy, names nothing
+  (`E_UNKNOWN_OP {arg: "id"}`). A command's outcome names a car and a
+  charger's car by the same ids.
 - **A durable change waits.** An agent that sends a `ftw.goals.request` op as
   `cmd` gets `E_NEEDS_OWNER`, with `{use: "agent.request"}`.
 - **The checks run in Core's order:** the command's expiry, a known op, the
@@ -400,8 +403,10 @@ The registry's `reads` table names each read and the scope it needs.
   fallbacks, refusals and plan against actual join it when the box keeps
   them; a field the box cannot fill is absent.
 - The box answers `events.get` and `diag.run` with `E_UNKNOWN_OP` until it
-  builds them, and `cars.get` until it has the car store. Until then
-  `loadpoints.get` carries no car id.
+  builds them. `cars.get` carries no name, maker, VIN, identifier or source,
+  and the redactor takes those out of `logs.get` and `config.get`; a box
+  without the car store answers it `E_UNAVAILABLE`. `plan.get` names each
+  charger and its car by agent id.
 - `logs.get` looks back over the box's whole log ring, its newest 2,000
   lines. `beforeMs` and `afterMs` together pick the lines between them; an
   `afterMs` at or past `beforeMs` gets `E_UNKNOWN_OP {field: "beforeMs"}`.

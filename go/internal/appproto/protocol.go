@@ -146,6 +146,12 @@ const (
 	OpLoadpointBoost          = protocol.OpLoadpointBoost
 	OpLoadpointSoCSet         = protocol.OpLoadpointSoCSet
 	OpLoadpointSurplusOnlySet = protocol.OpLoadpointSurplusOnlySet
+	OpCarGoalSet              = protocol.OpCarGoalSet
+	OpCarSoCSet               = protocol.OpCarSoCSet
+	OpSessionCarSet           = protocol.OpSessionCarSet
+	OpCarAdd                  = protocol.OpCarAdd
+	OpCarUpdate               = protocol.OpCarUpdate
+	OpCarRemove               = protocol.OpCarRemove
 	BoxModeFull               = protocol.BoxModeFull
 	BoxModeFloor              = protocol.BoxModeFloor
 	BoxModeBooting            = protocol.BoxModeBooting
@@ -238,6 +244,8 @@ const (
 	ScopeModeWrite        = protocol.ScopeModeWrite
 	ScopeMembersRead      = protocol.ScopeMembersRead
 	ScopeMembersWrite     = protocol.ScopeMembersWrite
+	ScopeCarsWrite        = protocol.ScopeCarsWrite
+	CapDerCar             = protocol.CapDerCar
 	ErrBooting            = protocol.ErrBooting
 	ErrUnknownOp          = protocol.ErrUnknownOp
 	ErrCmdExpired         = protocol.ErrCmdExpired
@@ -253,6 +261,8 @@ const (
 	ErrUnsupportedMedia   = protocol.ErrUnsupportedMedia
 	ErrWholeDocument      = protocol.ErrWholeDocument
 	ErrLocalOnly          = protocol.ErrLocalOnly
+	ErrNotFound           = protocol.ErrNotFound
+	ErrDuplicate          = protocol.ErrDuplicate
 	SourceLive            = protocol.SourceLive
 	SourceLagging         = protocol.SourceLagging
 	SourceStale           = protocol.SourceStale

@@ -247,3 +247,26 @@ func TestCloudLiveCarriesThePhasesUnderTheMeter(t *testing.T) {
 		t.Fatalf("the fuse follows %v; it is config", got)
 	}
 }
+
+// FTW Cloud's lp.session is the plug-in's id from the cars runtime, the
+// same across a restart, which a tap after car.which names.
+func TestCloudSessionIsTheCarsRuntimes(t *testing.T) {
+	c := &cloudSite{}
+	st := loadpoint.State{ID: "garage", DriverName: "easee", PluggedIn: true, Session: "7d1f0c2a9b3e4f50"}
+	if lp := c.loadpoint(st, time.Now()); lp.Session != "7d1f0c2a9b3e4f50" {
+		t.Fatalf("session %q", lp.Session)
+	}
+	st.Session = ""
+	if lp := c.loadpoint(st, time.Now()); lp.Session == "" {
+		t.Fatal("without the cars runtime the plug-in count is the session")
+	}
+	// The session's car by the box's id: the link cuts it per grant.
+	st.CarID, st.CarIdentifiedBy, st.Choose = "0123456789abcdef0123456789abcdef", "tap", nil
+	if lp := c.loadpoint(st, time.Now()); lp.CarID != st.CarID || lp.CarIdentifiedBy != "tap" {
+		t.Fatalf("car %q by %q", lp.CarID, lp.CarIdentifiedBy)
+	}
+	st.PluggedIn = false
+	if lp := c.loadpoint(st, time.Now()); lp.CarID != "" {
+		t.Fatal("an unplugged charger names a car")
+	}
+}

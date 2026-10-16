@@ -46,6 +46,11 @@ The Go types are in [`go/protocol/cars.go`](../go/protocol/cars.go).
 | `GET /api/cars` with `ftw.cars.read` | The owner role | Every field |
 | `GET /api/cars` without it | Viewers and watches | `id`, `name`, the level fields, `goal`, `surplusOnly` |
 | FTW Cloud's `car` class | Phones with `ftw.live.read` | Opaque `id`, the level fields, `goal`, `surplusOnly` |
+| `cars.get` | Agents with `ftw.live.read` | The car class under the agent key ([agents.md](agents.md)) |
+
+An agent asks for a car's goal or level with `car.goal.set` and
+`car.soc.set` as `agent.request`, which waits for an owner, naming the car
+by the id `cars.get` gave it. It never taps and never keeps the list.
 
 `car.add`, `car.update` and `car.remove` need `ftw.cars.write`, which only
 the owner role carries. They change no hardware, so they need no passkey
@@ -147,10 +152,14 @@ At each plug-in the box asks, in this order (`carIdentifiedBy`):
 
 The plan is made per session, from the session's car: its level, its
 capacity, its goal and its surplus-only choice. Planned power is held to the
-lower of the charger's maximum and the car's own (`maxW`). The charge limit
-the car reports caps the plan only while the level is the car's own and
-still exact. `phases` is the owner's note for now: the controller follows
-the charger's phase mode.
+lower of the charger's maximum and the car's own (`maxW`), keeping the
+charger's lowest step when that is above the car's maximum. The charge
+limit the car reports caps the plan only while the level is the car's own
+and still exact. The reserve that keeps a goal charging while no plan is
+accepted holds to the same power and limit. `phases` is the owner's note:
+`maxW` already counts the car's phases, and the controller follows the
+charger's phase mode. A change of car or goal rolls the charger's deadline
+before the replan, so that plan has the car's goal in it.
 
 - **One goal per car**, used wherever the car is plugged in. `readyByMin` is
   in the box's time zone.
@@ -162,9 +171,12 @@ the charger's phase mode.
   charger's `vehicle_capacity_wh`, so energy delivered still counts toward a
   goal, though the box shows no level. `car.goal.set` and
   `car.soc.set` with `charger_id` set them, and so do the charger routes;
-  neither ever touches a car. Until then the car charges from surplus only,
-  with no level. A goal set for it plans from empty, and the car stops when
-  it is full. The design's "or the cheapest quarters" without a goal is not
+  neither ever touches a car. Until someone sets a goal it charges from
+  surplus only, with no level. Someone who sets a goal wants it met: the
+  session no longer charges from surplus alone, and the plan and the reserve
+  plan from empty, while the level stays unknown and is never shown as a
+  number. The car stops when it is full. Clearing the goal brings
+  surplus-only back. The design's "or the cheapest quarters" without a goal is not
   built: with neither a level nor a goal there is no amount of energy to
   place.
 
@@ -223,7 +235,11 @@ by default: until someone taps, the car charges as a visitor.
   each do not fit, and the last is left out with TRUNC, as for any `now`.
 - FTW Cloud's `lp` carries the same charger fields with opaque car ids, and
   its `car` class carries each car's level and goal and nothing that names
-  it ([protocol-cloud.md](protocol-cloud.md)).
+  it ([protocol-cloud.md](protocol-cloud.md)). An agent's `loadpoints.get`
+  and `cars.get` are the same bodies under the agent key.
+- The plan a phone reads or is pushed names each charger's car in
+  `chargers[].carId`; a change of car replans, and the plan reaches the
+  phone pending at once.
 
 ## One release of overlap
 

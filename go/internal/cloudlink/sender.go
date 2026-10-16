@@ -469,13 +469,22 @@ func (l *Link) projectLP(snap grantSnapshot, in cloudwire.LP) cloudwire.LP {
 	return ProjectLP(snap.g.GrantKey, in)
 }
 
-// ProjectLP replaces loadpoint and driver names with opaque ids under gk.
+// ProjectLP replaces loadpoint, driver and car ids with opaque ids under gk.
 func ProjectLP(gk []byte, in cloudwire.LP) cloudwire.LP {
 	out := cloudwire.LP{ControlRev: in.ControlRev}
 	for _, lp := range in.Loadpoints {
 		lp.ID = cloudwire.LoadpointID(gk, lp.ID)
 		if lp.Src != "" {
 			lp.Src = cloudwire.SourceID(gk, lp.Src)
+		}
+		lp.CarID = carID(gk, lp.CarID)
+		lp.CarCorrectedFrom = carID(gk, lp.CarCorrectedFrom)
+		if lp.Choose != nil {
+			choose := make([]string, 0, len(lp.Choose))
+			for _, c := range lp.Choose {
+				choose = append(choose, carID(gk, c))
+			}
+			lp.Choose = choose
 		}
 		out.Loadpoints = append(out.Loadpoints, lp)
 	}
@@ -486,6 +495,34 @@ func ProjectLP(gk []byte, in cloudwire.LP) cloudwire.LP {
 		out.Feedback = append(out.Feedback, f)
 	}
 	return out
+}
+
+// ProjectCars is the car class under gk (docs/cars.md): each car's opaque
+// id, level and goal, and nothing that names a car. FTW Cloud's copy and an
+// agent's cars.get read the same projection, each under its own key.
+func ProjectCars(gk []byte, in []protocol.Car) cloudwire.Cars {
+	out := cloudwire.Cars{Cars: make([]cloudwire.Car, 0, len(in))}
+	for _, c := range in {
+		car := cloudwire.Car{
+			ID: carID(gk, c.ID), SocPermille: c.SocPermille, SocSource: c.SocSource, SocAgeS: c.SocAgeS,
+			EnergySinceWh: c.EnergySinceWh, SocEstimate: c.SocEstimate, ChargeLimitPermille: c.ChargeLimitPermille,
+			SurplusOnly: c.SurplusOnly,
+		}
+		if g := c.Goal; g != nil {
+			car.Goal = &cloudwire.CarGoal{TargetPermille: g.TargetPermille, ReadyByMin: g.ReadyByMin, Days: g.Days,
+				FinishAtLimit: g.FinishAtLimit}
+		}
+		out.Cars = append(out.Cars, car)
+	}
+	return out
+}
+
+// carID is a car's opaque id under gk; empty stays empty.
+func carID(gk []byte, id string) string {
+	if id == "" {
+		return ""
+	}
+	return cloudwire.CarID(gk, id)
 }
 
 // The change tests: encodings of what a phone must hear about, without the

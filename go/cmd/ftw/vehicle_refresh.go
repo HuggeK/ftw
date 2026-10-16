@@ -8,37 +8,26 @@ import (
 	"github.com/srcfl/ftw/go/internal/drivers"
 )
 
-// Until a loadpoint has an explicit vehicle binding, one configured vehicle
-// and one connected charger are the only unambiguous telemetry recipient.
-// Freshness remains a requirement for planning and charge_start, not for wake.
-func configuredVehicleRefreshDriver(configured []config.Driver, connected int) (string, error) {
-	if connected != 1 {
-		return "", fmt.Errorf("vehicle refresh requires one connected loadpoint")
-	}
-	var candidate *config.Driver
-	var entry drivers.CatalogEntry
+// configuredVehicleRefreshDriver is the source of the session's car that may
+// be woken for a fresh reading: the first of its vehicle drivers, in config
+// order, that is writable and declares telemetry_wake. The cars runtime binds
+// each driver to one car (docs/cars.md), so another car's driver is never a
+// candidate however many cars or chargers the site has. Freshness remains a
+// requirement for planning and charge_start, not for wake.
+func configuredVehicleRefreshDriver(configured []config.Driver, sources []string) (string, error) {
 	for i := range configured {
 		d := &configured[i]
-		if d.Disabled {
+		if d.Disabled || d.ObserveOnly || !slices.Contains(sources, d.Name) {
 			continue
 		}
 		e, err := drivers.ParseCatalogFile(d.Lua)
 		if err != nil {
 			return "", fmt.Errorf("vehicle refresh: cannot read driver metadata")
 		}
-		if !slices.Contains(e.Capabilities, "vehicle") {
+		if !slices.Contains(e.Capabilities, "vehicle") || e.ReadOnly || !e.TelemetryWake {
 			continue
 		}
-		if candidate != nil {
-			return "", fmt.Errorf("vehicle refresh is ambiguous with multiple configured vehicles")
-		}
-		candidate, entry = d, e
+		return d.Name, nil
 	}
-	if candidate == nil {
-		return "", nil
-	}
-	if candidate.ObserveOnly || entry.ReadOnly || !entry.TelemetryWake {
-		return "", nil
-	}
-	return candidate.Name, nil
+	return "", nil
 }

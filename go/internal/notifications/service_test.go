@@ -824,3 +824,22 @@ func TestCatalogueFuseOverLimitRendersFromCatalogue(t *testing.T) {
 		t.Fatalf("body = %q", msgs[0].Body)
 	}
 }
+
+// car.which names the charger it asks about, for FTW Cloud's event and the
+// web push alike, and the plug-in's session for the tap.
+func TestCarWhichNamesItsCharger(t *testing.T) {
+	pub := &fakePub{published: make(chan struct{}, 1)}
+	svc, _ := newSvc(pushCfg(config.NotificationRule{Type: PushCarWhich, Enabled: true, Priority: 3}), pub)
+	bus := events.NewBus()
+	svc.Subscribe(bus)
+	bus.Publish(events.CarWhich{LoadpointID: "easee", Session: "7d1f0c2a9b3e4f50", CarIDs: []string{"a", "b"}, At: time.Now()})
+	select {
+	case <-pub.published:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no push")
+	}
+	msgs := pub.Messages()
+	if len(msgs) != 1 || msgs[0].LoadpointID != "easee" || msgs[0].Args["session"] != "7d1f0c2a9b3e4f50" {
+		t.Fatalf("car.which %+v", msgs)
+	}
+}

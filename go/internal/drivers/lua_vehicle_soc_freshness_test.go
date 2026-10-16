@@ -82,10 +82,14 @@ end
 		t.Fatalf("cached samples = %+v, want power only", samples)
 	}
 
-	if pick := telemetry.PickBestVehicle(store, firstSoCUpdatedAt.Add(telemetry.VehicleMaxAge)); pick.Driver != "vehicle-cache" {
-		t.Fatalf("SoC at freshness boundary should remain usable, got %+v", pick)
+	obs := telemetry.VehicleObservations(store)
+	if len(obs) != 1 || !obs[0].At.Equal(firstSoCUpdatedAt) {
+		t.Fatalf("observation %+v, want the first fresh SoC's time", obs)
 	}
-	if pick := telemetry.PickBestVehicle(store, firstSoCUpdatedAt.Add(telemetry.VehicleMaxAge+time.Nanosecond)); pick.Driver != "" {
-		t.Fatalf("SoC past freshness boundary must be rejected, got %+v", pick)
+	if !obs[0].Live(firstSoCUpdatedAt.Add(telemetry.VehicleMaxAge)) {
+		t.Fatalf("SoC at freshness boundary should remain live, got %+v", obs[0])
+	}
+	if obs[0].Live(firstSoCUpdatedAt.Add(telemetry.VehicleMaxAge + time.Nanosecond)) {
+		t.Fatalf("SoC past freshness boundary must not be live, got %+v", obs[0])
 	}
 }

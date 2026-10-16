@@ -19,25 +19,33 @@ func TestVehicleSourceTimeControlsFreshnessAndFullCarRecovery(t *testing.T) {
 	if got := s.Get("tesla", DerVehicle); !got.SoCUpdatedAt.Equal(time.UnixMilli(old.UnixMilli())) {
 		t.Fatalf("source time replaced: %v", got.SoCUpdatedAt)
 	}
-	if pick := PickBestVehicle(s, now); pick.Driver != "" {
-		t.Fatal("old first response became planning truth")
+	live := func() (VehicleObservation, bool) {
+		for _, o := range VehicleObservations(s) {
+			if o.Driver == "tesla" && o.Live(now) {
+				return o, true
+			}
+		}
+		return VehicleObservation{}, false
+	}
+	if _, ok := live(); ok {
+		t.Fatal("an old first response became live")
 	}
 	emit(old, 0.5)
-	if pick := PickBestVehicle(s, now); pick.Driver != "" {
+	if _, ok := live(); ok {
 		t.Fatal("cached response renewed observation")
 	}
 	s.FlushSamples()
 	fresh := now.Add(-time.Second)
 	emit(fresh, 1)
-	pick := PickBestVehicle(s, now)
-	if pick.Driver != "tesla" || pick.SoC != 1 {
-		t.Fatalf("full car did not replace inferred demand: %+v", pick)
+	o, ok := live()
+	if !ok || o.SoC != 1 {
+		t.Fatalf("full car did not replace inferred demand: %+v", o)
 	}
 	if samples := s.FlushSamples(); len(samples) != 2 {
 		t.Fatalf("fresh source not stored: %+v", samples)
 	}
 	emit(fresh, 0.1)
-	if got := s.Get("tesla", DerVehicle); *got.SoC != 1 || !got.SoCUpdatedAt.Equal(pick.UpdatedAt) {
+	if got := s.Get("tesla", DerVehicle); *got.SoC != 1 || !got.SoCUpdatedAt.Equal(o.At) {
 		t.Fatal("identical source timestamp replaced full-car reading")
 	}
 }

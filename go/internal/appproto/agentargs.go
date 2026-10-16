@@ -78,6 +78,16 @@ func (h *Handler) agentArg(op string, a protocol.AgentArg, value any, caps proto
 			return nil, badArg(op, a.Name, s)
 		}
 		return id, nil
+	case "car":
+		s, ok := value.(string)
+		if !ok {
+			return nil, badArg(op, a.Name, value)
+		}
+		id, found := h.resolveCar(s)
+		if !found {
+			return nil, badArg(op, a.Name, s)
+		}
+		return id, nil
 	case "number", "power", "duration", "ratio":
 		n, ok := argNum(map[string]any{"v": value}, "v")
 		if !ok || (a.Min != nil && n < *a.Min) || (a.Max != nil && n > *a.Max) {
@@ -130,6 +140,12 @@ func (h *Handler) opArgs(op string, args map[string]any) *ErrorBody {
 		}
 		_, bad := surplusOnlyArg(op, args)
 		return bad
+	case OpCarGoalSet, OpCarSoCSet:
+		if h.cfg.Cars == nil {
+			return &ErrorBody{Code: ErrUnavailable, Retryable: ErrorRetryable[ErrUnavailable],
+				Args: map[string]any{"op": op, "subsystem": "cars"}}
+		}
+		return carIntentArgs(op, args)
 	}
 	return &ErrorBody{Code: protocol.ErrOpNotGranted, Args: map[string]any{"op": op}}
 }
@@ -137,6 +153,28 @@ func (h *Handler) opArgs(op string, args map[string]any) *ErrorBody {
 // agentLoadpointID is a charger's id as agents see it.
 func (h *Handler) agentLoadpointID(id string) string {
 	return cloudwire.LoadpointID(h.cfg.AgentKey, id)
+}
+
+// agentCarID is a car's id as agents see it: the car class's id under the
+// agent key. Empty stays empty.
+func (h *Handler) agentCarID(id string) string {
+	if id == "" {
+		return ""
+	}
+	return cloudwire.CarID(h.cfg.AgentKey, id)
+}
+
+// resolveCar finds the car behind an agent's id.
+func (h *Handler) resolveCar(agentID string) (string, bool) {
+	if h.cfg.Cars == nil {
+		return "", false
+	}
+	for _, c := range h.cfg.Cars.Cars() {
+		if h.agentCarID(c.ID) == agentID {
+			return c.ID, true
+		}
+	}
+	return "", false
 }
 
 // resolveLoadpoint finds the charger behind an agent's id.
@@ -228,9 +266,12 @@ func (h *Handler) forAgent(args map[string]any) map[string]any {
 			continue
 		case "value":
 			if s, ok := v.(string); ok {
-				if args["arg"] == "id" {
+				switch {
+				case args["arg"] == "id" && (args["op"] == OpCarGoalSet || args["op"] == OpCarSoCSet):
+					out[k] = h.agentCarID(s)
+				case args["arg"] == "id" || args["arg"] == "charger_id":
 					out[k] = h.agentLoadpointID(s)
-				} else if codeWord.MatchString(s) {
+				case codeWord.MatchString(s):
 					out[k] = s
 				}
 				continue
@@ -244,12 +285,30 @@ func (h *Handler) forAgent(args map[string]any) map[string]any {
 	return out
 }
 
-// forAgentResult is a command's outcome as an agent may read it.
+// forAgentResult is a command's outcome as an agent may read it: a car by
+// its agent id with its level and goal, a charger's car by agent ids.
 func (h *Handler) forAgentResult(res CmdResult) CmdResult {
 	if res.Error != nil {
 		e := *res.Error
 		e.Args = h.forAgent(e.Args)
 		res.Error = &e
+	}
+	if res.Car != nil {
+		c := briefCar(*res.Car)
+		c.ID = h.agentCarID(c.ID)
+		res.Car = &c
+	}
+	if res.Charger != nil {
+		cc := *res.Charger
+		cc.CarID, cc.CarCorrectedFrom = h.agentCarID(cc.CarID), h.agentCarID(cc.CarCorrectedFrom)
+		if cc.Choose != nil {
+			choose := make([]string, 0, len(cc.Choose))
+			for _, id := range cc.Choose {
+				choose = append(choose, h.agentCarID(id))
+			}
+			cc.Choose = choose
+		}
+		res.Charger = &cc
 	}
 	return res
 }
