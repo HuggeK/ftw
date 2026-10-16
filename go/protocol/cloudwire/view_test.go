@@ -371,3 +371,28 @@ func TestAnUnknownStateIsNeverLive(t *testing.T) {
 		t.Fatalf("an unknown state graded as %s, field %s", g.Sources["m"], g.Fields["2"])
 	}
 }
+
+// 17. A late table still counts.
+func TestFreshnessALateTableStillCounts(t *testing.T) {
+	box := newFakeBox(t, 1)
+	v := box.view()
+	t0 := int64(2_000_000)
+	accept(t, v, box.fullLive(t0, 1_000, protocol.SourceLive, 1), t0+transit)
+	withTable := box.fullLive(t0+3_000, 1_000, protocol.SourceLive, 2) // on the stream, late
+	overtaking := box.seal(MsgLive, Live{
+		Header: box.header(t0 + 4_000), Fields: map[string]int64{"2": 1200, "1": 0},
+		SrcRev: 2, Ages: map[string]int64{"m": 1_000},
+	})
+	accept(t, v, overtaking, t0+4_000+transit)
+	wantSource(t, v, t0+4_200, protocol.SourceStale)
+
+	accept(t, v, withTable, t0+4_300)
+	wantSource(t, v, t0+4_400, protocol.SourceLive)
+	if got := v.live.Fields["2"]; got != 1200 {
+		t.Fatalf("the late live moved the values back: field 2 is %d", got)
+	}
+	// The same table again, or an older one, brings nothing.
+	if err := v.Accept(withTable, t0+4_500); !errors.Is(err, ErrNotNewer) {
+		t.Fatalf("the late table twice: err = %v, want ErrNotNewer", err)
+	}
+}

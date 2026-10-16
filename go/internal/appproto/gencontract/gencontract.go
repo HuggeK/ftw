@@ -59,6 +59,8 @@ type Registry struct {
 	// with FTW Cloud, and what for.
 	CloudScopes   []string `yaml:"cloud_scopes"`
 	CloudPurposes []string `yaml:"cloud_purposes"`
+	// CloudTransports are what a session with FTW Cloud travels over.
+	CloudTransports []string `yaml:"cloud_transports"`
 	// AgentArgs is what an agent may put in each op it can name, and
 	// Reads the reads it may send with the scope each needs.
 	AgentArgs map[string][]struct {
@@ -336,6 +338,20 @@ func writeCloud(b *bytes.Buffer, reg Registry) {
 	b.WriteString("var CloudPurposes = []string{\n")
 	for _, p := range reg.CloudPurposes {
 		fmt.Fprintf(b, "\tCloudPurpose%s,\n", goName(p))
+	}
+	b.WriteString("}\n\n")
+
+	b.WriteString("// What a session with FTW Cloud travels over, under its carrier.\n")
+	b.WriteString("const (\n")
+	for _, t := range reg.CloudTransports {
+		fmt.Fprintf(b, "\tCloudTransport%s = %q\n", goName(t), t)
+	}
+	b.WriteString(")\n\n")
+
+	b.WriteString("// CloudTransports lists them in the registry's order.\n")
+	b.WriteString("var CloudTransports = []string{\n")
+	for _, t := range reg.CloudTransports {
+		fmt.Fprintf(b, "\tCloudTransport%s,\n", goName(t))
 	}
 	b.WriteString("}\n\n")
 }

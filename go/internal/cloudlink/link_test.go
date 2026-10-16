@@ -182,7 +182,7 @@ type fakeService struct {
 	badEKM      bool
 	wrongKey    bool
 	purge       bool
-	afterHello  func(conn *websocket.Conn, home string)
+	afterHello  func(conn uplinkConn, home string)
 	rosterSeqOK uint64
 	// wrongShard, when set, closes after hello with CloseWrongShard and
 	// this host, as an instance that does not hold the home;
@@ -200,6 +200,16 @@ type fakeService struct {
 	ch    chan cloudwire.Envelope
 	home  string
 	pub   *ecdsa.PublicKey
+	// kinds is how each message from the box came: by the control
+	// stream, the bulk stream or as a datagram over QUIC.
+	kinds map[string][]int
+	// transports counts the connections each transport carried.
+	transports map[string]int
+	// kick drops this many connections right after hello_ok, so the box
+	// dials again.
+	kick int
+	// usedEarly says, per QUIC connection, whether it took early data.
+	usedEarly []bool
 }
 
 func newFakeService(t *testing.T) *fakeService {
@@ -209,7 +219,8 @@ func newFakeService(t *testing.T) *fakeService {
 // newFakeServiceCert serves with cert, or httptest's own when nil.
 func newFakeServiceCert(t *testing.T, cert *tls.Certificate) *fakeService {
 	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	s := &fakeService{t: t, key: key, ch: make(chan cloudwire.Envelope, 256)}
+	s := &fakeService{t: t, key: key, ch: make(chan cloudwire.Envelope, 256), kinds: map[string][]int{},
+		transports: map[string]int{}}
 	s.srv = httptest.NewUnstartedServer(http.HandlerFunc(s.handle))
 	s.srv.TLS = &tls.Config{MinVersion: tls.VersionTLS13}
 	if cert != nil {
@@ -230,7 +241,7 @@ func (s *fakeService) roots() *x509.CertPool {
 	return pool
 }
 
-func (s *fakeService) write(conn *websocket.Conn, key *ecdsa.PrivateKey, home, t string, body any) {
+func (s *fakeService) write(conn uplinkConn, key *ecdsa.PrivateKey, home, t string, body any) {
 	env, err := cloudwire.Seal(key, home, t, body)
 	if err != nil {
 		s.t.Error(err)
@@ -248,11 +259,17 @@ func (s *fakeService) handle(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+	ekm, _ := r.TLS.ExportKeyingMaterial(cloudwire.EKMLabel, nil, cloudwire.EKMBytes)
+	s.serve(conn, ekm)
+}
+
+// serve is the service's side of one uplink, over either transport.
+func (s *fakeService) serve(conn uplinkConn, ekm []byte) {
 	defer conn.Close()
 	s.mu.Lock()
 	s.conns++
+	s.transports[transportOf(conn)]++
 	s.mu.Unlock()
-	ekm, _ := r.TLS.ExportKeyingMaterial(cloudwire.EKMLabel, nil, cloudwire.EKMBytes)
 	nonce := bytes.Repeat([]byte{7}, cloudwire.NonceBytes)
 	s.write(conn, nil, "", cloudwire.MsgChallenge, cloudwire.Challenge{V: 1, Nonce: nonce})
 
@@ -305,13 +322,22 @@ func (s *fakeService) handle(w http.ResponseWriter, r *http.Request) {
 	if s.afterHello != nil {
 		go s.afterHello(conn, home)
 	}
+	s.mu.Lock()
+	kick := s.kick > 0
+	if kick {
+		s.kick--
+	}
+	s.mu.Unlock()
+	if kick {
+		return
+	}
 
 	for {
 		kind, msg, err := conn.ReadMessage()
 		if err != nil {
 			return
 		}
-		if kind != websocket.BinaryMessage {
+		if kind != websocket.BinaryMessage && kind != msgBulk && kind != msgDatagram {
 			s.t.Errorf("the box sent a text message")
 			return
 		}
@@ -337,6 +363,7 @@ func (s *fakeService) handle(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		s.got = append(s.got, env)
 		s.raw = append(s.raw, msg)
+		s.kinds[env.T] = append(s.kinds[env.T], kind)
 		s.mu.Unlock()
 		s.ch <- env
 		if !s.purge {
@@ -639,7 +666,7 @@ func TestAReleaseBuildTrustsOnlyTheServicesKey(t *testing.T) {
 
 func TestUnknownDownlinkClosesTheUplink(t *testing.T) {
 	svc := newFakeService(t)
-	svc.afterHello = func(conn *websocket.Conn, home string) {
+	svc.afterHello = func(conn uplinkConn, home string) {
 		time.Sleep(200 * time.Millisecond)
 		svc.write(conn, nil, home, "cmd", map[string]any{"op": "site.mode.set"})
 	}
@@ -657,7 +684,7 @@ func TestUnknownDownlinkClosesTheUplink(t *testing.T) {
 
 func TestWatchRaisesTheCadence(t *testing.T) {
 	svc := newFakeService(t)
-	svc.afterHello = func(conn *websocket.Conn, home string) {
+	svc.afterHello = func(conn uplinkConn, home string) {
 		svc.write(conn, nil, home, cloudwire.MsgWatch, cloudwire.Watch{Hz: 1})
 	}
 	h := newHarness(t, svc)
@@ -676,7 +703,7 @@ func TestWatchRaisesTheCadence(t *testing.T) {
 // the next look at the box, and never sooner than a period after the last.
 func TestAWatchedReadingGoesAsItsPollLands(t *testing.T) {
 	svc := newFakeService(t)
-	svc.afterHello = func(conn *websocket.Conn, home string) {
+	svc.afterHello = func(conn uplinkConn, home string) {
 		svc.write(conn, nil, home, cloudwire.MsgWatch, cloudwire.Watch{Hz: 1})
 	}
 	h := newHarness(t, svc)

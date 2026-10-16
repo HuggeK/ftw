@@ -29,12 +29,18 @@ const (
 	TransportOverhead = SeqBytes + TagBytes
 
 	// ReplayWindow is how far out of order a frame may arrive and still be
-	// accepted: one machine word. Over the relay lane 0 goes once a second,
-	// so that is a minute. Through FTW Cloud it goes up to five times a
-	// second, about 13 s, while a bulk frame the link paces waits at most
-	// cloudlink.MaxBulkWait, about 9 s (appuplink tests the two).
-	ReplayWindow = 64
+	// accepted. Through FTW Cloud lane 0 goes up to five times a second,
+	// while a bulk frame the link paces waits at most cloudlink.MaxBulkWait,
+	// about 9 s (appuplink tests the two). Over QUIC one session's frames
+	// also travel on two streams and in datagrams, so a burst of bulk
+	// frames, a few hundred at most, can overtake a frame on the control
+	// stream. 1024 covers both in 128 bytes, far beyond any reordering a
+	// DataChannel produces.
+	ReplayWindow = 1024
 )
+
+// seenWords is the replay window in 64-bit words.
+const seenWords = ReplayWindow / 64
 
 // ErrReplay is a frame already accepted, or one older than the window.
 var ErrReplay = errors.New("appwire: replayed or out-of-window sequence")
@@ -54,8 +60,10 @@ type Transport struct {
 	// sentinel because sequence zero is a real, and the first, frame.
 	highestSeq uint64
 	haveSeq    bool
-	seen       uint64
-	closed     bool
+	// seen holds a bit for each sequence number in the window: bit i (word
+	// i/64, bit i%64) is highestSeq-i, set once that frame was accepted.
+	seen   [seenWords]uint64
+	closed bool
 
 	handshakeHash []byte
 	remoteStatic  []byte
@@ -164,7 +172,7 @@ func (t *Transport) checkReplay(seq uint64) error {
 	if behind >= ReplayWindow {
 		return fmt.Errorf("%w: sequence %d is outside the window", ErrReplay, seq)
 	}
-	if t.seen>>behind&1 == 1 {
+	if t.seen[behind/64]>>(behind%64)&1 == 1 {
 		return fmt.Errorf("%w: sequence %d was already accepted", ErrReplay, seq)
 	}
 	return nil
@@ -175,20 +183,37 @@ func (t *Transport) markSeen(seq uint64) {
 	if !t.haveSeq {
 		t.haveSeq = true
 		t.highestSeq = seq
-		t.seen = 1
+		t.seen = [seenWords]uint64{1}
 		return
 	}
 
 	if seq > t.highestSeq {
-		shift := seq - t.highestSeq
-		if shift >= ReplayWindow {
-			t.seen = 1
-		} else {
-			t.seen = t.seen<<shift | 1
-		}
+		t.shiftSeen(seq - t.highestSeq)
+		t.seen[0] |= 1
 		t.highestSeq = seq
 		return
 	}
 
-	t.seen |= 1 << (t.highestSeq - seq)
+	behind := t.highestSeq - seq
+	t.seen[behind/64] |= 1 << (behind % 64)
+}
+
+// shiftSeen ages the window by n: bit i moves to bit i+n, and bits that move
+// past the window are gone. Callers hold t.mu.
+func (t *Transport) shiftSeen(n uint64) {
+	if n >= ReplayWindow {
+		t.seen = [seenWords]uint64{}
+		return
+	}
+	words, bits := int(n/64), n%64
+	for i := seenWords - 1; i >= 0; i-- {
+		var w uint64
+		if j := i - words; j >= 0 {
+			w = t.seen[j] << bits
+			if bits > 0 && j > 0 {
+				w |= t.seen[j-1] >> (64 - bits)
+			}
+		}
+		t.seen[i] = w
+	}
 }

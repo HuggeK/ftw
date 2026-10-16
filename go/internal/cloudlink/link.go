@@ -200,7 +200,12 @@ type Options struct {
 	Arrivals <-chan struct{}
 	Logger   *slog.Logger
 
-	// Seams for tests. Production leaves them zero.
+	// Seams for tests. Production leaves them zero, and races QUIC against
+	// the WebSocket. A test that names its Endpoint gets the WebSocket alone
+	// unless it sets QUIC; QUICAddr names the service's UDP address when it
+	// is not the Endpoint's host and port.
+	QUIC        bool
+	QUICAddr    string
 	Endpoint    string
 	ServiceKeys []*ecdsa.PublicKey
 	RootCAs     *x509.CertPool
@@ -228,8 +233,22 @@ type Link struct {
 	grant     *grantRecord
 	notice    string
 	connected bool
-	lastSend  time.Time
-	budget    budget
+	// transport is how the uplink travels, or last travelled: quic or
+	// websocket. winners is the race's memory, the transport that opened
+	// first on each network.
+	transport string
+	quicOn    bool
+	winners   map[string]winner
+	// tickets and quicTickets hold the service's TLS tickets, one cache for
+	// each transport, so a reconnect resumes and, over QUIC, sends its
+	// target as early data. A ticket from TLS over TCP cannot carry 0-RTT
+	// into QUIC, nor the other way.
+	tickets     tls.ClientSessionCache
+	quicTickets tls.ClientSessionCache
+	// upAt is when the service's hello_ok arrived on this connection.
+	upAt     time.Time
+	lastSend time.Time
+	budget   budget
 	// tunOut and tunBulk carry framed tun messages, lane 0 and bulk, to
 	// the connection's tun writer. Nil while no uplink is up. tunBudget counts what left, apart from
 	// the readable copy's budget, and tunDropped what never did.
@@ -275,6 +294,7 @@ func New(opts Options) (*Link, error) {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
+	quicOn := opts.QUIC || opts.Endpoint == ""
 	if opts.Endpoint == "" {
 		opts.Endpoint = Endpoint
 	}
@@ -314,7 +334,8 @@ func New(opts Options) (*Link, error) {
 	}
 	l := &Link{
 		opts: opts, log: opts.Logger.With("component", "cloudlink"), boot: boot,
-		wake: make(chan struct{}, 1), sent: map[string]sentFrame{},
+		wake: make(chan struct{}, 1), sent: map[string]sentFrame{}, quicOn: quicOn,
+		tickets: tls.NewLRUClientSessionCache(4), quicTickets: tls.NewLRUClientSessionCache(4),
 	}
 	if err := l.load(); err != nil {
 		return nil, err
@@ -785,6 +806,9 @@ type Status struct {
 	GrantedBy   string   `json:"grantedBy,omitempty"`
 	Policy      string   `json:"policy,omitempty"`
 	Connected   bool     `json:"connected"`
+	// Transport is how the uplink travels, the registry's cloud_transports:
+	// quic or websocket. Empty before the first connection.
+	Transport string `json:"transport,omitempty"`
 	// LastSendAgeMs is how long ago the box last sent anything, -1 never.
 	LastSendAgeMs int64 `json:"lastSendAgeMs"`
 	// BytesLast24h counts what the box sent in the last 24 hours of uptime.
@@ -811,7 +835,7 @@ func (l *Link) Status() Status {
 	defer l.mu.Unlock()
 	s := Status{
 		State: "off", Notice: l.notice, Available: len(l.opts.ServiceKeys) > 0,
-		Scopes: []string{}, Purposes: []string{}, Connected: l.connected,
+		Scopes: []string{}, Purposes: []string{}, Connected: l.connected, Transport: l.transport,
 		LastSendAgeMs: -1, PurgedAtMs: l.purgedAt, EventsDropped: l.eventsDropped,
 		BytesLast24h: l.budget.total(l.uptimeMs()), BudgetBytes: budgetBytes,
 		Link: "off", TunBytesLast24h: l.tunBudget.total(l.uptimeMs()), TunBudgetBytes: tunBudgetBytes,
@@ -1021,7 +1045,14 @@ func (l *Link) caps(snap grantSnapshot) []string {
 // tlsConfig is TLS 1.3 only, with the system roots unless a test or a dev
 // build adds its own.
 func (l *Link) tlsConfig() *tls.Config {
-	return &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: l.opts.RootCAs}
+	return &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: l.opts.RootCAs, ClientSessionCache: l.tickets}
+}
+
+// quicTLSConfig is tlsConfig with QUIC's own ticket cache.
+func (l *Link) quicTLSConfig() *tls.Config {
+	c := l.tlsConfig()
+	c.ClientSessionCache = l.quicTickets
+	return c
 }
 
 // now is the wall clock, or a test's.

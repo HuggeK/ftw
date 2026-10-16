@@ -142,6 +142,13 @@ func (v *View) Accept(e Envelope, arrivalMs int64) error {
 		}
 		v.reset(h.Boot)
 	} else if h.Seq <= v.seq[e.T] {
+		// Over QUIC a live without its table can overtake the one that
+		// carries it. The late one still brings a newer table, and nothing
+		// else.
+		if live != nil && live.Sources != nil && live.SrcRev > v.tableRev {
+			v.table, v.tableRev, v.fieldSrc = live.Sources, live.SrcRev, live.FieldSources
+			return nil
+		}
 		return ErrNotNewer
 	}
 	if lead {

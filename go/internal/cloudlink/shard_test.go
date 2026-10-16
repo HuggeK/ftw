@@ -22,7 +22,7 @@ import (
 
 // closeWith ends a connection as the service does, with a close code and a
 // reason. The caller's read loop takes the box's answer.
-func closeWith(conn *websocket.Conn, code int, reason string) {
+func closeWith(conn uplinkConn, code int, reason string) {
 	_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(code, reason), time.Now().Add(time.Second))
 }
 
@@ -245,7 +245,7 @@ func TestARestartCloseRedialsWithinTheSpreadWithoutBackoff(t *testing.T) {
 	svc := newFakeService(t)
 	var mu sync.Mutex
 	restarts := 0
-	svc.afterHello = func(conn *websocket.Conn, _ string) {
+	svc.afterHello = func(conn uplinkConn, _ string) {
 		mu.Lock()
 		restarts++
 		n := restarts

@@ -246,6 +246,18 @@ var CloudPurposes = []string{
 	CloudPurposeStats,
 }
 
+// What a session with FTW Cloud travels over, under its carrier.
+const (
+	CloudTransportQuic      = "quic"
+	CloudTransportWebsocket = "websocket"
+)
+
+// CloudTransports lists them in the registry's order.
+var CloudTransports = []string{
+	CloudTransportQuic,
+	CloudTransportWebsocket,
+}
+
 // RegistryOps is the app's copy of the operations a cmd frame may name,
 // each mapped to the scope its grant must carry. defaultOps() in command.go
 // remains the authority on what this box accepts — this exists only so

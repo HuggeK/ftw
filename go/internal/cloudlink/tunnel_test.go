@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/srcfl/ftw/go/protocol"
 	"github.com/srcfl/ftw/go/protocol/cloudwire"
 )
@@ -92,7 +91,7 @@ func TestAPendingCodeIsListedByItsHash(t *testing.T) {
 // tunnel past its own does not stop the copy.
 func TestTunGoesBothWaysApartFromTheBudget(t *testing.T) {
 	svc := newFakeService(t)
-	svc.afterHello = func(conn *websocket.Conn, home string) {
+	svc.afterHello = func(conn uplinkConn, home string) {
 		svc.write(conn, nil, home, cloudwire.MsgTun, cloudwire.Tun{Dev: "q5Lw0Zb1", Sid: 9, D: []byte{1, 2, 3}})
 	}
 	h := newHarness(t, svc)
@@ -202,7 +201,7 @@ func TestSendTunWithoutAnUplinkIsRefused(t *testing.T) {
 // Every session the uplink carried ends with it.
 func TestTheTunnelDropsWithTheUplink(t *testing.T) {
 	svc := newFakeService(t)
-	svc.afterHello = func(conn *websocket.Conn, _ string) {
+	svc.afterHello = func(conn uplinkConn, _ string) {
 		time.Sleep(300 * time.Millisecond)
 		_ = conn.Close()
 	}

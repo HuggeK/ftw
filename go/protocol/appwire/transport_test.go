@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"errors"
+	mrand "math/rand/v2"
 	"testing"
 )
 
@@ -371,5 +372,72 @@ func TestAPassiveObserverLearnsOnlyThatAFrameWentBy(t *testing.T) {
 	}
 	if longest >= 8 {
 		t.Fatalf("a run of %d zero bytes survived encryption", longest)
+	}
+}
+
+// Over QUIC a burst on the bulk stream can overtake a frame on the control
+// stream. The late frame still opens, once.
+func TestABurstOfAHundredCanOvertakeAFrame(t *testing.T) {
+	app, box := connect(t)
+	late, err := app.Encrypt(tickFrame(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 100 {
+		wire, err := app.Encrypt(deltaFrame(t, map[string]int{"2": i}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := box.Decrypt(wire); err != nil {
+			t.Fatalf("burst frame %d: %v", i, err)
+		}
+	}
+	if _, err := box.Decrypt(late); err != nil {
+		t.Fatalf("the overtaken frame: %v", err)
+	}
+	if _, err := box.Decrypt(late); !errors.Is(err, ErrReplay) {
+		t.Fatalf("the overtaken frame again: err = %v, want ErrReplay", err)
+	}
+}
+
+// The window spans 16 words. Frames in a shuffled order, spread over many
+// shifts of every size, open exactly as a plain record of what was seen
+// says they should.
+func TestTheWindowMatchesARecordOfWhatWasSeen(t *testing.T) {
+	app, box := connect(t)
+	const n = 3000
+	wires := make([][]byte, n)
+	for i := range wires {
+		w, err := app.Encrypt(deltaFrame(t, map[string]int{"2": i}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		wires[i] = w
+	}
+	rng := mrand.New(mrand.NewPCG(1, 2))
+	order := make([]int, 0, 2*n)
+	for i := range n {
+		order = append(order, i)
+	}
+	// Shuffle locally, up to twice the window, and replay a tenth.
+	for i := range order {
+		j := min(len(order)-1, i+rng.IntN(2*ReplayWindow))
+		order[i], order[j] = order[j], order[i]
+	}
+	for range n / 10 {
+		order = append(order, rng.IntN(n))
+	}
+	seen := map[int]bool{}
+	highest := -1
+	for _, i := range order {
+		want := !seen[i] && (highest < 0 || i > highest || highest-i < ReplayWindow)
+		_, err := box.Decrypt(wires[i])
+		if got := err == nil; got != want {
+			t.Fatalf("frame %d with highest %d: opened %v, want %v (err %v)", i, highest, got, want, err)
+		}
+		if err == nil {
+			seen[i] = true
+			highest = max(highest, i)
+		}
 	}
 }
