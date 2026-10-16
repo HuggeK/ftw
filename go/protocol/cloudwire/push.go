@@ -65,6 +65,9 @@ type Event struct {
 	Src string `cbor:"src,omitempty"`
 	// LP is the opaque loadpoint id of the loadpoint it concerns.
 	LP string `cbor:"lp,omitempty"`
+	// Cars are opaque car ids, in the box's order: for car.which, the cars
+	// the phone offers one button each.
+	Cars []string `cbor:"cars,omitempty"`
 }
 
 // PushRegister tells the service a device's APNs token for one kind of push.

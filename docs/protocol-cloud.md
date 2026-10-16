@@ -137,6 +137,7 @@ Envelope = { t: text, b: bstr, sig: bstr }
 | `grantKey` | 32 random bytes in the grant record. A new grant draws a new one |
 | Opaque source id | First 8 bytes of HMAC-SHA256(`grantKey`, `src\0` ‖ driver name), base64url without padding |
 | Opaque loadpoint id | First 8 bytes of HMAC-SHA256(`grantKey`, `lp\0` ‖ loadpoint id), base64url without padding |
+| Opaque car id | First 8 bytes of HMAC-SHA256(`grantKey`, `car\0` ‖ car id), base64url without padding. The car id is the same on each of the owner's boxes; the opaque id is not, so the service cannot follow a car from one home to another |
 
 A home id comes only from the key that signed `hello` on this connection,
 never from a body field.
@@ -280,15 +281,15 @@ list still show what kinds of equipment a site has.
 | `id` | text | Opaque loadpoint id |
 | `src` | text | Opaque source id of the charger, whose freshness the loadpoint follows |
 | `plugged` | bool | A car is connected |
-| `socPermille` | uint or null | Car charge level, null when unplugged |
-| `socSource` | text | `vehicle`, `inferred` or `assumed`; empty when unplugged |
+| `socPermille` | uint or null | Car charge level, null when unplugged and for a visitor's car, whose level nobody knows |
+| `socSource` | text | `vehicle` (the car's own number, exact), `inferred` (an estimate, or a level someone set), `assumed`, or `unknown` (a visitor's car); empty when unplugged |
 | `socAgeS` | uint or null | Seconds since the car last reported the level, at send. Null unless `socSource` is `vehicle` |
 | `targetPermille` | uint or null | The level to reach |
 | `readyByMs` | int or null | Wall time the car should be ready |
 | `recurring` | bool | The target comes from a weekly schedule |
 | `powerW` | int | Charging power, positive while charging |
 | `sessionWh` | uint | Energy delivered this session |
-| `session` | text | The number of plug-ins at this loadpoint since the box started, as text; empty when unplugged. With `boot` it names one plug-in. Core has no session id yet |
+| `session` | text | This plug-in's id, the same across a restart of the box; empty when unplugged. A box from before cars sends the number of plug-ins since it started, which names one plug-in only with `boot` |
 | `manual` | Manual or null | Manual charging state, null when none |
 | `commandedW` | int or null | Power last commanded |
 | `commandedReason` | text | Stable code for that command |
@@ -299,6 +300,20 @@ list still show what kinds of equipment a site has.
 | `nextStartMs` | int or null | Wall time the next planned charge starts |
 | `nextEndMs` | int or null | Wall time it ends |
 | `nextWh` | uint or null | Energy it plans to deliver |
+| `carId` | text, optional | Opaque car id of the car on the charger. Absent while nothing is plugged in or the box does not know which car it is |
+| `carIdentifiedBy` | text, optional | How the box knows: `charger`, `car`, `only`, `tap`, `asking` or `none` ([docs/cars.md](cars.md)) |
+| `carCorrected` | bool, optional | A better rule replaced the car the box named first |
+| `carCorrectedFrom` | text, optional | Opaque car id of the car the box named before that |
+| `choose` | [text], optional | While `asking`: opaque ids of the cars a tap may pick, at most four, none on another charger |
+
+With cars ([docs/cars.md](cars.md)), the level fields of a Loadpoint
+(`socPermille`, `socSource`, `socAgeS`, `targetPermille`, `readyByMs`,
+`recurring`, `surplusOnly`) are views of the session's car, kept for apps
+that know only chargers. The join is `carId` to the `car` class's `id`, and
+where the two disagree the `car` class wins. A box drops the views two
+releases after the one that first sends `car`, and from then lists
+`lp.bare` in `hello.caps`: its Loadpoints carry no level fields. A box from
+before cars never lists it.
 
 **Manual**
 
@@ -337,6 +352,45 @@ Any other difference counts as a change. The full `lp` every 15 minutes
 carries exact values, and live field 10 carries the site's charging power at
 every period. Without the deadband, a simulated house with a car charging at
 11 kW sent 12.7 MB a day.
+
+### `car`: `ftw.live.read`
+
+The level and goal of each of the owners' cars on this box
+([docs/cars.md](cars.md)). Nothing here names a car: the phone reads the
+name, maker, VIN, identifiers and sources from the box over Noise.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `cars` | [Car] | One per car the box keeps |
+
+**Car**
+
+| Field | Type | Meaning |
+|---|---|---|
+| `id` | text | Opaque car id |
+| `socPermille` | uint or null | The car's level, null when the box has none. The car's or a person's own number while `socEstimate` is false |
+| `socSource` | text | `vehicle`, `manual` or `assumed`; empty without a level |
+| `socAgeS` | uint or null | Seconds since the car reported the level or someone set it, at send |
+| `energySinceWh` | int | Energy delivered to the car since then; negative when a V2X session took energy out |
+| `socEstimate` | bool | The box counts the level as an estimate |
+| `chargeLimitPermille` | uint or null | The charge limit the car reported with its level |
+| `goal` | CarGoal or null | What the car should reach and when |
+| `surplusOnly` | bool | The car charges from surplus PV only |
+
+**CarGoal**
+
+| Field | Type | Meaning |
+|---|---|---|
+| `targetPermille` | uint | The level to reach |
+| `readyByMin` | uint | Ready time in minutes after midnight in the box's time zone |
+| `days` | uint | ISO weekday mask, Monday in bit 0. 0 is once, at the next ready time, and 127 every day |
+| `finishAtLimit` | bool | Charge on until the car stops at its own limit |
+
+The box sends `car` when a car's level, source, goal or preference changes,
+at most once per period like `lp`, and in full every 15 minutes and after a
+`resync`, as `lp`. The change test ignores `socAgeS` and counts
+`energySinceWh` as changed at 100 Wh, as `lp` counts `sessionWh`. A service
+that does not know the class drops it, as for any unknown `t`.
 
 ### `prices`: `ftw.live.read`
 
@@ -396,10 +450,12 @@ The grid ceiling the plan defends is not sent.
 | `args` | map text→(text or int) | The catalogue's placeholders, except names |
 | `src` | text | Opaque source id, when the event concerns a device |
 | `lp` | text | Opaque loadpoint id, when the event concerns a loadpoint |
+| `cars` | [text], optional | Opaque car ids, for `car.which`: the cars the phone offers one button each, in the box's order. At most four; with more cars it is absent and the phone opens FTW. `args.session` is the plug-in's `session`, which the tap names |
 
-No argument carries a driver or device name. Where the catalogue text has a
-name placeholder, such as `{name}` in `driver.offline`, the box sends `src`
-and the phone fills in the name from its table. The box sends an event only
+No argument carries a driver, device or car name. Where the catalogue text
+has a name placeholder, such as `{name}` in `driver.offline`, the box sends
+`src` and the phone fills in the name from its table. `car.which` names its
+cars the same way. The box sends an event only
 when its own rules (enabled, cooldown) allow. Delivery is best effort.
 
 ### `tiles`: `ftw.history.read`
@@ -562,7 +618,7 @@ back `box.unreachable` until the box returns or an hour passes.
 - `plan` goes only when `decisionId` changes, `prices` only when its hash
   changes, `tiles` when a bucket closes, and `event` at once.
 - Every 15 minutes, and after a `resync`, the box sends a full `live` with
-  `sources` and `fieldSources`, and a full `lp`.
+  `sources` and `fieldSources`, a full `lp` and a full `car`.
 - **Heartbeat.** The box sends `hb` whenever neither `live` nor `hb` has left
   for H, where H = clamp(the smallest `staleAfterMs` among sources ÷ 2,
   2 s, 15 s), and 15 s when there are no sources. It sends no `hb` while a
@@ -750,12 +806,13 @@ Noise session, in the app protocol's `hello_ok.cloud`.
 | `boot` | bstr, 16 B | The uplink's current `boot`. It counts from the same Core start as `hello_ok.clock.uptimeMs`, which anchors rule U |
 | `sources` | map text→text | Opaque source id to driver name |
 | `loadpoints` | map text→text | Opaque loadpoint id to loadpoint id |
+| `cars` | map text→text, optional | Opaque car id to car id. Absent from a box without cars |
 
 - The box sends `cloud` while it is linked. It leaves it out when it holds
   no `cloud.key`, while the link waits for a purge, and in floor mode.
   Without it the phone reaches the box through the relay only.
-- `sources` and `loadpoints` are cut with the grant's `grantKey`, so they are
-  empty while the readable copy is off.
+- `sources`, `loadpoints` and `cars` are cut with the grant's `grantKey`, so
+  they are empty while the readable copy is off.
 - The tables name the drivers and loadpoints the box knows at `hello`. One
   added later has no name on the phone until its next session with the box.
 - The box lists `cloud.link` in `hello_ok.caps` when its build can run the
@@ -1267,6 +1324,8 @@ copied them here and to the app.
 | `reads` | The reads an agent may send and the scope each needs | `registry.yaml`, new block |
 | `E_GRANT_EXPIRED`, `E_OP_NOT_GRANTED`, `E_CAP_EXCEEDED`, `E_RATE_LIMITED`, `E_NEEDS_OWNER`, `E_BAD_SIGNATURE`, `E_NO_APPROVAL_KEY`, `E_NOT_FOUND`, `E_CLOCK_SKEW` | Agents' refusals | `registry.yaml`, `errors` |
 | `agent.added`, `agent.request`, `agent.expiring`, `approval.key.set`, `owner.added` | Push kinds, sent to every owner | `push-catalogue.yaml` |
+| `car.which` | Push kind: the box asks which car is on a charger ([docs/cars.md](cars.md)) | `push-catalogue.yaml` |
+| `car_soc_sources`, `car_identified_by` | Lists: where a car's level comes from, and how the box knows which car is on a charger | `registry.yaml`, new blocks |
 
 Class names, field names, close codes and the signing tags are not registry
 names. They live here and in `go/protocol`, held by golden vectors in both

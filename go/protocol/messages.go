@@ -188,6 +188,9 @@ type CloudSession struct {
 	Sources map[string]string `cbor:"sources"`
 	// Loadpoints maps each opaque loadpoint id to the loadpoint id.
 	Loadpoints map[string]string `cbor:"loadpoints"`
+	// Cars maps each opaque car id to the car's id. Absent from a box
+	// without cars.
+	Cars map[string]string `cbor:"cars,omitempty"`
 }
 
 // HintAppUpdate tells the app it is behind. It is a hint, not an error: the
@@ -355,6 +358,20 @@ type NowLoadpoint struct {
 	SocPermille *int64 `cbor:"socPermille,omitempty"`
 	// PowerW is the charger's draw, positive while charging.
 	PowerW int64 `cbor:"powerW"`
+	// The car on the charger (docs/cars.md): SocPermille is its level, and
+	// these say where the level came from and how the box knows the car.
+	// While the box asks, Session names the plug-in a tap answers and Choose
+	// lists the cars a tap may pick. To fit lane 0, car ids travel here as
+	// their 16 bytes, the 32 hex digits decoded: an asking charger with four
+	// cars takes about 180 B of the 512 B frame.
+	SocSource       string   `cbor:"socSource,omitempty"`
+	SocAgeS         *int64   `cbor:"socAgeS,omitempty"`
+	SocEstimate     bool     `cbor:"socEstimate,omitempty"`
+	Session         string   `cbor:"session,omitempty"`
+	CarID           []byte   `cbor:"carId,omitempty"`
+	CarIdentifiedBy string   `cbor:"carIdentifiedBy,omitempty"`
+	CarCorrected    bool     `cbor:"carCorrected,omitempty"`
+	Choose          [][]byte `cbor:"choose,omitempty"`
 }
 
 // --------------------------------------------------------------------------
@@ -424,6 +441,11 @@ type CmdResult struct {
 	State    string     `cbor:"state"`
 	Observed *Observed  `cbor:"observed,omitempty"`
 	Error    *ErrorBody `cbor:"error,omitempty"`
+	// Car is the car as the box holds it after a car op, and Charger the
+	// charger's car after session.car.set (docs/cars.md): read back, never
+	// the request's echo.
+	Car     *Car        `cbor:"car,omitempty"`
+	Charger *ChargerCar `cbor:"charger,omitempty"`
 }
 
 type Observed struct {

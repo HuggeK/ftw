@@ -25,6 +25,7 @@ const (
 	MsgHB     = "hb"
 	MsgRoster = "roster"
 	MsgBye    = "bye"
+	MsgCar    = "car"
 	// MsgNotice tells the owners' phones that something changed who may
 	// reach the box (docs/agents.md, Push kinds). It carries the kind and
 	// nothing else, and the box sends it whenever it is linked, copy or not.
@@ -42,6 +43,7 @@ var Downlink = []string{MsgChallenge, MsgHelloOK, MsgWatch, MsgResync, MsgPurged
 var ClassScope = map[string]string{
 	MsgLive:   protocol.ScopeLiveRead,
 	MsgLP:     protocol.ScopeLiveRead,
+	MsgCar:    protocol.ScopeLiveRead,
 	MsgPrices: protocol.ScopeLiveRead,
 	MsgPlan:   protocol.ScopePlanRead,
 	MsgHealth: protocol.ScopeHealthRead,
@@ -218,6 +220,48 @@ type Loadpoint struct {
 	NextStartMs     *int64  `cbor:"nextStartMs"`
 	NextEndMs       *int64  `cbor:"nextEndMs"`
 	NextWh          *int64  `cbor:"nextWh"`
+	// The car on the charger, by opaque car id, and how the box knows it
+	// (docs/cars.md). Absent while nothing is plugged in, and from a box
+	// without cars. The level fields above are views of this car for one
+	// release; the car class is the truth.
+	CarID            string   `cbor:"carId,omitempty"`
+	CarIdentifiedBy  string   `cbor:"carIdentifiedBy,omitempty"`
+	CarCorrected     bool     `cbor:"carCorrected,omitempty"`
+	CarCorrectedFrom string   `cbor:"carCorrectedFrom,omitempty"`
+	Choose           []string `cbor:"choose,omitempty"`
+}
+
+// Cars is the car class: the level and goal of each of the owners' cars on
+// this box. Nothing in it names a car: the id is opaque, and the phone reads
+// the name, maker, VIN and sources from the box over Noise.
+type Cars struct {
+	Header
+	Cars []Car `cbor:"cars"`
+}
+
+// Car is one car's level and goal.
+type Car struct {
+	// ID is the opaque car id.
+	ID          string `cbor:"id"`
+	SocPermille *int64 `cbor:"socPermille"`
+	SocSource   string `cbor:"socSource"`
+	// SocAgeS is the seconds since the car reported the level or someone
+	// set it, at send. Null without a level.
+	SocAgeS *int64 `cbor:"socAgeS"`
+	// EnergySinceWh is negative when a V2X session took energy out.
+	EnergySinceWh       int64    `cbor:"energySinceWh"`
+	SocEstimate         bool     `cbor:"socEstimate"`
+	ChargeLimitPermille *int64   `cbor:"chargeLimitPermille"`
+	Goal                *CarGoal `cbor:"goal"`
+	SurplusOnly         bool     `cbor:"surplusOnly"`
+}
+
+// CarGoal is protocol.CarGoal, as the car class carries it.
+type CarGoal struct {
+	TargetPermille int64 `cbor:"targetPermille"`
+	ReadyByMin     int64 `cbor:"readyByMin"`
+	Days           uint8 `cbor:"days"`
+	FinishAtLimit  bool  `cbor:"finishAtLimit"`
 }
 
 // Manual is a manual charging hold.

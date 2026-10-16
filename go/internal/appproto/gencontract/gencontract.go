@@ -82,6 +82,19 @@ type Registry struct {
 		RetentionDays int    `yaml:"retention_days"`
 		Source        string `yaml:"source"`
 	} `yaml:"resolutions"`
+	// Cars: their field names, the two enums and what a charger carries
+	// about its car (docs/cars.md).
+	CarFields        []carField `yaml:"car_fields"`
+	CarSoCSources    []string   `yaml:"car_soc_sources"`
+	CarIdentifiedBy  []string   `yaml:"car_identified_by"`
+	ChargerCarFields []carField `yaml:"charger_car_fields"`
+}
+
+// carField is one entry of car_fields or charger_car_fields.
+type carField struct {
+	Name string `yaml:"name"`
+	Kind string `yaml:"kind"`
+	Desc string `yaml:"desc"`
 }
 
 // field is one entry of frozen_fields or extra_fields.
@@ -122,6 +135,7 @@ func Generate(raw []byte) ([]byte, error) {
 	writeSourceStates(&b, reg)
 	writeResolutions(&b, reg)
 	writeRegistryModes(&b, reg)
+	writeCars(&b, reg)
 
 	return format.Source(b.Bytes())
 }
@@ -513,6 +527,39 @@ func writeRegistryModes(b *bytes.Buffer, reg Registry) {
 		fmt.Fprintf(b, "\t%q: %q,\n", m.Key, m.Tier)
 	}
 	b.WriteString("}\n")
+}
+
+// writeCars emits the car's enums as constants and its field names as lists.
+// The names are struct tags in go/protocol, read back against these lists by
+// TestCarStructsAreTheRegistrys, as the ops are against the command table.
+func writeCars(b *bytes.Buffer, reg Registry) {
+	b.WriteString("\n// Where a car's level comes from: the registry's car_soc_sources.\n")
+	b.WriteString("const (\n")
+	for _, s := range reg.CarSoCSources {
+		fmt.Fprintf(b, "\tCarSoC%s = %q\n", goName(s), s)
+	}
+	b.WriteString(")\n\n")
+
+	b.WriteString("// How the box knows which car is on a charger: the registry's\n")
+	b.WriteString("// car_identified_by.\n")
+	b.WriteString("const (\n")
+	for _, s := range reg.CarIdentifiedBy {
+		fmt.Fprintf(b, "\tCarIdentifiedBy%s = %q\n", goName(s), s)
+	}
+	b.WriteString(")\n\n")
+
+	writeNames := func(name, what string, fields []carField) {
+		fmt.Fprintf(b, "// %s is every name in the registry's %s. A dotted name is a\n", name, what)
+		b.WriteString("// field of the object before the dot.\n")
+		fmt.Fprintf(b, "var %s = []string{\n", name)
+		for _, f := range fields {
+			fmt.Fprintf(b, "\t%q, // %s\n", f.Name, f.Desc)
+		}
+		b.WriteString("}\n")
+	}
+	writeNames("CarFields", "car_fields", reg.CarFields)
+	b.WriteString("\n")
+	writeNames("ChargerCarFields", "charger_car_fields", reg.ChargerCarFields)
 }
 
 // errName turns E_CMD_EXPIRED into ErrCmdExpired.

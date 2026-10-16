@@ -389,6 +389,13 @@ func LoadpointID(grantKey []byte, loadpoint string) string {
 	return opaqueID(grantKey, "lp\x00", loadpoint)
 }
 
+// CarID is a car's opaque id, cut the same way with "car\0" from its
+// 128-bit id. The id is the same on each of the owner's boxes; the opaque id
+// differs per grant, so the service cannot follow a car from home to home.
+func CarID(grantKey []byte, car string) string {
+	return opaqueID(grantKey, "car\x00", car)
+}
+
 func opaqueID(key []byte, tag, name string) string {
 	mac := hmac.New(sha256.New, key)
 	mac.Write([]byte(tag))

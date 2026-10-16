@@ -53,6 +53,8 @@ var RoleScopes = map[string][]string{
 		"ftw.dispatch.hold",
 		"ftw.goals.request",
 		"ftw.update.request",
+		"ftw.cars.read",
+		"ftw.cars.write",
 	},
 	RoleRelease: {
 		"ftw.health.read",

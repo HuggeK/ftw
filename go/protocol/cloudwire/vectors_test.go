@@ -65,6 +65,12 @@ type vectorSigned struct {
 
 func i64(v int64) *int64 { return &v }
 
+// The two cars the vectors carry, by their 128-bit ids.
+const (
+	vectorCarTesla = "5f0c1e2d3a4b5c6d7e8f90a1b2c3d4e5"
+	vectorCarVolvo = "0123456789abcdef0123456789abcdef"
+)
+
 // vectorBodies are the bodies the vectors freeze, in order.
 func vectorBodies(grantKey []byte, boxPK []byte) []struct {
 	name, signer, t string
@@ -79,6 +85,8 @@ func vectorBodies(grantKey []byte, boxPK []byte) []struct {
 	inverter := SourceID(grantKey, "sungrow")
 	charger := SourceID(grantKey, "easee")
 	garage := LoadpointID(grantKey, "garage")
+	tesla := CarID(grantKey, vectorCarTesla)
+	volvo := CarID(grantKey, vectorCarVolvo)
 
 	return []struct {
 		name, signer, t string
@@ -216,6 +224,45 @@ func vectorBodies(grantKey []byte, boxPK []byte) []struct {
 			},
 			Grant: Grant{Scopes: []string{}, Purposes: []string{}, Controller: ControllerSourceful},
 		}},
+		// Cars (docs/cars.md). Two cars on one charger, neither named: the
+		// box asks, the lp says so and offers the two, the car class
+		// carries both levels, and car.which names the plug-in's session.
+		{"lp car asking", "box", MsgLP, LP{
+			Header: h(15, 76_000), ControlRev: 813,
+			Loadpoints: []Loadpoint{{
+				ID: garage, Src: charger, Plugged: true, SocSource: "unknown",
+				PowerW: 0, SessionWh: 0, Session: "7d1f0c2a9b3e4f50", CommandedReason: "pv_surplus_pause",
+				SurplusOnly: true, CarIdentifiedBy: protocol.CarIdentifiedByAsking, Choose: []string{tesla, volvo},
+			}},
+			Feedback: []Feedback{},
+		}},
+		{"car", "box", MsgCar, Cars{
+			Header: h(16, 76_010),
+			Cars: []Car{
+				{ID: tesla, SocPermille: i64(140), SocSource: protocol.CarSoCVehicle, SocAgeS: i64(540),
+					EnergySinceWh: 0, ChargeLimitPermille: i64(800),
+					Goal: &CarGoal{TargetPermille: 800, ReadyByMin: 420, Days: 0x7f}},
+				// Read before it last left a charger: an estimate, whatever
+				// flowed since.
+				{ID: volvo, SocPermille: i64(620), SocSource: protocol.CarSoCVehicle, SocAgeS: i64(30_600),
+					EnergySinceWh: 0, SocEstimate: true, SurplusOnly: true},
+			},
+		}},
+		{"event car which", "box", MsgEvent, Event{
+			Header: h(17, 76_020), EventID: "d2hpY2hjYXIx", Ts: i64(wall + 76_020 - 60_000 - 100),
+			Kind: protocol.PushCarWhich, Severity: SeverityInfo, Args: map[string]string{"session": "7d1f0c2a9b3e4f50"},
+			Src: charger, LP: garage, Cars: []string{tesla, volvo},
+		}},
+		{"lp car tapped", "box", MsgLP, LP{
+			Header: h(18, 81_000), ControlRev: 814,
+			Loadpoints: []Loadpoint{{
+				ID: garage, Src: charger, Plugged: true, SocPermille: i64(140), SocSource: "vehicle",
+				SocAgeS: i64(545), TargetPermille: i64(800), ReadyByMs: i64(1_791_867_600_000),
+				Recurring: true, Session: "7d1f0c2a9b3e4f50", CommandedReason: "plan",
+				CarID: tesla, CarIdentifiedBy: protocol.CarIdentifiedByTap,
+			}},
+			Feedback: []Feedback{},
+		}},
 	}
 }
 
@@ -242,10 +289,14 @@ func TestGoldenVectors(t *testing.T) {
 		ServiceKey: vectorKey{D: hex.EncodeToString(service.D.FillBytes(make([]byte, 32))), PK: hex.EncodeToString(servicePK)},
 		GrantKey:   hex.EncodeToString(grantKey),
 	}
-	for _, id := range []vectorID{{"src", "p1meter", ""}, {"src", "sungrow", ""}, {"src", "easee", ""}, {"lp", "garage", ""}} {
-		if id.Kind == "src" {
+	for _, id := range []vectorID{{"src", "p1meter", ""}, {"src", "sungrow", ""}, {"src", "easee", ""}, {"lp", "garage", ""},
+		{"car", vectorCarTesla, ""}, {"car", vectorCarVolvo, ""}} {
+		switch id.Kind {
+		case "src":
 			id.ID = SourceID(grantKey, id.Name)
-		} else {
+		case "car":
+			id.ID = CarID(grantKey, id.Name)
+		default:
 			id.ID = LoadpointID(grantKey, id.Name)
 		}
 		out.IDs = append(out.IDs, id)

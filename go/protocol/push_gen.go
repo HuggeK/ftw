@@ -23,6 +23,7 @@ const (
 	PushAgentExpiring           = "agent.expiring"
 	PushApprovalKeySet          = "approval.key.set"
 	PushOwnerAdded              = "owner.added"
+	PushCarWhich                = "car.which"
 )
 
 // PushSentence is one lock-screen sentence, exactly as the app wrote it.
@@ -49,4 +50,5 @@ var PushSentences = map[string]PushSentence{
 	PushAgentExpiring:           {Title: "Access ends tomorrow", Body: "An assistant's or Sourceful's access to your box runs out in a day. Renew it in the app if it should go on."},
 	PushApprovalKeySet:          {Title: "A phone can now approve access", Body: "A phone set up the key it uses to approve access to your box. If that was not you, remove the phone in the app."},
 	PushOwnerAdded:              {Title: "A new owner", Body: "A phone was paired as an owner of your box. If that was not you, remove it in the app."},
+	PushCarWhich:                {Title: "Which car is plugged in?", Body: "Tap the car so the box plans for its level and goal."},
 }

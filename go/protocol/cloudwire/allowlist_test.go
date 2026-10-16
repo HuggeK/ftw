@@ -167,3 +167,31 @@ func TestFieldsMatchTheProtocolDocument(t *testing.T) {
 		}
 	}
 }
+
+// The car class carries exactly these of the registry's car fields: the
+// level and the goal. An allowlist, so a field added to the car does not
+// leave the house until someone decides it may. Nothing that names a car or
+// says what it is (name, maker, VIN, capacity, identifiers, sources, owner)
+// is among them.
+func TestTheCarClassCarriesOnlyTheLevelAndTheGoal(t *testing.T) {
+	allowed := []string{"id", "socPermille", "socSource", "socAgeS", "energySinceWh", "socEstimate",
+		"chargeLimitPermille", "goal", "surplusOnly"}
+	if got := sorted(Fields["Car"]); !slices.Equal(got, sorted(allowed)) {
+		t.Errorf("car class %v, allowed %v", got, sorted(allowed))
+	}
+	for _, f := range append(allowed, "goal.targetPermille", "goal.readyByMin", "goal.days", "goal.finishAtLimit") {
+		if !slices.Contains(protocol.CarFields, f) {
+			t.Errorf("%s is not a registry car field", f)
+		}
+	}
+	for _, f := range Fields["CarGoal"] {
+		if !slices.Contains(protocol.CarFields, "goal."+f) {
+			t.Errorf("CarGoal.%s is not a registry goal field", f)
+		}
+	}
+	for _, f := range protocol.ChargerCarFields {
+		if !slices.Contains(Fields["Loadpoint"], f) {
+			t.Errorf("Loadpoint has no %s", f)
+		}
+	}
+}

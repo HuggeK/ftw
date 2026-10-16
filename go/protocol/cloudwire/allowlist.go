@@ -23,15 +23,23 @@ var Fields = map[string][]string{
 		"targetPermille", "readyByMs", "recurring", "powerW", "sessionWh",
 		"session", "manual", "commandedW", "commandedReason", "surplusOnly",
 		"gridDeferred", "planPending", "boost", "nextStartMs", "nextEndMs", "nextWh",
+		"carId", "carIdentifiedBy", "carCorrected", "carCorrectedFrom", "choose",
 	},
 	"Manual":   {"state", "sinceAgeMs", "requestedW", "commandedW", "reason"},
 	"Feedback": {"kind", "src", "status", "reason", "severity", "evidence", "fresh", "actualW", "ageMs"},
+
+	MsgCar: {"cars"},
+	"Car": {
+		"id", "socPermille", "socSource", "socAgeS", "energySinceWh", "socEstimate",
+		"chargeLimitPermille", "goal", "surplusOnly",
+	},
+	"CarGoal": {"targetPermille", "readyByMin", "days", "finishAtLimit"},
 
 	MsgPrices: {"zone", "currency", "t0Ms", "slotMs", "spotMinor", "totalMinor"},
 
 	MsgHB: {"clock", "srcRev", "liveSeq", "lpSeq", "ages"},
 
-	MsgEvent: {"eventId", "ts", "kind", "severity", "args", "src", "lp"},
+	MsgEvent: {"eventId", "ts", "kind", "severity", "args", "src", "lp", "cars"},
 
 	MsgRoster: {"rosterSeq", "ttlS", "devices", "grant", "pending", "noise"},
 	"Device":  {"id", "key", "role", "scopes", "epoch", "tun", "agent"},
@@ -61,6 +69,7 @@ var Bodies = map[string]any{
 	MsgHello:  Hello{},
 	MsgLive:   Live{},
 	MsgLP:     LP{},
+	MsgCar:    Cars{},
 	MsgPrices: Prices{},
 	MsgHB:     HB{},
 	MsgEvent:  Event{},
