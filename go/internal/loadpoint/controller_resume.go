@@ -11,6 +11,7 @@ type resumeOffer struct {
 	generation              uint64
 	nextAttempt             time.Time
 	retryDelay              time.Duration
+	acknowledgedAttempts    int
 }
 
 // resumeAfterZeroOffer remembers our standdown independently of commanded W.
@@ -37,6 +38,14 @@ func (c *Controller) resumeAfterZeroOffer(ctx context.Context, cfg Config, sampl
 	if !exists || now.Before(previous.nextAttempt) {
 		return
 	}
+	if previous.acknowledgedAttempts >= 3 {
+		if previous.acknowledgedAttempts == 3 {
+			slog.Warn("loadpoint resume acknowledged but no charge observed", "lp", cfg.ID, "driver", cfg.DriverName)
+			previous.acknowledgedAttempts++
+			c.resumeOffers[cfg.ID] = previous
+		}
+		return
+	}
 	if err := c.sendDispatchWithDeadline(ctx, cfg.DriverName, []byte(`{"action":"ev_resume"}`)); err != nil {
 		previous.retryDelay = min(time.Minute, max(5*time.Second, 2*previous.retryDelay))
 		previous.nextAttempt = now.Add(previous.retryDelay)
@@ -45,5 +54,11 @@ func (c *Controller) resumeAfterZeroOffer(ctx context.Context, cfg Config, sampl
 			"retry_at", previous.nextAttempt, "err", err)
 		return
 	}
-	delete(c.resumeOffers, cfg.ID)
+	// An HTTP acknowledgement does not establish that the contactor closed.
+	// Retry at a bounded rate, under the current dispatch gates, and stop after
+	// three acknowledged attempts. Only observed delivery clears the proof.
+	previous.acknowledgedAttempts++
+	previous.nextAttempt = now.Add(30 * time.Second)
+	previous.retryDelay = 0
+	c.resumeOffers[cfg.ID] = previous
 }
