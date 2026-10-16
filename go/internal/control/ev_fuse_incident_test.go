@@ -39,9 +39,9 @@ func TestImportCeilingStartSkewEvidence(t *testing.T) {
 	st.clock = func() time.Time { return now }
 	var log bytes.Buffer
 	old := slog.Default()
-	slog.SetDefault(slog.New(slog.NewJSONHandler(&log, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&log, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	defer slog.SetDefault(old)
-	capW, known := EVFuseBudget(store, st, []loadpoint.State{{ID: "a", DriverName: "car", PluggedIn: true}}, []loadpoint.Config{{ID: "a", DriverName: "car", PhaseMode: "3p"}}, 17250)
+	capW, known := EVFuseBudget(store, st, []loadpoint.State{{ID: "a", DriverName: "car", PluggedIn: true}}, []loadpoint.Config{{ID: "a", DriverName: "car", PhaseMode: "3p", MinChargeW: 4140}}, 17250)
 	if !known || math.Abs(capW-400) > .001 {
 		t.Fatalf("unconfirmed EV cannot earn credit: cap=%v known=%v", capW, known)
 	}
@@ -60,13 +60,19 @@ func TestImportCeilingStartSkewEvidence(t *testing.T) {
 		t.Fatal("incident minimum-step condition not reproduced")
 	}
 
+	// Repeated blocked ticks must not flood the production log ring.
+	before := log.Len()
+	_, _ = EVFuseBudget(store, st, []loadpoint.State{{ID: "a", DriverName: "car", PluggedIn: true}}, []loadpoint.Config{{ID: "a", DriverName: "car", PhaseMode: "3p", MinChargeW: 4140}}, 17250)
+	if log.Len() != before {
+		t.Fatal("unchanged blocked verdict was logged again inside one minute")
+	}
 	// Once actual EV power brackets a site observation, the same site reading
 	// earns replacement credit. Diagnostic logging must not alter that recovery.
 	emit("car", telemetry.DerEV, 6200, at.Add(6*time.Second), false)
 	emit("meter", telemetry.DerMeter, 7100, at.Add(7*time.Second), true)
 	emit("car", telemetry.DerEV, 6200, at.Add(8*time.Second), false)
 	now = time.Now()
-	capW, known = EVFuseBudget(store, st, []loadpoint.State{{ID: "a", DriverName: "car", PluggedIn: true}}, []loadpoint.Config{{ID: "a", DriverName: "car", PhaseMode: "3p"}}, 17250)
+	capW, known = EVFuseBudget(store, st, []loadpoint.State{{ID: "a", DriverName: "car", PluggedIn: true}}, []loadpoint.Config{{ID: "a", DriverName: "car", PhaseMode: "3p", MinChargeW: 4140}}, 17250)
 	if !known || math.Abs(capW-6600) > .001 {
 		t.Fatalf("confirmed EV recovery changed: cap=%v known=%v", capW, known)
 	}

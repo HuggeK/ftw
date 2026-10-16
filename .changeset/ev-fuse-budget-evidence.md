@@ -2,4 +2,4 @@
 "ftw": patch
 ---
 
-Include bounded common/latest site, EV-credit, import and phase-limit evidence in debug logs for EV fuse-budget decisions, without changing charging limits.
+Report rate-limited common/latest site, EV-credit, import and phase-limit evidence when an EV fuse budget falls below the charging minimum, without changing charging limits.

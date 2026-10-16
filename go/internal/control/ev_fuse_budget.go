@@ -1,7 +1,6 @@
 package control
 
 import (
-	"context"
 	"encoding/json"
 	"log/slog"
 	"math"
@@ -59,8 +58,17 @@ func EVFuseBudget(store *telemetry.Store, state *State, points []loadpoint.State
 		phaseCap = math.Max(0, balance.latestPoolW+phaseW-balance.latestPendingW)
 	}
 	finalCap := math.Min(cap, math.Min(latestCap, phaseCap))
-	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
-		slog.Debug("EV fuse budget evidence",
+	minimumW := 0.0
+	for _, cfg := range configs {
+		for _, point := range points {
+			if point.PluggedIn && point.ID == cfg.ID && cfg.MinChargeW > 0 && (minimumW == 0 || cfg.MinChargeW < minimumW) {
+				minimumW = cfg.MinChargeW
+			}
+		}
+	}
+	if minimumW > 0 && finalCap < minimumW && (state.evFuseEvidenceAt.IsZero() || now.Before(state.evFuseEvidenceAt) || now.Sub(state.evFuseEvidenceAt) >= time.Minute) {
+		state.evFuseEvidenceAt = now
+		slog.Info("EV fuse budget below charging minimum", "minimum_charge_w", minimumW,
 			"common_site_at_ms", balance.siteAt.UnixMilli(), "latest_site_received_at_ms", meter.UpdatedAt.UnixMilli(),
 			"physical_fuse_w", fuseMaxW, "configured_import_ceiling_w", state.PeakImportCeilingW,
 			"common_ceiling_w", commonCeiling, "latest_ceiling_w", latestCeiling,
