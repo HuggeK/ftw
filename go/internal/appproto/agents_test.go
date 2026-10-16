@@ -621,8 +621,20 @@ func TestASupportGrantEndsWhenItsTicketCloses(t *testing.T) {
 	}
 	r.agents.FlushAudit(r.audit, r.clock.now.Add(time.Minute).UnixMilli())
 	rows := r.audit.find(protocol.MsgHealthGet)
-	if last := rows[len(rows)-1]; last.By != "staff:s7" || last.Principal != "FTW-123" || last.Actor != "agent:"+row.ID {
-		t.Errorf("audit %+v", last)
+	// Folded reads have no order within a minute. Check the accepted call,
+	// which may precede the rejected calls in the flushed rows.
+	found := false
+	for _, entry := range rows {
+		if entry.Result != "ok" {
+			continue
+		}
+		found = true
+		if entry.By != "staff:s7" || entry.Principal != "FTW-123" || entry.Actor != "agent:"+row.ID || entry.Count != 1 {
+			t.Errorf("audit %+v", entry)
+		}
+	}
+	if !found {
+		t.Errorf("accepted support call absent from audit: %+v", rows)
 	}
 
 	// Another agent's row is not its to revoke.
