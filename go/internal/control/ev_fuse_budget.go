@@ -49,8 +49,8 @@ func EVFuseBudget(store *telemetry.Store, state *State, points []loadpoint.State
 	latestCeiling := state.phaseImportCeilingW(fuseMaxW, meter)
 	cap := evHeadroomW(commonCeiling, balance.gridW+balance.pendingW, balance.poolW)
 	latestCap := evHeadroomW(latestCeiling, meter.RawW+balance.latestPendingW, balance.latestPoolW)
-	// Keep the arithmetic and guard order unchanged. Evidence belongs to this
-	// exact decision, rather than a later status snapshot with different polls.
+	// Keep the newest site and phase bounds authoritative even when the
+	// common historical balance has more replacement credit.
 	phaseCap := latestCap
 	phaseKnown := false
 	if phaseW, known := evPhaseIncreaseW(meter, state, configs, balance.latestPoolW); known {
@@ -129,7 +129,7 @@ func coherentEVBalance(store *telemetry.Store, state *State, meter *telemetry.De
 		}
 		credit, coherent := 0.0, true
 		for _, ev := range series {
-			w, ok := bracketedEVPower(ev.points, site.At, ev.latest)
+			w, ok := bracketedEVPowerAt(ev.points, site.At, ev.latest)
 			if !ok {
 				coherent = false
 				break
@@ -144,7 +144,19 @@ func coherentEVBalance(store *telemetry.Store, state *State, meter *telemetry.De
 			return balance
 		}
 	}
-	balance.pendingW, _ = pendingBatteryIncreaseAt(batteries, siteAt)
+	// No common bracket exists. A battery already observed before this
+	// latest site read uses the same baseline as the latest-site guard.
+	// A first battery observation AFTER the site read cannot establish how
+	// much earlier discharge the meter contains: retain its full fallback.
+	balance.pendingW = 0
+	for _, battery := range batteries {
+		if battery.fresh && !battery.current.Seen().After(siteAt) {
+			balance.pendingW += math.Max(0, battery.upperW-battery.current.PowerW)
+		} else {
+			reserve, _ := pendingBatteryIncreaseAt([]pendingBatterySeries{battery}, siteAt)
+			balance.pendingW += reserve
+		}
+	}
 	return balance
 }
 
@@ -156,7 +168,10 @@ func qualifiedFuseObservation(r *telemetry.DerReading, now time.Time) (telemetry
 	return p, ok && !p.Seen().After(now) && now.Sub(p.Seen()) <= telemetry.ControlWindowDuration
 }
 
-func bracketedEVPower(points []telemetry.ControlObservation, at time.Time, latest float64) (float64, bool) {
+// bracketedEVPowerAt evaluates the historical site instant. Later EV
+// stops are handled by the separate latest-site/phase bounds, not by
+// retroactively subtracting them from this older grid observation.
+func bracketedEVPowerAt(points []telemetry.ControlObservation, at time.Time, latest float64) (float64, bool) {
 	var before, after telemetry.ControlObservation
 	hasBefore, hasAfter := false, false
 	for _, p := range points {
@@ -174,6 +189,14 @@ func bracketedEVPower(points []telemetry.ControlObservation, at time.Time, lates
 		return 0, false
 	}
 	baseline := math.Max(0, math.Min(latest, math.Min(before.PowerW, after.PowerW)))
+	return baseline, true
+}
+
+func bracketedEVPower(points []telemetry.ControlObservation, at time.Time, latest float64) (float64, bool) {
+	baseline, known := bracketedEVPowerAt(points, at, latest)
+	if !known {
+		return 0, false
+	}
 	// Another slow device may force an older common site observation. A
 	// later observed stop still removes its replacement credit, even if
 	// the charger has since started again.
