@@ -24,18 +24,19 @@ func TestFailureEvidenceKeepsRejectedDownsideInputs(t *testing.T) {
 	svc.PV = func(time.Time, float64) float64 { return 1000 }
 	svc.PVForecastSafetyK = 1
 	svc.PVUncertaintyW = func() float64 { return math.NaN() }
-	if svc.Replan(context.Background()) != nil {
-		t.Fatal("invalid current downside forecast became a plan")
+	plan := svc.Replan(context.Background())
+	if plan == nil || len(plan.Actions) != 4 {
+		t.Fatal("invalid optional downside forecast blocked a valid point plan")
 	}
 	failure := svc.PlanningFailureSnapshot()
 	if failure == nil || failure.Stage != "risk_inputs" {
 		t.Fatalf("rejected downside evidence was overwritten: %+v", failure)
 	}
 	var inputs struct {
-		Slots []map[string]any `json:"slots"`
+		Params map[string]any `json:"params"`
 	}
-	if err := json.Unmarshal(failure.Inputs, &inputs); err != nil || len(inputs.Slots) == 0 || inputs.Slots[0]["PVW"] != "NaN" {
-		t.Fatalf("failure reports the valid base forecast instead of rejected risk inputs: %s %v", failure.Inputs, err)
+	if err := json.Unmarshal(failure.Inputs, &inputs); err != nil || inputs.Params["PVUncertaintyW"] != "NaN" {
+		t.Fatalf("failure lost the raw uncertainty before caution was disabled: %s %v", failure.Inputs, err)
 	}
 	restored := New(svc.Store, nil, svc.Zone, svc.Defaults).PlanningFailureSnapshot()
 	if restored == nil || !bytes.Equal(restored.Inputs, failure.Inputs) || restored.Stage != "risk_inputs" {
@@ -343,13 +344,19 @@ func TestNativeSupportFailureEvidenceMatchesRejectedWorkerRequest(t *testing.T) 
 	svc.Optimizer = &EnergyplanOptimizer{ExternalOptimizer: worker}
 	plan := svc.Replan(context.Background())
 	failure := svc.PlanningFailureSnapshot()
-	if plan == nil || len(plan.Actions) != 2 || failure == nil || failure.OptimizerRequest == nil || failure.OptimizerResponse == nil {
+	if plan == nil || len(plan.Actions) != 4 || failure == nil || failure.OptimizerRequest == nil || failure.OptimizerResponse == nil {
 		t.Fatalf("native failure or safe recovery missing: plan=%v failure=%+v", plan != nil, failure)
 	}
 	var request externalRequest
 	var response externalResponse
 	if json.Unmarshal(failure.OptimizerRequest.JSON, &request) != nil || json.Unmarshal(failure.OptimizerResponse.JSON, &response) != nil ||
-		request.RequestID != response.RequestID || response.OK || len(request.Slots) != 4 || !strings.Contains(failure.Error, "infeasible") {
+		request.RequestID != response.RequestID || response.OK || len(request.Slots) != 4 || request.Slots[2].LoadW != 40000 || !strings.Contains(failure.Error, "infeasible") {
 		t.Fatal("captured exchange does not reproduce the rejected native request")
+	}
+	if plan.Solver.Engine != "native" || plan.Solver.Fallback || failure.RecoveredDecisionID != plan.DecisionID {
+		t.Fatal("simpler forecast did not recover native price planning")
+	}
+	if err := ValidatePlan(svc.lastSlots, svc.lastParams, plan); err != nil {
+		t.Fatal(err)
 	}
 }

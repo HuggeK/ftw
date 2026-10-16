@@ -681,6 +681,9 @@ func (f *forecastTracker) Snapshot(_ time.Time, weather []state.ForecastPoint) m
 		}
 		version := forecastModelRevision(issue.Models)
 		issue.Series[0].ModelVersion = version
+		// Core may recover with a prior after the selected model fails. Keep
+		// its accepted inputs separate from the raw worker and legacy series.
+		selected = recoveredForecastSources(base, selected)
 		issue.Series[0].Points = primaryForecastPoints(base, issue.Series[0].Points, selected)
 		issue.Series = append(issue.Series, forecasting.Series{Name: "planning", ModelVersion: version,
 			Points: primaryForecastPoints(planning, forecastPoints(planning, frozen, site, origin, load), selected)})
@@ -716,6 +719,26 @@ func (f *forecastTracker) Snapshot(_ time.Time, weather []state.ForecastPoint) m
 
 func usablePrimaryForecast(known bool, quality string, watts float64) bool {
 	return known && (quality == "cold_start" || quality == "learning" || quality == "ready") && watts >= 0 && !math.IsNaN(watts) && !math.IsInf(watts, 0)
+}
+
+// A changed point forecast belongs to Core's recovery, not the model whose
+// raw prediction was rejected. Risk adjustments keep the recovered source.
+func recoveredForecastSources(base []mpc.Slot, selected []forecasting.Point) []forecasting.Point {
+	out := append([]forecasting.Point(nil), selected...)
+	for i, slot := range base {
+		if i >= len(out) {
+			break
+		}
+		if slot.LoadW != out[i].LoadW {
+			out[i].LoadSource, out[i].LoadQuality = "core_recovery", "fallback"
+			out[i].ModelLoad = nil
+		}
+		if -slot.PVW != out[i].PVW {
+			out[i].PVSource, out[i].PVQuality = "core_recovery", "fallback"
+			out[i].ModelPV = nil
+		}
+	}
+	return out
 }
 
 // Preserve the source and quality used for each signal, while recording the

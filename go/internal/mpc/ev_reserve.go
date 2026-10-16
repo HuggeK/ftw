@@ -10,8 +10,8 @@ import (
 	"github.com/srcfl/ftw/go/internal/loadpoint"
 )
 
-// coreReservePlan makes prompt progress toward an EV deadline when the worker
-// is unavailable. It uses exact energy, legal on-power and idle/charge pulses;
+// coreReservePlan retains an EV departure schedule when the worker is
+// unavailable. It uses exact energy, legal on-power and idle/charge pulses;
 // optional home-battery trading must not consume the car's available headroom.
 // The service still validates the complete plan before publication.
 func coreReservePlan(ctx context.Context, slots []Slot, p Params) (Plan, error) {
@@ -117,7 +117,7 @@ func coreReservePlan(ctx context.Context, slots []Slot, p Params) (Plan, error) 
 	if lp == nil {
 		plan.Solver.Backend = "site_reserve"
 	}
-	return plan, nil
+	return priceReserveCharging(ctx, slots, p, plan)
 }
 
 type reserveEnergyBand struct{ min, max float64 }

@@ -500,12 +500,6 @@ func TestReplanRejectsInvalidPhysicsBeforeSolver(t *testing.T) {
 		{"negative export limit", func(s *Service) { s.FuseMaxW, s.MaxExportW = 11000, -1 }},
 		{"nan export limit", func(s *Service) { s.FuseMaxW, s.MaxExportW = 11000, math.NaN() }},
 		{"infinite export limit", func(s *Service) { s.FuseMaxW, s.MaxExportW = 11000, math.Inf(1) }},
-		{"nan pv uncertainty", func(s *Service) {
-			s.PVUncertaintyW = func() float64 { return math.NaN() }
-		}},
-		{"negative pv uncertainty", func(s *Service) {
-			s.PVUncertaintyW = func() float64 { return -1 }
-		}},
 		{"invalid plugged loadpoint", func(s *Service) {
 			s.Loadpoints = func(int) []*LoadpointSpec {
 				return []*LoadpointSpec{{ID: "garage", PluggedIn: true, CapacityWh: 0, Levels: 1}}

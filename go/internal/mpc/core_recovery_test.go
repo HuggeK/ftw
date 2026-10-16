@@ -160,7 +160,7 @@ func TestCoreRecoveryRejectsUnsafeCurrentSlotAndInvalidInputs(t *testing.T) {
 	}
 }
 
-func TestRecoveryPublishesPersistsAndReturnsToFullHorizon(t *testing.T) {
+func TestRecoveryPublishesFullPriorAndReturnsToModel(t *testing.T) {
 	for _, externalFailure := range []bool{false, true} {
 		t.Run(map[bool]string{false: "core", true: "external failure"}[externalFailure], func(t *testing.T) {
 			svc := shadowTestService(t)
@@ -193,16 +193,21 @@ func TestRecoveryPublishesPersistsAndReturnsToFullHorizon(t *testing.T) {
 			}
 			plan := svc.Replan(context.Background())
 			snap := svc.PlanSnapshot()
-			if plan == nil || len(plan.Actions) != 2 || snap.Outdated || snap.Error != "" || len(snap.Warnings) == 0 {
-				t.Fatalf("safe prefix not published: %+v", snap)
+			if plan == nil || len(plan.Actions) != 4 || snap.Outdated || snap.Error != "" || len(snap.Warnings) == 0 {
+				t.Fatalf("full prior plan not published: %+v", snap)
 			}
 			if _, ok := svc.SlotDirectiveAt(svc.now()); !ok {
 				t.Fatal("safe current plan cannot dispatch")
 			}
-			if _, ok := svc.SlotDirectiveAt(start.Add(2 * time.Hour)); ok {
-				t.Fatal("plan dispatches beyond its validated prefix")
+			if _, ok := svc.SlotDirectiveAt(start.Add(2 * time.Hour)); !ok {
+				t.Fatal("valid prior did not retain the full price horizon")
 			}
-			if saved == nil || len(saved.Slots) != 2 || saved.Horizon != 2 || recorded != 2 {
+			for _, slot := range svc.lastSlots {
+				if slot.LoadW != 500 {
+					t.Fatal("rejected forecast reached accepted plan")
+				}
+			}
+			if saved == nil || len(saved.Slots) != 4 || saved.Horizon != 4 || recorded != 4 {
 				t.Fatalf("diagnostic or forecast archive lost accepted horizon: saved=%+v recorded=%d", saved, recorded)
 			}
 			if err := ValidatePlan(svc.lastSlots, svc.lastParams, plan); err != nil {

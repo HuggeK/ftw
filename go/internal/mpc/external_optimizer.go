@@ -168,6 +168,10 @@ type externalError struct {
 	Message string `json:"message"`
 }
 
+func (e *externalError) Error() string {
+	return fmt.Sprintf("optimizer %s: %s", e.Code, e.Message)
+}
+
 type externalPlan struct {
 	FlexShortfallWh map[string]float64 `json:"flex_shortfall_wh,omitempty"`
 	Mode            Mode               `json:"mode"`
@@ -240,7 +244,7 @@ func (o *ExternalOptimizer) Optimize(ctx context.Context, slots []Slot, p Params
 		if response.Error == nil {
 			return Plan{}, errors.New("optimizer returned an unspecified error")
 		}
-		return Plan{}, fmt.Errorf("optimizer %s: %s", response.Error.Code, response.Error.Message)
+		return Plan{}, response.Error
 	}
 	if err := validateExternalAssets(request, response.Plan); err != nil {
 		return Plan{}, fmt.Errorf("optimizer contract rejected: %w", err)

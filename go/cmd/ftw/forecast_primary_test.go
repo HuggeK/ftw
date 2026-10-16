@@ -316,3 +316,26 @@ func trainNativeLoad(t *testing.T, r *rustForecast, target time.Time) {
 		}
 	}
 }
+
+func TestForecastRecoveryArchiveDoesNotClaimRejectedModel(t *testing.T) {
+	at := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	f := primaryFixture(at, primaryReply)
+	in := f.Snapshot(at, trackerWeather(at, at))
+	base := in.Resolve(context.Background(), trackerSlots(at, 4))
+	rawLoad := base[0].LoadW
+	for i := range base {
+		base[i].LoadW = 800
+	}
+	in.Record(base, base, "recovered-decision", at.UnixMilli())
+	issue := (<-f.queue).issue
+	champion := primarySeries(t, issue, "champion").Points[0]
+	if champion.LoadW != 800 || champion.LoadSource != "core_recovery" || champion.ModelLoad != nil || champion.LoadQuality != "fallback" {
+		t.Fatalf("recovery was attributed to rejected model: %+v", champion)
+	}
+	if raw := primarySeries(t, issue, "energyplan").Points[0]; raw.LoadW != rawLoad || raw.LoadSource == "core_recovery" {
+		t.Fatal("raw model prediction was overwritten")
+	}
+	if err := issue.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
