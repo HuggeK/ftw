@@ -131,7 +131,7 @@ func (r *rustForecast) Update(ctx context.Context, site forecastSite, o forecast
 	}
 	origin := max(o.AvailableAtMS, saved.LatestAvailableMS)
 	if weather != nil && weather.FetchedAtMs > o.AvailableAtMS {
-		return errors.New("observation weather arrived after update origin")
+		return &energyforecast.ObservationRejectedError{Err: errors.New("observation weather arrived after update origin")}
 	}
 	input := energyforecast.Observation{Interval: energyforecast.Interval{ValidStartMs: o.StartMS, ValidEndMs: o.EndMS},
 		Features: rustFeatures(time.UnixMilli(o.StartMS), site, !away, weather), AvailableAtMs: o.AvailableAtMS,

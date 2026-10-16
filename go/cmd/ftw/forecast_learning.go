@@ -47,6 +47,9 @@ func (f *forecastTracker) restoreLearning(ctx context.Context) error {
 	}
 	f.learningMu.Lock()
 	defer f.learningMu.Unlock()
+	if err := f.recoverClockJumpLearningLocked(ctx); err != nil {
+		slog.Warn("forecast load learning recovery pending", "err", err)
+	}
 	for _, signal := range []string{"pv", "load"} {
 		if err := f.applyLearningLocked(ctx, signal); err != nil {
 			slog.Warn("forecast learning restart pending", "signal", signal, "err", err)
@@ -113,6 +116,9 @@ func (f *forecastTracker) reconcileLearning(ctx context.Context) {
 	}
 	f.learningMu.Lock()
 	defer f.learningMu.Unlock()
+	if err := f.recoverClockJumpLearningLocked(ctx); err != nil {
+		slog.Warn("forecast load learning recovery pending", "err", err)
+	}
 	site := f.learningSiteLocked(f.site())
 	if site.IdentityPending {
 		return
@@ -175,6 +181,19 @@ func (f *forecastTracker) RestartLearning(ctx context.Context, signal string) er
 	// A retry of an incomplete operation retains its original cutoff.
 	if f.learningErrors[signal] != nil && previous > 0 {
 		cutoff = previous
+	}
+	return f.restartLearningLocked(ctx, site, signal, cutoff)
+}
+
+// Caller holds configMu and learningMu. Manual resets and archive-based recovery
+// share the durable intent and idempotent, signal-scoped apply.
+func (f *forecastTracker) restartLearningLocked(ctx context.Context, site forecastSite, signal string, cutoff int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	next := f.learningPeriods
+	if next.ConfigRevision != rustConfigRevision(site) {
+		next = forecastLearningPeriods{ConfigRevision: rustConfigRevision(site)}
 	}
 	if signal == "pv" {
 		next.PVMS = cutoff

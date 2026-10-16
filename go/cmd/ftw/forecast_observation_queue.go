@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/srcfl/ftw/go/internal/energyforecast"
 	"github.com/srcfl/ftw/go/internal/forecasting"
 	"github.com/srcfl/ftw/go/internal/state"
 )
@@ -106,9 +107,13 @@ func (f *forecastTracker) flushObservationsWith(ctx context.Context,
 			f.observationError = ""
 		}
 		f.mu.Unlock()
-		if err != nil {
+		rejected := job.archived && energyforecast.IsObservationRejected(err) && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled)
+		if err != nil && !rejected {
 			slog.Warn("forecast archive: observation retained for retry", "phase", phase, "start_ms", job.observation.StartMS, "err", err)
 			return
+		}
+		if rejected {
+			slog.Warn("forecast archive: archived observation rejected by model", "start_ms", job.observation.StartMS, "err", err)
 		}
 		f.pendingObservations[0] = forecastObservationJob{}
 		f.pendingObservations = f.pendingObservations[1:]

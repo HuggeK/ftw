@@ -25,7 +25,23 @@ func NewClient(transport RoundTripper) *Client {
 	return &Client{transport: transport, Timeout: DefaultTimeout}
 }
 
-type workerError struct{ detail string }
+type workerError struct {
+	detail  string
+	code    string
+	message string
+}
+
+// ObservationRejectedError marks input that cannot become trainable on retry.
+// The caller must retain its raw archive before it advances the training queue.
+type ObservationRejectedError struct{ Err error }
+
+func (e *ObservationRejectedError) Error() string { return e.Err.Error() }
+func (e *ObservationRejectedError) Unwrap() error { return e.Err }
+
+func IsObservationRejected(err error) bool {
+	var rejected *ObservationRejectedError
+	return errors.As(err, &rejected)
+}
 
 func (e workerError) Error() string { return "forecast worker rejected request: " + e.detail }
 
@@ -34,44 +50,11 @@ func (c *Client) Update(ctx context.Context, request UpdateRequest) (UpdateReply
 	if err := validateContext(request.RequestContext); err != nil {
 		return reply, err
 	}
-	if len(request.Observations) > MaxObservations {
-		return reply, errors.New("forecast update accepts at most 4096 observations")
+	if err := validateUpdateObservations(request); err != nil {
+		return reply, &ObservationRejectedError{Err: err}
 	}
 	if request.Observations == nil {
 		request.Observations = []Observation{}
-	}
-	var previousEnd int64
-	for i, o := range request.Observations {
-		if err := validateInterval(o.Interval); err != nil {
-			return reply, fmt.Errorf("observation %d: %w", i, err)
-		}
-		if o.ValidEndMs-o.ValidStartMs != 900000 || o.ValidStartMs%900000 != 0 {
-			return reply, errors.New("forecast observation must cover a complete quarter-hour")
-		}
-		if i > 0 && o.ValidStartMs < previousEnd {
-			return reply, errors.New("forecast observations overlap or are out of order")
-		}
-		previousEnd = o.ValidEndMs
-		if o.AvailableAtMs < o.ValidEndMs || o.AvailableAtMs > request.OriginMs {
-			return reply, errors.New("forecast observation was not available at origin")
-		}
-		if err := validateFeatures(o.Features, request.OriginMs); err != nil {
-			return reply, fmt.Errorf("observation %d: %w", i, err)
-		}
-		for _, signal := range []struct {
-			value   *float64
-			quality ObservationQuality
-		}{{o.PVAvailableW, o.PVQuality}, {o.HouseholdLoadW, o.LoadQuality}} {
-			if !validObservationQuality(signal.quality) {
-				return reply, errors.New("forecast observation needs explicit quality")
-			}
-			if signal.value != nil && (!finite(*signal.value) || *signal.value < 0) {
-				return reply, errors.New("forecast observation power must be finite and nonnegative")
-			}
-			if signal.value == nil && (signal.quality == QualityGood || signal.quality == QualityClipped) {
-				return reply, errors.New("good forecast observation has no measured power")
-			}
-		}
 	}
 	payload := struct {
 		Op      string `json:"op"`
@@ -80,6 +63,14 @@ func (c *Client) Update(ctx context.Context, request UpdateRequest) (UpdateReply
 		UpdateRequest
 	}{"forecast", ProtocolVersion, "update", request}
 	if err := c.call(ctx, payload, request.RequestContext, "update", &reply); err != nil {
+		var rejected workerError
+		// A bad state/configuration affects the pipeline, not this measured
+		// interval. Only explicit observation rejections may advance its queue.
+		if errors.As(err, &rejected) && rejected.code == "invalid_request" &&
+			(rejected.message == "household load exceeds configured limit" ||
+				rejected.message == "PV observation exceeds interval or power limit") {
+			return UpdateReply{}, &ObservationRejectedError{Err: err}
+		}
 		return UpdateReply{}, err
 	}
 	if err := validateState(reply.State, true); err != nil {
@@ -92,6 +83,46 @@ func (c *Client) Update(ctx context.Context, request UpdateRequest) (UpdateReply
 		return UpdateReply{}, err
 	}
 	return reply, nil
+}
+
+func validateUpdateObservations(request UpdateRequest) error {
+	if len(request.Observations) > MaxObservations {
+		return errors.New("forecast update accepts at most 4096 observations")
+	}
+	var previousEnd int64
+	for i, o := range request.Observations {
+		if err := validateInterval(o.Interval); err != nil {
+			return fmt.Errorf("observation %d: %w", i, err)
+		}
+		if o.ValidEndMs-o.ValidStartMs != 900000 || o.ValidStartMs%900000 != 0 {
+			return errors.New("forecast observation must cover a complete quarter-hour")
+		}
+		if i > 0 && o.ValidStartMs < previousEnd {
+			return errors.New("forecast observations overlap or are out of order")
+		}
+		previousEnd = o.ValidEndMs
+		if o.AvailableAtMs < o.ValidEndMs || o.AvailableAtMs > request.OriginMs {
+			return errors.New("forecast observation was not available at origin")
+		}
+		if err := validateFeatures(o.Features, request.OriginMs); err != nil {
+			return fmt.Errorf("observation %d: %w", i, err)
+		}
+		for _, signal := range []struct {
+			value   *float64
+			quality ObservationQuality
+		}{{o.PVAvailableW, o.PVQuality}, {o.HouseholdLoadW, o.LoadQuality}} {
+			if !validObservationQuality(signal.quality) {
+				return errors.New("forecast observation needs explicit quality")
+			}
+			if signal.value != nil && (!finite(*signal.value) || *signal.value < 0) {
+				return errors.New("forecast observation power must be finite and nonnegative")
+			}
+			if signal.value == nil && (signal.quality == QualityGood || signal.quality == QualityClipped) {
+				return errors.New("good forecast observation has no measured power")
+			}
+		}
+	}
+	return nil
 }
 
 func (c *Client) Predict(ctx context.Context, request PredictRequest) (PredictReply, error) {
@@ -211,7 +242,12 @@ func (c *Client) call(ctx context.Context, request any, expected RequestContext,
 		if detail == "" || detail == "null" {
 			detail = "unspecified error"
 		}
-		return workerError{detail}
+		var reason struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		}
+		_ = json.Unmarshal(echo.Error, &reason)
+		return workerError{detail: detail, code: reason.Code, message: reason.Message}
 	}
 	if raw, ok := fields["model_revision"]; !ok || bytes.Equal(raw, []byte("null")) {
 		return errors.New("forecast reply lacks a model revision")

@@ -89,16 +89,19 @@ type forecastTracker struct {
 	observationLoadValid bool
 	issueArchiveError    bool
 	sourceChoice         forecastSourceChoice // guarded by mu
+
+	learningRecoveryChecked string // guarded by learningMu; physical learning identity
+	learningRecoveryAfterMS int64  // a pre-sync clock retries when archived evidence becomes available
 }
 
 func (f *forecastTracker) Start(ctx context.Context) error {
-	if err := f.restoreLearning(ctx); err != nil {
-		return err
-	}
 	initCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	err := f.store.InitForecastArchive(initCtx)
 	cancel()
 	if err != nil {
+		return err
+	}
+	if err := f.restoreLearning(ctx); err != nil {
 		return err
 	}
 	f.queue = make(chan forecastJob, 8)

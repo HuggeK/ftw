@@ -428,6 +428,29 @@ func (s *Store) LoadForecastIssues(ctx context.Context, since, until int64, limi
 	return out, nil
 }
 
+// LoadForecastCohortSite reads one bounded issue to bind an older evaluation
+// cohort to its physical learning identity. Cohorts change on worker updates;
+// loading every issue and model snapshot would delay recovery on small boxes.
+func (s *Store) LoadForecastCohortSite(ctx context.Context, cohort string, until int64) (*forecasting.SiteContext, error) {
+	var data []byte
+	err := s.db.QueryRowContext(ctx, `SELECT payload FROM forecast_issues
+ WHERE config_version=? AND issued_at_ms<=? ORDER BY issued_at_ms DESC,id DESC LIMIT 1`, cohort, until).Scan(&data)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	issue, _, err := decodeForecastIssue(data)
+	if err != nil {
+		return nil, err
+	}
+	if issue.ConfigVersion != cohort {
+		return nil, errors.New("forecast cohort payload does not match archive key")
+	}
+	return issue.Site, nil
+}
+
 func (s *Store) LoadForecastObservations(ctx context.Context, since, until int64) (out []forecasting.Observation, err error) {
 	timing := newForecastReadTiming(ctx, "observations")
 	defer timing.finish(&err)

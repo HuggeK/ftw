@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/srcfl/ftw/go/internal/energyforecast"
 	"github.com/srcfl/ftw/go/internal/forecasting"
 	"github.com/srcfl/ftw/go/internal/state"
 )
@@ -237,5 +238,87 @@ func TestForecastObservationQueueOverflowHealthRecovers(t *testing.T) {
 	f.flushObservationsWith(context.Background(), func(context.Context, forecasting.Observation) error { return nil }, func(context.Context, forecastObservationJob) error { return nil })
 	if f.observationOverflow || len(f.pendingObservations) != 0 || f.observationDrops != 1 {
 		t.Fatal("current health did not recover or historical loss was erased")
+	}
+}
+
+func TestForecastObservationPermanentRejectionDoesNotStarveNextInterval(t *testing.T) {
+	for _, kind := range []string{"observation", "transport", "state", "deadline", "archive"} {
+		t.Run(kind, func(t *testing.T) {
+			f := trackerFixture(time.Now())
+			bad := observationJobFixture()
+			good := bad
+			good.observation.StartMS += 900000
+			good.observation.EndMS += 900000
+			good.observation.AvailableAtMS += 900000
+			f.enqueueObservation(bad)
+			f.enqueueObservation(good)
+			var saved []forecasting.Observation
+			var trained []forecasting.Observation
+			failed := false
+			save := func(_ context.Context, o forecasting.Observation) error {
+				if kind == "archive" && !failed {
+					failed = true
+					return &energyforecast.ObservationRejectedError{Err: errors.New("no raw archive acknowledgement")}
+				}
+				saved = append(saved, o)
+				return nil
+			}
+			update := func(_ context.Context, job forecastObservationJob) error {
+				if job.observation == bad.observation && !failed {
+					failed = true
+					switch kind {
+					case "observation":
+						return &energyforecast.ObservationRejectedError{Err: errors.New("household load exceeds configured limit")}
+					case "transport", "state":
+						return errors.New("retry model pipeline failure")
+					case "deadline":
+						return errors.Join(&energyforecast.ObservationRejectedError{Err: errors.New("rejection")}, context.DeadlineExceeded)
+					}
+				}
+				trained = append(trained, job.observation)
+				return nil
+			}
+			f.flushObservationsWith(context.Background(), save, update)
+			if kind == "observation" {
+				if len(f.pendingObservations) != 0 || !reflect.DeepEqual(trained, []forecasting.Observation{good.observation}) {
+					t.Fatal("permanent bad head starved valid training")
+				}
+			} else {
+				if len(f.pendingObservations) != 2 || f.observationError == "" {
+					t.Fatal("transient/pipeline/unarchived failure discarded evidence")
+				}
+				f.flushObservationsWith(context.Background(), save, update)
+				if len(f.pendingObservations) != 0 || len(trained) != 2 {
+					t.Fatal("retry did not train retained evidence")
+				}
+			}
+			if !reflect.DeepEqual(saved, []forecasting.Observation{bad.observation, good.observation}) {
+				t.Fatalf("archive changed or repeated: %+v", saved)
+			}
+		})
+	}
+}
+
+func TestForecastObservationNativeLimitRejectionKeepsRawAndTrainsNext(t *testing.T) {
+	st := hostForecastDB(t)
+	r := learningNative(t, st)
+	site := hostForecastSite()
+	start := time.Now().Add(-time.Hour).Truncate(time.Hour)
+	bad := learningObservation(site, start)
+	bad.LoadW = 107000 // Worker acceptance limit, not a site's grid fuse.
+	good := learningObservation(site, start.Add(15*time.Minute))
+	f := learningTracker(st, &site, start.Add(time.Hour), r)
+	f.enqueueObservation(forecastObservationJob{site: site, observation: bad})
+	f.enqueueObservation(forecastObservationJob{site: site, observation: good})
+	f.flushObservations(context.Background())
+	if len(f.pendingObservations) != 0 {
+		t.Fatal("permanently rejected load blocked next interval")
+	}
+	if got := r.LearningStatus(site, "load"); got.LatestTrainingMS != good.EndMS {
+		t.Fatalf("next good interval did not train: %+v", got)
+	}
+	rows, err := st.LoadForecastObservations(context.Background(), start.UnixMilli(), start.Add(time.Hour).UnixMilli())
+	if err != nil || !reflect.DeepEqual(rows, []forecasting.Observation{bad, good}) {
+		t.Fatalf("rejection rewrote raw evidence: %+v %v", rows, err)
 	}
 }

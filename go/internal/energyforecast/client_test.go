@@ -83,6 +83,46 @@ func TestClientPreservesUnknownAndProvisional(t *testing.T) {
 	}
 }
 
+func TestClientObservationRejectionLeavesModelFailuresRetryable(t *testing.T) {
+	for _, tc := range []struct {
+		code, message string
+		permanent     bool
+	}{
+		{"invalid_request", "household load exceeds configured limit", true},
+		{"invalid_request", "PV observation exceeds interval or power limit", true},
+		{"invalid_request", "invalid household-load configuration", false},
+		{"invalid_state", "household load exceeds configured limit", false},
+		{"invalid_state", "saved model is malformed", false},
+		{"numerical_failure", "update failed", false},
+		{"future_data", "clock precedes saved state", false},
+	} {
+		t.Run(tc.code+"/"+tc.message, func(t *testing.T) {
+			c := replying(func(r map[string]any) {
+				r["ok"] = false
+				r["error"] = map[string]string{"code": tc.code, "message": tc.message}
+			})
+			_, err := c.Update(context.Background(), updateRequest())
+			if err == nil || IsObservationRejected(err) != tc.permanent {
+				t.Fatalf("classification=%v err=%v", IsObservationRejected(err), err)
+			}
+		})
+	}
+	for _, value := range []float64{math.NaN(), math.Inf(1), -1} {
+		r := updateRequest()
+		r.Observations[0].HouseholdLoadW = ptr(value)
+		_, err := replying(nil).Update(context.Background(), r)
+		if !IsObservationRejected(err) {
+			t.Fatalf("invalid observation was not classified: %v", err)
+		}
+	}
+	r := updateRequest()
+	r.State = json.RawMessage(`{"bad-state":`)
+	_, err := replying(nil).Update(context.Background(), r)
+	if err == nil || IsObservationRejected(err) {
+		t.Fatalf("invalid state discarded valid observation: %v", err)
+	}
+}
+
 func TestClientRejectsWrongReplyIdentity(t *testing.T) {
 	for _, key := range []string{"op", "version", "action", "request_id", "site_id", "config_revision", "origin_ms", "ok"} {
 		t.Run(key, func(t *testing.T) {
