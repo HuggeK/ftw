@@ -79,6 +79,8 @@ type cadence struct {
 	liveAt     time.Time
 	lpLast     *cloudwire.LP
 	lpAt       time.Time
+	carLast    *cloudwire.Cars
+	carAt      time.Time
 	pricesKey  string
 	pricesAt   time.Time
 	anyAt      time.Time // last live or hb
@@ -92,8 +94,8 @@ type cadence struct {
 	// still waiting for its period. Composing reads the box, and on a Pi
 	// the loadpoint view is not free, so it happens no faster than a
 	// message could go.
-	liveCheckedAt, lpCheckedAt time.Time
-	liveWaiting, lpWaiting     bool
+	liveCheckedAt, lpCheckedAt, carCheckedAt time.Time
+	liveWaiting, lpWaiting, carWaiting       bool
 	// arrived says a driver finished a poll since live was last composed,
 	// while a phone watches.
 	arrived bool
@@ -315,6 +317,28 @@ func (w *writer) tick(snap grantSnapshot, st *cadence, now time.Time) error {
 				}
 			case changed:
 				st.lpWaiting = true
+			}
+		}
+	}
+	// car goes as lp does: at most once per lp's period, and in full with
+	// it (docs/protocol-cloud.md, car).
+	if cs, ok := l.opts.Site.(CarSite); ok && snap.allowed(cloudwire.MsgCar) && (full || now.Sub(st.carCheckedAt) >= lpPeriod) {
+		st.carCheckedAt = now
+		st.carWaiting = false
+		if in, ok := cs.Cars(); ok {
+			cars := ProjectCars(snap.g.GrantKey, in)
+			changed := st.carLast == nil || carsChanged(*st.carLast, cars)
+			switch {
+			case full || (changed && now.Sub(st.carAt) >= lpPeriod):
+				sent, err := w.sendBody(snap, cloudwire.MsgCar, &cars, false)
+				if err != nil {
+					return err
+				}
+				if sent {
+					st.carLast, st.carAt = &cars, now
+				}
+			case changed:
+				st.carWaiting = true
 			}
 		}
 	}
@@ -608,6 +632,36 @@ func lpChanged(prev, cur cloudwire.LP) bool {
 	return false
 }
 
+// carsKey is the car class without its ages and its measured values, which
+// carsChanged compares with lp's deadbands instead.
+func carsKey(c cloudwire.Cars) string {
+	k := cloudwire.Cars{Cars: make([]cloudwire.Car, 0, len(c.Cars))}
+	for _, car := range c.Cars {
+		car.SocAgeS, car.SocPermille, car.EnergySinceWh = nil, nil, 0
+		k.Cars = append(k.Cars, car)
+	}
+	return digest(k)
+}
+
+// carsChanged reports whether cur says something prev did not. The energy
+// since a reading counts as lp's sessionWh does, and an estimated level as
+// lp's level does, so a charging car does not send its class at every
+// reading.
+func carsChanged(prev, cur cloudwire.Cars) bool {
+	if carsKey(prev) != carsKey(cur) {
+		return true
+	}
+	for i, c := range cur.Cars {
+		p := prev.Cars[i]
+		if abs(p.EnergySinceWh-c.EnergySinceWh) >= lpEnergyBandWh ||
+			(p.SocPermille == nil) != (c.SocPermille == nil) ||
+			(c.SocPermille != nil && abs(*p.SocPermille-*c.SocPermille) >= lpSocBandPermille) {
+			return true
+		}
+	}
+	return false
+}
+
 func abs(v int64) int64 {
 	if v < 0 {
 		return -v
@@ -790,6 +844,13 @@ func (l *Link) sample() []sentFrame {
 		lp = l.projectLP(snap, lp)
 		lp.Header = h
 		add(cloudwire.MsgLP, lp)
+	}
+	if cs, ok := l.opts.Site.(CarSite); ok && snap.allowed(cloudwire.MsgCar) {
+		if in, ok := cs.Cars(); ok {
+			cars := ProjectCars(gk, in)
+			cars.Header = h
+			add(cloudwire.MsgCar, cars)
+		}
 	}
 	if p, ok := l.opts.Site.Prices(); ok && snap.allowed(cloudwire.MsgPrices) {
 		p.Header = h

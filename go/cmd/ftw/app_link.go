@@ -788,7 +788,7 @@ func startAppLink(
 	caps = append(caps, appproto.CapAccessAgents)
 	// One view for every agent session, so a charger's plug-in count is
 	// the same whichever session reads it.
-	views := agentViews{site: &cloudSite{site: site, api: gateway}, cars: carsRT}
+	views := agentViews{site: &cloudSite{site: site, api: gateway, cars: carsRT}, cars: carsRT}
 
 	// handlerFor builds one handler for one session: a phone's stream, or a
 	// watch's exchange. They share the ports above, which are read-only

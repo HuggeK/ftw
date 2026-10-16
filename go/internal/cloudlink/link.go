@@ -118,6 +118,14 @@ type Site interface {
 	Prices() (p cloudwire.Prices, ok bool)
 }
 
+// CarSite is a Site that keeps cars (docs/cars.md). Cars is every car in
+// the box's order, with its names, which the link leaves at home
+// (ProjectCars). ok is false while the box keeps no cars. A Site without it
+// sends no car class.
+type CarSite interface {
+	Cars() (cars []protocol.Car, ok bool)
+}
+
 // Live is the live class before ids are cut.
 type Live struct {
 	// Fields uses the app protocol's frozen ids as text keys.
@@ -1036,8 +1044,9 @@ func (snap grantSnapshot) allowed(class string) bool {
 // when the box takes the tunnel.
 func (l *Link) caps(snap grantSnapshot) []string {
 	var out []string
-	for _, c := range []string{cloudwire.MsgLive, cloudwire.MsgLP, cloudwire.MsgPrices, cloudwire.MsgHB, cloudwire.MsgEvent} {
-		if snap.allowed(c) {
+	_, cars := l.opts.Site.(CarSite)
+	for _, c := range []string{cloudwire.MsgLive, cloudwire.MsgLP, cloudwire.MsgCar, cloudwire.MsgPrices, cloudwire.MsgHB, cloudwire.MsgEvent} {
+		if snap.allowed(c) && (c != cloudwire.MsgCar || cars) {
 			out = append(out, c)
 		}
 	}

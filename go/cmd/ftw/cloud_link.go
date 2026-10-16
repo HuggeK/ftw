@@ -17,6 +17,7 @@ import (
 	"github.com/srcfl/ftw/go/internal/appenroll"
 	"github.com/srcfl/ftw/go/internal/appproto"
 	"github.com/srcfl/ftw/go/internal/appuplink"
+	"github.com/srcfl/ftw/go/internal/cars"
 	"github.com/srcfl/ftw/go/internal/cloudlink"
 	"github.com/srcfl/ftw/go/internal/control"
 	"github.com/srcfl/ftw/go/internal/loadpoint"
@@ -25,6 +26,7 @@ import (
 	"github.com/srcfl/ftw/go/internal/state"
 	"github.com/srcfl/ftw/go/internal/telemetry"
 	"github.com/srcfl/ftw/go/internal/units"
+	"github.com/srcfl/ftw/go/protocol"
 	"github.com/srcfl/ftw/go/protocol/cloudwire"
 )
 
@@ -43,6 +45,10 @@ type cloudSite struct {
 	site   *appSite
 	api    *lateAPI
 	prices *appPrices
+	// cars keeps the box's cars, nil on a box without the car runtime.
+	// With it, the link sends the car class, and a charger's level and
+	// goal fields are views of its session's car.
+	cars *cars.Runtime
 
 	sessMu   sync.Mutex
 	sessions map[string]*plugSession
@@ -143,10 +149,74 @@ func (c *cloudSite) Loadpoints() (cloudwire.LP, bool) {
 	for _, st := range states {
 		out.Loadpoints = append(out.Loadpoints, c.loadpoint(st, now))
 	}
+	c.joinCars(out.Loadpoints)
 	for _, f := range feedback {
 		out.Feedback = append(out.Feedback, cloudFeedback(f, now))
 	}
 	return out, true
+}
+
+// Cars is every car the box keeps, for the car class. The link cuts the
+// ids and leaves the names at home (cloudlink.ProjectCars).
+func (c *cloudSite) Cars() ([]protocol.Car, bool) {
+	if c.cars == nil {
+		return nil, false
+	}
+	return c.cars.Cars(), true
+}
+
+// joinCars makes each charger's level and goal fields views of its
+// session's car, read with the car class's own view.
+func (c *cloudSite) joinCars(lps []cloudwire.Loadpoint) {
+	if c.cars == nil {
+		return
+	}
+	byID := map[string]protocol.Car{}
+	for _, car := range c.cars.Cars() {
+		byID[car.ID] = car
+	}
+	for i := range lps {
+		if car, ok := byID[lps[i].CarID]; ok && lps[i].CarID != "" {
+			joinCar(&lps[i], car)
+		}
+	}
+}
+
+// A charger's socSource on the wire (docs/protocol-cloud.md, lp).
+const (
+	lpSoCVehicle  = "vehicle"
+	lpSoCInferred = "inferred"
+	lpSoCAssumed  = "assumed"
+	lpSoCUnknown  = "unknown"
+)
+
+// joinCar makes a charger's level and goal fields views of its session's
+// car (docs/protocol-cloud.md, lp): a phone that joins carId to the car
+// class finds the two agree, and an app that knows only chargers reads the
+// car's own level and goal. readyByMs stays the box's next ready time for
+// that goal.
+func joinCar(lp *cloudwire.Loadpoint, car protocol.Car) {
+	lp.SocPermille, lp.SocAgeS = car.SocPermille, nil
+	switch {
+	case car.SocPermille == nil:
+		lp.SocSource = lpSoCUnknown
+	case car.SocSource == protocol.CarSoCAssumed:
+		lp.SocSource = lpSoCAssumed
+	case car.SocEstimate || car.SocSource != protocol.CarSoCVehicle:
+		lp.SocSource = lpSoCInferred
+	default:
+		lp.SocSource, lp.SocAgeS = lpSoCVehicle, car.SocAgeS
+	}
+	lp.TargetPermille, lp.Recurring = nil, false
+	if g := car.Goal; g != nil {
+		if g.TargetPermille > 0 {
+			lp.TargetPermille = ptr(g.TargetPermille)
+		}
+		lp.Recurring = g.Days != 0
+	} else {
+		lp.ReadyByMs = nil
+	}
+	lp.SurplusOnly = car.SurplusOnly
 }
 
 func (c *cloudSite) session(id string, plugged bool) string {
@@ -311,12 +381,12 @@ func startCloudLink(
 	ctx context.Context, statePath, build string, st *state.Store, enroll *appenroll.Identity,
 	tel *telemetry.Store, ctrl *control.State, ctrlMu *sync.Mutex, revision *control.Revision,
 	siteMeterStale time.Duration, priceSvc *prices.Service, gateway *lateAPI, notices *cloudNotices,
-	tunnel *appuplink.Tunnel,
+	tunnel *appuplink.Tunnel, carsRT *cars.Runtime,
 ) *cloudlink.Link {
 	if st == nil || enroll == nil {
 		return nil
 	}
-	site := &cloudSite{api: gateway, site: &appSite{
+	site := &cloudSite{api: gateway, cars: carsRT, site: &appSite{
 		tel: tel, ctrl: ctrl, ctrlMu: ctrlMu, revision: revision,
 		started: processStarted, siteMeterStale: siteMeterStale,
 	}}

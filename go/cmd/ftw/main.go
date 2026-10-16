@@ -2425,7 +2425,7 @@ func main() {
 		appTunnel = appUplink.Tunnel()
 	}
 	cloudLink := startCloudLink(ctx, statePath, Version, st, appEnroll,
-		tel, ctrl, ctrlMu, controlRev, appLinkWatchdog, priceSvc, appAPI, cloudNotify, appTunnel)
+		tel, ctrl, ctrlMu, controlRev, appLinkWatchdog, priceSvc, appAPI, cloudNotify, appTunnel, carsRT)
 	appCloud.bind(cloudLink)
 	if cloudLink != nil {
 		agents.home = cloudLink.Home

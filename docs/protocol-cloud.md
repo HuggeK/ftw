@@ -455,7 +455,12 @@ With cars ([docs/cars.md](cars.md)), the level fields of a Loadpoint
 (`socPermille`, `socSource`, `socAgeS`, `targetPermille`, `readyByMs`,
 `recurring`, `surplusOnly`) are views of the session's car, kept for apps
 that know only chargers. The join is `carId` to the `car` class's `id`, and
-where the two disagree the `car` class wins. A box drops the views two
+where the two disagree the `car` class wins. The box fills the views from
+the car's own: `socPermille` as the car's; `socSource` `vehicle` for the
+car's exact reading, with its `socAgeS`, `assumed` for an assumed level,
+`unknown` with no level, and `inferred` otherwise; `targetPermille` and
+`recurring` (`days` not 0) from its goal; `surplusOnly` as the car's; and
+`readyByMs` as the next ready time of that goal. A box drops the views two
 releases after the one that first sends `car`, and from then lists
 `lp.bare` in `hello.caps`: its Loadpoints carry no level fields. A box from
 before cars never lists it.
@@ -533,9 +538,14 @@ name, maker, VIN, identifiers and sources from the box over Noise.
 
 The box sends `car` when a car's level, source, goal or preference changes,
 at most once per period like `lp`, and in full every 15 minutes and after a
-`resync`, as `lp`. The change test ignores `socAgeS` and counts
-`energySinceWh` as changed at 100 Wh, as `lp` counts `sessionWh`. A service
-that does not know the class drops it, as for any unknown `t`.
+`resync`, as `lp`. The change test ignores `socAgeS`, counts
+`energySinceWh` as changed at 100 Wh, as `lp` counts `sessionWh`, and
+`socPermille` at 10 or when it appears or goes, as `lp` counts its level, so
+an estimate that rises with a charging car does not send the class at every
+reading. Whether the level is an estimate counts at once. The box lists
+`car` in `hello.caps` while it keeps cars and the grant has
+`ftw.live.read`. A service that does not know the class drops it, as for any
+unknown `t`.
 
 ### `prices`: `ftw.live.read`
 
