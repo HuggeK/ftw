@@ -3027,6 +3027,10 @@ func main() {
 			// resume charging.
 			evCurtailHeadroomW := loadpoint.SurplusPotentialW(lpStatesSnapshot)
 			boostEVW, boostReserveSoC := activeBatteryBoostTotals(lpController, lpStatesSnapshot, tickNow)
+			var evFuseDemands []loadpoint.FuseDemand
+			if lpController != nil {
+				evFuseDemands = lpController.FuseDemands()
+			}
 
 			ctrlMu.Lock()
 			ctrl.EVSurplusOnlyReserveW = evReserveW
@@ -3035,6 +3039,7 @@ func main() {
 			ctrl.BatteryBoostEVChargingW = boostEVW
 			ctrl.BatteryBoostReserveSoC = boostReserveSoC
 			ctrl.EVCommandedW = loadpoint.CommandedEVPowerW(lpStatesSnapshot)
+			ctrl.SetEVFuseDemands(evFuseDemands)
 			fuseMaxW := ctrl.SiteFuseAmps * ctrl.SiteFuseVoltage * float64(ctrl.SiteFusePhases)
 			targets := control.ComputeDispatch(tel, ctrl, capsSnap, fuseMaxW)
 			planMissingNow := ctrl.Mode.IsPlannerMode() && ctrl.PlanStale

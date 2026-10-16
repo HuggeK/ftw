@@ -757,7 +757,8 @@ func (s *Store) RecordDriverError(name, err string) {
 // rendering the stale card. A replacement under the same name that no
 // longer emits a metric (e.g. site-meter phase currents) must not inherit
 // the old, ageing snapshot, which would read as stale and block dispatch.
-// Historical TS-DB samples are NOT touched; they stay queryable.
+// A battery's outstanding order bound survives until raw power confirms its
+// replacement. Historical TS-DB samples stay queryable.
 func (s *Store) Remove(driver string) {
 	s.mu.Lock()
 	for _, t := range allDerTypes {
@@ -773,11 +774,7 @@ func (s *Store) Remove(driver string) {
 		c.Baseline, c.StepAfter = nil, nil
 		s.commands[k] = c
 	}
-	for k, command := range s.commands {
-		if command.Driver == driver {
-			delete(s.commands, k)
-		}
-	}
+	s.clearCommandEvidenceLocked(driver, time.Now())
 	s.mu.Unlock()
 
 	prefix := driver + ":"

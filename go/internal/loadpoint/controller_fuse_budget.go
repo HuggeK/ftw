@@ -19,11 +19,14 @@ type fuseRequest struct {
 // already offered share. Metered reductions earn new room only next tick.
 func (c *Controller) freezeFuseBudget(now time.Time, samples map[string]EVSample) {
 	c.tickFuseCaps = nil
+	c.tickFusePhases = 0
 	if c.fuseEVMax == nil {
+		clear(c.fuseResumeTicks)
 		return
 	}
 	total, ok := c.fuseEVMax()
 	if !ok || total < 0 {
+		clear(c.fuseResumeTicks)
 		return
 	}
 	if !finite(total) {
@@ -36,7 +39,7 @@ func (c *Controller) freezeFuseBudget(now time.Time, samples map[string]EVSample
 		sample := samples[cfg.DriverName]
 		st, _ := c.manager.State(cfg.ID)
 		st.PluggedIn = sample.Connected && !sample.ConnectionUnknown
-		request := fuseRequest{cfg: cfg, deadline: st.TargetTime}
+		request := fuseRequest{cfg: c.fuseConfig(now, cfg), deadline: st.TargetTime}
 		if sample.Connected && finite(sample.PowerW) {
 			request.liveW = math.Max(0, sample.PowerW)
 			liveTotal += request.liveW
@@ -90,9 +93,40 @@ func (c *Controller) freezeFuseBudget(now time.Time, samples map[string]EVSample
 		// Do not spend another car's curtailment before its meter confirms it.
 		want := math.Min(target, request.liveW+increase)
 		cap := floorChargeW(want, request.cfg.MinChargeW, request.cfg.MaxChargeW, request.cfg.AllowedStepsW)
+		cap = c.recoverFuseCap(request.cfg.ID, request.wantW, cap)
 		c.tickFuseCaps[request.cfg.ID] = cap
 		increase -= math.Max(0, cap-request.liveW)
 	}
+}
+
+func (c *Controller) fuseConfig(now time.Time, cfg Config) Config {
+	if hold, held := c.GetManualHold(cfg.ID, now); held {
+		cfg.MinChargeW = manualMinChargeW(cfg, hold, c.siteFuse())
+	}
+	return cfg
+}
+
+func (c *Controller) recoverFuseCap(id string, wantW, capW float64) float64 {
+	if wantW <= 0 {
+		delete(c.fuseResumeTicks, id)
+		return capW
+	}
+	if capW <= 0 {
+		if c.fuseResumeTicks == nil {
+			c.fuseResumeTicks = map[string]int{}
+		}
+		c.fuseResumeTicks[id] = 0
+		return 0
+	}
+	if ready, paused := c.fuseResumeTicks[id]; paused {
+		ready++
+		if ready < fuseResumeSafeTicks {
+			c.fuseResumeTicks[id] = ready
+			return 0
+		}
+		delete(c.fuseResumeTicks, id)
+	}
+	return capW
 }
 
 // A new single-phase offer can land on the busiest phase. Do not spend a
@@ -107,26 +141,53 @@ func (c *Controller) sharedPhaseIncreaseW(now time.Time, requests []fuseRequest,
 		return 0, false
 	}
 	if !finite(l1) || !finite(l2) || !finite(l3) {
-		return 0, true
+		return -liveTotal, true
 	}
 	phaseCount := site.Phases()
 	unknownPhase := false
 	for _, request := range requests {
-		mode := request.cfg.PhaseMode
-		if hold, ok := c.GetManualHold(request.cfg.ID, now); ok && hold.PhaseMode != "" {
-			mode = hold.PhaseMode
-		}
-		if mode == "1p" || mode == "auto" {
+		mode := c.phaseModeForFuse(now, request.cfg)
+		if mode != "3p" {
 			phaseCount = 1
 			unknownPhase = true
 		}
 	}
+	c.tickFusePhases = phaseCount
 	worst := math.Max(math.Abs(l1), math.Max(math.Abs(l2), math.Abs(l3)))
 	deltaA := site.MaxAmps - fusePhaseMarginA - worst
 	if deltaA < 0 && unknownPhase {
 		return -liveTotal, true
 	}
 	return deltaA * site.Voltage * float64(phaseCount), true
+}
+
+// Empty is the driver's locked-3p default unless the command branch selects
+// auto or the surplus day lock selects 1p. Do not advance surplus hysteresis
+// here: an enabled unlock may arm later in this tick, so retain its 1p bound.
+func (c *Controller) phaseModeForFuse(now time.Time, cfg Config) string {
+	sched, _ := c.manager.GetSchedule(cfg.ID)
+	surplus := cfg.SurplusOnly
+	if !sched.HasTarget() && sched.SurplusUnlockBatSoC > 0 && c.batSoC != nil &&
+		!(c.tickDirectiveActive && c.tickDirectiveOK && c.tickDirective.LoadpointFallback[cfg.ID]) {
+		surplus = true
+	}
+	mode := cfg.PhaseMode
+	if hold, held := c.GetManualHold(cfg.ID, now); held {
+		if hold.PhaseMode != "" {
+			mode = hold.PhaseMode
+		}
+		if mode == "" && surplus {
+			mode = "auto"
+		}
+	} else {
+		// A surplus dwell can change while the offer is computed. Only a
+		// fixed 3p mode earns three phases of new headroom in this guard.
+		mode = resolvePhaseMode(mode, sched.HasTarget(), c.surplusLockedTo1P(cfg.ID), surplus, "")
+	}
+	if mode == "" {
+		return "3p"
+	}
+	return mode
 }
 
 func (c *Controller) currentDirective(now time.Time) (Directive, bool) {
@@ -142,6 +203,9 @@ func (c *Controller) currentDirective(now time.Time) (Directive, bool) {
 func (c *Controller) fuseCapFor(id string) (float64, bool) {
 	if c.tickFuseCaps != nil {
 		return c.tickFuseCaps[id], true
+	}
+	if c.tickDirectiveActive {
+		return 0, false // The tick's one callback read found no constraint.
 	}
 	if c.fuseEVMax != nil {
 		return c.fuseEVMax()
