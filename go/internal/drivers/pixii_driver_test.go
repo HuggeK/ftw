@@ -308,7 +308,7 @@ func (m *gatedPixiiModbus) WriteMulti(addr uint16, values []uint16) error {
 
 func (m *gatedPixiiModbus) Close() error { return m.inner.Close() }
 
-func TestPixiiRecoversAfterTransportGiveUp(t *testing.T) {
+func TestPixiiRecoversAfterTransportOutage(t *testing.T) {
 	path := filepath.Join("..", "..", "..", "drivers", "pixii.lua")
 	tel := telemetry.NewStore()
 	inner := newPixiiTestModbus()
@@ -329,7 +329,8 @@ func TestPixiiRecoversAfterTransportGiveUp(t *testing.T) {
 	if _, err := d.Poll(context.Background()); err != nil {
 		t.Fatalf("live poll: %v", err)
 	}
-	if tel.Get("pixii", telemetry.DerBattery) == nil {
+	before := tel.Get("pixii", telemetry.DerBattery)
+	if before == nil {
 		t.Fatal("expected battery telemetry before the blip")
 	}
 
@@ -338,18 +339,24 @@ func TestPixiiRecoversAfterTransportGiveUp(t *testing.T) {
 		if _, err := d.Poll(context.Background()); err == nil {
 			t.Fatalf("outage poll %d succeeded", poll)
 		}
+		if got := tel.Get("pixii", telemetry.DerBattery); got == nil || !got.UpdatedAt.Equal(before.UpdatedAt) {
+			t.Fatalf("outage poll %d refreshed battery telemetry: %+v", poll, got)
+		}
 	}
 
 	bus.setDown(false)
 	if _, err := d.Poll(context.Background()); err != nil {
 		t.Fatalf("recovery poll after Modbus returned: %v", err)
 	}
-	if d.reprobes() != 1 {
-		t.Fatalf("reprobes = %d, want 1: pixii.lua gives up every register after 3 misses", d.reprobes())
+	if d.reprobes() != 0 {
+		t.Fatalf("reprobes = %d, want 0: Pixii should recover without reloading the driver", d.reprobes())
 	}
 	got := tel.Get("pixii", telemetry.DerBattery)
 	if got == nil || got.SoC == nil || *got.SoC != 0.94 {
 		t.Fatalf("recovered battery = %+v, want SoC 0.94", got)
+	}
+	if !got.UpdatedAt.After(before.UpdatedAt) {
+		t.Fatal("recovery poll did not refresh battery telemetry")
 	}
 	h := tel.DriverHealth("pixii")
 	if h == nil || h.DeviceFault || !h.IsOnline() {
