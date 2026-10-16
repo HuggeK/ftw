@@ -271,5 +271,6 @@ func (m *Manager) directManifestRuntimePolicy(
 		AuthPostPath:  matched.Metadata.AuthPostPath,
 		AuthPostPaths: append([]string(nil), matched.Metadata.AuthPostPaths...),
 		ConfigSecrets: append([]string(nil), matched.Metadata.ConfigSecrets...),
+		Capabilities:  append([]string(nil), matched.Metadata.Capabilities...),
 	}, nil
 }

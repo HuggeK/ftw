@@ -167,21 +167,26 @@ func driverDeclaresReadOnly(L *lua.LState) bool {
 }
 
 func driverDeclaresReadOnlyBattery(L *lua.LState) bool {
-	if !driverDeclaresReadOnly(L) {
+	return driverDeclaresReadOnly(L) && driverDeclaresCapability(L, "battery")
+}
+
+// driverDeclaresCapability reports whether the DRIVER table lists capability.
+func driverDeclaresCapability(L *lua.LState, capability string) bool {
+	meta, ok := L.GetGlobal("DRIVER").(*lua.LTable)
+	if !ok {
 		return false
 	}
-	meta := L.GetGlobal("DRIVER").(*lua.LTable)
 	caps, ok := meta.RawGetString("capabilities").(*lua.LTable)
 	if !ok {
 		return false
 	}
-	hasBattery := false
+	found := false
 	caps.ForEach(func(_, value lua.LValue) {
-		if strings.EqualFold(value.String(), "battery") {
-			hasBattery = true
+		if strings.EqualFold(value.String(), capability) {
+			found = true
 		}
 	})
-	return hasBattery
+	return found
 }
 
 // Init calls driver_init(config) if defined. config is the optional
@@ -647,6 +652,26 @@ func registerHost(L *lua.LState, env *HostEnv) {
 	host.RawSetString("unix_ms", L.NewFunction(func(L *lua.LState) int {
 		L.Push(lua.LNumber(time.Now().UnixMilli()))
 		return 1
+	}))
+	// The site's coordinates, for a vehicle driver only: it measures its
+	// car's distance from the site and emits site_distance_m. Other drivers
+	// talk to vendor clouds that have no use for where the home is. What
+	// makes a driver a vehicle driver is its signed catalog entry: a Lua
+	// file's own DRIVER table could claim anything, so a bundled or local
+	// file gets nil.
+	host.RawSetString("site_location", L.NewFunction(func(L *lua.LState) int {
+		if env.SiteLocation == nil || !env.RuntimePolicy.Lists("vehicle") {
+			L.Push(lua.LNil)
+			return 1
+		}
+		lat, lon, ok := env.SiteLocation()
+		if !ok {
+			L.Push(lua.LNil)
+			return 1
+		}
+		L.Push(lua.LNumber(lat))
+		L.Push(lua.LNumber(lon))
+		return 2
 	}))
 	host.RawSetString("reserve_vehicle_wake", L.NewFunction(func(L *lua.LState) int {
 		allowed, retry, err := false, 30*time.Minute, ErrNoCapability

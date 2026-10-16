@@ -16,6 +16,49 @@ import (
 // car's level: a level stays the car's until energy flows (docs/cars.md).
 const VehicleMaxAge = 5 * time.Minute
 
+// A vehicle driver may give the car's distance from the site instead of
+// at_site. Within SiteNearM the car is here; beyond SiteAwayM it is
+// elsewhere; between, the box does not know. The site's position is the
+// weather pin, set for forecasts with a click on a map shown at zoom 11, so
+// it can be off by a kilometre or more. A car that wrongly reads as
+// elsewhere turns the only car into a visitor (docs/cars.md), which is worse
+// than not knowing.
+const (
+	SiteNearM = 300.0
+	SiteAwayM = 5000.0
+)
+
+// atSiteFromDistance turns a distance from the site into the car's at_site.
+// Nil is unknown, as is a distance that is not a finite, non-negative number.
+func atSiteFromDistance(m *float64) *bool {
+	if m == nil || math.IsNaN(*m) || math.IsInf(*m, 0) || *m < 0 {
+		return nil
+	}
+	switch {
+	case *m <= SiteNearM:
+		v := true
+		return &v
+	case *m > SiteAwayM:
+		v := false
+		return &v
+	}
+	return nil
+}
+
+// pluggedSinceFrom reads plugged_since_ms, the unix ms at which the car's
+// source saw its cable take the state plugged says. Zero is unknown, as is a
+// time before 2020 or more than a day ahead of now.
+func pluggedSinceFrom(ms *float64, now time.Time) time.Time {
+	if ms == nil || math.IsNaN(*ms) || math.IsInf(*ms, 0) {
+		return time.Time{}
+	}
+	t := time.UnixMilli(int64(*ms))
+	if t.Before(time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)) || t.After(now.Add(24*time.Hour)) {
+		return time.Time{}
+	}
+	return t
+}
+
 // VehicleConnectedRank scores how likely a DerVehicle driver is to be
 // the one physically plugged into the loadpoint right now, using the
 // charging_state vocabulary every vehicle driver normalizes to (the
@@ -81,9 +124,14 @@ type VehicleObservation struct {
 	// level may anchor an estimate, but its charging state is not live.
 	Stale bool
 	// Plugged and AtSite are the car's own word on its cable and place,
-	// when its driver gives them. Nil is unknown.
+	// when its driver gives them. Nil is unknown. AtSite comes from
+	// at_site, or else from site_distance_m.
 	Plugged *bool
 	AtSite  *bool
+	// PluggedSince is when the car's source saw its cable take the state
+	// Plugged says, by its own clock: Home Assistant's last_changed, or the
+	// first reading that showed it. Zero is unknown.
+	PluggedSince time.Time
 	// ReportedAt is when the driver last reported anything, which can be
 	// later than At: a cable changes without a new level.
 	ReportedAt time.Time
@@ -122,15 +170,25 @@ func VehicleObservations(s *Store) []VehicleObservation {
 			continue
 		}
 		var meta struct {
-			ChargingState  string  `json:"charging_state"`
-			ChargeLimit    float64 `json:"charge_limit"`
-			ChargeLimitPct float64 `json:"charge_limit_pct"`
-			Stale          bool    `json:"stale"`
-			Plugged        *bool   `json:"plugged"`
-			AtSite         *bool   `json:"at_site"`
+			ChargingState  string   `json:"charging_state"`
+			ChargeLimit    float64  `json:"charge_limit"`
+			ChargeLimitPct float64  `json:"charge_limit_pct"`
+			Stale          bool     `json:"stale"`
+			Plugged        *bool    `json:"plugged"`
+			PluggedSince   *float64 `json:"plugged_since_ms"`
+			AtSite         *bool    `json:"at_site"`
+			SiteDistanceM  *float64 `json:"site_distance_m"`
 		}
 		if len(vr.Data) > 0 {
 			_ = json.Unmarshal(vr.Data, &meta)
+		}
+		atSite := meta.AtSite
+		if atSite == nil {
+			atSite = atSiteFromDistance(meta.SiteDistanceM)
+		}
+		var since time.Time
+		if meta.Plugged != nil {
+			since = pluggedSinceFrom(meta.PluggedSince, vr.UpdatedAt)
 		}
 		out = append(out, VehicleObservation{
 			Driver:        vr.Driver,
@@ -140,7 +198,8 @@ func VehicleObservations(s *Store) []VehicleObservation {
 			At:            at,
 			Stale:         meta.Stale || cached,
 			Plugged:       meta.Plugged,
-			AtSite:        meta.AtSite,
+			AtSite:        atSite,
+			PluggedSince:  since,
 			ReportedAt:    vr.UpdatedAt,
 		})
 	}

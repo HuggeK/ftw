@@ -259,9 +259,21 @@ func (r *Runtime) ingestLocked(obs []telemetry.VehicleObservation, states []load
 			r.sources[o.Driver] = ss
 		}
 		plugged := pluggedEvidence(o)
-		if !plugged {
+		switch {
+		case !plugged:
 			ss.pluggedSince = time.Time{}
-		} else if !ss.plugged && ss.seen {
+		case o.Plugged != nil && !o.PluggedSince.IsZero():
+			// The car's own clock says when its cable went in, which a
+			// source that reports minutes apart, or a box that just
+			// started, cannot see for itself.
+			ss.pluggedSince = o.PluggedSince
+			if ss.pluggedSince.After(now) {
+				ss.pluggedSince = now
+			}
+		case !ss.plugged && ss.seen && o.At.Sub(ss.obs.At) <= IdentifyWindow:
+			// The box saw the change between two readings less than a
+			// minute apart. Further apart, the cable could have gone in at
+			// any time between them, and the time stays unknown.
 			ss.pluggedSince = o.ReportedAt
 			if ss.pluggedSince.IsZero() || ss.pluggedSince.After(now) {
 				ss.pluggedSince = now
@@ -431,19 +443,18 @@ func (r *Runtime) answerLocked(st loadpoint.State, s *session, states []loadpoin
 	if c, evidenceAt := r.carEvidenceLocked(st, s, states, now); c != "" {
 		return answer{car: c, by: protocol.CarIdentifiedByCar, rank: identifiedRank[protocol.CarIdentifiedByCar], at: evidenceAt}
 	}
-	if candidates := r.candidatesLocked(st.ID); len(candidates) == 1 {
-		only := candidates[0]
-		if at, away := r.notHereLocked(only, s); away {
-			return answer{by: protocol.CarIdentifiedByNone, rank: identifiedRank[protocol.CarIdentifiedByOnly], at: at, decisive: true}
-		}
-		return answer{car: only.ID, by: protocol.CarIdentifiedByOnly, rank: identifiedRank[protocol.CarIdentifiedByOnly],
+	candidates, awayAt := r.candidatesLocked(st.ID, s)
+	if len(candidates) == 1 {
+		return answer{car: candidates[0].ID, by: protocol.CarIdentifiedByOnly, rank: identifiedRank[protocol.CarIdentifiedByOnly],
 			at: time.UnixMilli(s.PluggedMs)}
-	} else if usual := r.usualCarLocked(st.ID, candidates); usual != nil {
-		if _, away := r.notHereLocked(usual, s); !away {
-			return answer{car: usual.ID, by: protocol.CarIdentifiedByOnly, rank: identifiedRank[protocol.CarIdentifiedByOnly],
-				at: time.UnixMilli(s.PluggedMs)}
-		}
-		// The usual car is elsewhere, but another car may be here: ask.
+	}
+	if len(candidates) == 0 && !awayAt.IsZero() {
+		// Every car that could be here said it is not: a visitor.
+		return answer{by: protocol.CarIdentifiedByNone, rank: identifiedRank[protocol.CarIdentifiedByOnly], at: awayAt, decisive: true}
+	}
+	if usual := r.usualCarLocked(st.ID, candidates); usual != nil {
+		return answer{car: usual.ID, by: protocol.CarIdentifiedByOnly, rank: identifiedRank[protocol.CarIdentifiedByOnly],
+			at: time.UnixMilli(s.PluggedMs)}
 	}
 	return none
 }
@@ -475,21 +486,32 @@ func (r *Runtime) onOtherChargerLocked(carID, lpID string) bool {
 	return other != "" && other != lpID
 }
 
-// candidatesLocked are the cars that could be on a charger: every car not on
-// another charger. Rule 3 answers when there is exactly one.
-func (r *Runtime) candidatesLocked(lpID string) []*Car {
-	var out []*Car
+// candidatesLocked are the cars that could be on a charger's session: every
+// car not on another charger whose source has not read it elsewhere, or with
+// its cable out, since the plug-in. Rule 3 answers when there is exactly one.
+// awayAt is the latest such reading, zero when no car was ruled out.
+func (r *Runtime) candidatesLocked(lpID string, s *session) (out []*Car, awayAt time.Time) {
 	for _, c := range r.rec.Cars {
-		if !r.onOtherChargerLocked(c.ID, lpID) {
-			out = append(out, c)
+		if r.onOtherChargerLocked(c.ID, lpID) {
+			continue
 		}
+		if at, away := r.notHereLocked(c, s); away {
+			if at.After(awayAt) {
+				awayAt = at
+			}
+			continue
+		}
+		out = append(out, c)
 	}
-	return out
+	return out, awayAt
 }
 
-// notHereLocked reports whether one of the car's sources said, within
-// IdentifyWindow of the plug-in, that the car is not here: somewhere else,
-// or with its cable out.
+// notHereLocked reports whether one of the car's sources read the car within
+// IdentifyWindow after the plug-in and found it not here: somewhere else, or
+// with its cable out. The reading's own time counts, not when it arrived: a
+// source that replays a reading from before the plug-in, or reads the car
+// minutes apart, has not seen this plug-in, and its old "cable out" would
+// make the only car a visitor.
 func (r *Runtime) notHereLocked(car *Car, s *session) (time.Time, bool) {
 	plugAt := time.UnixMilli(s.PluggedMs)
 	for _, d := range car.Sources {
@@ -498,7 +520,7 @@ func (r *Runtime) notHereLocked(car *Car, s *session) (time.Time, bool) {
 			continue
 		}
 		o := ss.obs
-		at := o.ReportedAt
+		at := o.At
 		if at.Before(plugAt) || at.Sub(plugAt) > IdentifyWindow {
 			continue
 		}
@@ -510,15 +532,25 @@ func (r *Runtime) notHereLocked(car *Car, s *session) (time.Time, bool) {
 }
 
 // carEvidenceLocked is rule 2: a car's own source says it was plugged in
-// within IdentifyWindow of this plug-in and not somewhere else, or says it is
-// charging at this site while this charger alone delivers. Two cars saying
-// so is no answer.
+// within IdentifyWindow of this plug-in, or says it is charging at this site
+// while this charger alone delivers, and none of the car's sources says it is
+// somewhere else. Two cars saying so is no answer. Nor is a cable time when
+// another charger saw a plug-in within the same window: a car whose cable
+// went in then could be on either.
 func (r *Runtime) carEvidenceLocked(st loadpoint.State, s *session, states []loadpoint.State, now time.Time) (string, time.Time) {
 	plugAt := time.UnixMilli(s.PluggedMs)
 	delivering := st.CurrentPowerW >= loadpoint.DeliveringW
+	byCable := true
 	for _, other := range states {
-		if other.ID != st.ID && other.PluggedIn && other.CurrentPowerW >= loadpoint.DeliveringW {
+		if other.ID == st.ID || !other.PluggedIn {
+			continue
+		}
+		if other.CurrentPowerW >= loadpoint.DeliveringW {
 			delivering = false
+		}
+		if os := r.rec.Sessions[other.ID]; os != nil &&
+			absDuration(time.UnixMilli(os.PluggedMs).Sub(plugAt)) <= IdentifyWindow {
+			byCable = false
 		}
 	}
 	found, foundAt := "", time.Time{}
@@ -526,6 +558,7 @@ func (r *Runtime) carEvidenceLocked(st loadpoint.State, s *session, states []loa
 		if r.onOtherChargerLocked(c.ID, st.ID) {
 			continue
 		}
+		claims, away, at := false, false, time.Time{}
 		for _, d := range c.Sources {
 			ss := r.sources[d]
 			if ss == nil || !ss.seen {
@@ -533,23 +566,24 @@ func (r *Runtime) carEvidenceLocked(st loadpoint.State, s *session, states []loa
 			}
 			o := ss.obs
 			if o.AtSite != nil && !*o.AtSite {
-				continue
+				away = true
+				break
 			}
-			var at time.Time
 			switch {
-			case ss.plugged && !ss.pluggedSince.IsZero() && absDuration(ss.pluggedSince.Sub(plugAt)) <= IdentifyWindow:
-				at = ss.pluggedSince
+			case byCable && ss.plugged && !ss.pluggedSince.IsZero() && absDuration(ss.pluggedSince.Sub(plugAt)) <= IdentifyWindow:
+				claims, at = true, ss.pluggedSince
 			case delivering && o.AtSite != nil && *o.AtSite && o.Live(now) &&
 				telemetry.VehicleConnectedRank(o.ChargingState) == 3:
-				at = now
-			default:
-				continue
+				claims, at = true, now
 			}
-			if found != "" && found != c.ID {
-				return "", time.Time{}
-			}
-			found, foundAt = c.ID, at
 		}
+		if !claims || away {
+			continue
+		}
+		if found != "" {
+			return "", time.Time{}
+		}
+		found, foundAt = c.ID, at
 	}
 	return found, foundAt
 }

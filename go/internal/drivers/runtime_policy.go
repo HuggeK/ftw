@@ -35,6 +35,22 @@ type RuntimePolicy struct {
 	// ConfigSecrets comes from verified signed metadata. A read-only OAuth
 	// driver may persist only these keys in its own secret namespace.
 	ConfigSecrets []string
+	// Capabilities are the signed catalog entry's, not what the Lua file
+	// says of itself. host.site_location() reads them.
+	Capabilities []string
+}
+
+// Lists reports whether the signed catalog entry lists capability.
+func (p *RuntimePolicy) Lists(capability string) bool {
+	if p == nil {
+		return false
+	}
+	for _, c := range p.Capabilities {
+		if strings.EqualFold(c, capability) {
+			return true
+		}
+	}
+	return false
 }
 
 // authPaths returns every declared sign-in path.

@@ -429,8 +429,10 @@ func (r *Runtime) SetSessionCar(lpID, sessionID, carID string) (protocol.Charger
 		r.mu.Unlock()
 		return protocol.ChargerCar{}, ErrElsewhere
 	}
+	// The box's own answer, a visitor's included, makes the tap final: a
+	// rule that answered once would otherwise undo it at the next tick.
 	automatic := s.By == protocol.CarIdentifiedByCharger || s.By == protocol.CarIdentifiedByCar ||
-		s.By == protocol.CarIdentifiedByOnly
+		s.By == protocol.CarIdentifiedByOnly || (s.By == protocol.CarIdentifiedByNone && s.Asked && !s.Tapped)
 	by := protocol.CarIdentifiedByTap
 	if carID == "" {
 		by = protocol.CarIdentifiedByNone

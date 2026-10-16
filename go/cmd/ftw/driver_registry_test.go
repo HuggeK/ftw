@@ -232,3 +232,23 @@ api:
 		t.Error("reused name did not start with the new account token C")
 	}
 }
+
+// The weather pin is the site's position, unless nobody has moved it.
+func TestSiteLocationSkipsTheUntouchedPin(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		w    *config.Weather
+		ok   bool
+	}{
+		{"no weather", nil, false},
+		{"0,0", &config.Weather{}, false},
+		{"the untouched pin", &config.Weather{Latitude: 59.3293, Longitude: 18.0686}, false},
+		{"out of range", &config.Weather{Latitude: 95, Longitude: 18}, false},
+		{"a pin someone set", &config.Weather{Latitude: 59.6099, Longitude: 16.5448}, true},
+	} {
+		lat, lon, ok := siteLocation(&config.Config{Weather: tc.w})
+		if ok != tc.ok || (ok && (lat != tc.w.Latitude || lon != tc.w.Longitude)) {
+			t.Errorf("%s: %v,%v %v", tc.name, lat, lon, ok)
+		}
+	}
+}

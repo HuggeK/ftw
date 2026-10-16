@@ -701,7 +701,14 @@ func main() {
 	if cfg.DeviceRepository != nil && cfg.DeviceRepository.Enabled {
 		go driverRepositoryRefreshLoop(ctx, driverRepository, cfg.DeviceRepository.RefreshIntervalH)
 	}
+	// cfgMu guards cfg, which a config apply replaces in place.
+	cfgMu := &sync.RWMutex{}
 	reg := newDriverRegistry(tel, st)
+	reg.SiteLocation = func() (float64, float64, bool) {
+		cfgMu.RLock()
+		defer cfgMu.RUnlock()
+		return siteLocation(cfg)
+	}
 	reg.SetTroubleshootingMode(cfg.Site.TroubleshootingMode)
 	reg.RuntimePolicyResolver = driverRepository.RuntimePolicy
 	reg.MQTTFactory = func(name string, c *config.MQTTConfig) (drivers.MQTTCap, error) {
@@ -795,7 +802,6 @@ func main() {
 	// counter every one of them had to remember would be wrong within a month.
 	controlRev := &control.Revision{}
 	capMu := &sync.RWMutex{}
-	cfgMu := &sync.RWMutex{}
 	modelsMu := &sync.Mutex{}
 
 	// Pre-declare services that the hot-reload Applier needs to touch.

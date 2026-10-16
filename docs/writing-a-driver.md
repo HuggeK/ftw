@@ -37,7 +37,8 @@ current host API and the source of truth for it. Today it registers:
 | Telemetry | `emit`, `emit_metric` |
 | Identity and nameplate | `set_make`, `set_sn`, `set_model`, `set_rated_w` |
 | Driver control | `set_poll_interval`, `set_warmup_s`, `set_watchdog_timeout_s`, `set_device_fault` |
-| Helpers | `log`, `sleep`, `millis`, `now_ms`, `json_encode`, `json_decode`, `persist_secret` |
+| Helpers | `log`, `sleep`, `millis`, `now_ms`, `unix_ms`, `json_encode`, `json_decode`, `persist_secret` |
+| Vehicle | `reserve_vehicle_wake`, `site_location` |
 | Decoding | `decode_string`, `decode_i16`, `decode_i32_be`, `decode_i32_le`, `decode_u32_be`, `decode_u32_le` |
 | Modbus | `modbus_read`, `write`, `write_registers` (canonical); `modbus_write`, `modbus_write_multi` (legacy aliases) |
 | MQTT | `mqtt_pub`, `mqtt_sub`, `mqtt_publish`, `mqtt_subscribe`, `mqtt_messages` |
@@ -232,3 +233,29 @@ Core restart do not reset it. Missing identity, storage failure and hosts
 without the function must prevent recovery wakes. This API reserves a budget;
 it does not grant a network or command capability. Proxy cache hits do not
 prove a new observation, even when HTTP succeeds.
+
+### Which car is plugged in
+
+A vehicle emit may say where the car's cable and the car are, so Core can
+name the car at a plug-in ([cars.md](cars.md), rule 2). Every field is
+optional; leave out what the source does not know.
+
+| Field | Meaning |
+|---|---|
+| `plugged` | The car's own word on its charge cable: `true` in, `false` out. |
+| `plugged_since_ms` | Unix ms at which the source saw the cable take that state. Send it only when the source reads the cable at least every 30 seconds, and leave it out until the driver has seen a change. The time is when the source read the change, not the plug-in itself: Home Assistant's `last_changed` is when Home Assistant read it. |
+| `at_site` | `true` when the car is at this site, `false` when it is somewhere else, from the source's own idea of home. |
+| `site_distance_m` | The car's distance from the site in metres. Core reads up to 300 m as here and over 5 km as elsewhere, and does not know in between: the site's position is a weather pin. `at_site` wins when both are given. |
+
+`host.site_location()` returns the site's `lat, lon`, or `nil` when the site
+has no position (no weather pin, or the pin nobody moved). Only a driver from
+the signed channel whose signed catalog entry lists `vehicle` gets it; a
+bundled or local file gets `nil`, whatever its own `DRIVER` table says.
+Measure the distance in the driver and emit only `site_distance_m`, so the
+car's coordinates stay there. Prefer the source's own idea of home (a Home
+Assistant zone, a TeslaMate geofence) as `at_site`: the pin is set for
+forecasts. Read the cable and the place at the driver's own cadence: never
+wake a car only to learn them.
+
+Send a vehicle `soc` as a percent, except 1 % or less, which goes as a
+fraction: Core reads 1 or less as a fraction, so a plain `1` is 100 %.

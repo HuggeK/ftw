@@ -903,6 +903,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		if r := s.deps.Tel.Get(name, telemetry.DerVehicle); r != nil {
 			var v struct {
 				SoC                  *float64 `json:"soc"`
+				ChargeLimit          *float64 `json:"charge_limit"`
 				ChargeLimitPct       *float64 `json:"charge_limit_pct"`
 				ChargingState        *string  `json:"charging_state"`
 				TimeToFullMin        *int     `json:"time_to_full_min"`
@@ -911,11 +912,22 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 				Stale                *bool    `json:"stale"`
 			}
 			if r.Data != nil && json.Unmarshal(r.Data, &v) == nil {
-				if v.SoC != nil {
-					d["vehicle_soc"] = *v.SoC
+				// Drivers send a fraction or a percent; the store holds the
+				// fraction, and the card shows a percent.
+				if r.SoC != nil {
+					d["vehicle_soc"] = units.PercentFromFraction(*r.SoC)
+				} else if v.SoC != nil {
+					d["vehicle_soc"] = units.PercentFromFraction(units.FractionFromLegacyPercent(*v.SoC))
 				}
-				if v.ChargeLimitPct != nil {
-					d["vehicle_charge_limit_pct"] = *v.ChargeLimitPct
+				if v.ChargeLimit != nil || v.ChargeLimitPct != nil {
+					var canonical, legacy float64
+					if v.ChargeLimit != nil {
+						canonical = *v.ChargeLimit
+					}
+					if v.ChargeLimitPct != nil {
+						legacy = *v.ChargeLimitPct
+					}
+					d["vehicle_charge_limit_pct"] = units.PercentFromFraction(units.DecodeJSONFraction(canonical, legacy))
 				}
 				if v.ChargingState != nil {
 					d["vehicle_charging_state"] = *v.ChargingState

@@ -106,18 +106,29 @@ At each plug-in the box asks, in this order (`carIdentifiedBy`):
 2. `car`: one of the car's sources saw its cable go in within a minute of
    the plug-in and does not say it is elsewhere (`at_site` false), or says
    it is charging at this site (`at_site` true) while this charger alone
-   delivers. A source says so with `plugged` and `at_site` in its `vehicle`
-   emit, or with a charging state that needs a cable. Two cars saying so is
-   no answer.
-3. `only`: exactly one car could be here: the box knows one car that is not
-   on another charger, and it has not said it is somewhere else. The car's
+   delivers. A source says so with `plugged` and `at_site` (or
+   `site_distance_m`) in its `vehicle` emit, or with a charging state that
+   needs a cable. The time that counts is when the source read the cable
+   change: its `plugged_since_ms`, or else when the box first saw the source
+   say so, if the source's reading before that was less than a minute
+   older. A change seen between readings further apart has no time and does
+   not count. A source that does not know where the car is counts only by
+   that minute. Two cars saying so is no answer, and so is a cable time
+   when another charger saw a plug-in within the same minute: the car could
+   be on either. One source of a car that says it is elsewhere rules the
+   car out. The fields are in
+   [writing-a-driver.md](writing-a-driver.md#which-car-is-plugged-in).
+3. `only`: exactly one car could be here: one car is not on another
+   charger and has not been read elsewhere since the plug-in. The car's
    usual charger counts the same way: a car the box made from a charger's
    old settings has that charger as its usual one, and a plug-in there names
    it when no other car that could be here claims the charger, that is when
    each of them has a usual charger elsewhere. A car with none, as one an
-   owner added since, could be on any charger, and the box asks. If the car's source says, within a minute of the
-   plug-in, `at_site` false or that its cable is out, the session is a
-   visitor's (`none`). One car is on one charger at a time: rules 2 and 3
+   owner added since, could be on any charger, and the box asks. A car whose
+   source read it within a minute after the plug-in and found `at_site`
+   false or its cable out is not one that could be here; when that leaves
+   no car, the session is a visitor's (`none`). A reading from before the
+   plug-in does not count, however late it arrives. One car is on one charger at a time: rules 2 and 3
    skip a car another session has.
 4. `tap`, after `asking`: with more than one car, the box waits a minute for
    rules 1 and 2, then raises `car.which` once per plug-in and says

@@ -199,6 +199,7 @@ func TestOfficialBetaChannelInstallsOneSignedDriver(t *testing.T) {
 	fixture.manifest.Drivers[0].Metadata.ReadOnly = true
 	fixture.manifest.Drivers[0].Metadata.AuthPostPath = "/oauth/token"
 	fixture.manifest.Drivers[0].Metadata.ConfigSecrets = []string{"client_secret", "refresh_token"}
+	fixture.manifest.Drivers[0].Metadata.Capabilities = []string{"vehicle"}
 	fixture.mu.Unlock()
 
 	dir := t.TempDir()
@@ -257,7 +258,7 @@ func TestOfficialBetaChannelInstallsOneSignedDriver(t *testing.T) {
 		t.Helper()
 		policy, err := m.RuntimePolicy(driverCfg)
 		if err != nil || policy == nil || !policy.IsReadOnly() || policy.AuthPostPath != "/oauth/token" ||
-			len(policy.ConfigSecrets) != 2 || policy.ConfigSecrets[1] != "refresh_token" {
+			len(policy.ConfigSecrets) != 2 || policy.ConfigSecrets[1] != "refresh_token" || !policy.Lists("vehicle") {
 			t.Fatalf("installed beta OAuth policy = %+v, %v", policy, err)
 		}
 	}

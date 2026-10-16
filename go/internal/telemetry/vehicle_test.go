@@ -254,3 +254,50 @@ func TestVehicleObservationsCarryPluggedAndAtSite(t *testing.T) {
 		t.Fatalf("plugged/at_site %+v", o)
 	}
 }
+
+// A car says where its cable and it are: plugged, the time its source saw
+// the cable go in, and at_site or a distance the box reads with a gap.
+func TestVehicleObservationsReadPlugAndPlace(t *testing.T) {
+	since := time.Now().Add(-20 * time.Second).UnixMilli()
+	for _, tc := range []struct {
+		name      string
+		data      map[string]any
+		wantSite  *bool
+		wantSince bool
+	}{
+		{"at_site", map[string]any{"plugged": true, "plugged_since_ms": since, "at_site": true}, ptrBool(true), true},
+		{"near", map[string]any{"plugged": true, "site_distance_m": 120}, ptrBool(true), false},
+		{"between", map[string]any{"plugged": true, "site_distance_m": 600}, nil, false},
+		{"a few km is still unknown", map[string]any{"plugged": true, "site_distance_m": 4200}, nil, false},
+		{"away", map[string]any{"plugged": true, "site_distance_m": 6200}, ptrBool(false), false},
+		{"at_site wins", map[string]any{"at_site": true, "site_distance_m": 6200}, ptrBool(true), false},
+		{"a negative distance is unknown", map[string]any{"site_distance_m": -5}, nil, false},
+		{"a time with no plug flag is ignored", map[string]any{"plugged_since_ms": since}, nil, false},
+		{"a time before 2020 is unknown", map[string]any{"plugged": true, "plugged_since_ms": 1000}, nil, false},
+		{"a time days ahead is unknown", map[string]any{"plugged": true,
+			"plugged_since_ms": time.Now().Add(72 * time.Hour).UnixMilli()}, nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewStore()
+			soc := 0.5
+			data, _ := json.Marshal(tc.data)
+			s.Update("car", DerVehicle, 0, &soc, data)
+			s.DriverHealthMut("car").RecordSuccess()
+			o, ok := observation(t, s, "car")
+			if !ok {
+				t.Fatal("no observation")
+			}
+			if (o.AtSite == nil) != (tc.wantSite == nil) || (o.AtSite != nil && *o.AtSite != *tc.wantSite) {
+				t.Fatalf("at_site %v, want %v", o.AtSite, tc.wantSite)
+			}
+			if got := !o.PluggedSince.IsZero(); got != tc.wantSince {
+				t.Fatalf("plugged since %v, want set=%v", o.PluggedSince, tc.wantSince)
+			}
+			if tc.wantSince && o.PluggedSince.UnixMilli() != since {
+				t.Fatalf("plugged since %v, want %d", o.PluggedSince, since)
+			}
+		})
+	}
+}
+
+func ptrBool(v bool) *bool { return &v }

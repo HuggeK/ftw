@@ -1,6 +1,7 @@
 package ha
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -9,6 +10,8 @@ import (
 	paho "github.com/eclipse/paho.mqtt.golang"
 
 	"github.com/srcfl/ftw/go/internal/config"
+	"github.com/srcfl/ftw/go/internal/telemetry"
+	"github.com/srcfl/ftw/go/internal/units"
 )
 
 // TestNilBridgeSafe verifies that all diagnostic methods on a nil *Bridge
@@ -375,5 +378,23 @@ func TestPercentFromFractionUsedForSoCDoor(t *testing.T) {
 	}
 	if unit, class := metricUnitAndClass("pack_soc", ""); unit != "%" || class != "battery" {
 		t.Fatalf("_soc suffix class = (%q, %q)", unit, class)
+	}
+}
+
+// vehicle_json goes to the LAN broker: it carries the car's level and
+// charging fields, never where the car is or when its cable went in.
+func TestVehicleJSONLeavesOutWhereTheCarIs(t *testing.T) {
+	soc := 0.14
+	r := &telemetry.DerReading{Driver: "tesla-ha", SoC: &soc, UpdatedAt: time.Unix(1792082304, 0),
+		Data: json.RawMessage(`{"soc":0.14,"charge_limit":0.8,"charging_state":"Stopped","plugged":true,` +
+			`"plugged_since_ms":1792082304065,"at_site":true,"site_distance_m":40}`)}
+	attrs := vehicleAttrs(r)
+	for _, k := range []string{"at_site", "site_distance_m", "plugged_since_ms"} {
+		if _, ok := attrs[k]; ok {
+			t.Errorf("vehicle_json carries %s: %v", k, attrs)
+		}
+	}
+	if attrs["soc_pct"] != units.PercentFromFraction(soc) || attrs["charging_state"] != "Stopped" || attrs["plugged"] != true {
+		t.Errorf("vehicle_json lost the car's own fields: %v", attrs)
 	}
 }

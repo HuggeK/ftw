@@ -103,6 +103,9 @@ type Registry struct {
 	// restart. Returns ("", false) when no override exists.
 	SecretOverride         func(owner, key string) (string, bool)
 	VehicleWakeReservation func(makeName, serial string) (bool, time.Duration, error)
+	// SiteLocation, when set, gives vehicle drivers the site's coordinates
+	// (HostEnv.SiteLocation). Wired by main.go to the live config.
+	SiteLocation func() (lat, lon float64, ok bool)
 	// RuntimePolicyResolver returns the verified signed policy of a managed
 	// read-only artifact. Nil means bundled, local and control-capable
 	// signed drivers, which run without one.
@@ -547,6 +550,7 @@ func (r *Registry) add(ctx context.Context, cfg config.Driver, startupDefault bo
 		}
 		return r.VehicleWakeReservation(makeName, serial)
 	}
+	env.SiteLocation = r.SiteLocation
 	secretOwner := cfg.SecretOwner()
 	env.PersistSecret = func(key, value string) error {
 		if r.SecretPersister == nil {

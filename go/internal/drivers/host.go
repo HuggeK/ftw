@@ -190,6 +190,12 @@ type HostEnv struct {
 	// The host binds this to hardware identity, independent of the driver name.
 	ReserveVehicleWake func(makeName, serial string) (bool, time.Duration, error)
 
+	// SiteLocation returns the site's latitude and longitude, or false when
+	// the site has none. host.site_location() gives it only to a vehicle
+	// driver, which turns its car's position into site_distance_m so the
+	// car's coordinates never leave the driver.
+	SiteLocation func() (lat, lon float64, ok bool)
+
 	// Poll-scoped Modbus evidence prevents a Modbus driver from turning failed
 	// reads into fresh zero-valued telemetry. The Lua runtime holds emissions
 	// until driver_poll ends, then commits them only when every read succeeded.
