@@ -26,7 +26,9 @@ type ForecastInputs struct {
 	Risk func(base, planning []Slot, k float64)
 	// Record runs only for a published plan, outside the service lock.
 	// Implementations enqueue bounded immutable work instead of disk/network I/O.
-	Record func(base, planning []Slot, decisionID string, issuedAtMS int64)
+	// recoveredLoad marks the base loads Core replaced after the selected
+	// forecast failed; the live meter's in-flight load is not one of them.
+	Record func(base, planning []Slot, recoveredLoad []bool, decisionID string, issuedAtMS int64)
 }
 
 const ForecastMaxAge = 12 * time.Hour

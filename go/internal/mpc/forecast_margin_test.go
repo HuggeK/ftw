@@ -23,7 +23,8 @@ func (*optionalMarginOptimizer) UsesDownsidePV() bool { return true }
 func (*optionalMarginOptimizer) Close() error         { return nil }
 func (o *optionalMarginOptimizer) Optimize(ctx context.Context, slots []Slot, p Params) (Plan, error) {
 	o.calls++
-	if o.calls == 1 {
+	// The fixture's point load is 1000 W and its caution load 1200 W.
+	if slots[0].LoadW != 1200 {
 		return o.worker.Optimize(ctx, slots, p)
 	}
 	switch o.fault {
@@ -40,7 +41,7 @@ func (o *optionalMarginOptimizer) Optimize(ctx context.Context, slots []Slot, p 
 	return o.worker.Optimize(ctx, slots, p)
 }
 
-func TestForecastMarginKeepsPointAfterOptionalFailure(t *testing.T) {
+func TestNativeForecastMarginKeepsPointAfterOptionalFailure(t *testing.T) {
 	for _, fault := range []string{"infeasible", "broken reply", "timeout", "invalid plan"} {
 		t.Run(fault, func(t *testing.T) {
 			svc := shadowTestService(t)
@@ -51,6 +52,7 @@ func TestForecastMarginKeepsPointAfterOptionalFailure(t *testing.T) {
 			optimizer := &optionalMarginOptimizer{worker: worker, fault: fault}
 			svc.Optimizer = optimizer
 			svc.Defaults.MaxChargeW, svc.Defaults.MaxDischargeW = 0, 0
+			svc.PVForecastSafetyK = .3
 			svc.ForecastSnapshot = func(time.Time, []state.ForecastPoint) ForecastInputs {
 				return ForecastInputs{Load: func(time.Time) float64 { return 1000 },
 					Risk: func(_, risk []Slot, _ float64) {
@@ -70,6 +72,9 @@ func TestForecastMarginKeepsPointAfterOptionalFailure(t *testing.T) {
 			if plan == nil || len(plan.Actions) != 4 || plan.Solver.Engine != "native" || plan.Solver.Fallback || optimizer.calls != 2 {
 				t.Fatalf("optional failure lost the native point plan: status=%+v calls=%d", svc.PlanSnapshot(), optimizer.calls)
 			}
+			if !plan.CautionOff {
+				t.Fatal("the point plan does not say caution is off")
+			}
 			if err := ValidatePlan(svc.lastSlots, svc.lastParams, plan); err != nil {
 				t.Fatal(err)
 			}
@@ -82,11 +87,16 @@ func TestForecastMarginKeepsPointAfterOptionalFailure(t *testing.T) {
 			if failure == nil || failure.RecoveredDecisionID != plan.DecisionID || !svc.PlanningFailureStorageSnapshot().Durable {
 				t.Fatal("optional failure lost its durable evidence")
 			}
+			optimizer.fault = ""
+			if next := svc.Replan(context.Background()); next == nil || next.CautionOff || next.Solver.Engine != "native" {
+				t.Fatalf("working caution did not clear the flag on the Energyplan path: %+v", svc.PlanSnapshot())
+			}
+			svc.shadowWG.Wait()
 		})
 	}
 }
 
-func TestForecastMarginInvalidPVKeepsFullPointHorizon(t *testing.T) {
+func TestNativeForecastMarginInvalidPVKeepsFullPointHorizon(t *testing.T) {
 	for _, backend := range []string{"core", "native"} {
 		for _, badSlot := range []int{0, 2} {
 			t.Run(fmt.Sprintf("%s/slot%d", backend, badSlot), func(t *testing.T) {
@@ -116,7 +126,7 @@ func TestForecastMarginInvalidPVKeepsFullPointHorizon(t *testing.T) {
 	}
 }
 
-func TestForecastMarginRetainsRealDepartureShortfall(t *testing.T) {
+func TestNativeForecastMarginRetainsRealDepartureShortfall(t *testing.T) {
 	for _, backend := range []string{"core", "native", "worker unavailable"} {
 		t.Run(backend, func(t *testing.T) {
 			svc := shadowTestService(t)
@@ -177,8 +187,9 @@ func TestForecastMarginCannotTradeDepartureGoalsBetweenCars(t *testing.T) {
 	var point, candidate Plan
 	choice, err := planWithForecastMargin(context.Background(), slots, risk, p, func() time.Time { return time.UnixMilli(slots[0].ExecutionStart()) }, func(_ context.Context, inputs []Slot, p Params) (Plan, []Slot, error) {
 		calls++
+		cautious := inputs[0].LoadW == 1200
 		powers := [][2]float64{{0, 2000}, {2000, 2000}}
-		if calls == 2 {
+		if cautious {
 			powers = [][2]float64{{2000, 2000}, {2000, 1000}}
 		}
 		plan := Plan{CapacityWh: p.CapacityWh, InitialSoC: p.InitialSoC, HorizonSlots: 2, Mode: p.Mode}
@@ -205,10 +216,10 @@ func TestForecastMarginCannotTradeDepartureGoalsBetweenCars(t *testing.T) {
 		if err := ValidatePlan(inputs, p, &plan); err != nil {
 			t.Fatal(err)
 		}
-		if calls == 1 {
-			point = plan
-		} else {
+		if cautious {
 			candidate = plan
+		} else {
+			point = plan
 		}
 		return plan, inputs, nil
 	})
@@ -225,29 +236,50 @@ func TestForecastMarginCannotTradeDepartureGoalsBetweenCars(t *testing.T) {
 	}
 }
 
+// Invented house load cannot buy battery export the mode forbids. How the
+// battery and the car share power is judged on the cautious plan's own inputs
+// and again at dispatch, so a point-load replay does not refuse it: with
+// battery_covers_ev off, dispatch stops discharge at the house, and with it
+// on the owner lets the battery feed the car.
 func TestForecastMarginCannotGrantExtraDischargePermission(t *testing.T) {
-	for _, mode := range []Mode{ModeSelfConsumption, ModeArbitrage} {
-		t.Run(string(mode), func(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		mode     Mode
+		car      bool
+		coversEV bool
+		export   bool
+		refused  bool
+	}{
+		{"self consumption export", ModeSelfConsumption, false, false, false, true},
+		{"protected car", ModeArbitrage, true, false, false, false},
+		{"car covered and export allowed", ModeArbitrage, true, true, true, false},
+		{"car covered and export forbidden", ModePassiveArbitrage, true, true, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			slots, p := externalTestFixture()
 			slots = slots[:1]
-			slots[0].LoadW, p.Mode, p.InitialSoC = 2000, mode, .5
+			slots[0].LoadW, p.Mode, p.InitialSoC = 2000, tc.mode, .5
 			p.DischargeEfficiency = 1
 			a := Action{SlotStartMs: slots[0].StartMs, SlotLenMin: 60, LoadW: 2000, BatteryW: -1500, GridW: 500, SoC: .35}
-			if mode == ModeArbitrage {
+			if tc.car {
 				p.Loadpoint = &LoadpointSpec{ID: "car", CapacityWh: 10000, InitialSoC: .2, SoCMax: 1, Levels: 11, PluggedIn: true,
-					TargetSoC: .3, TargetSlotIdx: 0, MaxChargeW: 1000, AllowedStepsW: []float64{0, 1000}, ChargeEfficiency: 1, NoBatteryToEV: true}
+					TargetSoC: .3, TargetSlotIdx: 0, MaxChargeW: 1000, AllowedStepsW: []float64{0, 1000}, ChargeEfficiency: 1, NoBatteryToEV: !tc.coversEV}
 				a.LoadpointW, a.LoadpointSoC, a.GridW = 1000, .3, 1500
 			}
+			if tc.export {
+				// The battery covers the house and the car; nothing is imported.
+				a.BatteryW, a.SoC, a.GridW = -3000, .2, 0
+			}
 			a.CostOre = reserveSlotCost(slots[0], p, a)
-			plan := Plan{Mode: mode, CapacityWh: p.CapacityWh, InitialSoC: .5, HorizonSlots: 1, Actions: []Action{a}, TotalCostOre: a.CostOre}
+			plan := Plan{Mode: tc.mode, CapacityWh: p.CapacityWh, InitialSoC: .5, HorizonSlots: 1, Actions: []Action{a}, TotalCostOre: a.CostOre}
 			if err := ValidatePlan(slots, p, &plan); err != nil {
 				t.Fatalf("risk candidate must satisfy its inflated load: %v", err)
 			}
 			point := append([]Slot(nil), slots...)
 			point[0].LoadW = 1000
 			before, _ := json.Marshal(plan)
-			if err := validateMarginPointLoad(point, slots, p, plan); err == nil {
-				t.Fatal("optional load granted battery export or battery-to-EV permission")
+			if err := validateMarginPointLoad(point, slots, p, plan); (err != nil) != tc.refused {
+				t.Fatalf("refused = %v, want %v: %v", err != nil, tc.refused, err)
 			}
 			after, _ := json.Marshal(plan)
 			if string(before) != string(after) {
@@ -340,7 +372,7 @@ func TestForecastMarginKeepsActualPublicationTime(t *testing.T) {
 
 // These fields describe optional caution, not equipment. Invalid values must
 // survive in support evidence while the effective solve uses the point model.
-func TestForecastMarginBadOptionalParametersKeepPoint(t *testing.T) {
+func TestNativeForecastMarginBadOptionalParametersKeepPoint(t *testing.T) {
 	for _, backend := range []string{"core", "native"} {
 		for _, field := range []string{"PVUncertaintyW", "PVRelativeUncertainty", "PVForecastSafetyK"} {
 			for _, bad := range []struct {

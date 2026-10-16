@@ -227,7 +227,7 @@ func reserveSlotCost(slot Slot, p Params, a Action) float64 {
 // Check the minimum and maximum simultaneous EV draw. Full-interval charges
 // never contribute an off state; partial charges may start or stop together.
 // Both endpoints must respect the site limit and the battery/PV policies.
-func validateEVPulse(slot Slot, p Params, a Action, pvW float64) error {
+func validateEVPulse(slot Slot, p Params, a Action, pvW float64, vehicleRules bool) error {
 	if len(a.LoadpointMaxPowerW) == 0 {
 		return nil
 	}
@@ -261,7 +261,7 @@ func validateEVPulse(slot Slot, p Params, a Action, pvW float64) error {
 		if lp.SurplusOnly {
 			solarPeak += peak
 		}
-		if peak > 0 && lp.blocksBatteryToEV() && loadpoint.BatteryDischargeFeedsEV(a.BatteryW, peak, slot.LoadW, pvW) {
+		if vehicleRules && peak > 0 && lp.blocksBatteryToEV() && loadpoint.BatteryDischargeFeedsEV(a.BatteryW, peak, slot.LoadW, pvW) {
 			return fmt.Errorf("battery discharge feeds EV pulse")
 		}
 	}
@@ -277,7 +277,7 @@ func validateEVPulse(slot Slot, p Params, a Action, pvW float64) error {
 		if !modeAllows(p.Mode, baseline, grid, a.BatteryW) {
 			return fmt.Errorf("EV pulse violates mode")
 		}
-		if power > 0 && a.BatteryW < 0 && grid < -50 {
+		if vehicleRules && power > 0 && a.BatteryW < 0 && grid < -50 {
 			return fmt.Errorf("EV pulse charges during battery export")
 		}
 	}

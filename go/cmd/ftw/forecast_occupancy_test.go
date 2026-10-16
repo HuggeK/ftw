@@ -21,7 +21,7 @@ func TestForecastOccupancySnapshotSurvivesIntentChange(t *testing.T) {
 	inputs := tracker.Snapshot(at, trackerWeather(at, at))
 	away = false
 	slots := trackerSlots(at, 4)
-	inputs.Record(slots, slots, "occupancy-frozen", at.UnixMilli())
+	inputs.Record(slots, slots, nil, "occupancy-frozen", at.UnixMilli())
 	job := <-tracker.queue
 	if len(job.issue.Occupancy) != 193 {
 		t.Fatalf("captured quarter count=%d", len(job.issue.Occupancy))

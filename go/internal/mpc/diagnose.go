@@ -113,6 +113,7 @@ type Diagnostic struct {
 	Solver                *SolverInfo      `json:"solver,omitempty"`
 	DPShadow              *ShadowPlan      `json:"dp_shadow,omitempty"`
 	DPEvaluationShadow    *ShadowPlan      `json:"dp_evaluation_shadow,omitempty"`
+	CautionOff            bool             `json:"caution_off,omitempty"`
 	OptimizerInput        json.RawMessage  `json:"optimizer_input,omitempty"`
 	Params                DiagnosticParams `json:"params"`
 	Slots                 []DiagnosticSlot `json:"slots"`
@@ -209,6 +210,7 @@ func buildDiagnostic(plan *Plan, slots []Slot, p Params, zone string,
 		Solver:                plan.Solver,
 		DPShadow:              plan.DPShadow,
 		DPEvaluationShadow:    plan.DPEvaluationShadow,
+		CautionOff:            plan.CautionOff,
 		OptimizerInput:        append(json.RawMessage(nil), plan.OptimizerInput...),
 		Params: DiagnosticParams{
 			Mode:                       p.Mode,
@@ -447,6 +449,7 @@ func planFromDiagnostic(d *Diagnostic) (*Plan, []Slot, Params, time.Time, bool) 
 		Solver:             d.Solver,
 		DPShadow:           d.DPShadow,
 		DPEvaluationShadow: d.DPEvaluationShadow,
+		CautionOff:         d.CautionOff,
 		OptimizerInput:     append(json.RawMessage(nil), d.OptimizerInput...),
 	}
 	return plan, slots, params, time.UnixMilli(replanAtMs), true

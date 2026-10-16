@@ -70,7 +70,7 @@ func TestForecastPrimaryRustControlsSlotsAndArchivesFrozenLegacy(t *testing.T) {
 	*weather[0].SolarWm2 = 999
 	f.pv.SetRated(100000)
 	f.load.SetHeatingCoef(900)
-	in.Record(base, planning, "decision", at.Add(time.Second).UnixMilli())
+	in.Record(base, planning, nil, "decision", at.Add(time.Second).UnixMilli())
 	issue := (<-f.queue).issue
 	if err := issue.Validate(); err != nil {
 		t.Fatal(err)
@@ -107,7 +107,7 @@ func TestForecastPrimarySelectsEachSignalAndRealZero(t *testing.T) {
 	if got[0].PVW != legacy[0].PVW || got[0].LoadW != 1100 || got[1].PVW != 0 || got[1].LoadW != legacy[1].LoadW {
 		t.Fatalf("signal fallback or real zero wrong: %+v", got)
 	}
-	in.Record(got, got, "decision", at.UnixMilli())
+	in.Record(got, got, nil, "decision", at.UnixMilli())
 	points := primarySeries(t, (<-f.queue).issue, "champion").Points
 	if points[0].PVSource != "legacy" || points[0].ModelPV != nil || points[0].PVKnown || points[1].LoadSource != "legacy" || points[1].ModelLoad != nil || !points[1].PVKnown || points[1].PVQuality != "cold_start" {
 		t.Fatalf("fallback fabricated knowledge or retained wrong model range: %+v", points)
@@ -144,7 +144,7 @@ func TestForecastPrimaryUnavailableRetainsLegacy(t *testing.T) {
 			if !reflect.DeepEqual(got, legacy) {
 				t.Fatalf("unavailable worker changed legacy fallback: %+v", got)
 			}
-			in.Record(got, got, "decision", at.UnixMilli())
+			in.Record(got, got, nil, "decision", at.UnixMilli())
 			issue := (<-f.queue).issue
 			if primarySeries(t, issue, "champion").Points[0].LoadSource != "legacy" {
 				t.Fatal("fallback not explicit")
@@ -163,7 +163,7 @@ func TestForecastPrimaryPartialCurrentIntervalUsesRustRemainder(t *testing.T) {
 	if got[0].PVW != -100 || got[0].LoadW != 1100 || got[1].PVW != -200 || got[2].LoadW != 1300 {
 		t.Fatalf("current interval did not use Rust remainder: %+v", got)
 	}
-	in.Record(got, got, "partial-decision", at.UnixMilli())
+	in.Record(got, got, nil, "partial-decision", at.UnixMilli())
 	issue := (<-f.queue).issue
 	if err := issue.Validate(); err != nil {
 		t.Fatal(err)
@@ -202,7 +202,7 @@ func TestForecastPrimaryNativeColdLoadKeepsHeatingPriorUntilLearning(t *testing.
 	if got[0].LoadW != legacy[0].LoadW {
 		t.Fatalf("cold model replaced heating prior: %v -> %v", legacy[0].LoadW, got[0].LoadW)
 	}
-	in.Record(got, got, "native-decision", at.Add(time.Second).UnixMilli())
+	in.Record(got, got, nil, "native-decision", at.Add(time.Second).UnixMilli())
 	issue := (<-f.queue).issue
 	point := primarySeries(t, issue, "champion").Points[0]
 	if point.LoadSource != "legacy" || !point.LoadKnown || point.ModelLoad != nil {
@@ -217,7 +217,7 @@ func TestForecastPrimaryNativeColdLoadKeepsHeatingPriorUntilLearning(t *testing.
 	if next[0].LoadW >= 1000 {
 		t.Fatalf("measured low load did not replace the prior: %+v", next[0])
 	}
-	learned.Record(next, next, "learned-decision", at.UnixMilli())
+	learned.Record(next, next, nil, "learned-decision", at.UnixMilli())
 	if p := primarySeries(t, (<-f.queue).issue, "champion").Points[0]; p.LoadSource != "energyplan" || p.LoadQuality != "learning" {
 		t.Fatalf("learned load did not take over: %+v", p)
 	}
@@ -250,7 +250,7 @@ func TestForecastPrimaryResolveUsesCapturedStateAndFeatures(t *testing.T) {
 	if got[0].PVW != -100 || string(request.State) != `{"epoch":1}` || request.Horizon[0].Home == nil || !*request.Horizon[0].Home || *request.Horizon[0].GHIWm2 != 500 {
 		t.Fatalf("live state or features leaked into primary request: %+v", request)
 	}
-	in.Record(got, got, "decision", at.Add(time.Second).UnixMilli())
+	in.Record(got, got, nil, "decision", at.Add(time.Second).UnixMilli())
 	issue := (<-f.queue).issue
 	for _, model := range issue.Models {
 		if model.Name == "energyplan" && string(model.State) != `{"epoch":1}` {
@@ -281,7 +281,7 @@ func TestForecastPrimaryNativeCurrentIntervalReplaysAfterNewObservation(t *testi
 	if got[0].LoadW == legacy[0].LoadW {
 		t.Fatal("first current control interval still used legacy load")
 	}
-	in.Record(got, got, "native-partial", origin.Add(time.Second).UnixMilli())
+	in.Record(got, got, nil, "native-partial", origin.Add(time.Second).UnixMilli())
 	issue := (<-f.queue).issue
 	primary := primarySeries(t, issue, "champion").Points[0]
 	if primary.PredictionStartMS != origin.UnixMilli() || primary.LoadSource != "energyplan" {
@@ -323,14 +323,19 @@ func TestForecastRecoveryArchiveDoesNotClaimRejectedModel(t *testing.T) {
 	in := f.Snapshot(at, trackerWeather(at, at))
 	base := in.Resolve(context.Background(), trackerSlots(at, 4))
 	rawLoad := base[0].LoadW
-	for i := range base {
+	recovered := []bool{true, true, true, false}
+	for i := range base[:3] {
 		base[i].LoadW = 800
 	}
-	in.Record(base, base, "recovered-decision", at.UnixMilli())
+	in.Record(base, base, recovered, "recovered-decision", at.UnixMilli())
 	issue := (<-f.queue).issue
-	champion := primarySeries(t, issue, "champion").Points[0]
+	points := primarySeries(t, issue, "champion").Points
+	champion := points[0]
 	if champion.LoadW != 800 || champion.LoadSource != "core_recovery" || champion.ModelLoad != nil || champion.LoadQuality != "fallback" {
 		t.Fatalf("recovery was attributed to rejected model: %+v", champion)
+	}
+	if kept := points[3]; kept.LoadSource != "energyplan" || kept.ModelLoad == nil {
+		t.Fatalf("unrecovered slot lost its model: %+v", kept)
 	}
 	if raw := primarySeries(t, issue, "energyplan").Points[0]; raw.LoadW != rawLoad || raw.LoadSource == "core_recovery" {
 		t.Fatal("raw model prediction was overwritten")

@@ -95,18 +95,19 @@ func recoverInvalidForecastLoads(slots, legacy []Slot, priorW float64) ([]Slot, 
 
 // Core keeps the point plan before optional caution or a degraded load prior.
 // A prior may extend a safe prefix, but cannot replace a complete point plan.
-func corePlanWithForecastRecovery(ctx context.Context, risk, point []Slot, p Params, priorW float64, currentMeasured bool, now func() time.Time) (Plan, []Slot, error, string) {
+func corePlanWithForecastRecovery(ctx context.Context, risk, point []Slot, p Params, priorW float64, currentMeasured bool, now func() time.Time) (forecastChoice, error) {
 	choice, err := planWithForecastMargin(ctx, point, risk, p, now, corePlanWithRecovery)
 	if err == nil && len(choice.slots) == len(point) {
-		return choice.plan, choice.slots, nil, choice.warning
+		return choice, nil
 	}
 	prior := priorForecast(point, priorW, currentMeasured)
 	if prior == nil || sameForecast(point, prior) || ctx.Err() != nil {
-		return choice.plan, choice.slots, err, choice.warning
+		return choice, err
 	}
 	candidate, accepted, retryErr := corePlanWithRecovery(ctx, prior, p)
 	if retryErr == nil && len(accepted) > len(choice.slots) {
-		return candidate, accepted, nil, forecastPriorWarning
+		return forecastChoice{plan: candidate, slots: accepted, warning: forecastPriorWarning,
+			withoutCaution: !sameForecast(point, risk)}, nil
 	}
-	return choice.plan, choice.slots, err, choice.warning
+	return choice, err
 }

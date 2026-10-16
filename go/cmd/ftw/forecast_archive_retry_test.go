@@ -50,7 +50,7 @@ func TestForecastArchiveSurvivesWriterContention(t *testing.T) {
 	f := trackerFixture(at)
 	f.store = st
 	slots := trackerSlots(at.Add(time.Minute), 193)
-	f.Snapshot(at, trackerWeather(at.Add(time.Minute), at)).Record(slots, slots, "contended-decision", at.UnixMilli())
+	f.Snapshot(at, trackerWeather(at.Add(time.Minute), at)).Record(slots, slots, nil, "contended-decision", at.UnixMilli())
 	frozen := <-f.queue
 	f.queue <- frozen
 	workerCtx, stop := context.WithCancel(ctx)
@@ -73,7 +73,7 @@ func TestForecastArchiveSurvivesWriterContention(t *testing.T) {
 	if _, err := conn.ExecContext(ctx, "ROLLBACK"); err != nil {
 		t.Fatal(err)
 	}
-	f.Snapshot(at.Add(time.Second), trackerWeather(at.Add(time.Minute), at)).Record(slots, slots, "next-decision", at.Add(time.Second).UnixMilli())
+	f.Snapshot(at.Add(time.Second), trackerWeather(at.Add(time.Minute), at)).Record(slots, slots, nil, "next-decision", at.Add(time.Second).UnixMilli())
 
 	deadline := time.NewTimer(5 * time.Second)
 	defer deadline.Stop()
@@ -128,7 +128,7 @@ func TestForecastArchiveRetryPreservesFrozenIssue(t *testing.T) {
 			at := time.Now().UTC().Truncate(time.Minute)
 			f := trackerFixture(at)
 			slots := trackerSlots(at.Add(time.Minute), 193)
-			f.Snapshot(at, trackerWeather(at.Add(time.Minute), at)).Record(slots, slots, "frozen-decision", at.UnixMilli())
+			f.Snapshot(at, trackerWeather(at.Add(time.Minute), at)).Record(slots, slots, nil, "frozen-decision", at.UnixMilli())
 			frozen := (<-f.queue).issue
 			calls := 0
 			err = saveForecastIssueWithRetry(ctx, frozen, func(writeCtx context.Context, issue forecasting.Issue) error {

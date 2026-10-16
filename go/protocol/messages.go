@@ -521,6 +521,12 @@ type Plan struct {
 	// read. Absent on a box with no chargers or no planner. An older app
 	// ignores it.
 	Chargers []PlanCharger `cbor:"chargers,omitempty"`
+	// CautionOff is set when the household's planning style asks for
+	// forecast caution and this plan uses the point forecast instead,
+	// because the caution inputs were invalid or a cautious plan could not
+	// keep the plan's limits and departure goals. The box sets it again on
+	// every replan and clears it once caution works. An older app ignores it.
+	CautionOff bool `cbor:"cautionOff,omitempty"`
 }
 
 // PlanCharger is one charger's share of the plan. Keyed by the charger,

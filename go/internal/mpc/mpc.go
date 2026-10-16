@@ -392,6 +392,11 @@ type Plan struct {
 	// persisted Diagnostic for deterministic replay.
 	OptimizerInput       json.RawMessage    `json:"-"`
 	LoadpointShortfallWh map[string]float64 `json:"loadpoint_shortfall_wh,omitempty"`
+	// CautionOff is set when the planning style asks for forecast caution and
+	// this plan uses the point forecast instead: the caution inputs were
+	// invalid, or a caution plan could not keep the point plan's limits and
+	// departure goals. The planning warnings say why.
+	CautionOff bool `json:"caution_off,omitempty"`
 }
 
 // ShadowPlan is a challenger candidate calculated alongside the active plan.

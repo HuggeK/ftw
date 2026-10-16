@@ -426,7 +426,7 @@ func scenarioPlannerPV(t *testing.T, providerW, learnedW, weight float64) float6
 	svc.Horizon = time.Hour
 	var built []mpc.Slot
 	svc.ForecastSnapshot = func(time.Time, []state.ForecastPoint) mpc.ForecastInputs {
-		return mpc.ForecastInputs{Weather: weather, PV: func(time.Time, float64) float64 { return learnedW }, PVWeight: func(time.Time) float64 { return weight }, Load: func(time.Time) float64 { return 1000 }, Record: func(base, planning []mpc.Slot, _ string, _ int64) { built = append([]mpc.Slot(nil), base...) }}
+		return mpc.ForecastInputs{Weather: weather, PV: func(time.Time, float64) float64 { return learnedW }, PVWeight: func(time.Time) float64 { return weight }, Load: func(time.Time) float64 { return 1000 }, Record: func(base, planning []mpc.Slot, _ []bool, _ string, _ int64) { built = append([]mpc.Slot(nil), base...) }}
 	}
 	if svc.Replan(context.Background()) == nil || len(built) != 1 {
 		t.Fatalf("planner did not publish one forecast slot: %d", len(built))

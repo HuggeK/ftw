@@ -349,6 +349,16 @@ func overlayLiveHouseLoad(slots []Slot, loadW float64, ok bool) {
 	slots[0].LoadW = loadW
 }
 
+// recoveredLoads marks the published loads Core replaced after the selected
+// forecast failed. point already holds the live meter's in-flight load.
+func recoveredLoads(point, published []Slot) []bool {
+	out := make([]bool, len(published))
+	for i := range published {
+		out[i] = i < len(point) && published[i].LoadW != point[i].LoadW
+	}
+	return out
+}
+
 // New constructs a service. Caller wires it in main.go after store + telemetry.
 func New(st *state.Store, tl *telemetry.Store, zone string, p Params) *Service {
 	s := &Service{
@@ -1620,6 +1630,9 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	liveLoadW, liveLoadOK := s.liveHouseLoadW()
 	liveLoadOK = liveLoadOK && finite(liveLoadW) && liveLoadW >= 0
 	overlayLiveHouseLoad(slots, liveLoadW, liveLoadOK)
+	// The point forecast as selected, with the live meter's in-flight load.
+	// A published load that differs from it is Core's recovery.
+	pointInputs := append([]Slot(nil), slots...)
 	var forecastWarnings []string
 	admitted, forecastErr := recoverInvalidForecastLoads(slots, legacySlots, baseLoad)
 	if forecastErr != nil {
@@ -1732,11 +1745,15 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	if pvRelative != nil || s.ForecastSnapshot != nil {
 		p.PVRelativeUncertainty = pvRelativeUncertainty
 	}
+	// Set when the plan does without its caution forecast. It reaches the
+	// published plan only when the planning style asks for caution.
+	cautionOff := false
 	if cautionErr := validateForecastCaution(p); cautionErr != nil {
 		// Preserve the raw optional model/preference before disabling caution.
 		// Hardware, telemetry, prices and goals still pass their strict gates.
 		s.recordPlanningFailure(request, "risk_inputs", cautionErr.Error(), fallbackSlots, p, nil)
 		forecastWarnings = append(forecastWarnings, "Forecast caution is invalid; using the point forecast: "+cautionErr.Error())
+		cautionOff = true
 		p.PVForecastSafetyK, p.PVUncertaintyW, p.PVRelativeUncertainty = 0, 0, 0
 	} else {
 		applyPVDownsidePerSlot(fallbackSlots, p.PVForecastSafetyK,
@@ -1747,8 +1764,11 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	}
 	if recovered, err := recoverInvalidForecastLoads(fallbackSlots, slots, baseLoad); err != nil {
 		s.recordPlanningFailure(request, "risk_inputs", err.Error(), fallbackSlots, p, nil)
-		forecastWarnings = append(forecastWarnings, err.Error())
+		// The replacements here are the point loads, not legacy or the prior.
+		forecastWarnings = append(forecastWarnings, "Forecast caution had invalid load values; using the point forecast for those slots")
 		fallbackSlots = recovered
+		// Point loads in every slot leave no caution; some slots leave some.
+		cautionOff = cautionOff || sameForecast(fallbackSlots, slots)
 	}
 	// Keep the point forecast distinct from the downside inputs passed to the
 	// solver. Calibrating point errors against the risk adjustment biases them.
@@ -1850,6 +1870,7 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 		s.recordPlanningFailure(request, "risk_inputs", riskErr.Error(), fallbackSlots, p, nil)
 		warnings = append(warnings, "Forecast caution inputs are invalid; using the point forecast: "+riskErr.Error())
 		fallbackSlots = append([]Slot(nil), slots...)
+		cautionOff = true
 	}
 	if err := validatePlanningParams(p); err != nil {
 		slog.Error("mpc: invalid optimization parameters; keeping previous plan", "err", err)
@@ -1908,13 +1929,13 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 		slots = fallbackSlots
 		solverInputs = baseForecastSlots
 		solveStart := time.Now()
-		var err error
-		var forecastWarning string
-		plan, slots, err, forecastWarning = corePlanWithForecastRecovery(context.WithoutCancel(ctx), slots, baseForecastSlots, p, baseLoad, liveLoadOK, s.planningNow)
-		if forecastWarning != "" {
-			s.recordPlanningFailure(request, "forecast_recovery", forecastWarning, fallbackSlots, p, nil)
-			warnings = append(warnings, forecastWarning)
-			if forecastWarning == forecastPriorWarning {
+		choice, err := corePlanWithForecastRecovery(context.WithoutCancel(ctx), slots, baseForecastSlots, p, baseLoad, liveLoadOK, s.planningNow)
+		plan, slots = choice.plan, choice.slots
+		cautionOff = cautionOff || choice.withoutCaution
+		if choice.warning != "" {
+			s.recordPlanningFailure(request, "forecast_recovery", choice.warning, fallbackSlots, p, nil)
+			warnings = append(warnings, choice.warning)
+			if choice.warning == forecastPriorWarning {
 				baseForecastSlots = append([]Slot(nil), slots...)
 			}
 		}
@@ -1937,6 +1958,7 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 					return plan, inputs, err
 				})
 			candidate, slots, err = choice.plan, choice.slots, solveErr
+			cautionOff = cautionOff || choice.withoutCaution
 			if choice.warning != "" {
 				s.recordPlanningFailure(request, "forecast_caution", choice.warning, fallbackSlots, p, choice.marginErr)
 				warnings = append(warnings, choice.warning)
@@ -1963,6 +1985,8 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 					break
 				}
 				if retryErr == nil {
+					// Only a downside planner solved the caution forecast.
+					cautionOff = cautionOff || (downsidePrimary && !sameForecast(fallbackSlots, baseForecastSlots))
 					candidate, slots, err = recovered, attempt.slots, nil
 					baseForecastSlots = append([]Slot(nil), attempt.base...)
 					fallbackSlots = append([]Slot(nil), attempt.slots...)
@@ -2054,12 +2078,12 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 			slots = fallbackSlots
 			solverInputs = baseForecastSlots
 			solveStart := time.Now()
-			var fallbackErr error
-			var forecastWarning string
-			plan, slots, fallbackErr, forecastWarning = corePlanWithForecastRecovery(context.WithoutCancel(ctx), slots, baseForecastSlots, p, baseLoad, liveLoadOK, s.planningNow)
-			if forecastWarning != "" {
-				warnings = append(warnings, forecastWarning)
-				if forecastWarning == forecastPriorWarning {
+			choice, fallbackErr := corePlanWithForecastRecovery(context.WithoutCancel(ctx), slots, baseForecastSlots, p, baseLoad, liveLoadOK, s.planningNow)
+			plan, slots = choice.plan, choice.slots
+			cautionOff = cautionOff || choice.withoutCaution
+			if choice.warning != "" {
+				warnings = append(warnings, choice.warning)
+				if choice.warning == forecastPriorWarning {
 					baseForecastSlots = append([]Slot(nil), slots...)
 				}
 			}
@@ -2176,6 +2200,9 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	// actions yet, and nothing edits them after this point.
 	s.setLivePVSurplusSoCCapsLocked(plan.Actions, p)
 	plan.DecisionID = s.nextDecisionIDLocked()
+	// A safety_k of 0 asks for no caution; NaN asks for caution it cannot get.
+	plan.CautionOff = cautionOff && request.safetyK != 0
+	cautionChanged := plan.CautionOff != (s.last != nil && s.last.CautionOff)
 	s.last = &plan
 	if f := s.lastPlanningFailure; f != nil && f.RecoveredDecisionID == "" {
 		recovered := *f
@@ -2199,8 +2226,14 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	changed := s.planChanged
 	s.mu.Unlock()
 	tell(changed)
+	if cautionChanged && plan.CautionOff {
+		slog.Warn("mpc: forecast caution off; the plan uses the point forecast",
+			"decision_id", plan.DecisionID, "safety_k", request.safetyK, "warnings", warnings)
+	} else if cautionChanged {
+		slog.Info("mpc: forecast caution back on", "decision_id", plan.DecisionID)
+	}
 	if captured.Record != nil {
-		captured.Record(baseForecastSlots, fallbackSlots, plan.DecisionID, replanAtMs)
+		captured.Record(baseForecastSlots, fallbackSlots, recoveredLoads(pointInputs, baseForecastSlots), plan.DecisionID, replanAtMs)
 	}
 	// Horizon statistics — surfaced in logs so operators can
 	// reconstruct "what did the DP know?" without pulling the full

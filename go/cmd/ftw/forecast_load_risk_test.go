@@ -34,7 +34,7 @@ func TestForecastPrimaryLoadQualityKeepsSitePriorUntilLearning(t *testing.T) {
 			if got[0].LoadW != want || got[0].PVW != -100 {
 				t.Fatalf("load selection changed the site prior or independent PV: %+v", got)
 			}
-			in.Record(got, got, "load-quality", at.UnixMilli())
+			in.Record(got, got, nil, "load-quality", at.UnixMilli())
 			issue := (<-f.queue).issue
 			point := primarySeries(t, issue, "champion").Points[0]
 			if point.LoadW != want || point.LoadSource != source {
@@ -135,7 +135,7 @@ func TestForecastLoadRiskBeforeNetCalibration(t *testing.T) {
 			if !reflect.DeepEqual(base, unchanged) {
 				t.Fatal("risk changed the issued forecast")
 			}
-			in.Record(base, planning, "load-risk", at.UnixMilli())
+			in.Record(base, planning, nil, "load-risk", at.UnixMilli())
 			issue := (<-f.queue).issue
 			if primarySeries(t, issue, "champion").Points[0].LoadW != 1000 || primarySeries(t, issue, "planning").Points[0].LoadW != tc.wantLoad {
 				t.Fatal("archive lost the difference between forecast and planning margin")

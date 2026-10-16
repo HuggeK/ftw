@@ -16,15 +16,8 @@ func TestSanitizeLoadW(t *testing.T) {
 	}
 }
 
-func TestSanitizeSlotAndPlanLoads(t *testing.T) {
+func TestSanitizePlanLoads(t *testing.T) {
 	t.Parallel()
-	slots := []Slot{{LoadW: 50000}, {LoadW: 700}, {LoadW: -10}, {LoadW: math.NaN()}}
-	sanitizeSlotLoads(slots)
-	for i, want := range []float64{50000, 700, 0, 0} {
-		if slots[i].LoadW != want {
-			t.Fatalf("slot %d load = %v, want %v", i, slots[i].LoadW, want)
-		}
-	}
 	plan := &Plan{Actions: []Action{{LoadW: -1}, {LoadW: 800}}}
 	sanitizePlanLoads(plan)
 	if plan.Actions[0].LoadW != 0 || plan.Actions[1].LoadW != 800 {

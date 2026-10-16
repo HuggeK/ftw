@@ -181,6 +181,32 @@ describe("plan brief normalization", () => {
     assert.equal(brief.planner.detail, "Worker unavailable");
   });
 
+  it("says when the plan does without the forecast caution the household chose", () => {
+    const warning = "Forecast caution is invalid; using the point forecast: pv_uncertainty_w must be finite and non-negative";
+    const brief = derivePlanBrief({
+      enabled: true,
+      plan: { actions: [slot(8), slot(23)], solver: {}, caution_off: true },
+      planning: { warnings: [warning] },
+      status: { mode: "planner_arbitrage" },
+      now,
+    });
+
+    assert.equal(brief.state.key, "caution_off");
+    assert.equal(brief.state.tone, "warn");
+    assert.equal(brief.forecast.label, "Point forecast");
+    assert.match(brief.forecast.detail, /^No margin for forecast error in this plan\. Plan until /);
+    assert.match(brief.constraint, /point forecast/);
+
+    const kept = derivePlanBrief({
+      enabled: true,
+      plan: { actions: [slot(8)], solver: {} },
+      status: { mode: "planner_arbitrage" },
+      now,
+    });
+    assert.equal(kept.state.key, "active");
+    assert.equal(kept.forecast.label, "Published prices");
+  });
+
   it("surfaces active safety clamps and how far the published prices reach", () => {
     const brief = derivePlanBrief({
       enabled: true,

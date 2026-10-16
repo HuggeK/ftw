@@ -52,7 +52,7 @@ func priceReserveCharging(ctx context.Context, slots []Slot, p Params, reserve P
 				LoadpointPowerW:    map[string]float64{lp.ID: peak / 2},
 				LoadpointMaxPowerW: map[string]float64{lp.ID: peak},
 			}
-			if validateEVPulse(slot, p, probe, slot.PVW) != nil {
+			if validateEVPulse(slot, p, probe, slot.PVW, true) != nil {
 				continue
 			}
 			hours := slot.DurationHours()

@@ -34,7 +34,7 @@ func TestRecoveryPublishesBeforeCorruptFutureInputs(t *testing.T) {
 							}
 							return slots
 						},
-						Record: func(base, planning []Slot, _ string, _ int64) {
+						Record: func(base, planning []Slot, _ []bool, _ string, _ int64) {
 							if len(base) != len(planning) {
 								t.Errorf("recorded horizons differ: %d != %d", len(base), len(planning))
 							}

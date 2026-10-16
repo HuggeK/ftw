@@ -146,7 +146,7 @@ func TestForecastSourceChoiceSteersResolve(t *testing.T) {
 	if got[4].PVW != -100 {
 		t.Fatalf("legacy PV without weather replaced Energyplan PV: %+v", got[4])
 	}
-	in.Record(got, got, "decision", at.UnixMilli())
+	in.Record(got, got, nil, "decision", at.UnixMilli())
 	points := primarySeries(t, (<-f.queue).issue, "champion").Points
 	if p := points[0]; p.PVSource != "legacy" || p.LoadSource != "energyplan" || p.LoadQuality != "cold_start" || p.ModelLoad == nil {
 		t.Fatalf("chosen sources not recorded: %+v", p)
@@ -184,7 +184,7 @@ func TestForecastPVHorizonChoiceReachesPlannerAndArchive(t *testing.T) {
 	if resolved[0].PVW != -2000 || resolved[1].PVW != -100 {
 		t.Fatalf("per-horizon PV did not reach MPC: %+v", resolved)
 	}
-	in.Record(resolved, resolved, "horizon-choice", at.UnixMilli())
+	in.Record(resolved, resolved, nil, "horizon-choice", at.UnixMilli())
 	issue := (<-f.queue).issue
 	champion := primarySeries(t, issue, "champion").Points
 	if champion[0].PVSource != "legacy" || champion[0].ModelPV != nil || champion[1].PVSource != "energyplan" || champion[1].ModelPV == nil {
@@ -212,7 +212,7 @@ func TestForecastLoadHorizonChoiceReachesPlannerAndArchive(t *testing.T) {
 	if resolved[0].LoadW != legacy[0].LoadW || resolved[1].LoadW != 1100 {
 		t.Fatalf("per-horizon load did not reach MPC: %+v", resolved)
 	}
-	in.Record(resolved, resolved, "load-horizon-choice", at.UnixMilli())
+	in.Record(resolved, resolved, nil, "load-horizon-choice", at.UnixMilli())
 	issue := (<-f.queue).issue
 	champion := primarySeries(t, issue, "champion").Points
 	if champion[0].LoadSource != "legacy" || champion[0].ModelLoad != nil || champion[1].LoadSource != "energyplan" || champion[1].ModelLoad == nil {
@@ -240,7 +240,7 @@ func TestForecastColdLoadCannotBorrowAnotherHorizonsEvidence(t *testing.T) {
 	if got[0].LoadW != 6000 || got[1].LoadW != 1100 {
 		t.Fatalf("cold load borrowed another horizon's evidence: %+v", got)
 	}
-	in.Record(got, got, "cold-load-horizon", at.UnixMilli())
+	in.Record(got, got, nil, "cold-load-horizon", at.UnixMilli())
 	points := primarySeries(t, (<-f.queue).issue, "champion").Points
 	if points[0].LoadSource != "legacy" || points[0].ModelLoad != nil || points[1].LoadSource != "energyplan" {
 		t.Fatalf("cold load fallback provenance lost: %+v", points)
@@ -331,7 +331,7 @@ func TestForecastDaytimeRiskAndArchivedBandsExcludeNightErrors(t *testing.T) {
 	if planning[0].PVW != 0 || planning[0].LoadW != 2000 {
 		t.Fatalf("night errors narrowed the daytime margin: base %+v planning %+v", base[0], planning[0])
 	}
-	in.Record(base, planning, "daytime-risk", at.UnixMilli())
+	in.Record(base, planning, nil, "daytime-risk", at.UnixMilli())
 	issue := (<-f.queue).issue
 	point := primarySeries(t, issue, "energyplan").Points[0]
 	if point.PVBand.Samples != daylightHours || point.NetBand.Samples != daylightHours || point.PVBand.Method != forecasting.BandMethodEmpirical || point.NetBand.HighW != 2000 {

@@ -11,12 +11,6 @@ func sanitizeLoadW(w float64) float64 {
 	return w
 }
 
-func sanitizeSlotLoads(slots []Slot) {
-	for i := range slots {
-		slots[i].LoadW = sanitizeLoadW(slots[i].LoadW)
-	}
-}
-
 func sanitizePlanLoads(plan *Plan) {
 	if plan == nil {
 		return

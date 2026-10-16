@@ -80,6 +80,27 @@ func TestPlanCarriesTheBatteryLevelAtEachSlotsEnd(t *testing.T) {
 	}
 }
 
+// A phone says when the plan does without the forecast caution the household
+// chose. The flag is absent from a plan that keeps it, so an older app reads
+// the same bytes.
+func TestPlanSaysWhenForecastCautionIsOff(t *testing.T) {
+	h, box, rec, clock := newRig(t)
+	subscribe(t, h, rec)
+	plan := samplePlan(clock.now)
+	box.plan = plan
+	deliver(t, h, MsgPlanGet, ptrU32(5), nil)
+	if p := body[Plan](t, rec.only(t, MsgPlan)); p.CautionOff {
+		t.Fatal("a plan with caution reads as caution off")
+	}
+
+	plan.CautionOff = true
+	rec.reset()
+	deliver(t, h, MsgPlanGet, ptrU32(6), nil)
+	if p := body[Plan](t, rec.only(t, MsgPlan)); !p.CautionOff {
+		t.Fatal("caution off did not reach the wire")
+	}
+}
+
 // Reason codes are stable machine strings. The box has no idea what language
 // anyone reads, and the app owns every word the user sees.
 func TestPlanReasonsAreStableCodes(t *testing.T) {

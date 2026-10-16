@@ -11,6 +11,12 @@ func (s *Service) failedReplan(request replanRequest, message string) *Plan {
 	s.mu.Lock()
 	if request.generation == s.latestReplanGeneration && !request.wasCanceledByService() {
 		s.lastPlanningError = message
+		// A repeated failure keeps its record; after a recovery it is current again.
+		if f := s.lastPlanningFailure; f != nil && f.RecoveredDecisionID != "" {
+			current := *f
+			current.RecoveredDecisionID, current.RecoveredAtMs = "", 0
+			s.lastPlanningFailure = &current
+		}
 	}
 	plan := s.last
 	s.mu.Unlock()

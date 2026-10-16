@@ -110,7 +110,7 @@ func TestForecastSnapshotFreezesHorizonAndRecord(t *testing.T) {
 		t.Fatal("live changes altered captured horizon")
 	}
 	slots := trackerSlots(target, 1)
-	in.Record(slots, slots, "decision", origin.UnixMilli())
+	in.Record(slots, slots, nil, "decision", origin.UnixMilli())
 	job := <-f.queue
 	if err := job.issue.Validate(); err != nil {
 		t.Fatal(err)
@@ -125,7 +125,7 @@ func TestForecastSnapshotFreezesHorizonAndRecord(t *testing.T) {
 	if job.issue.Series[0].Points[0].LoadQuality != "cold_start" {
 		t.Fatal("cold load called trained")
 	}
-	in.Record(trackerSlots(target, 1), trackerSlots(target, 1), "decision-2", origin.UnixMilli())
+	in.Record(trackerSlots(target, 1), trackerSlots(target, 1), nil, "decision-2", origin.UnixMilli())
 	job2 := <-f.queue
 	if job.issue.Series[0].ModelVersion != job2.issue.Series[0].ModelVersion {
 		t.Fatal("one capture has multiple model revisions")
@@ -146,7 +146,7 @@ func TestForecastSnapshotRejectsWeatherFromPreviousLocation(t *testing.T) {
 		t.Fatal("weather captured before a location change survived the snapshot")
 	}
 	slots := trackerSlots(target, 1)
-	old.Record(slots, slots, "old-weather", origin.UnixMilli())
+	old.Record(slots, slots, nil, "old-weather", origin.UnixMilli())
 	job := <-f.queue
 	if err := job.issue.Validate(); err != nil {
 		t.Fatal(err)
@@ -162,7 +162,7 @@ func TestForecastSnapshotRejectsWeatherFromPreviousLocation(t *testing.T) {
 	if len(fresh.Weather) != 1 {
 		t.Fatal("new location weather was rejected")
 	}
-	fresh.Record(slots, slots, "new-weather", origin.UnixMilli())
+	fresh.Record(slots, slots, nil, "new-weather", origin.UnixMilli())
 	job = <-f.queue
 	if len(job.issue.Weather) != 1 || !job.issue.Series[0].Points[0].PVKnown {
 		t.Fatal("new location weather did not restore PV evidence")
@@ -196,7 +196,7 @@ func TestForecastOriginFollowsCandidateCapture(t *testing.T) {
 	f.candidate = c
 	in := f.Snapshot(at, nil)
 	slots := trackerSlots(at.Add(time.Minute), 1)
-	in.Record(slots, slots, "decision", clock.UnixMilli())
+	in.Record(slots, slots, nil, "decision", clock.UnixMilli())
 	job := <-f.queue
 	if job.issue.OriginMS != clock.UnixMilli() {
 		t.Fatal("origin preceded candidate snapshot")
@@ -248,7 +248,7 @@ func TestForecastArchiveRejectsCurrentPartialAsEvidence(t *testing.T) {
 	f := trackerFixture(origin)
 	in := f.Snapshot(origin, trackerWeather(origin.Truncate(time.Hour), origin))
 	slots := trackerSlots(origin.Truncate(15*time.Minute), 1)
-	in.Record(slots, slots, "decision", origin.UnixMilli())
+	in.Record(slots, slots, nil, "decision", origin.UnixMilli())
 	job := <-f.queue
 	end := slots[0].StartMs + 15*time.Minute.Milliseconds()
 	obs := []forecasting.Observation{{StartMS: slots[0].StartMs, EndMS: end, AvailableAtMS: end, PVW: 2000, LoadW: 1000, PVKnown: true, LoadKnown: true, Quality: "complete_balance_v1", ConfigVersion: trackerSite().Revision}}
@@ -267,7 +267,7 @@ func TestForecastColdPriorRiskPreservesPowerSigns(t *testing.T) {
 	if planning[0].PVW <= base[0].PVW || planning[0].PVW > 0 || planning[1].PVW != 0 {
 		t.Fatal("cold prior no hedge or invented solar")
 	}
-	in.Record(base, planning, "decision", at.UnixMilli())
+	in.Record(base, planning, nil, "decision", at.UnixMilli())
 	job := <-f.queue
 	if job.issue.Series[0].Points[0].PVBand.Method != forecasting.BandMethodColdStart {
 		t.Fatal("cold prior called empirical")
@@ -319,7 +319,7 @@ func TestForecastStopDrainsIssuedChampion(t *testing.T) {
 	}
 	in := f.Snapshot(at, trackerWeather(at.Add(time.Minute), at))
 	slots := trackerSlots(at.Add(time.Minute), 1)
-	in.Record(slots, slots, "shutdown-decision", at.UnixMilli())
+	in.Record(slots, slots, nil, "shutdown-decision", at.UnixMilli())
 	ctx, cancel := context.WithCancel(context.Background())
 	f.cancel = cancel
 	f.wg = sync.WaitGroup{}
@@ -348,7 +348,7 @@ func TestForecastFullHorizonRecordFitsArchive(t *testing.T) {
 		slots[i].LoadW = 1234.567 + float64(i)*0.03
 		slots[i].PVW = -2345.678
 	}
-	in.Record(slots, slots, "full-horizon", at.UnixMilli())
+	in.Record(slots, slots, nil, "full-horizon", at.UnixMilli())
 	job := <-f.queue
 	if err := job.issue.Validate(); err != nil {
 		t.Fatal(err)
@@ -395,7 +395,7 @@ func TestForecastMalformedWeatherDoesNotPoisonArchive(t *testing.T) {
 	rows[0].CloudCoverPct = nil
 	in := f.Snapshot(at, rows)
 	slots := trackerSlots(at, 1)
-	in.Record(slots, slots, "bad-weather", at.UnixMilli())
+	in.Record(slots, slots, nil, "bad-weather", at.UnixMilli())
 	job := <-f.queue
 	if err := job.issue.Validate(); err != nil {
 		t.Fatal(err)
@@ -411,9 +411,9 @@ func TestForecastDirectPVAndStableModelStateArchive(t *testing.T) {
 	rows := trackerWeather(at, at)
 	rows[0].Source = "forecast_solar"
 	slots := trackerSlots(at, 1)
-	f.Snapshot(at, rows).Record(slots, slots, "first", at.UnixMilli())
+	f.Snapshot(at, rows).Record(slots, slots, nil, "first", at.UnixMilli())
 	first := <-f.queue
-	f.Snapshot(at, rows).Record(slots, slots, "second", at.UnixMilli())
+	f.Snapshot(at, rows).Record(slots, slots, nil, "second", at.UnixMilli())
 	second := <-f.queue
 	if first.issue.Weather[0].DirectPVW == nil || *first.issue.Weather[0].DirectPVW != 4000 {
 		t.Fatal("direct forecast power missing from input archive")
@@ -439,7 +439,7 @@ func BenchmarkForecastTrackingFullHorizon(b *testing.B) {
 			_ = in.Load(time.UnixMilli(s.StartMs))
 		}
 		in.Risk(slots, append([]mpc.Slot(nil), slots...), 1)
-		in.Record(slots, slots, "benchmark", at.UnixMilli())
+		in.Record(slots, slots, nil, "benchmark", at.UnixMilli())
 		<-f.queue
 	}
 }

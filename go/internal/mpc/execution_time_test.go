@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-func TestPartialSlotCoreAndWorkerReplay(t *testing.T) {
+func TestNativePartialSlotCoreAndWorkerReplay(t *testing.T) {
 	for _, native := range []bool{false, true} {
 		t.Run(fmt.Sprint("native=", native), func(t *testing.T) {
 			var worker *ExternalOptimizer

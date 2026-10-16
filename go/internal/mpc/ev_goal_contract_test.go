@@ -10,7 +10,7 @@ import (
 
 // An unreachable departure changes the reported shortfall, never whether the
 // rest of the site receives a plan. These expectations use direct Wh arithmetic.
-func TestEVGoalPlanAndPriceContract(t *testing.T) {
+func TestNativeEVGoalPlanAndPriceContract(t *testing.T) {
 	for _, backend := range []string{"native", "reserve"} {
 		t.Run(backend, func(t *testing.T) {
 			solve := coreReservePlan

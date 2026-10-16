@@ -68,7 +68,7 @@ func TestForecastPrimaryNativeFullHorizonArchivesEveryInterval(t *testing.T) {
 					t.Fatalf("cold load replaced site prior at interval %d of %d", i, tc.count)
 				}
 			}
-			inputs.Record(resolved, resolved, "full-horizon-"+tc.name, origin.Add(time.Second).UnixMilli())
+			inputs.Record(resolved, resolved, nil, "full-horizon-"+tc.name, origin.Add(time.Second).UnixMilli())
 			issue := (<-tracker.queue).issue
 			if err := issue.Validate(); err != nil {
 				t.Fatalf("composed forecast rejected: %v", err)

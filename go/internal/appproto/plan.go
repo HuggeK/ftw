@@ -34,6 +34,7 @@ func planFrom(p *mpc.Plan, rev uint64, ceilingW *int64, uptimeMs int64, now time
 	// A plan older than the control loop is willing to act on is not what the
 	// box is doing any more, whatever it says.
 	out.Stale = now.Sub(time.UnixMilli(p.GeneratedAtMs)) > mpc.MaxPlanAge
+	out.CautionOff = p.CautionOff
 
 	mean := meanPriceOre(p.Actions)
 	minSoC := minSoC(p.Actions)

@@ -435,6 +435,14 @@ const solverZeroPowerToleranceW = 1e-5
 // this boundary: NaN, stale slot alignment, energy drift, illegal EV steps, or
 // mode/grid-limit violations reject the entire plan.
 func ValidatePlan(slots []Slot, p Params, plan *Plan) error {
+	return validatePlan(slots, p, plan, true)
+}
+
+// vehicleRules judges how the battery and the cars share power: no battery
+// discharge into a protected car, and no car charging while the battery
+// drives export. Only a replay of a plan already accepted against its own
+// inputs leaves them out.
+func validatePlan(slots []Slot, p Params, plan *Plan, vehicleRules bool) error {
 	if err := validatePartialSlots(slots); err != nil {
 		return err
 	}
@@ -627,11 +635,11 @@ func ValidatePlan(slots []Slot, p Params, plan *Plan) error {
 			if lp.SurplusOnly && surplusOnlyExceedsHousePV(powerW, slot.LoadW, effectivePVW) {
 				return fmt.Errorf("slot %d surplus-only loadpoint %s exceeds PV leftover after house load", i, lp.ID)
 			}
-			if powerW > solverZeroPowerToleranceW && a.BatteryW < -solverZeroPowerToleranceW && a.GridW < -50 {
+			if vehicleRules && powerW > solverZeroPowerToleranceW && a.BatteryW < -solverZeroPowerToleranceW && a.GridW < -50 {
 				return fmt.Errorf("slot %d loadpoint %s charges during battery-driven export: ev_w=%.9f battery_w=%.9f grid_w=%.9f",
 					i, lp.ID, powerW, a.BatteryW, a.GridW)
 			}
-			if lp.blocksBatteryToEV() && loadpoint.BatteryDischargeFeedsEV(a.BatteryW, powerW, slot.LoadW, effectivePVW) {
+			if vehicleRules && lp.blocksBatteryToEV() && loadpoint.BatteryDischargeFeedsEV(a.BatteryW, powerW, slot.LoadW, effectivePVW) {
 				return fmt.Errorf("slot %d battery discharge feeds loadpoint %s", i, lp.ID)
 			}
 		}
@@ -647,7 +655,7 @@ func ValidatePlan(slots []Slot, p Params, plan *Plan) error {
 			(slot.Limits.MaxExportW > 0 && a.GridW < -slot.Limits.MaxExportW-solverGridLimitToleranceW) {
 			return fmt.Errorf("slot %d grid_w %.3f violates grid limits", i, a.GridW)
 		}
-		if err := validateEVPulse(slot, p, a, effectivePVW); err != nil {
+		if err := validateEVPulse(slot, p, a, effectivePVW, vehicleRules); err != nil {
 			return fmt.Errorf("slot %d: %w", i, err)
 		}
 		wantCost := reserveSlotCost(slot, p, a)

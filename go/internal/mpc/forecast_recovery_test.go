@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/srcfl/ftw/go/internal/state"
+	"github.com/srcfl/ftw/go/internal/telemetry"
 )
 
 // Reproduce the reported chain: prices exist, one impossible future forecast
@@ -89,7 +90,7 @@ func TestNativePlannerRetainsPricesAndHorizonAfterBadForecast(t *testing.T) {
 							slots[0].PVW = math.NaN()
 						}
 					},
-					Record: func(base, planning []Slot, _ string, _ int64) {
+					Record: func(base, planning []Slot, _ []bool, _ string, _ int64) {
 						archivedBase = append([]Slot(nil), base...)
 						archivedPlanning = append([]Slot(nil), planning...)
 					},
@@ -141,7 +142,8 @@ func TestForecastRecoveryCannotChangeMeasuredOverload(t *testing.T) {
 	if prior[0].LoadW != 55700 || prior[1].LoadW != 800 || slots[1].LoadW != 2000 {
 		t.Fatal("lost actual overload or mutated raw inputs")
 	}
-	plan, used, err, _ := corePlanWithForecastRecovery(context.Background(), slots, slots, p, 800, true, time.Now)
+	choice, err := corePlanWithForecastRecovery(context.Background(), slots, slots, p, 800, true, time.Now)
+	plan, used := choice.plan, choice.slots
 	if err == nil || len(used) != 0 || len(plan.Actions) != 0 {
 		t.Fatal("forecast prior hid a real current overload")
 	}
@@ -164,7 +166,8 @@ func TestForecastRecoveryKeepsValidBatteryAndPVPeaks(t *testing.T) {
 				slots[12].PVW = -16000
 				p.Mode = ModeSelfConsumption
 			}
-			plan, used, err, warning := corePlanWithForecastRecovery(context.Background(), slots, slots, p, 800, false, time.Now)
+			choice, err := corePlanWithForecastRecovery(context.Background(), slots, slots, p, 800, false, time.Now)
+			plan, used, warning := choice.plan, choice.slots, choice.warning
 			if err != nil || warning != "" || len(used) != len(slots) || used[12].LoadW != slots[12].LoadW {
 				t.Fatalf("valid peak was replaced: %v %s", err, warning)
 			}
@@ -196,5 +199,45 @@ func TestForecastRecoveryOnlyHandlesStructuredInfeasibility(t *testing.T) {
 				t.Fatal("recovery changed market, timeline or limits")
 			}
 		}
+	}
+}
+
+// The archive learns which published loads Core replaced. The live meter's
+// in-flight load is a measurement, so a valid meter alone marks nothing.
+func TestRecordMarksOnlyRecoveredLoads(t *testing.T) {
+	for _, invalid := range []bool{false, true} {
+		t.Run(map[bool]string{false: "live meter", true: "invalid model load"}[invalid], func(t *testing.T) {
+			svc := shadowTestService(t)
+			start := time.Now().UTC().Truncate(time.Hour)
+			svc.now = func() time.Time { return start.Add(5 * time.Minute) }
+			svc.HouseholdMeasurement = func() telemetry.ForecastReading {
+				return telemetry.ForecastReading{HouseholdW: 2345, Valid: true}
+			}
+			var base []Slot
+			var recovered []bool
+			svc.ForecastSnapshot = func(time.Time, []state.ForecastPoint) ForecastInputs {
+				return ForecastInputs{
+					Resolve: func(_ context.Context, slots []Slot) []Slot {
+						for i := range slots {
+							slots[i].LoadW = 600 + 100*float64(i)
+						}
+						if invalid {
+							slots[2].LoadW = math.NaN()
+						}
+						return slots
+					},
+					Record: func(b, _ []Slot, r []bool, _ string, _ int64) {
+						base, recovered = append([]Slot(nil), b...), append([]bool(nil), r...)
+					},
+				}
+			}
+			if plan := svc.Replan(context.Background()); plan == nil {
+				t.Fatalf("no plan: %+v", svc.PlanSnapshot())
+			}
+			want := []bool{false, false, invalid, false}
+			if len(base) != 4 || base[0].LoadW != 2345 || fmt.Sprint(recovered) != fmt.Sprint(want) {
+				t.Fatalf("recovered=%v want %v; base=%+v", recovered, want, base)
+			}
+		})
 	}
 }

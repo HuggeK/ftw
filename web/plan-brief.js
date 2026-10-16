@@ -276,14 +276,19 @@ export function derivePlanBrief({
 
   const solver = plan.solver || {};
   const stale = Boolean(status.plan_stale);
+  // The household asked for forecast caution and this plan uses the point
+  // forecast instead. The planning warnings say why.
+  const cautionOff = Boolean(plan.caution_off);
   const plannerActive = String(status.mode || "").startsWith("planner_");
   const state = stale
     ? { key: "stale", label: "Fallback active", tone: "warn" }
     : solver.fallback
       ? { key: "fallback", label: "Built-in plan active", tone: "warn" }
-      : plannerActive
-        ? { key: "active", label: "Plan active", tone: "active" }
-        : { key: "ready", label: "Plan ready", tone: "idle" };
+      : cautionOff
+        ? { key: "caution_off", label: "Caution off", tone: "warn" }
+        : plannerActive
+          ? { key: "active", label: "Plan active", tone: "active" }
+          : { key: "ready", label: "Plan ready", tone: "idle" };
 
   const live = actions.find((action) => (
     now >= action.slot_start_ms &&
@@ -321,11 +326,14 @@ export function derivePlanBrief({
   const finalAction = actions[actions.length - 1];
   // The plan reaches as far as the published prices, and says how far.
   const forecast = {
-    label: "Published prices",
+    label: cautionOff ? "Point forecast" : "Published prices",
     detail: finalAction
       ? `Plan until ${formatPlanEnd(finalAction.slot_start_ms + (finalAction.slot_len_min || 15) * 60_000)}`
       : "The plan reaches as far as the published prices",
   };
+  if (cautionOff) {
+    forecast.detail = `No margin for forecast error in this plan. ${forecast.detail}`;
+  }
   // Expected charge follows the next step. Charging the car reports that
   // car's planned SoC. The home battery on the same slot (start SoC in
   // the header) is a different number — a car at 76% must not read as

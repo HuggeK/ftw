@@ -40,7 +40,7 @@ func TestNativePrimaryForecastReachesSolverBeforeRisk(t *testing.T) {
 					planning[i].PVW, planning[i].LoadW = -2000, 800
 				}
 			},
-			Record: func(base, planning []Slot, decisionID string, issuedAtMS int64) {
+			Record: func(base, planning []Slot, _ []bool, decisionID string, issuedAtMS int64) {
 				if decisionID == "" || issuedAtMS <= 0 {
 					t.Error("forecast archived before a plan was published")
 				}
