@@ -124,6 +124,7 @@ func TestLiveBoxForTheiPhone(t *testing.T) {
 	defer closeTun()
 	uplink.Tunnel().Attach(timedTun{inner: link, log: tunLog})
 	bound.Store(link)
+	enroll.SetHome(link.Home)
 	enroll.OnChange(link.RosterChanged)
 	enroll.OnPairingCode(link.RosterChanged)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -170,13 +171,11 @@ func TestLiveBoxForTheiPhone(t *testing.T) {
 	}
 	link.RosterChanged()
 	time.Sleep(300 * time.Millisecond)
-	v2, err := enroll.EnrollmentURL(code, "")
+	pairURL, err := enroll.EnrollmentURL(code, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// v3 by hand while appenroll.QRNamesHome stays off.
-	v3 := strings.Replace(v2, "#v2.", "#v3.", 1) + "." + base64.RawURLEncoding.EncodeToString([]byte(link.Status().Home))
-	if err := os.WriteFile(filepath.Join(dir, "pair.url"), []byte(v3), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "pair.url"), []byte(pairURL), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("box linked as %s; pairing link written", link.Status().Home)

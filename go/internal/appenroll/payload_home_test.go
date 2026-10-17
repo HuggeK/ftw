@@ -63,14 +63,8 @@ func TestAnUnlinkedBoxShowsV2(t *testing.T) {
 	}
 }
 
-// The QR stays v2 until every shipped app parses v3: ftw-app's
-// Enrollment.swift and Enrollment.kt and ftw-webapp's enrollment.ts each
-// take exactly five segments today. Flipping QRNamesHome is step 2's, and
-// this test is there to be changed with it.
-func TestTheQRStaysV2UntilTheAppsParseV3(t *testing.T) {
-	if QRNamesHome {
-		t.Fatal("QRNamesHome is on; check that ftw-app (iOS and Android) and ftw-webapp parse v3 in builds people have, then change this test")
-	}
+// A linked box gives a new client enough to pair with the relay blocked.
+func TestTheLinkedQRNamesItsCloudHome(t *testing.T) {
 	id, _ := newIdentity(t)
 	id.SetHome(func() string { return testHome })
 	code, _, _ := id.MintPairingCode(apiauth.RoleOwner, PairingTTL)
@@ -78,7 +72,7 @@ func TestTheQRStaysV2UntilTheAppsParseV3(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(url, base64.RawURLEncoding.EncodeToString([]byte(testHome))) || !strings.Contains(url, "#"+PayloadVersion+".") {
-		t.Fatalf("the QR names the home before the apps can read it: %q", url)
+	if !strings.Contains(url, "."+base64.RawURLEncoding.EncodeToString([]byte(testHome))) || !strings.Contains(url, "#"+PayloadVersionHome+".") {
+		t.Fatalf("the linked QR omits its Cloud home: %q", url)
 	}
 }

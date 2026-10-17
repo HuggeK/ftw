@@ -12,6 +12,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  verify-helpers:
+    name: verify-ftw helper tests (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test instance ownership and command evidence
+        run: python3 -m unittest discover -s .cursor/skills/verify-ftw/scripts -p 'test_verify.py'
+
   planning-docs:
     name: no agent planning documents
     runs-on: ubuntu-latest
@@ -25,3 +36,23 @@ jobs:
         env:
           PLANNING_DOCS_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: .github/check-no-planning-docs.sh
+
+  telemetry-reads:
+    name: no new direct telemetry reads
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Test the telemetry check
+        run: python3 -m unittest discover -s .github/scripts -p 'test_telemetry_reads.py'
+
+      - name: Count direct reads of cached telemetry
+        env:
+          TELEMETRY_READS_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: bash .github/scripts/check-telemetry-reads.sh

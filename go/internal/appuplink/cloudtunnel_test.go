@@ -254,7 +254,15 @@ func TestACommandThroughFTWCloudWithTheRelayGone(t *testing.T) {
 			SrcGrid: "meter", SrcPV: "meter", SrcBattery: "meter", Logger: slog.New(slog.DiscardHandler),
 		})
 	}
-	relay := unreachable(t)
+	var relayDials atomic.Int64
+	trap := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { relayDials.Add(1); w.WriteHeader(503) }))
+	t.Cleanup(trap.Close)
+	relay := "ws" + trap.URL[4:]
+	t.Cleanup(func() {
+		if relayDials.Load() != 0 {
+			t.Errorf("retired relay dialled %d times", relayDials.Load())
+		}
+	})
 	uplink, err := New(Options{Endpoint: relay, Enroll: enroll, Handler: build, Logger: slog.New(slog.DiscardHandler)})
 	if err != nil {
 		t.Fatal(err)

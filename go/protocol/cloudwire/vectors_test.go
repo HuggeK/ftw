@@ -263,6 +263,7 @@ func vectorBodies(grantKey []byte, boxPK []byte) []struct {
 			}},
 			Feedback: []Feedback{},
 		}},
+		{"roster browser notice", "box", MsgRoster, Roster{Header: h(19, 82_000), RosterSeq: 5, TTLS: 86400, Devices: []Device{{ID: "browser", Key: bytes.Repeat([]byte{0x55}, 32), Role: "owner", Scopes: []string{protocol.ScopeEventsRead}, Epoch: 1}}, WebPush: []WebPushRow{{ID: "opaque-subscription", Device: "browser", Epoch: 1, Endpoint: "https://push.example/opaque", CT: bytes.Repeat([]byte{0x66}, 128), Auth: "vapid box-signed"}}}},
 	}
 }
 

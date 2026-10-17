@@ -1836,6 +1836,103 @@ footer {
   color: var(--text-dim);
 }
 
+/* ---- Access settings tab ---- */
+/* Who outside the house may reach it. The page reads top to bottom in the
+   order an owner acts: what is missing, the code, the offer, what waits for
+   a yes, and who has access now. */
+.access-lede {
+  margin: 0 0 10px;
+  font-size: 0.85rem;
+  line-height: 1.45;
+}
+.access-quiet {
+  margin: 4px 0;
+  color: var(--text-dim);
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+/* What stops a grant is the first thing on the page, set apart from the
+   help around it, with the button that fixes it. */
+.access-blocked {
+  margin: 10px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--amber);
+  border-radius: 6px;
+  background: color-mix(in oklch, var(--amber) 10%, transparent);
+  font-size: 0.85rem;
+  line-height: 1.45;
+}
+.access-blocked p { margin: 0 0 8px; }
+.access-blocked button { margin-right: 8px; }
+.access-code-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.modal-body .access-code-row input[type="text"] {
+  flex: 1 1 auto;
+  max-width: 14ch;
+  font-size: 1.1rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.access-code-row .btn-send { margin-top: 0; }
+.access-note { margin: 6px 0 0; font-size: 0.85rem; min-height: 1.2em; }
+.access-error { margin: 6px 0 0; color: var(--red-e); font-size: 0.85rem; }
+.access-error:empty { display: none; }
+.access-warn { margin: 4px 0; color: var(--amber); font-size: 0.85rem; line-height: 1.4; }
+.access-done { color: var(--green-e); font-size: 0.85rem; }
+/* The offer, and a row being changed. A card, because it is one decision. */
+.access-card {
+  margin: 12px 0 4px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface2);
+}
+.access-card.access-done { border-color: var(--green-e); color: var(--text); }
+.access-card.access-done p:first-child { color: var(--green-e); font-weight: 600; }
+.access-title { margin: 0 0 6px; font-size: 1rem; line-height: 1.3; overflow-wrap: anywhere; }
+.access-heading { margin: 12px 0 2px; font-weight: 600; font-size: 0.85rem; }
+.access-subheading { margin: 10px 0 2px; color: var(--text-dim); font-size: 0.8rem; }
+.modal-body label.checkbox-row.access-check { margin: 4px 0; font-size: 0.85rem; }
+.modal-body label.checkbox-row.access-control-toggle { margin-top: 14px; font-weight: 600; font-size: 0.85rem; }
+.access-control {
+  margin-left: 6px;
+  padding-left: 12px;
+  border-left: 2px solid var(--border);
+}
+.access-cap-input { display: flex; gap: 8px; align-items: center; }
+.modal-body .access-cap-input input[type="number"] { max-width: 9ch; }
+.access-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+.access-actions button { margin-top: 0; }
+.access-code-row button:disabled,
+.access-actions button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+/* One assistant with access, or one request. Its name takes the line. */
+.access-row {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.85rem;
+}
+.access-row:last-child { border-bottom: 0; }
+.access-row-head { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
+.access-row-name { margin: 0; font-weight: 600; overflow-wrap: anywhere; }
+.access-row details { margin-top: 4px; font-size: 0.8rem; color: var(--text-dim); }
+.access-may { margin: 4px 0 0; padding-left: 18px; }
+.access-args {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px 12px;
+  margin: 6px 0;
+  font-size: 0.8rem;
+}
+.access-args dt { color: var(--text-dim); }
+.access-args dd { margin: 0; overflow-wrap: anywhere; }
+.access-why { margin: 6px 0; overflow-wrap: anywhere; }
+
 /* Collapse the generic two-column settings rows to a single column on phones,
    so inputs aren't squeezed to unusable widths. */
 @media (max-width: 560px) {

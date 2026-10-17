@@ -152,7 +152,7 @@ func newRigOpts(t *testing.T, epoch int64, set func(*Options)) *rig {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	done := make(chan error, 1)
-	go func() { done <- uplink.Run(ctx) }()
+	go func() { done <- uplink.runRelay(ctx) }()
 
 	return &rig{relay: relay, enroll: enroll, uplink: uplink, cancel: cancel, done: done}
 }

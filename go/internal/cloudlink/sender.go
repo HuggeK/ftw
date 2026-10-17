@@ -701,6 +701,14 @@ func (l *Link) rosterNumber(snap grantSnapshot) (uint64, cloudwire.Roster) {
 	}
 	sort.Slice(r.Devices, func(a, b int) bool { return r.Devices[a].ID < r.Devices[b].ID })
 	r.Noise = l.opts.Roster.Noise()
+	if l.opts.WebPush != nil {
+		var err error
+		r.WebPush, err = l.opts.WebPush.WebPushRows()
+		if err != nil {
+			l.log.Warn("could not prepare browser offline notices")
+		}
+		sort.Slice(r.WebPush, func(a, b int) bool { return r.WebPush[a].ID < r.WebPush[b].ID })
+	}
 	if code, expires, ok := l.opts.Roster.Pending(); ok && snap.home != "" {
 		if left := time.Until(expires); left > 0 {
 			r.Pending = append(r.Pending, cloudwire.Pending{
@@ -715,7 +723,7 @@ func (l *Link) rosterNumber(snap grantSnapshot) (uint64, cloudwire.Roster) {
 	for _, p := range r.Pending {
 		pending = append(pending, p.Hash)
 	}
-	sum := digest([]any{r.Devices, r.Grant, pending, r.Noise})
+	sum := digest([]any{r.Devices, r.Grant, pending, r.Noise, r.WebPush})
 
 	l.mu.Lock()
 	defer l.mu.Unlock()

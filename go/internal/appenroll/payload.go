@@ -33,8 +33,8 @@ const (
 
 	// PayloadVersionHome is v2 with a sixth segment: the home id at FTW
 	// Cloud, base64url of its 26 ASCII characters, so a new phone knows
-	// where to dial before any session with the box. No shipped app reads
-	// it; each parser takes exactly five segments of v2.
+	// where to dial before any session with the box. Both the web client
+	// and iPhone read this form.
 	PayloadVersionHome = "v3"
 
 	// PayloadOrigin is where the app is served. It is also the passkey RP
@@ -47,12 +47,9 @@ const (
 	MaxLANHintChars = 64
 )
 
-// QRNamesHome is the one switch that puts the home id in the QR, as v3. It
-// stays false until the apps parse v3 and those builds are out: ftw-app's
-// Enrollment.swift and Enrollment.kt, and ftw-webapp's enrollment.ts. A v3
-// QR before then stops pairing on every shipped app. Until it flips, a new
-// phone learns the home id from hello_ok.cloud on its first session.
-const QRNamesHome = false
+// QRNamesHome puts the Cloud home id in the QR, as v3. The web client needs
+// it to pair through Cloud; iPhone also reads v3. An unlinked box keeps v2.
+const QRNamesHome = true
 
 // SetHome tells enrolment where to find the home id at FTW Cloud, for a QR
 // that names it. fn returns "" while the box is not linked.
@@ -66,7 +63,7 @@ func (i *Identity) SetHome(fn func() string) {
 //
 // lanHint is where the box believes it can be reached on the local network,
 // and is allowed to be empty: a box that does not know its own address should
-// say nothing rather than guess, and the app falls back to the relay.
+// say nothing rather than guess. The Cloud home id does not depend on it.
 func (i *Identity) EnrollmentURL(code []byte, lanHint string) (string, error) {
 	return i.enrollmentURL(code, lanHint, QRNamesHome)
 }

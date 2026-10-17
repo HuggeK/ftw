@@ -247,10 +247,10 @@ type FleetPing struct {
 	Endpoint string `yaml:"endpoint,omitempty" json:"endpoint,omitempty"`
 }
 
-// DefaultFleetPingEndpoint is the fleet-report door on FTW's relay. The relay
+// DefaultFleetPingEndpoint is the anonymous fleet-report route on FTW Cloud. It
 // adds the report to daily totals and discards the request; a failed ping is
 // forgotten, never retried.
-const DefaultFleetPingEndpoint = "https://relay.ftw.energy/fleet"
+const DefaultFleetPingEndpoint = "https://cloud.ftw.energy/v1/fleet"
 
 // On reports whether the ping is switched on, and is the only place that
 // answers it.
@@ -274,7 +274,7 @@ func (f *FleetPing) On() bool {
 // this address after FTW moved the collector, and the aggregate would
 // quietly lose every box that had ever saved its settings.
 func (f *FleetPing) Resolved() string {
-	if f == nil || f.Endpoint == "" {
+	if f == nil || f.Endpoint == "" || strings.TrimSpace(f.Endpoint) == "https://relay.ftw.energy/fleet" {
 		return DefaultFleetPingEndpoint
 	}
 	return f.Endpoint

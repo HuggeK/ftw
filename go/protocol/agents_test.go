@@ -119,6 +119,9 @@ func vectorMessages(t *testing.T, key *ecdsa.PrivateKey) []struct {
 	t.Helper()
 	f := vectorFor()
 	const atMs = 1_792_000_000_000
+	// The vectors keep the 30-day ends they were cut with: the app checks
+	// the same bytes, and the length is only data here.
+	const month = 30 * 24 * 60 * 60 * 1000
 
 	keySet := ApprovalKeySet{Pub: vectorPub(key), AtMs: atMs}
 	add := AgentAdd{
@@ -126,7 +129,7 @@ func vectorMessages(t *testing.T, key *ecdsa.PrivateKey) []struct {
 		Scopes:      []string{ScopeDispatchHold, ScopeLiveRead, ScopePlanRead},
 		Ops:         []string{OpLoadpointHold},
 		Caps:        Caps{HoldS: 900, MaxW: 11_000, PerMin: 6},
-		ExpiresAtMs: atMs + AgentMaxMs,
+		ExpiresAtMs: atMs + month,
 		Principal:   Principal{Client: "Claude", ClientID: "https://claude.ai/oauth/mcp-client-metadata"},
 		AtMs:        atMs,
 	}
@@ -141,7 +144,7 @@ func vectorMessages(t *testing.T, key *ecdsa.PrivateKey) []struct {
 		ID: "oKGio6Sl", Epoch: 2,
 		Scopes:      []string{ScopeLiveRead, ScopePlanRead},
 		Caps:        Caps{PerMin: 6},
-		ExpiresAtMs: atMs + AgentMaxMs, AtMs: atMs,
+		ExpiresAtMs: atMs + month, AtMs: atMs,
 	}
 	confirm := AgentConfirm{ReqID: vectorRequest().ReqID, Approve: true, AtMs: atMs}
 

@@ -129,3 +129,14 @@ func TestFleetPingSwitchNeedsNoRestartButTheEndpointDoes(t *testing.T) {
 		t.Errorf("moving the endpoint gave %v, want one fleet_ping.endpoint reason", reasons)
 	}
 }
+
+func TestAnExplicitRetiredFleetCollectorResolvesToCloud(t *testing.T) {
+	f := &FleetPing{Enabled: true, Endpoint: "https://relay.ftw.energy/fleet"}
+	if f.Resolved() != DefaultFleetPingEndpoint {
+		t.Fatal(f.Resolved())
+	}
+	f.Endpoint = "https://my-collector.example/report"
+	if f.Resolved() != f.Endpoint {
+		t.Fatal("changed a private collector")
+	}
+}

@@ -41,7 +41,8 @@ func (b *agentBox) signedFor(device string) protocol.SignedFor {
 	return protocol.SignedFor{BoxKey: b.id.StaticKey().Public(), DeviceID: device}
 }
 
-// readGrant is an assistant that reads live data and the plan for 30 days.
+// readGrant is an assistant that reads live data and the plan for as long as
+// an assistant may have.
 func (b *agentBox) readGrant(key []byte) protocol.AgentAdd {
 	return protocol.AgentAdd{
 		Key: key, Role: apiauth.RoleAgent,
@@ -178,6 +179,54 @@ func TestAGrantStaysWithinTheBoxsLimits(t *testing.T) {
 	}
 	if len(b.id.Agents()) != 0 {
 		t.Errorf("a refused grant left a row: %+v", b.id.Agents())
+	}
+}
+
+// An assistant may have a year, renewed for a year from the day it renews,
+// and not a millisecond more. The refusal names the latest end the box takes,
+// so a client knows what it may ask for.
+func TestAnAssistantMayHaveAYearAndNoMore(t *testing.T) {
+	b := newAgentBox(t)
+	year := (365 * 24 * time.Hour).Milliseconds()
+	over := func(err error) bool {
+		var r *protocol.Refusal
+		return errors.As(err, &r) && r.Code == protocol.ErrCapExceeded &&
+			r.Args["cap"] == "expiresAtMs" && r.Args["max"] == b.ms()+year
+	}
+	m := b.readGrant(appKey(t))
+	m.ExpiresAtMs = b.ms() + year + 1
+	if _, err := b.id.AddAgent(AtTheBoxPage, m); !over(err) {
+		t.Fatalf("a year and a millisecond: %v", err)
+	}
+	m.ExpiresAtMs = b.ms() + year
+	row := b.add(t, m)
+
+	b.now = b.now.Add(200 * 24 * time.Hour)
+	by := Approver{DeviceID: b.owner.DeviceID}
+	renew := protocol.AgentWiden{ID: row.ID, Epoch: row.Epoch, Scopes: row.Scopes, Ops: row.Ops, Caps: row.Caps,
+		ExpiresAtMs: b.ms() + year + 1, AtMs: b.ms()}
+	if _, err := b.id.WidenAgent(by, b.signer.Widen(b.signedFor(b.owner.DeviceID), renew, row.Key)); !over(err) {
+		t.Fatalf("renewed past a year: %v", err)
+	}
+	renew.ExpiresAtMs = b.ms() + year
+	renewed, err := b.id.WidenAgent(by, b.signer.Widen(b.signedFor(b.owner.DeviceID), renew, row.Key))
+	if err != nil || renewed.ExpiresAtMs != b.ms()+year {
+		t.Fatalf("renewed for a year: %+v %v", renewed, err)
+	}
+}
+
+// The limits agent.list tells owners are the ones the box holds a grant to.
+func TestTheBoxTellsTheLimitsItHolds(t *testing.T) {
+	day := (24 * time.Hour).Milliseconds()
+	want := map[string]int64{apiauth.RoleAgent: 365 * day, apiauth.RoleSupport: 14 * day, apiauth.RoleRelease: 90 * day}
+	got := protocol.LongestMs()
+	if len(got) != len(want) {
+		t.Fatalf("LongestMs = %v", got)
+	}
+	for role, ms := range want {
+		if got[role] != ms || longest(role) != ms {
+			t.Errorf("%s: told %d, holds %d, want %d", role, got[role], longest(role), ms)
+		}
 	}
 }
 
