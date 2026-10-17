@@ -89,6 +89,13 @@ describe("how the box knows a car", () => {
     assert.equal(bare[2][1], "None");
   });
 
+  it("says they are hidden when the box left them out for this device", () => {
+    const rows = P.knownBy({ name: "Model Y" }, true);
+    assert.deepEqual(rows.map((r) => r[0]), ["VIN", "Level from", "Charger tags"]);
+    for (const [, v] of rows) assert.match(v, /^Hidden/);
+    assert.match(source, /state\.redacted = !!\(data && data\.redacted\)/);
+  });
+
   it("puts names and sources in as text", () => {
     assert.doesNotMatch(source.slice(source.indexOf("function carRow")), /innerHTML/);
   });

@@ -110,20 +110,37 @@ export function noticeTitle(lp, cars = []) {
   return car ? `${car.name} connected` : 'Car connected';
 }
 
-export function tapRefusedText(body) {
+// tapRefusedText says why a tap did not land. status is the HTTP status:
+// a 401 is a device that has not signed in with the house password (the
+// page asked and the person cancelled), not a refusal of the car.
+export function tapRefusedText(body, status) {
+  if (status === 401) return 'Choosing the car needs the house password. Sign in and try again.';
+  if (status === 403) return 'This device may not choose the car.';
   return (body && TAP_REFUSED[body.reason]) || 'The box did not take that. Try again.';
 }
 
+// TAP_TIMEOUT_MS is how long a tap waits for the box, as the EV modal's
+// writes do.
+export const TAP_TIMEOUT_MS = 30000;
+
 // tap sends session.car.set for the plug-in the page shows. An empty carId
-// is "None of these", a visitor's car.
-export async function tap(fetchFn, lp, carId) {
-  const r = await fetchFn(`/api/loadpoints/${encodeURIComponent(lp.id)}/car`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ session: lp.session, car_id: carId }),
-  });
-  if (r.ok) return { ok: true };
-  const body = await r.json().catch(() => null);
-  return { ok: false, text: tapRefusedText(body) };
+// is "None of these", a visitor's car. It gives up after TAP_TIMEOUT_MS.
+export async function tap(fetchFn, lp, carId, timeoutMs = TAP_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const r = await fetchFn(`/api/loadpoints/${encodeURIComponent(lp.id)}/car`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: lp.session, car_id: carId }), signal: controller.signal,
+    });
+    if (r.ok) return { ok: true };
+    const body = await r.json().catch(() => null);
+    return { ok: false, text: tapRefusedText(body, r.status) };
+  } catch {
+    return { ok: false, text: 'The box did not answer. Try again.' };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function node(doc, tag, className, parent, text) {
@@ -183,23 +200,32 @@ export function createWhichCar(doc, { onTap }) {
 }
 
 // carTiles is what the card shows of each car, in words. sinceS is the time
-// since the list was read.
-export function carTiles(cars = [], loadpoints = [], sinceS = 0) {
+// since the list was read. chargersFresh is false while the chargers' own
+// read is old: the car's level still stands, but where it is does not.
+export function carTiles(cars = [], loadpoints = [], sinceS = 0, chargersFresh = true) {
   const names = Object.fromEntries(cars.map(c => [c.id, c.name]));
   return cars.map(car => {
-    const lp = chargerOf(car, loadpoints);
+    const lp = chargersFresh ? chargerOf(car, loadpoints) : null;
     const level = levelView(car, sinceS);
     const facts = [];
-    if (Number.isFinite(car.charge_limit_permille)) facts.push(`Limit ${pct(car.charge_limit_permille)}`);
+    // The limit is the car's, read with its level; only beside that reading
+    // does it say how old it is.
+    if (car.soc_source === 'vehicle' && Number.isFinite(car.charge_limit_permille)) {
+      facts.push(`Limit ${pct(car.charge_limit_permille)}`);
+    }
     facts.push(car.goal ? `Goal ${goalText(car.goal)}` : 'No goal');
     if (car.surplus_only) facts.push('Solar only');
     // While a charger asks, a car it may be is not known to be unplugged.
-    const maybe = lp ? [] : loadpoints.filter(o => asking(o) && Array.isArray(o.choose) && o.choose.includes(car.id));
-    const where = lp ? `On ${lp.id}` : maybe.length ? `On ${maybe.map(o => o.id).join(' or ')}?` : 'Not plugged in';
+    const maybe = lp || !chargersFresh ? [] : loadpoints.filter(o => asking(o) && Array.isArray(o.choose) && o.choose.includes(car.id));
+    // A charger that has gone quiet cannot say the car is still on it.
+    const quiet = !!(lp && lp.charger && lp.charger.available === false);
+    const where = !chargersFresh || quiet ? 'Charger status unknown'
+      : lp ? `On ${lp.id}` : maybe.length ? `On ${maybe.map(o => o.id).join(' or ')}?` : 'Not plugged in';
+    const on = !!lp && !quiet;
     return {
       id: car.id, name: car.name, where,
       level: level.value, estimate: level.estimate, source: level.source, facts: facts.join(' · '),
-      charger: lp ? { id: lp.id, driver_name: lp.driver_name } : null, knownBy: lp ? knownByText(lp, names) : '',
+      charger: on ? { id: lp.id, driver_name: lp.driver_name } : null, knownBy: on ? knownByText(lp, names) : '',
     };
   });
 }
@@ -216,11 +242,11 @@ export function createCarsCard(doc, el, { onOpenCharger } = {}) {
   const age = node(doc, 'span', 'overview-cars-age', head);
   const list = node(doc, 'div', 'car-tiles', el);
   let shown = '';
-  function update({ cars = [], loadpoints = [], fetchedAt = 0, now = Date.now(), fresh = true } = {}) {
+  function update({ cars = [], loadpoints = [], fetchedAt = 0, now = Date.now(), fresh = true, chargersFresh = true } = {}) {
     el.hidden = !cars.length;
     age.textContent = fresh || !fetchedAt ? ''
       : `Not updated since ${new Date(fetchedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })}`;
-    const tiles = carTiles(cars, loadpoints, fetchedAt ? Math.max(0, (now - fetchedAt) / 1000) : 0);
+    const tiles = carTiles(cars, loadpoints, fetchedAt ? Math.max(0, (now - fetchedAt) / 1000) : 0, fresh && chargersFresh);
     // Rebuilt only when what it shows changes; ages move once a minute.
     const key = JSON.stringify(tiles);
     if (key === shown) return;

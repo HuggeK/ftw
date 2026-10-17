@@ -22,7 +22,7 @@
     persistence_unconfirmed: "The box could not confirm it saved this. Check the list before trying again.",
   };
 
-  var state = { cars: null, problem: "" };
+  var state = { cars: null, redacted: false, problem: "" };
 
   // newCarId mints a car's id as the owner's app does: 128 random bits as 32
   // lowercase hex digits.
@@ -80,8 +80,14 @@
     return Object.keys(body).length ? body : null;
   }
 
-  // How the box knows a car, as label and value pairs.
-  function knownBy(car) {
+  // How the box knows a car, as label and value pairs. redacted is the
+  // box's word that it left these out for this device, which has not signed
+  // in; then they are hidden, not missing.
+  function knownBy(car, redacted) {
+    if (redacted) {
+      var hidden = "Hidden until this device signs in with the house password";
+      return [["VIN", hidden], ["Level from", hidden], ["Charger tags", hidden]];
+    }
     var rows = [];
     rows.push(["VIN", car.vin || "Not set"]);
     if (car.make) rows.push(["Make", car.make]);
@@ -121,6 +127,7 @@
       .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
       .then(function (data) {
         state.cars = (data && data.cars) || [];
+        state.redacted = !!(data && data.redacted);
         state.problem = "";
       })
       .catch(function () { state.problem = "The box did not answer. Try again in a moment."; })
@@ -190,7 +197,7 @@
     });
 
     var facts = el("dl", { className: "cars-facts" });
-    knownBy(car).forEach(function (row) {
+    knownBy(car, state.redacted).forEach(function (row) {
       facts.appendChild(el("dt", { text: row[0] }));
       facts.appendChild(el("dd", { text: row[1] }));
     });

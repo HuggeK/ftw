@@ -65,8 +65,30 @@ func writeCarError(w http.ResponseWriter, op string, err error) {
 	writeJSON(w, status, map[string]string{"error": err.Error(), "code": code, "reason": reason})
 }
 
-// POST /api/cars is car.add. The body is the car in the names of GET
-// /api/cars, with the id the page minted.
+// carArgs reads a route's body as the op's arguments: the map a cmd frame
+// carries, so the op's own checks read it.
+func carArgs(w http.ResponseWriter, r *http.Request) (map[string]any, bool) {
+	var args map[string]any
+	if err := readJSON(r, &args); err != nil || args == nil {
+		msg := "body must be a JSON object"
+		if err != nil {
+			msg = err.Error()
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": msg})
+		return nil, false
+	}
+	return args, true
+}
+
+// writeBadCarArg refuses one argument as the op does: E_UNKNOWN_OP naming
+// it, with the reason the page reads as "check what you typed".
+func writeBadCarArg(w http.ResponseWriter, arg string) {
+	writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad argument: " + arg,
+		"code": appproto.ErrUnknownOp, "reason": "invalid", "arg": arg})
+}
+
+// POST /api/cars is car.add. The body is car.add's arguments: the id the
+// page minted and the car's fields, in the names of GET /api/cars.
 func (s *Server) handleCarAdd(w http.ResponseWriter, r *http.Request) {
 	if !mayKeepCars(w, r) {
 		return
@@ -75,9 +97,13 @@ func (s *Server) handleCarAdd(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	var car protocol.Car
-	if err := readJSON(r, &car); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	args, ok := carArgs(w, r)
+	if !ok {
+		return
+	}
+	car, bad := appproto.CarAddArgs(args)
+	if bad != "" {
+		writeBadCarArg(w, bad)
 		return
 	}
 	added, err := edits.Add(car)
@@ -89,7 +115,7 @@ func (s *Server) handleCarAdd(w http.ResponseWriter, r *http.Request) {
 }
 
 // PATCH /api/cars/{id} is car.update: the fields present change, the rest
-// stay as they were.
+// stay as they were. The car is the one the path names.
 func (s *Server) handleCarUpdate(w http.ResponseWriter, r *http.Request) {
 	if !mayKeepCars(w, r) {
 		return
@@ -98,25 +124,18 @@ func (s *Server) handleCarUpdate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	var req struct {
-		NewID       *string   `json:"new_id"`
-		Name        *string   `json:"name"`
-		Make        *string   `json:"make"`
-		VIN         *string   `json:"vin"`
-		CapacityWh  *float64  `json:"capacity_wh"`
-		MaxW        *float64  `json:"max_w"`
-		Phases      *int      `json:"phases"`
-		Identifiers *[]string `json:"identifiers"`
-		Sources     *[]string `json:"sources"`
-	}
-	if err := readJSON(r, &req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	args, ok := carArgs(w, r)
+	if !ok {
 		return
 	}
-	car, err := edits.UpdateCar(r.PathValue("id"), cars.Update{
-		NewID: req.NewID, Name: req.Name, Make: req.Make, VIN: req.VIN, CapacityWh: req.CapacityWh,
-		MaxW: req.MaxW, Phases: req.Phases, Identifiers: req.Identifiers, Sources: req.Sources,
-	})
+	id := r.PathValue("id")
+	args["id"] = id
+	u, bad := appproto.CarUpdateArgs(args)
+	if bad != "" {
+		writeBadCarArg(w, bad)
+		return
+	}
+	car, err := edits.UpdateCar(id, u)
 	if err != nil {
 		writeCarError(w, protocol.OpCarUpdate, err)
 		return

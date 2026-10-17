@@ -2168,6 +2168,9 @@
   // true between reads and an old list says how old it is.
   var lastCars = [];
   var carsFetchedAt = 0;
+  // Where a car is comes from the chargers' read, which can fail while the
+  // cars' read answers: each list has its own time.
+  var loadpointsFetchedAt = 0;
   var carsCard = null;
   function openChargerOf(lp) {
     if (energyFlowEl) energyFlowEl.dispatchEvent(new CustomEvent("ftw-planet-click", { detail: { role: "ev", name: lp.driver_name } }));
@@ -2186,6 +2189,7 @@
       carsCard.update({
         cars: lastCars, loadpoints: chargingNoticePoints, fetchedAt: carsFetchedAt, now: Date.now(),
         fresh: !document.hidden && Date.now() - carsFetchedAt < 15000,
+        chargersFresh: !document.hidden && Date.now() - loadpointsFetchedAt < 15000,
       });
     }).catch(function (err) { console.error("cars:", err); });
   }
@@ -2300,6 +2304,7 @@
         try { updateStorageBanner(health && health.storage); }
         catch (eSb) { /* silent */ }
         if (lp && Array.isArray(lp.loadpoints)) {
+          loadpointsFetchedAt = Date.now();
           var idx = {};
           lp.loadpoints.forEach(function (l) {
             if (l && l.driver_name) idx[l.driver_name] = l;

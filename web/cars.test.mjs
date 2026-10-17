@@ -10,7 +10,7 @@ import { describe, it } from 'node:test';
 
 import {
   ageText, asking, carTiles, choices, createCarsCard, createWhichCar, daysText, goalText,
-  levelView, noticeTitle, tap, tapRefusedText,
+  levelView, noticeTitle, tap, tapRefusedText, TAP_TIMEOUT_MS,
 } from './cars.js';
 
 const read = path => readFileSync(new URL(path, import.meta.url), 'utf8');
@@ -137,6 +137,23 @@ describe('each car shows, plugged in or not', () => {
     assert.equal(tiles[0].charger, null, 'a car the box asks about is on no charger yet');
   });
 
+  it('says the charger status is unknown when the chargers’ read is old', () => {
+    // The cars answered, the chargers did not: the level stands, the place does not.
+    const [, v] = carTiles([tesla, volvo], [garage], 0, false);
+    assert.equal(v.where, 'Charger status unknown');
+    assert.equal(v.charger, null);
+    assert.equal(v.knownBy, '');
+    const [, quiet] = carTiles([tesla, volvo], [{ ...garage, charger: { available: false } }]);
+    assert.equal(quiet.where, 'Charger status unknown', 'a charger that went quiet cannot say the car is on it');
+    assert.equal(quiet.charger, null);
+  });
+
+  it('shows the charge limit only beside the car’s own reading', () => {
+    assert.match(carTiles([tesla])[0].facts, /^Limit 80%/);
+    assert.doesNotMatch(carTiles([{ ...tesla, soc_source: 'manual' }])[0].facts, /Limit/);
+    assert.doesNotMatch(carTiles([{ ...tesla, soc_source: 'assumed' }])[0].facts, /Limit/);
+  });
+
   it('does not put a car on a charger that has been unplugged', () => {
     assert.equal(carTiles([volvo], [{ ...garage, plugged_in: false }])[0].where, 'Not plugged in');
   });
@@ -204,6 +221,20 @@ describe('a charger whose car the box cannot name asks', () => {
     assert.equal(current.getAttribute('aria-pressed'), 'true');
   });
 
+  it('says a tap needs the house password rather than that the box refused it', () => {
+    assert.match(tapRefusedText({ error: 'valid LAN password required' }, 401), /house password/);
+    assert.equal(tapRefusedText({ error: 'only an owner' }, 403), 'This device may not choose the car.');
+  });
+
+  it('gives up on a tap the box does not answer', async () => {
+    const fetchFn = (path, opts) => new Promise((_, reject) => {
+      opts.signal.addEventListener('abort', () => reject(new Error('aborted')));
+    });
+    assert.deepEqual(await tap(fetchFn, { id: 'garage', session: 's1' }, kia.id, 10),
+      { ok: false, text: 'The box did not answer. Try again.' });
+    assert.equal(TAP_TIMEOUT_MS, 30000, 'as long as the EV modal waits');
+  });
+
   it('says why the box refused a tap', async () => {
     assert.equal(tapRefusedText({ reason: 'session' }), 'That plug-in has ended.');
     assert.equal(tapRefusedText({ reason: 'elsewhere' }), 'That car is on another charger.');
@@ -211,7 +242,7 @@ describe('a charger whose car the box cannot name asks', () => {
     const sent = [];
     const fetchFn = async (path, opts) => {
       sent.push([path, opts.method, JSON.parse(opts.body)]);
-      return { ok: false, json: async () => ({ code: 'E_PRECONDITION', reason: 'session' }) };
+      return { ok: false, status: 409, json: async () => ({ code: 'E_PRECONDITION', reason: 'session' }) };
     };
     const res = await tap(fetchFn, { id: 'gar age', session: 's1' }, kia.id);
     assert.deepEqual(sent, [['/api/loadpoints/gar%20age/car', 'POST', { session: 's1', car_id: kia.id }]]);
@@ -269,6 +300,11 @@ describe('the dashboard wiring', () => {
     assert.match(app, /import\("\/cars\.js"\)/);
     assert.match(app, /ui\.noticeTitle\(lp, lastCars\)/);
     assert.match(app, /row\.which\.update\(lp, lastCars, chargingNoticePoints, available\)/);
+  });
+
+  it('dates the chargers’ read apart from the cars’', () => {
+    assert.match(app, /loadpointsFetchedAt = Date\.now\(\)/);
+    assert.match(app, /chargersFresh: !document\.hidden && Date\.now\(\) - loadpointsFetchedAt < 15000/);
   });
 
   it('places the cars after Power now and spans the row', () => {

@@ -343,6 +343,12 @@ func optBool(args map[string]any, k string) (*bool, string) {
 	return &b, ""
 }
 
+// CarAddArgs and CarUpdateArgs read car.add's and car.update's arguments as
+// the ops do, for the box page's routes. bad names an argument they refuse.
+func CarAddArgs(args map[string]any) (car protocol.Car, bad string) { return carArgs(args) }
+
+func CarUpdateArgs(args map[string]any) (u cars.Update, bad string) { return carUpdateArgs(args) }
+
 // carArgs reads car.add: id, which the owner's app mints, and the car's own
 // fields without the level.
 func carArgs(args map[string]any) (protocol.Car, string) {
