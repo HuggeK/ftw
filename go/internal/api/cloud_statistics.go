@@ -137,7 +137,7 @@ func (s *Server) handleCloudStatsPolicy(w http.ResponseWriter, r *http.Request) 
 		"fields":                     cloudwire.StatsMetricKeys,
 		"meaning":                    "One reporting installation, configured flexible power and solar ratings, battery capacity, and recorded closed-hour energy. Configured limits do not prove physical control. Missing readings are unknown.",
 		"resolution":                 "Closed UTC hours, energy rounded to 10 Wh, capacities and limits rounded to 10 Wh or W. No names, addresses, device ids or location.",
-		"retention":                  "13 months. Leaving Cloud or stopping local sharing deletes unpublished household rows; published group totals remain.",
+		"retention":                  "48 hours. Leaving Cloud or stopping local sharing deletes unpublished household rows; published group totals remain.",
 		"publication_minimum_homes":  cloudwire.StatsMinimumHomes,
 		"publication_max_home_share": 0.3,
 		"controller":                 "sourceful", "local_default": "ask_yes", "local_optional": true, "cloud_required": true,

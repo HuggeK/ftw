@@ -5,10 +5,13 @@ import "slices"
 // StatsPolicy names the scope included in the current Cloud terms, or
 // accepted through the separate local statistics question. Earlier choices
 // never accept this policy. Collection still requires service approval.
-const StatsPolicy = "ftw-project-stats-2026-10-v2"
-const CloudTermsPolicy = "ftw-cloud-2026-10-v2"
+const StatsPolicy = "ftw-project-stats-2026-10-v3"
+const CloudTermsPolicy = "ftw-cloud-2026-10-v3"
 const MsgStats = "stats"
 const StatsHourMS = int64(3_600_000)
+
+// StatsRetentionMS is the maximum age of a stored household hour.
+const StatsRetentionMS = 48 * StatsHourMS
 const StatsMinimumHomes = 20
 
 var StatsMetricKeys = []string{

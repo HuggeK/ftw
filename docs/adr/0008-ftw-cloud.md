@@ -178,7 +178,7 @@ that question and the DPIA have been reviewed and signed.
   prices, free text, configuration documents or logs.
 - **`statsId`.** 128 random bits drawn by the box at consent, derived from
   nothing else. A new consent draws a new one.
-- **Retention.** Rows go 13 months after the hour they describe. Leaving Cloud, stopping local sharing or
+- **Retention.** Rows go 48 hours after the hour they describe. Leaving Cloud, stopping local sharing or
   a purge deletes unpublished rows when Cloud receives the signed request.
   An offline box sends it on reconnection. Published aggregates stay, and the
   consent screen says so.
@@ -218,7 +218,7 @@ The privacy notice says so.
 | Access logs | 14 days, with a keyed hash instead of the address |
 | SSM sessions and deploy log | 24 months |
 | Backups | None; boxes refill the service |
-| Statistics | 13 months |
+| Statistics | 48 hours |
 
 ## Operations and cost
 
@@ -311,8 +311,8 @@ rules, the app asks again. A public launch needs C2–C4 and the legal work.
 
 ### Project statistics policy, October 2026
 
-`ftw-project-stats-2026-10-v2` covers configured capacities, flexible power,
-solar rating and closed-hour energy. `ftw-cloud-2026-10-v2` includes that scope
+`ftw-project-stats-2026-10-v3` covers configured capacities, flexible power,
+solar rating and closed-hour energy. `ftw-cloud-2026-10-v3` includes that scope
 for every Cloud home. An owner reads `GET /api/cloud/stats-policy`, then
 accepts the Cloud terms through `POST /api/cloud/grant`. Core records the
 scope, random stats id and start time in the same grant. An older Cloud
@@ -336,7 +336,7 @@ The public view counts installations reporting in the last 24 closed hours.
 It sums the recorded hours, which may be incomplete; it does not claim all
 FTW users, full-day production or measured control capacity. Configured
 limits remain distinct from measured command results. Unknown values stay
-absent. Cloud keeps the consented hourly rows for 13 months and publishes
+absent. Cloud keeps the consented hourly rows for 48 hours and publishes
 only the existing group thresholds. Withdrawal deletes unpublished rows
 when Cloud receives the signed roster; offline withdrawal takes effect on
 reconnect. Published group totals remain. Native consent UI must adopt the

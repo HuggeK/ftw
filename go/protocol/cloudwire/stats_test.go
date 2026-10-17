@@ -14,7 +14,7 @@ func TestStatisticsOnlyClosedAllowlistedQuantizedHours(t *testing.T) {
 	if !valid().Valid(now) {
 		t.Fatal("valid closed hour rejected")
 	}
-	cases := map[string]func(*Stats){"open hour": func(s *Stats) { s.HourMS += StatsHourMS }, "before window": func(s *Stats) { s.HourMS -= 24 * StatsHourMS }, "fine time": func(s *Stats) { s.HourMS++ }, "new field": func(s *Stats) { s.Metrics["address"] = 0 }, "fine energy": func(s *Stats) { s.Metrics["pv_generation_wh"] = 121 }, "too large": func(s *Stats) { s.Metrics["pv_generation_wh"] = 1000010 }, "old policy": func(s *Stats) { s.Policy = "old" }, "no id": func(s *Stats) { s.StatsID = nil }}
+	cases := map[string]func(*Stats){"open hour": func(s *Stats) { s.HourMS += StatsHourMS }, "before window": func(s *Stats) { s.HourMS -= 24 * StatsHourMS }, "fine time": func(s *Stats) { s.HourMS++ }, "new field": func(s *Stats) { s.Metrics["address"] = 0 }, "fine energy": func(s *Stats) { s.Metrics["pv_generation_wh"] = 121 }, "too large": func(s *Stats) { s.Metrics["pv_generation_wh"] = 1000010 }, "previous policy": func(s *Stats) { s.Policy = "ftw-project-stats-2026-10-v2" }, "no id": func(s *Stats) { s.StatsID = nil }}
 	for name, change := range cases {
 		t.Run(name, func(t *testing.T) {
 			s := valid()

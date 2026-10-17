@@ -3,7 +3,7 @@
   "use strict";
   var read = window.fetch.bind(window);
   var details = "Recorded hourly energy, configured battery capacity, battery and charger power limits, and solar capacity help improve FTW and publish group totals. Values are rounded to 10 Wh or W. No names, addresses or device ids.";
-  var privacy = "Sourceful links reports to this box for deletion. They are not anonymous and stay for 13 months. Public values need at least 20 homes, with no home above 30% of a sum. Turning sharing off deletes unpublished reports when the box reaches the collector. Published totals remain.";
+  var privacy = "Sourceful links reports to this box for deletion. They are not anonymous and stay for 48 hours. Public values need at least 20 homes, with no home above 30% of a sum. Turning sharing off deletes unpublished reports when the box reaches the collector. Published totals remain.";
   var status, policy, justAnswered=false;
   function node(tag, text, parent) {
     var el = document.createElement(tag);

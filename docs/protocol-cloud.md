@@ -754,7 +754,7 @@ the service find it offline; it pairs over the relay or the home network.
 
 Signed box to service only. Never forwarded to phones or agents. The box
 sends at most one report per closed UTC hour, after fresh consent to
-`ftw-project-stats-2026-10-v1`. Older policies send nothing.
+`ftw-project-stats-2026-10-v3`. Older policies send nothing.
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -771,7 +771,7 @@ limits, with shared inverter groups counted once; it does not prove physical
 control. Energy is recorded ledger energy and may cover only part of an hour.
 No names, hardware ids, location, prices or live readings leave this path.
 
-The service upserts by home and hour, keeps these consented rows for 13 months,
+The service upserts by home and hour, keeps these consented rows for 48 hours,
 and deletes them when it receives statistics withdrawal or a home purge.
 Only cells with at least 20 homes and no home above 30 percent of the sum
 are public. The public view counts reporting installations, never people.
@@ -1625,14 +1625,14 @@ constants, so `srcfl/ftw-cloud` need not spell them by hand.
 | Sessions closed | When the roster runs out |
 | Tokens and APNs dropped after | 30 days |
 | Home deleted after | 90 days without a roster; 24 hours for a new home without one |
-| Statistics rows kept | 13 months from the hour they describe |
+| Statistics rows kept | 48 hours from the hour they describe |
 | Rule N clock lead allowed | 2 s |
 | Rule U drift margin, lifetime | 0.01 % of the time since learned; 24 hours |
 
 
-### Cloud terms and local statistics, policy version 2
+### Cloud terms and local statistics, policy version 3
 
-`ftw-cloud-2026-10-v2` includes `ftw-project-stats-2026-10-v2` for every Cloud
+`ftw-cloud-2026-10-v3` includes `ftw-project-stats-2026-10-v3` for every Cloud
 home. `Grant.termsPolicy` carries the owner-accepted terms. Once the operator
 approves collection, Cloud admits only that bundled grant or a statistics-only
 roster. Old terms are not silently upgraded; they need an owner answer.
