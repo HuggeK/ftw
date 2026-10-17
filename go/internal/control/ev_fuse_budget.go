@@ -68,7 +68,7 @@ func EVFuseBudget(store *telemetry.Store, state *State, points []loadpoint.State
 	}
 	if minimumW > 0 && finalCap < minimumW && (state.evFuseEvidenceAt.IsZero() || now.Before(state.evFuseEvidenceAt) || now.Sub(state.evFuseEvidenceAt) >= time.Minute) {
 		state.evFuseEvidenceAt = now
-		slog.Info("EV fuse budget below charging minimum", "minimum_charge_w", minimumW,
+		slog.Debug("EV fuse budget below charging minimum", "minimum_charge_w", minimumW,
 			"common_site_at_ms", balance.siteAt.UnixMilli(), "latest_site_received_at_ms", meter.UpdatedAt.UnixMilli(),
 			"physical_fuse_w", fuseMaxW, "configured_import_ceiling_w", state.PeakImportCeilingW,
 			"common_ceiling_w", commonCeiling, "latest_ceiling_w", latestCeiling,

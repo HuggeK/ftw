@@ -39,7 +39,7 @@ func TestImportCeilingStartSkewEvidence(t *testing.T) {
 	st.clock = func() time.Time { return now }
 	var log bytes.Buffer
 	old := slog.Default()
-	slog.SetDefault(slog.New(slog.NewJSONHandler(&log, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&log, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	defer slog.SetDefault(old)
 	capW, known := EVFuseBudget(store, st, []loadpoint.State{{ID: "a", DriverName: "car", PluggedIn: true}}, []loadpoint.Config{{ID: "a", DriverName: "car", PhaseMode: "3p", MinChargeW: 4140}}, 17250)
 	if !known || math.Abs(capW-400) > .001 {
@@ -48,6 +48,9 @@ func TestImportCeilingStartSkewEvidence(t *testing.T) {
 	var e map[string]any
 	if err := json.Unmarshal(log.Bytes(), &e); err != nil {
 		t.Fatal(err)
+	}
+	if e["level"] != "DEBUG" {
+		t.Fatalf("budget evidence level=%v want DEBUG", e["level"])
 	}
 	for key, want := range map[string]float64{"configured_import_ceiling_w": 7500, "physical_fuse_w": 17250, "latest_grid_w": 7100, "latest_ev_credit_w": 0, "latest_site_cap_w": 400, "final_cap_w": 400} {
 		if e[key] != want {
