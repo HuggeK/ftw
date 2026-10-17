@@ -4,7 +4,7 @@
   var read = window.fetch.bind(window);
   var details = "Recorded hourly energy, configured battery capacity, battery and charger power limits, and solar capacity help improve FTW and publish group totals. Values are rounded to 10 Wh or W. No names, addresses or device ids.";
   var privacy = "Sourceful links reports to this box for deletion. They are not anonymous and stay for 48 hours. Public values need at least 20 homes, with no home above 30% of a sum. Turning sharing off deletes unpublished reports when the box reaches the collector. Published totals remain.";
-  var status, policy, justAnswered=false;
+  var status, policy, authStatus, justAnswered=false, saving=false, refreshNumber=0;
   function node(tag, text, parent) {
     var el = document.createElement(tag);
     if (text) el.textContent = text;
@@ -12,11 +12,24 @@
     return el;
   }
   function say(parent, text) { var p=node("p",text,parent);p.className="hint";return p; }
-  function button(parent,text,run,primary) {
+  function button(parent,text,run,primary,feedback) {
     var b=node("button",text,parent);b.type="button";b.className=primary?"btn-send":"btn-ghost";
     b.addEventListener("click",function(){
+      if(saving)return;
+      saving=true;
+      document.querySelectorAll(".project-statistics-panel button").forEach(function(button){button.disabled=true;});
       b.disabled=true;
-      Promise.resolve().then(run).then(refresh).catch(function(e){say(parent,e.message||"The choice could not be saved. Check the box status.");}).finally(function(){b.disabled=false;});
+      b.textContent="Saving…";
+      feedback.textContent="";
+      feedback.hidden=true;
+      Promise.resolve().then(run).then(function(){saving=false;return refresh();}).catch(function(e){
+        feedback.textContent=e.message||"The choice could not be saved. Try again.";
+        feedback.hidden=false;
+      }).finally(function(){
+        saving=false;
+        document.querySelectorAll(".project-statistics-panel button").forEach(function(button){button.disabled=false;});
+        b.disabled=false;b.textContent=text;
+      });
     });
   }
   function write(method,path,body) {
@@ -27,44 +40,61 @@
     if (!status || !policy || (!settings && !status.statisticsDecisionRequired && !justAnswered)) {host.hidden=true;return;}
     host.hidden=false;
     if(!settings && !status.statisticsDecisionRequired && justAnswered) {
-      say(host,status.link==="ending"?"Stopping Cloud and deleting its stored copy. The box continues locally.":status.statisticsActive?"Statistics choice saved. Hourly reports wait for approval; change this in Settings → FTW app.":"Statistics sharing is off. The box continues locally.");return;
+      var saved=status.link==="ending"?"Stopping Cloud and deleting its stored copy. The box continues locally.":status.cloudTermsAccepted?"Cloud terms accepted and saved on this box.":status.statisticsActive?"Statistics choice saved. Change it in Settings → FTW app.":"Statistics sharing is off. The box continues locally.";
+      var receipt=say(host,saved);receipt.className="project-statistics-saved";receipt.setAttribute("role","status");
+      return;
     }
     var panel=node("fieldset",null,host);
+    panel.className="project-statistics-panel";
     var cloud=status.link==="on" && !status.statisticsOnly;
-    node("legend",cloud?"FTW Cloud includes statistics":"Contribute to FTW statistics?",panel);
-    if(cloud) say(panel,"Everyone using FTW Cloud contributes to project statistics. Accept the updated Cloud terms to use the app and remote access. To stop contributing, turn FTW Cloud off and use the box locally.");
+    node("legend",cloud?(status.cloudTermsAccepted?"FTW Cloud":"Review FTW Cloud terms"):"Contribute to FTW statistics?",panel);
+    if(cloud) say(panel,status.cloudTermsAccepted?"The current Cloud terms are accepted. FTW Cloud includes project statistics.":"FTW Cloud includes project statistics. Sourceful can read its copy of your energy data. Accept the updated terms for the app and remote access, or turn Cloud off and keep using the box locally.");
     else say(panel,"For local FTW use, sharing is your choice. Yes is the suggested choice. Nothing starts until you answer, and saying no leaves local operation working. Statistics-only sharing gives no app, phone or assistant remote access.");
-    say(panel,details);
-    say(panel,privacy);
+    say(panel,"Shares recorded hourly energy and configured system capacities. Reports stay for 48 hours; public totals require at least 20 homes.");
+    var disclosure=node("details",null,panel);
+    node("summary","What is shared and how it is used",disclosure);
+    say(disclosure,details);
+    say(disclosure,privacy);
     var link=node("a","Privacy and Cloud terms",panel);link.href="https://ftw.sourceful.energy/privacy#statistics";link.target="_blank";link.rel="noopener";
-    if(!policy.available) say(panel,"Hourly collection is waiting for privacy review and activation. Your choice can be saved now; no hourly report leaves before that approval.");
+    if(!policy.available) say(panel,"You can save your choice now. Hourly reports wait for privacy review and activation.");
+    if(!status.cloudTermsAccepted) {
+      say(panel,authStatus && authStatus.lan_auth
+        ?"Your house password protects this choice. The box will ask you to log in if needed."
+        :authStatus && authStatus.lan_auth===false
+          ?"No house password is required. With password protection off, anyone who can reach this box on your private network can save this choice."
+          :"This choice uses the same sign-in rules as Settings. A house password is optional.");
+    }
     var actions=node("div",null,panel);actions.className="app-link-actions";
+    var feedback=node("p",null,panel);feedback.className="project-statistics-error";feedback.setAttribute("role","alert");feedback.hidden=true;
     if(status.link==="ending") {say(panel,"Cloud is stopping and deleting its stored copy. Refresh after the box receives the deletion receipt.");return;}
     if(cloud) {
       if(status.cloudTermsAccepted) say(panel,"The current Cloud terms include statistics for this box.");
-      else button(actions,"Accept Cloud terms",function(){return write("POST","/api/cloud/grant",{scopes:policy.cloud_scopes,policy:policy.cloud_policy});},true);
+      else button(actions,"Accept Cloud terms",function(){return write("POST","/api/cloud/grant",{scopes:policy.cloud_scopes,policy:policy.cloud_policy});},true,feedback);
       button(actions,"Turn FTW Cloud off",function(){
         if(!window.confirm("Turn FTW Cloud off? The app and assistants lose remote access. The box keeps working locally. You may need to pair phones again if you turn Cloud back on."))return;
         return write("DELETE","/api/cloud");
-      },false);
+      },false,feedback);
     } else if(status.statisticsOnly) {
       say(panel,"Local statistics sharing is on. Remote Cloud functions are off.");
-      button(actions,"Stop sharing statistics",function(){return write("DELETE","/api/cloud/stats");},false);
+      button(actions,"Stop sharing statistics",function(){return write("DELETE","/api/cloud/stats");},false,feedback);
     } else {
-      button(actions,"Yes, contribute",function(){return write("POST","/api/cloud/stats",{policy:policy.policy});},true);
-      if(status.statisticsDecisionRequired) button(actions,"No, keep it local",function(){return write("DELETE","/api/cloud/stats");},false);
+      button(actions,"Yes, contribute",function(){return write("POST","/api/cloud/stats",{policy:policy.policy});},true,feedback);
+      if(status.statisticsDecisionRequired) button(actions,"No, keep it local",function(){return write("DELETE","/api/cloud/stats");},false,feedback);
       else say(panel,"Local statistics sharing is off.");
     }
     if(settings && !cloud) {
       var more=node("details",null,panel);node("summary","Use FTW Cloud and the app",more);
       say(more,"FTW Cloud adds app and assistant remote access and a readable state copy. Statistics are included for every Cloud user. Read the information above before accepting.");
-      button(more,"Accept Cloud terms and turn it on",function(){return write("POST","/api/cloud/grant",{scopes:policy.cloud_scopes,policy:policy.cloud_policy});},true);
+      button(more,"Accept Cloud terms and turn it on",function(){return write("POST","/api/cloud/grant",{scopes:policy.cloud_scopes,policy:policy.cloud_policy});},true,feedback);
     }
   }
   function refresh() {
-    return Promise.all([read("/api/cloud"),read("/api/cloud/stats-policy")]).then(function(rs){if(rs.some(function(r){return !r.ok;}))return null;return Promise.all(rs.map(function(r){return r.json();}));}).then(function(v){
-      if(!v)return;
-      status=v[0];policy=v[1];
+    var current=++refreshNumber;
+    return Promise.all([read("/api/cloud"),read("/api/cloud/stats-policy"),read("/api/auth/status").catch(function(){return null;})]).then(function(rs){
+      return Promise.all(rs.map(function(r){return r && r.ok?r.json().catch(function(){return null;}):null;}));
+    }).then(function(v){
+      if(current!==refreshNumber || saving || !v[0] || !v[1])return;
+      status=v[0];policy=v[1];authStatus=v[2];
       if(!policy.cloud_includes_statistics || !policy.standalone)return;
       var prompt=document.getElementById("project-statistics-prompt");
       if(!prompt){
@@ -79,6 +109,9 @@
       paint(prompt,false);
       document.querySelectorAll("[data-project-statistics-settings]").forEach(function(host){paint(host,true);});
     }).catch(function(){});
+  }
+  if(!document.getElementById("project-statistics-styles")) {
+    var styles=node("link");styles.id="project-statistics-styles";styles.rel="stylesheet";styles.href="/project-statistics.css";document.head.appendChild(styles);
   }
   window.FTWStatistics={refresh:refresh,cloudAccepted:function(){return !!(status && status.cloudTermsAccepted);},mount:function(host){if(status&&policy)paint(host,true);refresh();}};
   window.addEventListener("ftw-owner-ready",refresh);

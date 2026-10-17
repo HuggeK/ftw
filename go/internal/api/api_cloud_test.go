@@ -66,9 +66,8 @@ func loopbackRequest(method, target, body string) *http.Request {
 
 const grantBody = `{"scopes":["ftw.live.read"],"policy":"2026-10"}`
 
-// Turning FTW Cloud on is an owner's act: over an app session, or at the box.
-// A LAN client without the house password is refused, unlike the rest of the
-// LAN API, because this sends the house out of it.
+// Turning FTW Cloud on follows the box's owner rules. With the optional house
+// password off, a direct private LAN client may consent, as it may save settings.
 func TestWhoMayTurnFTWCloudOn(t *testing.T) {
 	cases := []struct {
 		name string
@@ -78,7 +77,7 @@ func TestWhoMayTurnFTWCloudOn(t *testing.T) {
 		{"owner over a session", sessionRequest(http.MethodPost, "/api/cloud/grant", grantBody), http.StatusOK},
 		{"viewer over a session", viewerRequest(http.MethodPost, "/api/cloud/grant", grantBody), http.StatusForbidden},
 		{"the box itself", loopbackRequest(http.MethodPost, "/api/cloud/grant", grantBody), http.StatusOK},
-		{"a LAN client", localRequest(http.MethodPost, "/api/cloud/grant", grantBody), http.StatusForbidden},
+		{"a LAN client", localRequest(http.MethodPost, "/api/cloud/grant", grantBody), http.StatusOK},
 		{"a LAN client with the house password", func() *http.Request {
 			r := localRequest(http.MethodPost, "/api/cloud/grant", grantBody)
 			return r.WithContext(withLANSecret(r.Context(), true))
@@ -100,6 +99,95 @@ func TestWhoMayTurnFTWCloudOn(t *testing.T) {
 			}
 			if granted := len(cloud.granted) == 1; granted != (c.want == http.StatusOK) {
 				t.Fatalf("granted = %v with status %d", granted, w.Code)
+			}
+		})
+	}
+}
+
+func TestCloudConsentUsesTheConfiguredLANProtection(t *testing.T) {
+	for _, choice := range []struct{ path, body string }{
+		{"/api/cloud/grant", grantBody},
+		{"/api/cloud/stats", statsBody},
+	} {
+		t.Run(choice.path, func(t *testing.T) {
+			resetLANGuesses(t)
+			s := newLANAuthServer(t)
+			cloud := &stubCloud{}
+			s.deps.Cloud = cloud
+			attempt := func(req *http.Request, want, calls int) {
+				t.Helper()
+				req.Header.Set("Content-Type", "application/json")
+				w := httptest.NewRecorder()
+				s.Handler().ServeHTTP(w, req)
+				if w.Code != want {
+					t.Fatalf("got %d, want %d: %s", w.Code, want, w.Body.String())
+				}
+				if got := len(cloud.granted) + len(cloud.stats); got != calls {
+					t.Fatalf("Cloud writes = %d, want %d", got, calls)
+				}
+			}
+			attempt(localRequest(http.MethodPost, choice.path, choice.body), http.StatusOK, 1)
+			enableStoredLANAuth(t, s)
+			attempt(localRequest(http.MethodPost, choice.path, choice.body), http.StatusUnauthorized, 1)
+
+			login := postLANAuthJSON(s, http.MethodPost, "http://ftw.local:8080/api/auth/login", "192.168.1.10:43210",
+				`{"password":"`+testHousePassword+`"}`)
+			if login.Code != http.StatusOK {
+				t.Fatalf("login = %d: %s", login.Code, login.Body.String())
+			}
+			req := localRequest(http.MethodPost, choice.path, choice.body)
+			req.AddCookie(&http.Cookie{Name: lanSessionCookieName, Value: lanSessionFromRecorder(t, login)})
+			attempt(req, http.StatusOK, 2)
+
+			req = localRequest(http.MethodPost, choice.path, choice.body)
+			req.Header.Set("Authorization", "Bearer "+testHousePassword)
+			attempt(req, http.StatusOK, 3)
+			req = localRequest(http.MethodPost, choice.path, choice.body)
+			req.Header.Set("Authorization", "Bearer wrong-password")
+			attempt(req, http.StatusUnauthorized, 3)
+		})
+	}
+}
+
+func TestCloudConsentWithoutAPasswordStaysOnThePrivateNetwork(t *testing.T) {
+	for _, choice := range []struct{ path, body string }{
+		{"/api/cloud/grant", grantBody},
+		{"/api/cloud/stats", statsBody},
+	} {
+		t.Run(choice.path, func(t *testing.T) {
+			for _, tc := range []struct {
+				name, host, remote, header, value string
+				want                              int
+			}{
+				{"private IPv4", "ftw.local:8080", "192.168.1.10:1234", "", "", http.StatusOK},
+				{"private IPv6", "[fd00::1]:8080", "[fd00::2]:1234", "", "", http.StatusOK},
+				{"CGNAT", "ftw.local:8080", "100.64.0.10:1234", "", "", http.StatusForbidden},
+				{"public client", "ftw.local:8080", "203.0.113.9:1234", "", "", http.StatusForbidden},
+				{"public host", "box.example.com", "192.168.1.10:1234", "", "", http.StatusForbidden},
+				{"forwarded LAN", "ftw.local:8080", "192.168.1.10:1234", "X-Forwarded-For", "192.168.1.20", http.StatusForbidden},
+				{"loopback proxy", "localhost:8080", "127.0.0.1:1234", "Forwarded", "for=203.0.113.9", http.StatusForbidden},
+				{"cross-site origin", "ftw.local:8080", "192.168.1.10:1234", "Origin", "https://other.example", http.StatusForbidden},
+				{"cross-site fetch", "ftw.local:8080", "192.168.1.10:1234", "Sec-Fetch-Site", "cross-site", http.StatusForbidden},
+				{"non-JSON body", "ftw.local:8080", "192.168.1.10:1234", "Content-Type", "text/plain", http.StatusUnsupportedMediaType},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					cloud := &stubCloud{}
+					s := New(&Deps{Cloud: cloud})
+					req := localRequest(http.MethodPost, choice.path, choice.body)
+					req.Host, req.RemoteAddr = tc.host, tc.remote
+					req.Header.Set("Content-Type", "application/json")
+					if tc.header != "" {
+						req.Header.Set(tc.header, tc.value)
+					}
+					w := httptest.NewRecorder()
+					s.Handler().ServeHTTP(w, req)
+					if w.Code != tc.want {
+						t.Fatalf("got %d, want %d: %s", w.Code, tc.want, w.Body.String())
+					}
+					if called := len(cloud.granted)+len(cloud.stats) == 1; called != (tc.want == http.StatusOK) {
+						t.Fatalf("Cloud write = %v with status %d", called, w.Code)
+					}
+				})
 			}
 		})
 	}
@@ -213,7 +301,7 @@ func TestWhoMayTurnStatisticsOn(t *testing.T) {
 		{"owner over a session", sessionRequest(http.MethodPost, "/api/cloud/stats", statsBody), http.StatusOK},
 		{"viewer over a session", viewerRequest(http.MethodPost, "/api/cloud/stats", statsBody), http.StatusForbidden},
 		{"the box itself", loopbackRequest(http.MethodPost, "/api/cloud/stats", statsBody), http.StatusOK},
-		{"a LAN client", localRequest(http.MethodPost, "/api/cloud/stats", statsBody), http.StatusForbidden},
+		{"a LAN client", localRequest(http.MethodPost, "/api/cloud/stats", statsBody), http.StatusOK},
 		{"a LAN client with the house password", func() *http.Request {
 			r := localRequest(http.MethodPost, "/api/cloud/stats", statsBody)
 			return r.WithContext(withLANSecret(r.Context(), true))

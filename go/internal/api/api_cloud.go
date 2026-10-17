@@ -11,15 +11,14 @@ import (
 	"github.com/srcfl/ftw/go/internal/loadpoint"
 )
 
-// FTW Cloud, at the HTTP door.
+// FTW Cloud over HTTP.
 //
-// The grant lets the box send a readable copy of the house to a Sourceful
-// service, so who may turn it on is the narrowest door this API has: an owner
-// over an app session, or on the LAN only from the box itself or with the
-// house password. Turning it off narrows access, so any door may do that. The
-// box cannot verify the app's step-up, so the grant asks for none and the
-// app's consent screen claims no more than an owner's session. Statistics are
-// a second consent under the grant, behind the same doors.
+// A grant lets the box send a readable copy of the house to Sourceful, so
+// an owner must accept it. LAN consent follows the private network and
+// optional house-password rules used by Settings and owner pairing.
+// Turning Cloud off narrows access, so any local client may do that.
+// The box cannot verify the app's step-up, so a grant requires an owner's
+// session without claiming a separate step-up. Statistics use the same check.
 
 // CloudGrant is the box's FTW Cloud link as the routes see it.
 type CloudGrant interface {
@@ -43,8 +42,9 @@ func (s *Server) cloudRoutes() {
 	s.handle("DELETE /api/cloud/stats", Configure, s.handleCloudStopStats, NoStepUp)
 }
 
-// cloudGate admits an owner's session, and on the LAN a local client. With
-// toGrant, the LAN needs more: the box itself, or the house password.
+// cloudGate admits an owner's session, and on the LAN a local client. A grant
+// follows the private LAN's settings rule: the house password is optional,
+// but when it is on the caller must have proved it.
 func (s *Server) cloudGate(w http.ResponseWriter, r *http.Request, toGrant bool) bool {
 	if hasForwardingHeader(r.Header) {
 		writeAppLinkError(w, http.StatusForbidden, "FTW Cloud is managed in the app or on your home network")
@@ -69,8 +69,11 @@ func (s *Server) cloudGate(w http.ResponseWriter, r *http.Request, toGrant bool)
 	if ok, checked := lanSecretFrom(r.Context()); checked && ok {
 		return true
 	}
+	if !s.lanAuthEnabled() && isPrivateClient(r.RemoteAddr) {
+		return true
+	}
 	writeAppLinkError(w, http.StatusForbidden,
-		"turn FTW Cloud on in the app, or on your home network with the house password on")
+		"log in with the house password to save this choice, or use the owner's app")
 	return false
 }
 
@@ -144,7 +147,7 @@ func (s *Server) handleCloudGrant(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, cloudlink.ErrNoService):
 		writeAppLinkError(w, http.StatusServiceUnavailable, err.Error())
 	default:
-		writeAppLinkError(w, http.StatusInternalServerError, "could not turn FTW Cloud on")
+		writeAppLinkError(w, http.StatusInternalServerError, "could not save Cloud terms. Try again.")
 	}
 }
 

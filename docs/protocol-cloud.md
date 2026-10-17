@@ -1407,13 +1407,19 @@ consent text.
 | `GET /api/cloud` | An owner's session, or a client on the LAN. State, scopes, purposes, bytes sent in the last 24 hours of uptime, whether the byte budget is reached |
 | `GET /api/cloud/stats-policy` | The same. Exact fields, purpose and group rules for a fresh consent |
 | `GET /api/cloud/preview` | The same. The exact bytes that leave the house |
-| `POST /api/cloud/grant {scopes, policy}` | An owner's session. On the LAN, only from loopback or with the house password. On a grant already on, it changes the scopes and keeps the key, home id and `grantKey` |
+| `POST /api/cloud/grant {scopes, policy}` | An owner's session, the box itself, or a direct private LAN client. The optional house password, when on, requires a LAN login as Settings does. On a grant already on, it changes the scopes and keeps the key, home id and `grantKey` |
 | `POST /api/cloud/stats {policy}` | The same gate, as a separate consent. 409 while the grant is off or a revoke waits for its receipt |
 | `DELETE /api/cloud/grant`, `DELETE /api/cloud/stats` | An owner's session, or any client on the LAN, because narrowing access is safe |
 
 A viewer's session gets 403 on every route, and so does a request with
 forwarding headers. No route asks for a step-up: the box cannot verify the
 app's, so the grant screen claims no more than an owner's session.
+
+The house password is not a prerequisite for consent. With it off, a client
+that can reach the box on a private network may turn Cloud or statistics on,
+as it may save settings and pair an owner. This includes private VPN peers.
+Public clients, public hostnames, forwarding headers and browser cross-site
+writes do not gain access. CGNAT is not a private network for this choice.
 
 - Turning FTW Cloud on pushes `cloud.granted` to all owners, and turning it
   off pushes `cloud.revoked`. A change of scopes, and turning statistics on
