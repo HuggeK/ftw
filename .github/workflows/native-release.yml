@@ -34,6 +34,8 @@ jobs:
     name: verify, package and publish native ${{ inputs.channel }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    outputs:
+      newly_published: ${{ steps.publication.outputs.newly_published }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -187,6 +189,7 @@ jobs:
             "${RUNNER_TEMP}/native-release/ftw-native-release.json" CHANGELOG.md \
             "${RUNNER_TEMP}/native-release/notes.md" --repo "${GITHUB_REPOSITORY}"
       - name: Anchor immutable tag and publish the selected channel
+        id: publication
         if: ${{ !inputs.dry_run }}
         env:
           CHANNEL: ${{ inputs.channel }}
@@ -259,7 +262,21 @@ jobs:
           if jq -e '.isDraft == true' <<<"${release_info}" >/dev/null; then
             gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" \
               --draft=false --latest=false --verify-tag --notes-file "${release_dir}/notes.md"
+            echo "newly_published=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "newly_published=false" >> "${GITHUB_OUTPUT}"
           fi
       - name: Report verified dry run
         if: ${{ inputs.dry_run }}
         run: echo "Verified native packages without creating a tag or release."
+
+  discord:
+    needs: publish
+    if: ${{ !inputs.dry_run && needs.publish.outputs.newly_published == 'true' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/release-discord.yml
+    with:
+      tag: ${{ inputs.tag }}
+    secrets:
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
