@@ -46,3 +46,49 @@ func TestAnAgentAddedAtTheBoxPageNamesItsClient(t *testing.T) {
 		t.Fatalf("a widened grant: notices %+v", notices)
 	}
 }
+
+// A grant of a year warns the owners once, in its last day, as a short one
+// does: never on the day it was given or months before its end.
+func TestAYearLongGrantWarnsInItsLastDay(t *testing.T) {
+	enroll, err := appenroll.LoadOrCreate(filepath.Join(t.TempDir(), "box.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.UnixMilli(1_792_000_000_000)
+	clock := func() (time.Time, bool) { return now, true }
+	enroll.SetClock(clock)
+	expiring := 0
+	p := &agentPorts{access: &appuplink.AgentAccess{Enroll: enroll, Clock: clock},
+		notice: func(kind, _ string) bool {
+			if kind == protocol.PushAgentExpiring {
+				expiring++
+			}
+			return true
+		}}
+	year := 365 * 24 * time.Hour
+	if _, err := (boxPageAgents{p}).AddAgent("owner", protocol.AgentAdd{
+		Key: bytes.Repeat([]byte{7}, 32), Role: apiauth.RoleAgent, Scopes: []string{protocol.ScopeLiveRead},
+		ExpiresAtMs: now.Add(year).UnixMilli(), Principal: protocol.Principal{Client: "Claude"}}); err != nil {
+		t.Fatal(err)
+	}
+	end := now.Add(year)
+	for _, at := range []time.Time{now, now.Add(300 * 24 * time.Hour), end.Add(-25 * time.Hour)} {
+		if p.warnExpiring(at.UnixMilli()); expiring != 0 {
+			t.Fatalf("warned %s before the end", end.Sub(at))
+		}
+	}
+	p.warnExpiring(end.Add(-23 * time.Hour).UnixMilli())
+	p.warnExpiring(end.Add(-time.Hour).UnixMilli())
+	if expiring != 1 {
+		t.Fatalf("%d warnings in the last day, want 1", expiring)
+	}
+}
+
+// The box page learns from the box's facts how long it may let each kind of
+// access last, so it offers nothing the box would refuse.
+func TestTheBoxPageIsToldTheLongestGrant(t *testing.T) {
+	got := boxPageAgents{&agentPorts{}}.Facts().LongestMs
+	if got[protocol.RoleAgent] != protocol.AgentMaxMs || got[protocol.RoleSupport] != protocol.SupportMaxMs {
+		t.Fatalf("longestMs = %v", got)
+	}
+}

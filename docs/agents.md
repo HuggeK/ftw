@@ -36,7 +36,7 @@ whose source table carries names.
 
 | Role | Who | Granted by | Longest grant | Ends |
 |---|---|---|---|---|
-| `agent` | A personal assistant | An owner, in the app or on the box page | 30 days, renewable | Expiry, revoke, or removal of the approving phone |
+| `agent` | A personal assistant | An owner, in the app or on the box page | One year, renewable | Expiry, revoke, or removal of the approving phone |
 | `support` | Sourceful, for one ticket | An owner, from "Get help" | 14 days | Expiry, revoke, the ticket closing, or removal of the approving phone |
 | `release` | The release check | An owner, on joining the beta | 90 days, renewable | Expiry, revoke, or removal of the approving phone |
 
@@ -300,8 +300,9 @@ roster leaves it out. Answer `{id}`. Error: `E_NOT_FOUND`.
 ### `agent.list` — who has access
 
 `{}`. To an owner: `{agents: [agent row], requests: [request], keys:
-[{deviceId, setAtMs}]}`, every row on the box. To an agent: its own row and
-its own requests. A viewer gets `E_SCOPE_DENIED`.
+[{deviceId, setAtMs}], longestMs: {role: ms}}`, every row on the box and the
+longest grant it takes for each role. To an agent: its own row and its own
+requests. A viewer gets `E_SCOPE_DENIED`.
 
 ### `agent.request` — an agent asks for a durable change
 
@@ -494,7 +495,20 @@ key ends as from a stranger. The watch exchange refuses it too.
 - **Revoke is immediate.** The row goes, the sessions end, the holds end,
   and the next call fails with `E_GRANT_REVOKED`, whatever the cloud admits.
 - **A warning first.** A day before a grant runs out, the box pushes
-  `agent.expiring` to every owner.
+  `agent.expiring` to every owner, whatever the grant's length.
+- **The owner picks the length.** For an `agent`, the app and the box page
+  offer 1, 7, 30 and 90 days and a year. The app starts at 30 days, the box
+  page at a week. Neither offers more than the offer's `ttlS` or the box's
+  `longestMs` for the role.
+
+### Mixed versions
+
+Boxes before `longestMs` took at most 30 days for an `agent`, and refuse a
+longer expiry with `E_CAP_EXCEEDED` rather than cut it short. A client that
+finds no `longestMs` in `agent.list` therefore offers an `agent` 30 days at
+most. FTW Cloud asks for a year in every offer, since it makes the offer
+before the owner picks a home; apps and box pages from before this change
+offer 30 days at most whatever the offer asks.
 
 ## The approval signature
 
@@ -572,9 +586,10 @@ above and its approval key, and an agent can never reach them.
   every route, the narrowing ones too.
 - **The page checks before it asks for a code,** since a code works once.
   `GET /api/agents` carries `box {offers, lookup, clock, nowMs, markMs,
-  widen}`: whether this build pins an offer key, FTW Cloud's code lookup on
-  the host this build links to, whether the clock is `ok`, `unsynced` or
-  `behind` its mark, and whether this request could widen access. It also
+  widen, longestMs}`: whether this build pins an offer key, FTW Cloud's code
+  lookup on the host this build links to, whether the clock is `ok`,
+  `unsynced` or `behind` its mark, whether this request could widen access,
+  and the longest grant the box takes for each role. It also
   carries `registry {agentOps, writeScopes,
   agentArgs}`, so the page names no scope, op or argument by hand.
 - **The box says why it will not take an offer.** `POST /api/agents/offer`
@@ -594,7 +609,9 @@ above and its approval key, and an agent can never reach them.
   the owner types the consent page's code, and the page, in the owner's
   browser, fetches the signed offer from FTW Cloud's code lookup and posts
   it here. The owner may grant less: `scopes`, `ops`, `caps` and `ttlS`
-  replace the offer's when given.
+  replace the offer's when given. Without `ttlS` the grant lasts 30 days, or
+  the offer's length if shorter. A `ttlS` past the role's longest grant is
+  `E_CAP_EXCEEDED {cap: "expiresAtMs", max}`.
 - **Every route that widens access needs another device on the home
   network, signed in with the house password.** The box never reads the
   sign-in from loopback, so a browser on the box, or one through an SSH
@@ -668,7 +685,7 @@ old one signed has expired.
 | `verified` | bool | FTW Cloud knows the client from its own list |
 | `scopes`, `ops` | [text] | What the client asks for |
 | `caps` | `{holdS, maxW, perMin}` | Proposed caps |
-| `ttlS` | uint | Proposed length |
+| `ttlS` | uint | The longest the owner may grant. FTW Cloud asks for an `agent`'s longest, a year |
 | `ticket` | text | The ticket id, for `support`; empty otherwise |
 | `code` | text | The code on the consent page |
 | `exp` | int | Wall-clock ms when the offer stops being good, at most 10 minutes after FTW Cloud made it |
@@ -727,7 +744,7 @@ FTW Cloud keeps its own log of what it forwarded; neither replaces the other.
 
 | What | Value |
 |---|---|
-| Longest grant | `agent` 30 days, `support` 14 days, `release` 90 days |
+| Longest grant | `agent` one year, `support` 14 days, `release` 90 days |
 | Agent rows per box | 16 |
 | `holdS` | 60 to 1,800 s |
 | `maxW` | 1 to 100,000 W, either direction |
