@@ -146,6 +146,7 @@ jobs:
           #   - .changeset/ (the changesets themselves + README/config)
           #   - .github/ (workflows, CODEOWNERS, issue templates…)
           #   - .vscode/ (editor settings)
+          #   - .cursor/ (agent skills and policies; nothing ships to users)
           #   - dotfiles at repo root
           REQUIRES_CHANGESET="$(echo "${CHANGED}" | grep -vE \
               -e '(^|/)[^/]+\.(md|mdx|txt)$' \
@@ -153,6 +154,7 @@ jobs:
               -e '^\.changeset/' \
               -e '^\.github/' \
               -e '^\.vscode/' \
+              -e '^\.cursor/' \
               -e '^\.editorconfig$' \
               -e '^\.gitignore$' \
               -e '^\.gitattributes$' \

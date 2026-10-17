@@ -12,6 +12,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  verify-helpers:
+    name: verify-ftw helper tests (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test instance ownership and command evidence
+        run: python3 -m unittest discover -s .cursor/skills/verify-ftw/scripts -p 'test_verify.py'
+
   planning-docs:
     name: no agent planning documents
     runs-on: ubuntu-latest
