@@ -26,6 +26,7 @@ type evFuseBalance struct {
 	gridW, poolW, pendingW      float64
 	latestPoolW, latestPendingW float64
 	siteAt                      time.Time
+	evEvidence                  []evFuseEvidence
 }
 
 // EVFuseBudget refreshes the common EV cap before a charger command, also
@@ -74,6 +75,7 @@ func EVFuseBudget(store *telemetry.Store, state *State, points []loadpoint.State
 			"common_ceiling_w", commonCeiling, "latest_ceiling_w", latestCeiling,
 			"common_grid_w", balance.gridW, "common_ev_credit_w", balance.poolW, "common_pending_battery_w", balance.pendingW,
 			"latest_grid_w", meter.RawW, "latest_ev_credit_w", balance.latestPoolW, "latest_pending_battery_w", balance.latestPendingW,
+			"ev_credit_evidence", balance.evEvidence,
 			"common_cap_w", cap, "latest_site_cap_w", latestCap, "phase_bound_known", phaseKnown, "phase_cap_w", phaseCap, "final_cap_w", finalCap)
 	}
 	return finalCap, true
@@ -111,11 +113,19 @@ func coherentEVBalance(store *telemetry.Store, state *State, meter *telemetry.De
 		r := store.Get(point.DriverName, telemetry.DerEV)
 		h := store.DriverHealth(point.DriverName)
 		current, ok := qualifiedFuseObservation(r, now)
+		evidence := fuseEVEvidence(point.DriverName, r, h, current, ok, now)
+		balance.evEvidence = append(balance.evEvidence, evidence)
 		if !ok || h == nil || !h.TelemetryLive() || current.PowerW <= 0 {
 			continue // Unknown EV power stays inside the measured site demand.
 		}
 		ps := windows[point.DriverName+":"+telemetry.DerEV.String()].Points
 		ps = append(ps, current) // Includes explicit change-only confirmations.
+		credit := evPowerAtLatestSite(ps, siteAt, current)
+		balance.evEvidence[len(balance.evEvidence)-1].LatestCreditW = credit
+		balance.evEvidence[len(balance.evEvidence)-1].Points = len(ps)
+		if credit <= 0 {
+			balance.evEvidence[len(balance.evEvidence)-1].Reason = "no_bracket_or_observed_stop"
+		}
 		series = append(series, evSeries{math.Min(current.PowerW, r.RawW), current, ps})
 	}
 	for _, ev := range series {
