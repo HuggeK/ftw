@@ -321,32 +321,11 @@ func productionDialer() *websocket.Dialer {
 	}
 }
 
-// Run keeps the uplink up until the context ends. The tunnel's table runs
-// beside it, so a phone reaches the box through FTW Cloud while the relay
-// cannot be reached.
+// Run serves phone sessions carried by FTW Cloud until the context ends.
+// It opens no connection to the retired relay.
 func (u *Uplink) Run(ctx context.Context) error {
-	go u.tunnel.Run(ctx)
-	for {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-
-		delay, err := u.once(ctx)
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if err != nil {
-			u.log.Warn("app uplink dropped; retrying", "retry_in", delay, "err", err)
-		}
-
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
-	}
+	u.tunnel.Run(ctx)
+	return ctx.Err()
 }
 
 // once dials, serves until the connection ends, and says how long to wait.

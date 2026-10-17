@@ -2404,7 +2404,7 @@ func main() {
 	appEnroll, appUplink, appLinkEnabled, appLinkErr := startAppLink(
 		ctx, cfg, identityKeyPath, boxID, Version,
 		st, tel, mpcSvc, lpMgr, lpController, carsRT, priceSvc, ctrl, ctrlMu, plannerPrefs,
-		controlRev, appLinkWatchdog, appAPI, webPush, appCloud, agents,
+		controlRev, appLinkWatchdog, appAPI, appCloud, agents,
 	)
 	switch {
 	case appLinkErr != nil:
@@ -2419,13 +2419,13 @@ func main() {
 	// FTW Cloud: the phones' own sessions with the box, carried as
 	// ciphertext the service cannot read, from the first pairing on; and a
 	// signed, readable copy of the house, off until an owner turns it on.
-	// The relay keeps running beside it.
+	// Both use the one FTW Cloud connection.
 	var appTunnel *appuplink.Tunnel
 	if appUplink != nil {
 		appTunnel = appUplink.Tunnel()
 	}
 	cloudLink := startCloudLink(ctx, statePath, Version, st, appEnroll,
-		tel, ctrl, ctrlMu, controlRev, appLinkWatchdog, priceSvc, appAPI, cloudNotify, appTunnel, carsRT)
+		tel, ctrl, ctrlMu, controlRev, appLinkWatchdog, priceSvc, appAPI, cloudNotify, appTunnel, carsRT, webPush)
 	appCloud.bind(cloudLink)
 	if cloudLink != nil {
 		agents.home = cloudLink.Home
@@ -2433,7 +2433,7 @@ func main() {
 	}
 
 	// The anonymous fleet ping: how many boxes, which versions, which drivers.
-	// Its separate relay HTTP door keeps daily totals; the encrypted app path
+	// Its separate Cloud HTTP route keeps daily totals; the encrypted app path
 	// stays opaque and stores no routed traffic.
 	// The bundled drivers dir is deliberately not passed: which drivers this
 	// build ships with is compiled in, not discovered on disk. See
@@ -2661,8 +2661,8 @@ func main() {
 			Plugged: lp.PluggedIn, LevelKnown: lp.PluggedIn && lp.SoCSource != "assumed", HasGoal: lp.TargetSoC > 0,
 		}, true
 	})
-	if appUplink != nil {
-		deps.PushResync = appUplink.ResyncDeadman
+	if cloudLink != nil {
+		deps.PushResync = cloudLink.RosterChanged
 	}
 	// The loadpoint manager publishes its session latches (completion,
 	// interruption) on the same bus the engine listens to.

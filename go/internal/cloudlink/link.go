@@ -187,9 +187,15 @@ type Tunnel interface {
 	Drop()
 }
 
+// WebPushSource renders and encrypts the notices the service may send when the box is away.
+type WebPushSource interface {
+	WebPushRows() ([]cloudwire.WebPushRow, error)
+}
+
 // Options wires a link. Site, Roster, KV and KeyPath are required.
 type Options struct {
 	Site    Site
+	WebPush WebPushSource
 	Roster  Roster
 	KV      KV
 	KeyPath string

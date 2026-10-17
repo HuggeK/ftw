@@ -53,11 +53,12 @@ import (
 
 	"github.com/srcfl/ftw/go/internal/config"
 	"github.com/srcfl/ftw/go/internal/prices"
+	"github.com/srcfl/ftw/go/protocol/fleetwire"
 )
 
 // Schema names the payload shape so the endpoint can read old pings after the
 // fields change. It is the one constant string in the message.
-const Schema = "ftw.fleet/1"
+const Schema = fleetwire.Schema
 
 const (
 	// period is the nominal gap between pings.
@@ -128,15 +129,7 @@ type Facts struct {
 // Payload is the whole ping. Every field is a bucket or a label shared with
 // thousands of other boxes; there is deliberately no field a household could
 // be looked up by, and no field that says which ping came first.
-type Payload struct {
-	Schema  string   `json:"schema"`
-	Version string   `json:"ftw_version"`
-	Channel string   `json:"channel"`
-	Drivers []string `json:"drivers"`
-	Battery string   `json:"battery_kwh"`
-	Zone    string   `json:"price_zone"`
-	Age     string   `json:"install_age"`
-}
+type Payload = fleetwire.Report
 
 // Build coarsens one box's facts into the message that may leave it.
 //

@@ -23,7 +23,6 @@ import (
 	"github.com/srcfl/ftw/go/internal/loadpoint"
 	"github.com/srcfl/ftw/go/internal/localzone"
 	"github.com/srcfl/ftw/go/internal/mpc"
-	"github.com/srcfl/ftw/go/internal/notifications"
 	"github.com/srcfl/ftw/go/internal/prices"
 	"github.com/srcfl/ftw/go/internal/state"
 	"github.com/srcfl/ftw/go/internal/telemetry"
@@ -672,7 +671,6 @@ func startAppLink(
 	revision *control.Revision,
 	siteMeterStale time.Duration,
 	gateway *lateAPI,
-	webPush *notifications.WebPush,
 	cloud *cloudSession,
 	agents *agentPorts,
 ) (*appenroll.Identity, *appuplink.Uplink, bool, error) {
@@ -759,22 +757,9 @@ func startAppLink(
 	// starting, which is true.
 	caps = append(caps, appproto.CapApiPassthrough)
 
-	// The dead man's switch rides on the uplink exactly when there is
-	// state to hold subscriptions in and a VAPID key to sign for them —
-	// a row the push service would refuse is not a farewell. With neither
-	// it produces no rows and the uplink says no extra word.
-	var deadman appuplink.DeadmanSource
-	if st != nil && webPush != nil {
-		deadman = deadmanFromState{st: st, wp: webPush}
-	}
-
 	// One command log for the box. Sessions come and go with their sockets,
 	// and a retry in the next session must meet the id the last one took.
 	cmds := appproto.NewCmdLog()
-
-	// The box takes a watch through the relay's exchange (ADR 0009), and
-	// says so, so a phone offers "Add watch".
-	caps = append(caps, appproto.CapCmdExchange)
 
 	// Agents (docs/agents.md): an owner's grants to an assistant, Sourceful
 	// support or the release check. They reach the box through FTW Cloud's
@@ -794,7 +779,7 @@ func startAppLink(
 	// watch's exchange. They share the ports above, which are read-only
 	// apart from the mode and the command log, and the mode goes through
 	// control's own validation.
-	handlerFor := func(exchange bool) appuplink.HandlerBuilder {
+	handlerFor := func() appuplink.HandlerBuilder {
 		return func(
 			sender appproto.Sender,
 			caller apiauth.Caller,
@@ -817,7 +802,6 @@ func startAppLink(
 				Caller:       caller,
 				Grants:       grants,
 				Commands:     cmds,
-				Exchange:     exchange,
 				Access:       agents.access,
 				Agents:       agents.state,
 				Audit:        agents.audit,
@@ -843,18 +827,16 @@ func startAppLink(
 	}
 
 	uplink, err := appuplink.New(appuplink.Options{
-		Enroll:          enroll,
-		Deadman:         deadman,
-		Handler:         handlerFor(false),
-		ExchangeHandler: handlerFor(true),
-		Arrivals:        arrivalsFor(ctx, tel),
+		Enroll:   enroll,
+		Handler:  handlerFor(),
+		Arrivals: arrivalsFor(ctx, tel),
 	})
 	if err != nil {
 		return enroll, nil, enabled, err
 	}
 	agents.access.Drop = func(key []byte) { uplink.DropSessionsByAppKey(key) }
 	agents.boxPage = func(by string) (*appproto.Handler, error) {
-		return handlerFor(false)(discardSender{}, boxPageCaller(by), boxPageGrant{})
+		return handlerFor()(discardSender{}, boxPageCaller(by), boxPageGrant{})
 	}
 	go sweepAgents(ctx, agents)
 
@@ -1053,7 +1035,6 @@ func (a *appLinkAPI) RevokeDevice(id string, atTheBox bool) error {
 			a.agents.agentGone(gone.ID, "app-link")
 		}
 	}
-	var swept int64
 	for _, gone := range removed {
 		// Forgetting the key locks the next handshake out; dropping the
 		// live sessions locks out the one running now. Both, or "remove"
@@ -1063,7 +1044,7 @@ func (a *appLinkAPI) RevokeDevice(id string, atTheBox bool) error {
 		}
 		// A device that may no longer read the house may no longer be told
 		// about it: its push subscriptions go with the grant, and the
-		// relay's pre-encrypted farewell rows for them go on the resync.
+		// Cloud roster's encrypted offline notices for them go on the resync.
 		if a.st != nil {
 			n, err := a.st.DeletePushSubscriptionsByDevice(gone.ID)
 			switch {
@@ -1071,12 +1052,8 @@ func (a *appLinkAPI) RevokeDevice(id string, atTheBox bool) error {
 				slog.Warn("could not sweep a revoked device's push subscriptions", "device", gone.ID, "err", err)
 			case n > 0:
 				slog.Info("swept a revoked device's push subscriptions", "device", gone.ID, "rows", n)
-				swept += n
 			}
 		}
-	}
-	if swept > 0 && a.uplink != nil {
-		go a.uplink.ResyncDeadman()
 	}
 	return nil
 }

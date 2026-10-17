@@ -57,7 +57,7 @@ func TestExchangeThroughARealRelay(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = uplink.Run(ctx) }()
+	go func() { _ = uplink.runRelay(ctx) }()
 
 	code, _, err := enroll.MintPairingCode(apiauth.RoleOwner, appenroll.PairingTTL)
 	if err != nil {
