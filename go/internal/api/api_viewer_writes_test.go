@@ -208,11 +208,17 @@ func TestAViewerMayStillRead(t *testing.T) {
 			Method: appproto.APIGet, Path: path,
 		})
 		env := awaitID(t, rig.frames, id)
+		if env.T == appproto.MsgError {
+			t.Fatalf("a viewer's read of %s was refused: %+v", path, decode[appproto.ErrorBody](t, env))
+		}
 		if env.T != appproto.MsgAPIHead {
 			t.Fatalf("a viewer's read of %s answered %s, want a head", path, env.T)
 		}
 		if head := decode[appproto.APIHeadMsg](t, env); head.Status != http.StatusOK {
 			t.Fatalf("a viewer's read of %s answered %d, want 200", path, head.Status)
 		}
+		// The box serves one call at a time, and the app waits for each to
+		// end before it asks again. Asking sooner would be refused as busy.
+		awaitIDType(t, rig.frames, id, appproto.MsgAPIEnd)
 	}
 }
