@@ -5,15 +5,54 @@ import "math"
 // A manual selection is a ceiling. Never round it up to a larger step or
 // let it bypass the configured charger's rating.
 func clampManualPower(cfg Config, hold ManualHold, site SiteFuse) float64 {
+	minimum := manualMinChargeW(cfg, hold, site)
+	w := floorChargeW(hold.PowerW, minimum, cfg.MaxChargeW, cfg.AllowedStepsW)
+	amps := hold.MaxAmpsPerPhase
+	if site.MaxAmps > 0 && (!finite(amps) || amps <= 0 || amps > site.MaxAmps) {
+		amps = site.MaxAmps
+	}
+	if amps <= 0 {
+		return w
+	}
+	mode := hold.PhaseMode
+	if mode == "" {
+		mode = cfg.PhaseMode
+	}
+	if site.Phases() == 1 {
+		mode = "1p"
+	} else if mode == "" && cfg.SurplusOnly {
+		mode = "auto"
+	}
+	voltage := site.Voltage
+	if voltage <= 0 {
+		voltage = hold.Voltage
+	}
+	split := hold.PhaseSplitW
+	if split <= 0 {
+		split = cfg.PhaseSplitW
+	}
+	cmd := map[string]any{"power_w": w, "phase_mode": mode, "voltage": voltage, "phase_split_w": split, "max_amps_per_phase": amps}
+	// A current reduction may move an auto offer from three phases to one.
+	// Apply the same final ceiling until that phase choice is stable.
+	for applyCurrentCeiling(cmd) {
+	}
+	return floorChargeW(cmd["power_w"].(float64), minimum, cfg.MaxChargeW, cfg.AllowedStepsW)
+}
+
+func manualMinChargeW(cfg Config, hold ManualHold, site SiteFuse) float64 {
 	floor := cfg.MinChargeW
 	mode := hold.PhaseMode
 	if mode == "" {
 		mode = cfg.PhaseMode
 	}
 	if (mode == "1p" || mode == "auto") && site.Phases() == 3 {
-		floor /= 3
+		voltage := site.Voltage
+		if !finite(voltage) || voltage <= 0 {
+			voltage = 230
+		}
+		floor = math.Max(floor/3, 6*voltage)
 	}
-	return floorChargeW(hold.PowerW, floor, cfg.MaxChargeW, cfg.AllowedStepsW)
+	return floor
 }
 
 func (c *Controller) applyInstallationLimits(cmd map[string]any) {

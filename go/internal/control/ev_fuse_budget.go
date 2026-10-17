@@ -21,9 +21,15 @@ func evHeadroomW(ceiling, gridW, poolW float64) float64 {
 
 func finiteFuseValue(w float64) bool { return !math.IsNaN(w) && !math.IsInf(w, 0) }
 
+type evFuseBalance struct {
+	gridW, poolW, pendingW      float64
+	latestPoolW, latestPendingW float64
+}
+
 // EVFuseBudget refreshes the common EV cap before a charger command, also
 // without batteries. The shared freshness gate must already allow dispatch.
 // Other EVs remain measured household demand. Callers hold the control lock.
+// The controller also applies its final tick's phase choice before sending.
 func EVFuseBudget(store *telemetry.Store, state *State, points []loadpoint.State, configs []loadpoint.Config, fuseMaxW float64) (float64, bool) {
 	if store == nil || state == nil || !finiteFuseValue(fuseMaxW) || fuseMaxW <= 0 {
 		return 0, true
@@ -32,15 +38,17 @@ func EVFuseBudget(store *telemetry.Store, state *State, points []loadpoint.State
 	if meter == nil || !finiteFuseValue(meter.RawW) {
 		return 0, true
 	}
-	gridW, poolW := coherentEVBalance(store, state.SiteMeterDriver, meter, points, state.now())
-	cap := evHeadroomW(state.phaseImportCeilingW(fuseMaxW, meter), gridW, poolW)
-	if phaseW, known := evPhaseIncreaseW(meter, state, configs, poolW); known {
-		cap = math.Min(cap, math.Max(0, poolW+phaseW))
+	now := state.now()
+	balance := coherentEVBalance(store, state, meter, points, now)
+	// The common balance includes later observed DER increases. Keep the
+	// newest site/phase read as an independent bound so the same increase is
+	// not counted once in its grid watts and again as a pending command.
+	cap := evHeadroomW(state.effectiveImportCeilingW(fuseMaxW), balance.gridW+balance.pendingW, balance.poolW)
+	latestCap := evHeadroomW(state.phaseImportCeilingW(fuseMaxW, meter), meter.RawW+balance.latestPendingW, balance.latestPoolW)
+	if phaseW, known := evPhaseIncreaseW(meter, state, configs, balance.latestPoolW); known {
+		latestCap = math.Min(latestCap, math.Max(0, balance.latestPoolW+phaseW-balance.latestPendingW))
 	}
-	if state.FuseSaturated {
-		cap = math.Min(cap, state.FuseEVMaxW)
-	}
-	return cap, true
+	return math.Min(cap, latestCap), true
 }
 
 // A managed EV earns replacement credit only across a site observation that
@@ -48,18 +56,22 @@ func EVFuseBudget(store *telemetry.Store, state *State, points []loadpoint.State
 // preventing a later start or an earlier stop from inventing spare capacity.
 // The existing bounded telemetry ring owns the samples; no second cache or
 // filtered load estimate participates in the hard limit.
-func coherentEVBalance(store *telemetry.Store, meterDriver string, meter *telemetry.DerReading, points []loadpoint.State, now time.Time) (gridW, poolW float64) {
-	gridW = meter.RawW
+func coherentEVBalance(store *telemetry.Store, state *State, meter *telemetry.DerReading, points []loadpoint.State, now time.Time) evFuseBalance {
+	balance := evFuseBalance{gridW: meter.RawW}
+	siteAt := meter.UpdatedAt
 	from := now.Add(-telemetry.ControlWindowDuration)
 	windows := store.ControlWindows(from, now)
-	sites := windows[meterDriver+":"+telemetry.DerMeter.String()].Points
+	batteries := pendingBatterySeriesForFuse(store, state, windows, now)
+	sites := windows[state.SiteMeterDriver+":"+telemetry.DerMeter.String()].Points
 	if current, ok := qualifiedFuseObservation(meter, now); ok {
 		current.At = current.Seen()
+		siteAt = current.At
 		sites = append(sites, current)
 	}
 	type evSeries struct {
-		latest float64
-		points []telemetry.ControlObservation
+		latest  float64
+		current telemetry.ControlObservation
+		points  []telemetry.ControlObservation
 	}
 	var series []evSeries
 	seen := map[string]bool{}
@@ -76,8 +88,12 @@ func coherentEVBalance(store *telemetry.Store, meterDriver string, meter *teleme
 		}
 		ps := windows[point.DriverName+":"+telemetry.DerEV.String()].Points
 		ps = append(ps, current) // Includes explicit change-only confirmations.
-		series = append(series, evSeries{math.Min(current.PowerW, r.RawW), ps})
+		series = append(series, evSeries{math.Min(current.PowerW, r.RawW), current, ps})
 	}
+	for _, ev := range series {
+		balance.latestPoolW += evPowerAtLatestSite(ev.points, siteAt, ev.current)
+	}
+	balance.latestPendingW = pendingBatteryIncreaseAtLatestSite(batteries, siteAt)
 	sort.SliceStable(sites, func(i, j int) bool { return sites[i].At.After(sites[j].At) })
 	for _, site := range sites {
 		if site.At.Before(from) || site.At.After(now) || !finiteFuseValue(site.PowerW) {
@@ -93,12 +109,15 @@ func coherentEVBalance(store *telemetry.Store, meterDriver string, meter *teleme
 			credit += w
 		}
 		if coherent {
-			// A fresh increase in house/site demand always wins over an
-			// older coherent sample. A fresh EV drop already reduced credit.
-			return math.Max(gridW, site.PowerW), credit
+			balance.pendingW, coherent = pendingBatteryIncreaseAt(batteries, site.At)
+		}
+		if coherent {
+			balance.gridW, balance.poolW = site.PowerW, credit
+			return balance
 		}
 	}
-	return gridW, 0
+	balance.pendingW, _ = pendingBatteryIncreaseAt(batteries, siteAt)
+	return balance
 }
 
 func qualifiedFuseObservation(r *telemetry.DerReading, now time.Time) (telemetry.ControlObservation, bool) {
@@ -126,7 +145,16 @@ func bracketedEVPower(points []telemetry.ControlObservation, at time.Time, lates
 	if !hasBefore || !hasAfter {
 		return 0, false
 	}
-	return math.Max(0, math.Min(latest, math.Min(before.PowerW, after.PowerW))), true
+	baseline := math.Max(0, math.Min(latest, math.Min(before.PowerW, after.PowerW)))
+	// Another slow device may force an older common site observation. A
+	// later observed stop still removes its replacement credit, even if
+	// the charger has since started again.
+	for _, point := range points {
+		if !point.Seen().Before(at) && finiteFuseValue(point.PowerW) && point.PowerW >= 0 {
+			baseline = math.Min(baseline, point.PowerW)
+		}
+	}
+	return baseline, true
 }
 
 // Phase-current magnitudes cannot tell us that an exporting phase makes
@@ -159,7 +187,9 @@ func evPhaseIncreaseW(meter *telemetry.DerReading, state *State, configs []loadp
 	phases := state.SiteFusePhases
 	unknownPhase := false
 	for _, cfg := range configs {
-		if cfg.PhaseMode == "1p" || cfg.PhaseMode == "auto" {
+		// Empty retains the config's declared three-phase default. The
+		// controller's final guard covers runtime auto/manual phase changes.
+		if cfg.PhaseMode != "" && cfg.PhaseMode != "3p" {
 			phases = 1 // No promise about an auto charger's current phase dwell.
 			unknownPhase = true
 		}

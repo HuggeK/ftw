@@ -30,9 +30,9 @@ type ControlBaseline struct {
 
 const ControlWindowDuration = 20 * time.Second
 
-// Caller holds mu. At most 64 points per DER. EVs retain every new source
-// sample: dropping an observed stop could create false replacement credit.
-// Other DERs retain at most one point per second for response checks.
+// Caller holds mu. At most 64 points per DER. Controlled consumers retain
+// every new source sample: dropping an observed stop could create false
+// replacement credit. Other DERs keep at most one point per second.
 func (s *Store) recordControlObservation(driver string, kind DerType, power float64, data json.RawMessage, now time.Time) {
 	if kind == DerVehicle {
 		return
@@ -52,7 +52,7 @@ func (s *Store) recordControlObservation(driver string, kind DerType, power floa
 	if len(points) > 0 && !at.After(points[len(points)-1].At) {
 		return
 	}
-	if kind != DerEV && len(points) > 0 && at.Unix() == points[len(points)-1].At.Unix() {
+	if kind != DerEV && kind != DerBattery && kind != DerV2X && len(points) > 0 && at.Unix() == points[len(points)-1].At.Unix() {
 		points[len(points)-1] = p
 	} else {
 		points = append(points, p)

@@ -101,7 +101,7 @@ func TestCommandedReasonFuseCapZero(t *testing.T) {
 	}
 }
 
-func TestCommandedReasonFuseCooldownOverridesManualHold(t *testing.T) {
+func TestCommandedReasonFuseLimitOverridesManualHold(t *testing.T) {
 	base := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
 	sender := &fakeSender{}
 	cfg := reasonLoadpoint()
@@ -109,14 +109,14 @@ func TestCommandedReasonFuseCooldownOverridesManualHold(t *testing.T) {
 	c := newTestController(t, []Config{cfg}, nil, samples, sender)
 	c.SetManualHold(cfg.ID, ManualHold{PowerW: 11040, PhaseMode: "3p", Persistent: true})
 	// The hold wants 11 kW, the fuse allows nothing below the minimum
-	// step — the clamp pauses, arms the cooldown, and the reason must
+	// step — the clamp pauses, and the reason must
 	// say fuse, not manual_hold.
 	c.SetFuseEVMax(func() (float64, bool) { return 0, true })
 
 	c.Tick(context.Background(), base)
 
-	if w, r := commandedReason(t, c, cfg.ID); w != 0 || r != "fuse_cooldown" {
-		t.Errorf("hold vs fuse: want (0, fuse_cooldown), got (%.0f, %q)", w, r)
+	if w, r := commandedReason(t, c, cfg.ID); w != 0 || r != "fuse_limit" {
+		t.Errorf("hold vs fuse: want (0, fuse_limit), got (%.0f, %q)", w, r)
 	}
 }
 

@@ -6,6 +6,27 @@ import (
 	"time"
 )
 
+func TestControlObservationsRetainBatteryAndV2XStopsWithinASecond(t *testing.T) {
+	for _, kind := range []DerType{DerBattery, DerV2X} {
+		t.Run(kind.String(), func(t *testing.T) {
+			s, at := NewStore(), time.Now().Truncate(time.Second)
+			for i, w := range []float64{8000, 0, 8000} {
+				s.recordControlObservation("device", kind, w, nil, at.Add(time.Duration(i+1)*100*time.Millisecond))
+			}
+			points := s.controlObservations[key("device", kind)]
+			if len(points) != 3 || points[1].PowerW != 0 {
+				t.Fatalf("lost an observed stop within one second: %+v", points)
+			}
+			for i := 0; i < 100; i++ {
+				s.recordControlObservation("device", kind, 8000, nil, at.Add(400*time.Millisecond+time.Duration(i)*time.Millisecond))
+			}
+			if n := len(s.controlObservations[key("device", kind)]); n != 64 {
+				t.Fatalf("raw ring has %d points, want bounded 64", n)
+			}
+		})
+	}
+}
+
 func TestControlWindowsAreBoundedAndMissingDataBreaksProof(t *testing.T) {
 	s := NewStore()
 	now := time.Now()

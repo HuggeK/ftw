@@ -2,12 +2,38 @@ package control
 
 import (
 	"encoding/json"
+	"math"
 	"testing"
 	"time"
 
 	"github.com/srcfl/ftw/go/internal/loadpoint"
 	"github.com/srcfl/ftw/go/internal/telemetry"
 )
+
+func TestLiveFuseBudgetKeepsDeclaredPhaseDefault(t *testing.T) {
+	for _, tc := range []struct {
+		name, phase string
+		wantW       float64
+	}{
+		{"legacy_default", "", 13110},
+		{"explicit_3p", "3p", 13110},
+		{"explicit_1p", "1p", 4370},
+		{"explicit_auto", "auto", 4370},
+		{"unknown", "unknown", 4370},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := telemetry.NewStore()
+			store.Update("meter", telemetry.DerMeter, 3450, nil, []byte(`{"l1_a":5,"l2_a":5,"l3_a":5}`))
+			state := NewState(0, 0, "meter")
+			state.SiteFuseAmps, state.SiteFuseVoltage, state.SiteFusePhases = 25, 230, 3
+			cfg := loadpoint.Config{ID: "car", DriverName: "charger", PhaseMode: tc.phase}
+			got, known := EVFuseBudget(store, state, nil, []loadpoint.Config{cfg}, 17250)
+			if !known || math.Abs(got-tc.wantW) > .01 {
+				t.Fatalf("declared phase%q cap=%.0fW known=%t, want%.0fW", tc.phase, got, known, tc.wantW)
+			}
+		})
+	}
+}
 
 func TestLiveFuseBudgetPhysicalBalance(t *testing.T) {
 	cases := []struct {

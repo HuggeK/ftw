@@ -6,8 +6,68 @@ import (
 	"testing"
 	"time"
 
+	"github.com/srcfl/ftw/go/internal/loadpoint"
 	"github.com/srcfl/ftw/go/internal/mpc"
 )
+
+func TestFuseLimitedManualDemandMakesBatteryYield(t *testing.T) {
+	st := NewState(0, 0, "ferroamp")
+	st.Mode = ModeSelfConsumption
+	st.SetEVFuseDemands([]loadpoint.FuseDemand{{DriverName: "car", PowerW: 10350, PhaseMode: "3p"}})
+	// A zero final offer must not erase the demand that asks the battery to
+	// back off. The next charger offer still needs measured fuse headroom.
+	st.EVCommandedW = 0
+	if got := scheduledEVPowerW(st); got != 10350 {
+		t.Fatalf("clamped manual demand lost: %v W", got)
+	}
+	store := seedStore(-6000, []struct {
+		name          string
+		currentW, soc float64
+	}{{"battery", 0, .5}})
+	targets := ComputeDispatch(store, st, caps(map[string]float64{"battery": 10000}), 5000)
+	if len(targets) != 1 || targets[0].TargetW > 650.001 {
+		t.Fatalf("battery used space requested by the car: %v", targets)
+	}
+	st.SetEVFuseDemands(nil)
+	if got := scheduledEVPowerW(st); got != 0 {
+		t.Fatalf("cleared demand still reserves %v W", got)
+	}
+}
+
+func TestFuseDemandSnapshotDoesNotDoubleCountOrAlias(t *testing.T) {
+	st := NewState(0, 0, "meter")
+	demands := []loadpoint.FuseDemand{
+		{DriverName: "car", PowerW: 6900, PhaseMode: "3p"},
+		{DriverName: "car", PowerW: 10350, PhaseMode: "1p"},
+		{DriverName: "other", PowerW: 1380, PhaseMode: "unknown"},
+		{DriverName: "", PowerW: 5000},
+		{DriverName: "invalid", PowerW: math.NaN()},
+		{DriverName: "invalid", PowerW: math.Inf(1)},
+		{DriverName: "invalid", PowerW: -1},
+	}
+	st.SetEVFuseDemands(demands)
+	demands[0].PowerW = 100000
+	if got := scheduledEVPowerW(st); got != 11730 {
+		t.Fatalf("deduplicated demand = %v W", got)
+	}
+	if len(st.evFuseDemands) != 2 || st.evFuseDemands[0].phaseMode != "auto" || st.evFuseDemands[1].phaseMode != "auto" {
+		t.Fatalf("mixed or unknown phase must stay conservative: %+v", st.evFuseDemands)
+	}
+}
+
+func TestLiveFuseDemandReplacesOldPlanReservation(t *testing.T) {
+	now := time.Now()
+	st := newStateWithEnergyDispatch(SlotDirective{SlotStart: now, SlotEnd: now.Add(15 * time.Minute),
+		LoadpointEnergyWh: map[string]float64{"car": 100}, LoadpointMaxPowerW: map[string]float64{"car": 10350}}, "meter")
+	st.SetEVFuseDemands(nil)
+	if got := scheduledEVPowerW(st); got != 0 {
+		t.Fatalf("stopped/completed/duty-off car still reserves %v W from old plan", got)
+	}
+	st.SetEVFuseDemands([]loadpoint.FuseDemand{{DriverName: "car", PowerW: 4140, PhaseMode: "3p"}})
+	if got := scheduledEVPowerW(st); got != 4140 {
+		t.Fatalf("live request must replace old on-power: %v W", got)
+	}
+}
 
 func TestScheduledEVKeepsBudgetBeforeBatteryCharge(t *testing.T) {
 	for _, draw := range []float64{0, 4000, 8000} {
