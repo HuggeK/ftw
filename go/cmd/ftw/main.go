@@ -2069,14 +2069,11 @@ func main() {
 			go mpcSvc.ReplanWithReason(context.Background(), "loadpoint_battery_boost_stopped")
 			slog.Info("battery boost stopped — replan requested", "lp", id, "reason", reason)
 		})
-		// Wire the live per-phase site-meter current reader. The control
-		// package's fuse guard is site-TOTAL only (sum across phases);
-		// a single phase can still trip from house-load imbalance (e.g.
-		// a vacuum or oven on L1) stacked on top of the EV's per-phase
-		// draw. This reader feeds the loadpoint's reactive per-phase EV
-		// clamp (applyPerPhaseFuseClamp), which lowers max_amps_per_phase
-		// the instant the worst phase approaches the breaker. Reads the
-		// same meter_lN_a metrics the fuse_over_limit notifier uses.
+		// Wire the live per-phase site-meter current reader. The EV hard
+		// limit (control.EVFuseBudget) cuts a worst-phase overage; this
+		// reader lets the loadpoint gate an increase on the phase a
+		// runtime 1p or auto charger may land on. Reads the same
+		// meter_lN_a metrics the fuse_over_limit notifier uses.
 		lpController.SetPerPhaseMeterAmps(func() (float64, float64, float64, bool) {
 			cfgMu.RLock()
 			siteMeter := cfg.SiteMeterDriver()
