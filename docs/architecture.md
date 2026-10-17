@@ -403,8 +403,8 @@ The gateway's display name is a label, never an authenticator.
 The service sees a stable home id, public keys, roster roles and scopes, pairing
 code hashes, source addresses and traffic timing. It cannot read the inner
 Noise session. A separate owner grant enables a signed, readable copy for
-Cloud features; that grant is off by default. An authorized cloud agent has
-its own Noise endpoint and the box checks its grant on every request. Neither
+Cloud features; that grant is off by default. Core's agent checks require a
+separate Noise session and a current owner grant on every request. Neither
 transport access nor a readable-copy grant grants an agent control.
 
 Lane 0 frames keep their fixed length. On the Cloud tunnel the box sends on
@@ -460,7 +460,8 @@ session may ask for its code, and only with a passkey step-up on that request;
 the code binds to that phone and has a slot of its own, so it never cancels an
 invite. The watch holds the `watch` role's scopes that its phone holds at that
 moment, spends its phone's command ids, and is listed and removed with its
-phone. It reaches the box through the exchange and never through the stream.
+phone. The native Watch sends box commands through its phone. Cloud one-shot
+reads remain read-only; the retired relay exchange is not a current route.
 
 The routes behind that list have two doors, and what each one PROVES decides
 what it opens:
@@ -482,6 +483,11 @@ share a view and was handed a house. What a caller did not say is a question,
 and the answer is 400.
 
 ### The code that can be read aloud
+
+Core retains a LAN-issued spoken-code form for clients that already hold the
+box's trust material. Current web and iOS pairing uses a QR over Cloud: the
+service lists no spoken-code hash, so a new client key needs a new QR. The
+encoding and Core checks for spoken codes are described below.
 
 A phone with no printed QR and no other paired device still has to be able to
 get back into its home. The floor is somebody standing at the box, reading
@@ -604,19 +610,20 @@ The honest limits, which belong here rather than in a comment nobody reads:
 
 ## Fleet ping
 
-The box's other outbound path, and the only one that carries readable content:
-once a day it posts its FTW version and channel, the driver types in use, a
+The box's anonymous daily report is separate from the Cloud readable-copy
+grant. Once a day it posts its FTW version and channel, the driver types in use, a
 battery-capacity bucket, its price zone and an install-age bucket. It answers
 how many reports arrive and what they describe, which helps size engineering
 bets.
 
-It goes over HTTPS to a separate `/fleet` door on `relay.ftw.energy`. It never
-enters the encrypted WebSocket path: that stays blind and stores no routed
-traffic. The HTTP door validates the fixed payload, adds it to the UTC day's
-counters and drops it. It keeps 90 days of totals, not raw reports.
+It goes over HTTPS to `https://cloud.ftw.energy/v1/fleet`. It never enters the
+Noise session. The HTTP handler validates the fixed payload, adds it to the UTC
+day's counters and drops it. It keeps 90 calendar days of totals, not raw
+reports. An operator reads totals only on the loopback metrics listener. An
+explicitly saved former default resolves to Cloud; a private collector keeps
+its chosen address.
 
-The constraint is the one above: Sourceful must not be able to follow a
-household. So the message carries no gateway ID, no key, no serial, no site
+Fleet totals must not form a household record. The message carries no gateway ID, no key, no serial, no site
 name, no counter and no timestamp — nothing in it says which box sent it —
 values are bucketed rather than reported, the version travels only when it is a
 release tag so a developer's build reports as unknown, and the send time is
@@ -663,12 +670,12 @@ left through it is writing an FTW-signed row into the box's own `state.db` by
 hand, which this design does not claim to stop.
 
 Three things this does not fix, and each is said on the Settings screen or the
-relay's local stats response. The fields still describe a household, so the
+Cloud service's loopback stats response. The fields still describe a household, so the
 payload remains a quasi-identifier: a beta box in a small price zone with a big
 battery may be the only one like it, and coarse buckets with a small field set
 are what keep that population large rather than a proof that it is. The endpoint
-also sees the source IP while the request is open, though neither the relay nor
-Caddy writes it. And with no id there is no way to dedupe, so the totals count
+also sees the source IP while the request is open, though the Cloud service writes no
+request log or source address. And with no id there is no way to dedupe, so the totals count
 reports, not unique boxes.
 
 A failed send is forgotten, never retried. Settings → FTW app → Fleet statistics renders the
