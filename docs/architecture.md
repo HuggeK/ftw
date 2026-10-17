@@ -395,6 +395,11 @@ origin. The box is not a WebAuthn relying party and holds no passkey: it admits
 the first session by a code inside Noise and later sessions by the client's
 static key.
 
+The machine identity in [`go/internal/gatewayidentity`](../go/internal/gatewayidentity)
+is separate from app enrolment and the Cloud link key. It uses a protected
+P-256 key where the hardware supports one and a bound software key elsewhere.
+The gateway's display name is a label, never an authenticator.
+
 The service sees a stable home id, public keys, roster roles and scopes, pairing
 code hashes, source addresses and traffic timing. It cannot read the inner
 Noise session. A separate owner grant enables a signed, readable copy for
