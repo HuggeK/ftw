@@ -5,9 +5,10 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/srcfl/ftw/go/internal/appuplink"
+	"github.com/srcfl/ftw/go/internal/appenroll"
 	"github.com/srcfl/ftw/go/internal/notifications"
 	"github.com/srcfl/ftw/go/internal/state"
+	"github.com/srcfl/ftw/go/protocol/cloudwire"
 )
 
 // The web-push glue: state.Store adapted onto the narrow interfaces the
@@ -37,20 +38,21 @@ func (p pushSubscriptionSource) DeletePushSubscription(id string) error {
 	return p.st.DeletePushSubscription(id)
 }
 
-// deadmanFromState renders and encrypts the box.unreachable farewell, one
+// webPushFromState renders and encrypts the box.unreachable farewell, one
 // row per stored subscription. The sentence comes from the push catalogue
 // and the encryption is the same RFC 8291 construction every live push
-// uses — the relay stores it and can read none of it. Each row also carries
+// uses — FTW Cloud stores it and can read none of it. Each row also carries
 // the VAPID Authorization header the push service will demand, signed here
-// by the provider's own key because the relay must never hold that key; the
-// uplink calls back every six hours, so the signature is re-made long
+// by the provider's own key because the service must never hold that key; the
+// roster calls back every six hours, so the signature is re-made long
 // before its 24 hours run out.
-type deadmanFromState struct {
-	st *state.Store
-	wp *notifications.WebPush
+type webPushFromState struct {
+	st     *state.Store
+	wp     *notifications.WebPush
+	enroll *appenroll.Identity
 }
 
-func (d deadmanFromState) DeadmanRows() ([]appuplink.DeadmanRow, error) {
+func (d webPushFromState) WebPushRows() ([]cloudwire.WebPushRow, error) {
 	subs, err := d.st.PushSubscriptions()
 	if err != nil {
 		return nil, err
@@ -66,25 +68,35 @@ func (d deadmanFromState) DeadmanRows() ([]appuplink.DeadmanRow, error) {
 	if err != nil {
 		return nil, err
 	}
-	rows := make([]appuplink.DeadmanRow, 0, len(subs))
+	rows := make([]cloudwire.WebPushRow, 0, len(subs))
 	for _, sub := range subs {
+		device, ok := d.enroll.GrantFor(sub.DeviceID)
+		if !ok {
+			continue
+		}
 		ct, err := notifications.EncryptForSubscription(sub.P256dh, sub.Auth, payload)
 		if err != nil {
 			// One unencryptable subscription must not disarm the rest.
-			slog.Warn("dead man's switch: skipping a subscription", "id", sub.ID, "err", err)
+			slog.Warn("dead man's switch: skipping a subscription", "err", err)
 			continue
 		}
 		auth, err := d.wp.DeadmanAuthorization(sub.Endpoint)
 		if err != nil {
-			slog.Warn("dead man's switch: skipping a subscription", "id", sub.ID, "err", err)
+			slog.Warn("dead man's switch: skipping a subscription", "err", err)
 			continue
 		}
-		rows = append(rows, appuplink.DeadmanRow{
-			SubscriptionID: sub.ID,
-			Endpoint:       sub.Endpoint,
-			CT:             ct,
-			Auth:           auth,
-		})
+		row := cloudwire.WebPushRow{
+			ID: sub.ID, Device: sub.DeviceID, Epoch: device.Epoch,
+			Endpoint: sub.Endpoint,
+			CT:       ct,
+			Auth:     auth,
+		}
+		proposed := append(rows, row)
+		if cloudwire.ValidateWebPush(proposed) != nil {
+			slog.Warn("browser offline notice limit reached")
+			break
+		}
+		rows = proposed
 	}
 	return rows, nil
 }

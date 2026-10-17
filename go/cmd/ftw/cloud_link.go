@@ -17,6 +17,7 @@ import (
 	"github.com/srcfl/ftw/go/internal/appenroll"
 	"github.com/srcfl/ftw/go/internal/appproto"
 	"github.com/srcfl/ftw/go/internal/appuplink"
+
 	"github.com/srcfl/ftw/go/internal/cars"
 	"github.com/srcfl/ftw/go/internal/cloudlink"
 	"github.com/srcfl/ftw/go/internal/control"
@@ -381,7 +382,7 @@ func startCloudLink(
 	ctx context.Context, statePath, build string, st *state.Store, enroll *appenroll.Identity,
 	tel *telemetry.Store, ctrl *control.State, ctrlMu *sync.Mutex, revision *control.Revision,
 	siteMeterStale time.Duration, priceSvc *prices.Service, gateway *lateAPI, notices *cloudNotices,
-	tunnel *appuplink.Tunnel, carsRT *cars.Runtime,
+	tunnel *appuplink.Tunnel, carsRT *cars.Runtime, webPush *notifications.WebPush,
 ) *cloudlink.Link {
 	if st == nil || enroll == nil {
 		return nil
@@ -403,6 +404,9 @@ func startCloudLink(
 		ClockSynced: cloudlink.ClockSynced,
 		Notify:      notices.notify,
 		Arrivals:    arrivalsFor(ctx, tel),
+	}
+	if webPush != nil {
+		opts.WebPush = webPushFromState{st: st, wp: webPush, enroll: enroll}
 	}
 	// Set only with a table: a typed nil would read as a tunnel.
 	if tunnel != nil {

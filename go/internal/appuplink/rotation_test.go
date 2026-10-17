@@ -289,7 +289,7 @@ func newRotationRig(t *testing.T, epoch int64) *rotationRig {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- u.Run(ctx) }()
+	go func() { done <- u.runRelay(ctx) }()
 	t.Cleanup(func() {
 		cancel()
 		<-done

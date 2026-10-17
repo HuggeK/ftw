@@ -652,6 +652,29 @@ The service never forwards these to a phone.
 | `pending` | [Pending] | The pairing codes the box shows now, at most one |
 | `noise` | bstr, 32 B | The box's X25519 Noise static key, the one in its pairing QR code. FTW Cloud's `keys` part opens an agent's session to it, and trusts it only as signed here |
 
+| `webpush` | [WebPushRow], optional | Box-encrypted browser offline notices. Service only; no browser key leaves the box |
+
+**WebPushRow**
+
+| Field | Type | Meaning |
+|---|---|---|
+| `id` | text | Subscription id, scoped to this home |
+| `dev` | text | Current roster device id |
+| `epoch` | uint | Its current grant epoch |
+| `endpoint` | text | HTTPS address at a supported browser push vendor |
+| `ct` | bstr | RFC 8291 encrypted box.unreachable payload |
+| `auth` | text | Box-signed VAPID Authorization, renewed within six hours |
+
+At most 16 rows and 32 KiB of encoded rows fit in one roster. Each ciphertext
+has at most 1,024 bytes, endpoint 2,048 bytes and Authorization 512 bytes.
+
+The service sends these only after the box has been away ten minutes, using
+the same timer and update grace as APNs. It checks the current device, epoch,
+events scope and suspension before each send. It needs no readable-copy grant.
+The rows never reach another phone. It stores only a sent marker per outage
+and subscription; purge removes it. Removed subscriptions leave the next roster.
+A deploy drains and starts no offline alert.
+
 **Device**
 
 | Field | Type | Meaning |
