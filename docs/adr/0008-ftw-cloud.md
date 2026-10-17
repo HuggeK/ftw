@@ -154,33 +154,46 @@ cases.
 
 ## Statistics
 
-**The start flow has two switches.** The first turns FTW Cloud on; the iPhone
-app needs it, and it lists what leaves the house. The second turns statistics
-on; it is off by default, and the app works the same either way. A change to
-purpose or fields needs a new policy version and fresh consent.
+**Product amendment, 17 October 2026.** Everyone who chooses FTW Cloud
+contributes to project statistics. The updated Cloud terms name this scope;
+there is no separate statistics opt-out within Cloud. Existing users must
+accept the new terms before the approved policy can admit their home.
+Owners who decline use the box locally without Cloud.
+
+Local-only users get a separate question, with Yes as the suggested action.
+Nothing starts before an active answer. No leaves local control working.
+This statistics-only link publishes no phone keys, pairing codes, Noise key,
+read grant, live state or remote access. It reuses the signed upload path.
+A policy or purpose change requires a new version and a fresh answer.
+This product decision does not establish a lawful basis; C8 stays off until
+that question and the DPIA have been reviewed and signed.
 
 - **Purpose.** To learn how homes with FTW use and shift energy, to improve
   FTW's planning and defaults, and to publish figures about homes as a group.
   Not for advertising, decisions about one home, or handing rows to anyone.
-- **Fields.** Per closed hour, the site's energy totals in Wh, rounded to
-  10 Wh, under the ledger's flow names; the price zone; which of battery,
-  solar and charger the site has; the policy version. Nothing finer than an
-  hour, and no names, addresses, IP addresses, serials, coordinates, VINs,
-  config or logs.
+- **Fields.** Recorded closed-hour grid import/export, solar generation,
+  battery and vehicle charge/discharge; configured battery capacity,
+  battery/charger power limits and solar rating. Rounded to 10 Wh or W.
+  Missing values stay absent. No names, addresses, location, device ids,
+  prices, free text, configuration documents or logs.
 - **`statsId`.** 128 random bits drawn by the box at consent, derived from
   nothing else. A new consent draws a new one.
-- **Retention.** Rows go 13 months after the hour they describe. Withdrawal or
-  a purge deletes them within 24 hours. Published aggregates stay, and the
+- **Retention.** Rows go 13 months after the hour they describe. Leaving Cloud, stopping local sharing or
+  a purge deletes unpublished rows when Cloud receives the signed request.
+  An offline box sends it on reconnection. Published aggregates stay, and the
   consent screen says so.
-- **Cell rules.** At least 20 homes per figure, nothing finer than a price
-  zone or an hour, and no home above 30 % of a cell's sum. Code applies the
-  rules; no person reads raw rows.
+- **Cell rules.** At least 20 homes per figure, no per-home output, and no
+  home above 30 % of a cell's sum. Code applies the rules. No staff route
+  reads raw rows; full host administrators can read the database.
 - **Partners.** Homes under a partner's control stay out unless that
   partner's contract allows them in. Nova keeps B2B partner telemetry.
-- **Law.** The service links `statsId` to the home so a purge can reach it,
-  which makes the rows personal data (CJEU C-413/23 P). Serving the owner's phones
-  is necessary for the service asked for and meets the exemption in LEK
-  9 kap. 28 §; statistics are not, so they need consent. A lawyer confirms.
+- **Law.** The service links `statsId` to the home for deletion, so these
+  rows are personal data. The required Cloud model needs its own documented
+  lawful-basis assessment. Writing it in terms does not establish contractual
+  necessity or make conditional consent freely given. Local sharing proposes
+  informed, separate consent. A legal review must settle both paths, other
+  household members and terminal-access rules before activation. The review
+  draft lives in `ftw-cloud/privacy/project-statistics-dpia.md`.
 
 ## Security and retention
 
@@ -262,7 +275,9 @@ later step stands on it and ships on its own.
 | C7 Live Activity | Signed state in the extension view | A forged state shows "Open FTW" |
 | C8 Statistics | Ingest, backfill, cell rules | DPIA signed; withdrawal purges within 24 hours |
 
-The statistics switch ships with the start flow in C4. The box records consent
+The original separate Cloud statistics switch is replaced by the 17 October
+product amendment above. The Cloud terms and the local question ship with the
+start flow. The box records consent
 and `statsId` from then on. The October project policy below needs new
 consent and sends only later hours; it does not backfill the earlier gap. The lawyer also confirms that order: if the DPIA in C8 changes the
 rules, the app asks again. A public launch needs C2–C4 and the legal work.
@@ -296,13 +311,26 @@ rules, the app asks again. A public launch needs C2–C4 and the legal work.
 
 ### Project statistics policy, October 2026
 
-`ftw-project-stats-2026-10-v1` adds configured battery capacity, flexible
-power and solar ratings to the closed-hour energy scope. This needs fresh
-consent; an earlier statistics choice sends none of these fields. The owner
-can read the policy through `GET /api/cloud/stats-policy`, then accept its
-exact id through the existing owner-only statistics API. Stats stay off by
-default. Changing the policy rotates the random stats id and starts a new
-consent window. Hours before that window never contribute.
+`ftw-project-stats-2026-10-v2` covers configured capacities, flexible power,
+solar rating and closed-hour energy. `ftw-cloud-2026-10-v2` includes that scope
+for every Cloud home. An owner reads `GET /api/cloud/stats-policy`, then
+accepts the Cloud terms through `POST /api/cloud/grant`. Core records the
+scope, random stats id and start time in the same grant. An older Cloud
+answer or saved statistics checkbox does not accept this version.
+
+A local owner can instead accept the statistics policy through
+`POST /api/cloud/stats`, without granting readable state or remote access.
+`DELETE /api/cloud/stats` stops that local contribution. Within Cloud,
+statistics cannot be turned off alone; `DELETE /api/cloud` ends Cloud,
+requests home deletion and remembers the off choice across restarts.
+Phones can need pairing again after the home key is deleted. An app user
+who declines its terms pauses Cloud on that phone and keeps its local keys.
+
+The daily anonymous report also waits for the current project choice.
+Its saved config switch cannot bypass a missing answer or a local No.
+A new policy rotates the stats id and starts a new reporting window. An
+unset wall clock starts that window only once time is known; no earlier
+hours are filled in.
 
 The public view counts installations reporting in the last 24 closed hours.
 It sums the recorded hours, which may be incomplete; it does not claim all

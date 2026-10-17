@@ -80,7 +80,7 @@
   function whereLine(body) {
     var endpoint = (body && body.endpoint) || "nowhere";
     var handling = body && body.ftw_relay
-      ? " The FTW relay adds the report to that day's totals, then drops it and does not save the source address. These are reports, not unique boxes."
+      ? " FTW Cloud adds the report to that day's totals, then drops it and does not save the source address. These are reports, not unique boxes."
       : " This box uses a custom collector. FTW cannot say what that service stores or whether it counts unique boxes.";
     if (body && body.enabled) {
       return "Sent to " + endpoint +
@@ -181,7 +181,8 @@
       setTimeout(refresh, 0);
 
       return (
-        "<fieldset><legend>Fleet statistics</legend>" +
+        "<fieldset><legend>Anonymous daily report</legend>" +
+        '<p class="hint">The project statistics choice above controls whether this box contributes. This additional daily report describes versions and integrations. It does not count unique boxes.</p>' +
         '<p class="hint">When sharing is on, this box sends six things once a day: its ' +
         "FTW version, its release channel, the kinds of device it talks to, " +
         "roughly how much battery, its price zone, and roughly how old the " +

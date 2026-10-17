@@ -731,6 +731,7 @@ every call.
 | `purposes` | [text] | A subset of `cloud_purposes`: `serve` while the copy is on, and `stats` while the owner contributes to statistics. Empty while the copy is off or being withdrawn |
 | `statsId` | bstr, 16 B, optional | Random id for the separately accepted statistics policy; omitted when off |
 | `statsPolicy` | text, optional | Exact policy the owner accepted |
+| `termsPolicy` | text, optional | Cloud terms accepted by the owner; the current Cloud policy includes statistics |
 | `statsSinceMs` | uint, optional | Consent start in UTC milliseconds; only later closed hours may contribute |
 | `controller` | text | The data controller: `sourceful` unless a partner pairing flow sets another. No such flow exists yet |
 
@@ -1627,3 +1628,19 @@ constants, so `srcfl/ftw-cloud` need not spell them by hand.
 | Statistics rows kept | 13 months from the hour they describe |
 | Rule N clock lead allowed | 2 s |
 | Rule U drift margin, lifetime | 0.01 % of the time since learned; 24 hours |
+
+
+### Cloud terms and local statistics, policy version 2
+
+`ftw-cloud-2026-10-v2` includes `ftw-project-stats-2026-10-v2` for every Cloud
+home. `Grant.termsPolicy` carries the owner-accepted terms. Once the operator
+approves collection, Cloud admits only that bundled grant or a statistics-only
+roster. Old terms are not silently upgraded; they need an owner answer.
+Restoring a roster after restart applies the same rule.
+
+A statistics-only roster names the statistics policy as its terms policy,
+contains the stats purpose alone and has no read scopes, devices, pending
+codes, Noise key or browser subscriptions. It grants no remote access. Core
+also rejects tunnels locally in that mode and emits no live or event data.
+Collection stays off until the signed C8 review; the default operator setting
+is empty. Withdrawal and retention continue while it is paused.

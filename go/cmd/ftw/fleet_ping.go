@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/srcfl/ftw/go/internal/cloudlink"
 	"github.com/srcfl/ftw/go/internal/config"
 	"github.com/srcfl/ftw/go/internal/drivers"
 	"github.com/srcfl/ftw/go/internal/fleetping"
@@ -76,7 +77,7 @@ func startFleetPing(
 	installedAt := firstSeen(st, time.Now())
 
 	pinger, err := fleetping.New(fleetping.Options{
-		Enabled: fleetPingEnabled(cfg, cfgMu),
+		Enabled: func() bool { return fleetPingEnabled(cfg, cfgMu)() && cloudlink.StatisticsChoice(st) },
 		Facts: func() fleetping.Facts {
 			// Drivers can be installed without restarting FTW. Read the signed
 			// catalogue at the same time as the config so tomorrow's report and

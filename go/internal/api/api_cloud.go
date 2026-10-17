@@ -29,10 +29,12 @@ type CloudGrant interface {
 	Revoke(by string) error
 	Stats(cloudlink.StatsRequest) error
 	StopStats(by string) error
+	End(by string) error
 }
 
 func (s *Server) cloudRoutes() {
 	s.handle("GET  /api/cloud", Read, s.handleCloudStatus)
+	s.handle("DELETE /api/cloud", Configure, s.handleCloudEnd, NoStepUp)
 	s.handle("GET  /api/cloud/preview", Read, s.handleCloudPreview)
 	s.handle("GET /api/cloud/stats-policy", Read, s.handleCloudStatsPolicy)
 	s.handle("POST   /api/cloud/grant", Configure, s.handleCloudGrant, NoStepUp)
@@ -204,6 +206,10 @@ func (s *Server) handleCloudStopStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := link.StopStats(cloudCaller(r)); err != nil {
+		if errors.Is(err, cloudlink.ErrCloudNeedsStatistics) {
+			writeAppLinkError(w, http.StatusConflict, err.Error())
+			return
+		}
 		writeAppLinkError(w, http.StatusInternalServerError, "could not turn statistics off")
 		return
 	}
@@ -227,4 +233,19 @@ func (s *Server) CloudLoadpoints(now time.Time) (states []loadpoint.State, feedb
 	s.decorateLoadpointsWithBatteryBoost(states)
 	s.decorateLoadpointsWithPlan(states)
 	return states, s.controlFeedback(now), true
+}
+
+func (s *Server) handleCloudEnd(w http.ResponseWriter, r *http.Request) {
+	if !s.cloudGate(w, r, false) {
+		return
+	}
+	link, ok := s.cloudLink(w)
+	if !ok {
+		return
+	}
+	if err := link.End(cloudCaller(r)); err != nil {
+		writeAppLinkError(w, http.StatusInternalServerError, "could not stop FTW Cloud")
+		return
+	}
+	writeJSON(w, http.StatusOK, link.Status())
 }

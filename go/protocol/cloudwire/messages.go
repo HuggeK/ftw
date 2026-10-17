@@ -394,6 +394,7 @@ type Pending struct {
 // id, scopes or purposes. While a revoke waits for its receipt it keeps the
 // id and has neither scopes nor purposes.
 type Grant struct {
+	TermsPolicy  string   `cbor:"termsPolicy,omitempty"`
 	ID           []byte   `cbor:"id"`
 	Scopes       []string `cbor:"scopes"`
 	Purposes     []string `cbor:"purposes"`

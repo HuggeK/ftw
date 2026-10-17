@@ -48,7 +48,7 @@ var Fields = map[string][]string{
 	"Agent":      {"scopes", "ops", "caps", "expiresAtMs", "principal"},
 	"Caps":       {"holdS", "maxW", "perMin"},
 	"Principal":  {"client", "clientId", "ticket"},
-	"Grant":      {"id", "scopes", "purposes", "controller", "statsId", "statsPolicy", "statsSinceMs"},
+	"Grant":      {"id", "scopes", "purposes", "controller", "termsPolicy", "statsId", "statsPolicy", "statsSinceMs"},
 	"Pending":    {"hash", "ttlS"},
 	"WebPushRow": {"id", "dev", "epoch", "endpoint", "ct", "auth"},
 
