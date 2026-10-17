@@ -1255,6 +1255,12 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	// prefers it to the plan's per-slot cap, so the Plan card needs it to say
 	// where extra sun goes.
 	resp["pv_surplus_absorb_soc_cap"] = ctrl.PVSurplusAbsorbSoCCap
+	// The import ceiling caps each clock hour's mean import: what is left of
+	// this hour's budget and the import limit it sets now. Null while off.
+	resp["peak_import_hour_left_wh"], resp["peak_import_limit_w"] = nil, nil
+	if left, limit, ok := ctrl.ImportHourStatus(ctrl.SiteFuseAmps * ctrl.SiteFuseVoltage * float64(ctrl.SiteFusePhases)); ok {
+		resp["peak_import_hour_left_wh"], resp["peak_import_limit_w"] = left, limit
+	}
 	// A stale or missing site meter is not 0 W. Publishing zero made the
 	// dashboard and the FTW app draw "balanced" / "0 W" as if the house
 	// were idle. JSON null is what the flow mapping already treats as
@@ -1811,12 +1817,12 @@ func (s *Server) handleSetPeakLimit(w http.ResponseWriter, r *http.Request) {
 
 // ---- /api/peak_import_ceiling ----
 //
-// Hard import ceiling enforced in every mode. Default 0 = disabled. When
-// > 0, dispatch's import-side clamps (joint EV/battery allocator,
-// applyFuseGuard import branch, forceFuseDischarge) use min(fuse, peak)
-// as the binding threshold. Persisted in state.db so the operator's
-// tariff stays armed across restarts. See control.State.PeakImportCeilingW
-// for the full rationale.
+// Import ceiling on each clock hour's mean import, in every mode. Default
+// 0 = disabled. When > 0, dispatch's import-side clamps (joint EV/battery
+// allocator, applyFuseGuard import branch, forceFuseDischarge, the EV hard
+// limit) use the tighter of the fuse and the hour's import limit.
+// Persisted in state.db so the operator's tariff stays armed across
+// restarts. See control.State.PeakImportCeilingW.
 func (s *Server) handleSetPeakImportCeiling(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		PeakImportCeilingW float64 `json:"peak_import_ceiling_w"`

@@ -957,10 +957,10 @@
   <ftw-modal id="grid-modal" style="--ftw-modal-max-width:420px">
     <span slot="title">Grid</span>
     <div id="grid-modal-body">
-      <!-- Peak import ceiling (tariff cap, hard rule across all modes).
-           Default off — operator opts in via the checkbox. When on, the
-           slider value caps grid import; battery briefly bridges while
-           EV throttles. See PR for the full enforcement matrix. -->
+      <!-- Peak import ceiling (power tariff, across all modes). Default
+           off — operator opts in via the checkbox. When on, the slider
+           value caps the mean grid import over each clock hour; the EV and
+           battery follow the hour's budget left. -->
       <div class="control-card">
         <div class="card-label">Peak import limit</div>
         <label class="ftw-toggle">
@@ -973,7 +973,7 @@
           <span id="peak-limit-value" class="slider-current">5000 W</span>
           <button id="peak-limit-send" class="btn-send" disabled>Save</button>
         </div>
-        <div class="card-sub card-hint">Hard cap on grid import (tariff peak). Off = no cap; only the physical fuse applies.</div>
+        <div class="card-sub card-hint">Caps the average grid import over each clock hour (power tariff). Off = no cap; only the physical fuse applies.</div>
       </div>
 
       <!-- Grid target (legacy PI setpoint for manual modes). -->

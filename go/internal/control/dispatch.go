@@ -319,10 +319,13 @@ type State struct {
 	// Peak limit — enforced only in PeakShaving mode
 	PeakLimitW float64
 
-	// PeakImportCeilingW is an import cap in every mode, at or below the
-	// fuse. Zero disables it. The battery covers the overrun while the EV
-	// ramps, then stops. Export and the per-phase clamp still use the fuse.
+	// PeakImportCeilingW caps the mean import over each local clock hour,
+	// in every mode. Zero disables it. The hour's budget sets the import
+	// limit (import_hour.go); the fuse stays an instant limit. Export and
+	// the per-phase clamp use the fuse only.
 	PeakImportCeilingW float64
+	importHour         hourImport
+	importHourZone     *time.Location // nil: the box's zone
 
 	// MaxExportW is an export cap in every mode, in watts of magnitude.
 	// Zero leaves only the fuse. Ferroamp EnergyHub 0x8030 trips after
@@ -2037,8 +2040,8 @@ func ComputeDispatch(
 	evInMeterW := state.evInMeterW()
 	if fuseMaxW > 0 && math.Max(evInMeterW, plannedEVW) > 0 {
 		// Use the effective import ceiling (fuse minus safety margin,
-		// or tariff peak when tighter) so PeakImportCeilingW throttles
-		// the EV through the same surface as the fuse. Steady-state
+		// or the hour's import limit when tighter) so PeakImportCeilingW
+		// throttles the EV through the same surface as the fuse. Steady-state
 		// with peak active and BatteryCoversEV=false: the EV settles
 		// at this scaled rate; the battery's transient discharge to
 		// bridge the ramp-down is handled by forceFuseDischarge below.
@@ -2399,8 +2402,7 @@ func republishFuseEVCapAfterFuseDischarge(targets []DispatchTarget, store *telem
 		return
 	}
 	peakBindingW := fuseMaxW - state.fuseSafetyMarginW()
-	peakBinding := state.PeakImportCeilingW > 0 && state.PeakImportCeilingW < peakBindingW
-	if peakBinding {
+	if state.effectiveImportCeilingW(fuseMaxW) < peakBindingW {
 		return
 	}
 
@@ -3602,7 +3604,7 @@ func applyFuseGuard(targets []DispatchTarget, store *telemetry.Store, state *Sta
 	// own per-phase limiter doesn't fire first and cause a flap.
 	//
 	// Import ceiling is the tighter of (fuse − safety margin) and the
-	// operator's tariff peak; export ceiling is the tighter of (fuse −
+	// clock hour's import limit; export ceiling is the tighter of (fuse −
 	// safety margin) and the operator's max_export_w protection limit —
 	// set when an inverter trips on sustained export below the breaker
 	// (recurring Ferroamp 0x8030 fault). Both share one enforcement surface.
@@ -3766,22 +3768,21 @@ func (s *State) fuseSafetyMarginW() float64 {
 }
 
 // effectiveImportCeilingW returns the binding ceiling for grid import in
-// watts: the fuse limit minus its safety margin, further capped by
-// PeakImportCeilingW when the operator has opted into a tariff peak
-// (PeakImportCeilingW > 0). Used by every import-side clamp in the
-// dispatch path so peak and fuse share one enforcement surface.
+// watts: the fuse limit minus its safety margin, further capped by the
+// clock hour's import limit when the operator has opted into a tariff
+// ceiling (PeakImportCeilingW > 0). Used by every import-side clamp in the
+// dispatch path so the hour's budget and the fuse share one surface.
 //
-// Peak is taken at face value (no additional safety subtraction) — the
-// operator typed the contract limit, so the controller honours exactly
-// that. The fuse retains its independent safety margin because it
+// The hour's budget is the ceiling at face value — the operator typed the
+// contract limit. The fuse retains its independent safety margin because it
 // guards against a hardware breaker, not a billing line.
 func (s *State) effectiveImportCeilingW(fuseMaxW float64) float64 {
 	eff := fuseMaxW - s.fuseSafetyMarginW()
 	if eff < 0 {
 		eff = 0
 	}
-	if s != nil && s.PeakImportCeilingW > 0 && s.PeakImportCeilingW < eff {
-		eff = s.PeakImportCeilingW
+	if limitW, _, ok := s.importHourLimitsW(); ok && limitW < eff {
+		eff = limitW
 	}
 	return eff
 }

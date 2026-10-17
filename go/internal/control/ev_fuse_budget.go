@@ -87,7 +87,9 @@ type evMeterLimit struct {
 	readingAt   time.Time // newest site reading seen
 	roomSince   time.Time // first reading of the current run with room to start
 	raised      bool
-	raisedGridW float64 // site import when the last rise was sent
+	raisedGridW float64   // site import when the last rise was sent
+	overSince   time.Time // first reading of a run over the hour's import limit
+	idleWh      float64   // import since roomSince, for the ceiling's start test
 }
 
 type evPool struct {
@@ -132,8 +134,8 @@ func EVFuseBudget(store *telemetry.Store, state *State, points []loadpoint.State
 
 func (s *State) stepEVMeterLimit(meter *telemetry.DerReading, gridW float64, pool evPool, fuseMaxW float64) {
 	lim, now, at := &s.evLimit, s.now(), meter.UpdatedAt
-	first := !lim.set
-	gap := first || at.Sub(lim.readingAt) > evSettle
+	first, prevAt := !lim.set, lim.readingAt
+	gap := first || at.Sub(prevAt) > evSettle
 	lim.readingAt = at
 	prev := math.Inf(1)
 	if !first {
@@ -144,40 +146,45 @@ func (s *State) stepEVMeterLimit(meter *telemetry.DerReading, gridW float64, poo
 	if _, high, _, ok := s.evOffers.span(now); ok {
 		peakW = math.Max(peakW, high)
 	}
-	roomW, measured, worstA := s.evMeterRoomW(meter, gridW, pool.phases, fuseMaxW)
-	if roomW < 0 {
+	r := s.evMeterRoom(meter, gridW, pool.phases, fuseMaxW)
+	step := evPhaseMarginA * s.SiteFuseVoltage * pool.phases
+	// The fuse cuts on every reading. The hour's budget absorbs a short
+	// overage of less than a step: it cuts once the overage has lasted
+	// evSettle, so one reading over the ceiling changes nothing.
+	cutW := r.fuseW
+	if r.limitW >= 0 {
+		lim.overSince = time.Time{}
+	} else {
+		if lim.overSince.IsZero() || gap {
+			lim.overSince = at
+		}
+		if !r.hourly || gap || -r.limitW >= step || at.Sub(lim.overSince) >= evSettle {
+			cutW = math.Min(cutW, r.limitW)
+		}
+	}
+	if cutW < 0 {
 		// The meter may still show any offer of the last evSettle. Taking
 		// the overage from the highest cuts each measured watt once.
-		lim.capW, lim.roomSince = math.Min(prev, math.Max(0, peakW+roomW)), time.Time{}
+		lim.capW, lim.roomSince = math.Min(prev, math.Max(0, peakW+cutW)), time.Time{}
 		if lim.capW < prev {
 			lim.changedAt, lim.raised = now, false
-			slog.Info("EV hard limit: site meter over limit", "grid_w", gridW, "worst_phase_a", worstA,
-				"overage_w", -roomW, "offer_w", peakW, "cap_w", lim.capW)
+			slog.Info("EV hard limit: site meter over limit", "grid_w", gridW, "worst_phase_a", r.worstA,
+				"import_limit_w", s.effectiveImportCeilingW(fuseMaxW), "overage_w", -cutW, "offer_w", peakW, "cap_w", lim.capW)
 		}
 		return
 	}
-	// An increase needs a fresh reading and room left after our own battery
-	// commands that the meter may not show yet.
+	// An increase needs a fresh reading and room below the level increases
+	// may reach, left after our own battery commands that the meter may not
+	// show yet. Between that level and the import limit the cap holds.
+	pending := s.pendingBatteryCommandsW(now)
+	_, fresh := qualifiedFuseObservation(meter, now)
+	fresh = fresh && r.measured
 	room := 0.0
-	if _, fresh := qualifiedFuseObservation(meter, now); fresh && measured {
-		room = math.Max(0, roomW-s.pendingBatteryCommandsW(now))
+	if fresh {
+		room = math.Max(0, math.Min(r.fuseW, r.riseW)-pending)
 	}
-	step := evPhaseMarginA * s.SiteFuseVoltage * pool.phases
 	if pool.offerW <= 0 {
-		lim.capW, lim.changedAt, lim.raised = 0, now, false
-		if room < pool.minW+step {
-			lim.roomSince = time.Time{}
-			return
-		}
-		if lim.roomSince.IsZero() || gap {
-			lim.roomSince = at
-			if first {
-				lim.roomSince = at.Add(-evRestartDwell) // No stop of ours to wait out.
-			}
-		}
-		if at.Sub(lim.roomSince) >= evRestartDwell {
-			lim.capW = room - step
-		}
+		s.stepEVIdleStart(r, gridW, pool, first, gap, fresh, at, prevAt, pending, step)
 		return
 	}
 	// Keeping the current offers is never a cut. Headroom above them stays
@@ -197,19 +204,83 @@ func (s *State) stepEVMeterLimit(meter *telemetry.DerReading, gridW float64, poo
 	}
 }
 
-// evMeterRoomW is the measured room below the nearer limit, total import or
-// worst phase, in EV watts. Negative is an overage. measured is false when
-// the meter reports phase currents that cannot be read.
-func (s *State) evMeterRoomW(meter *telemetry.DerReading, gridW, phases, fuseMaxW float64) (roomW float64, measured bool, worstA float64) {
-	roomW = s.effectiveImportCeilingW(fuseMaxW) - gridW
-	worstA, present, valid := worstPhaseA(meter, s)
-	if !present {
-		return roomW, true, 0
+// stepEVIdleStart starts an idle pool once the meter has kept showing room
+// for evRestartDwell: room on every reading for its minimum plus a step
+// below the fuse. Under a measured hour, the ceiling's part is judged on the
+// dwell's mean import, the house's load rather than one reading of it, and
+// the minimum needs no step of margin there: a short overage waits.
+func (s *State) stepEVIdleStart(r evMeterRoom, gridW float64, pool evPool, first, gap, fresh bool, at, prevAt time.Time, pending, step float64) {
+	lim := &s.evLimit
+	lim.capW, lim.changedAt, lim.raised = 0, s.now(), false
+	perReadingW := r.fuseW
+	if !r.hourly {
+		perReadingW = math.Min(perReadingW, r.riseW)
 	}
-	if !valid {
-		return roomW, false, 0
+	room := 0.0
+	if fresh {
+		room = math.Max(0, perReadingW-pending)
 	}
-	return math.Min(roomW, (s.SiteFuseAmps-evPhaseMarginA-worstA)*s.SiteFuseVoltage*phases), true, worstA
+	if room < pool.minW+step {
+		lim.roomSince = time.Time{}
+		return
+	}
+	switch {
+	case first:
+		// No stop of ours to wait out.
+		lim.roomSince, lim.idleWh = at.Add(-evRestartDwell), math.Max(0, gridW)*evRestartDwell.Hours()
+	case lim.roomSince.IsZero() || gap:
+		lim.roomSince, lim.idleWh = at, 0
+	default:
+		lim.idleWh += math.Max(0, gridW) * at.Sub(prevAt).Hours()
+	}
+	dwell := at.Sub(lim.roomSince)
+	if dwell < evRestartDwell {
+		return
+	}
+	lim.capW = room - step
+	if !r.hourly {
+		return
+	}
+	ceilingRoomW := r.startLevelW - lim.idleWh/dwell.Hours() - pending
+	if ceilingRoomW < pool.minW {
+		lim.capW, lim.roomSince, lim.idleWh = 0, at, 0 // Judge the next dwell.
+		return
+	}
+	lim.capW = math.Min(lim.capW, ceilingRoomW)
+}
+
+// evMeterRoom is the measured room in EV watts. The fuse's part holds on
+// every reading. The import ceiling's parts are +Inf while it is off.
+type evMeterRoom struct {
+	fuseW       float64 // below the fuse less its margin and the worst phase
+	limitW      float64 // below the hour's import limit; negative is an overage
+	riseW       float64 // below the level an increase may reach
+	startLevelW float64 // import an idle start may reach: the rise level, at most the ceiling
+	hourly      bool    // the hour's import is measured, so a short overage may wait
+	measured    bool    // false when the meter reports phase currents that cannot be read
+	worstA      float64
+}
+
+func (s *State) evMeterRoom(meter *telemetry.DerReading, gridW, phases, fuseMaxW float64) evMeterRoom {
+	inf := math.Inf(1)
+	r := evMeterRoom{fuseW: math.Max(0, fuseMaxW-s.fuseSafetyMarginW()) - gridW, limitW: inf, riseW: inf, startLevelW: inf}
+	if limitW, riseW, ok := s.importHourLimitsW(); ok {
+		r.limitW, r.riseW = limitW-gridW, riseW-gridW
+		// A car that could run only on one hour's slack would stop when
+		// the next hour starts at the ceiling.
+		r.startLevelW = math.Min(riseW, s.PeakImportCeilingW)
+		r.hourly = s.importHourMeasured()
+	}
+	worst, present, valid := worstPhaseA(meter, s)
+	if present && !valid {
+		return r
+	}
+	r.measured = true
+	if present {
+		r.fuseW = math.Min(r.fuseW, (s.SiteFuseAmps-evPhaseMarginA-worst)*s.SiteFuseVoltage*phases)
+		r.worstA = worst
+	}
+	return r
 }
 
 // worstPhaseA reads the site's configured phases. present is false when the

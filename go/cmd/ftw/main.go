@@ -639,6 +639,7 @@ func main() {
 			ctrl.PeakImportCeilingW = f
 		}
 	}
+	seedImportHour(st, ctrl, time.Now())
 
 	// ---- Driver catalog (pure text scan, no Lua VM) ----
 	// Loaded once here so the pre-flight capacity + warning logic can
@@ -2901,6 +2902,7 @@ func main() {
 			// telemetry exists, closes every physical dispatch path. Safe
 			// standdown/default commands remain permitted.
 			ctrlMu.Lock()
+			ctrl.ObserveSiteImport(tel)
 			siteMeterDriver := ctrl.SiteMeterDriver
 			siteFuseAmps := ctrl.SiteFuseAmps
 			siteFusePhases := ctrl.SiteFusePhases
@@ -3319,6 +3321,18 @@ func rolloffLoop(ctx context.Context, st *state.Store, coldDir string, dataMaint
 			run()
 		}
 	}
+}
+
+// seedImportHour gives the import ceiling the clock hour's import that
+// state.db recorded before this start, so a restart keeps it.
+func seedImportHour(st *state.Store, ctrl *control.State, now time.Time) {
+	start := control.ImportHourStart(now)
+	wh, covered, err := st.ImportWhIntervals(context.Background(), [][2]int64{{start.UnixMilli(), now.UnixMilli()}})
+	if err != nil || len(wh) != 1 || len(covered) != 1 {
+		slog.Warn("import ceiling: the hour's recorded import is unavailable; it counts at the ceiling", "err", err)
+		return
+	}
+	ctrl.SeedHourImport(now, wh[0], time.Duration(covered[0])*time.Millisecond)
 }
 
 func flushHistoryOnStop(st *state.Store) {

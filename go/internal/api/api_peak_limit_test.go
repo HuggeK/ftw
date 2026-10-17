@@ -1,12 +1,14 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/srcfl/ftw/go/internal/config"
 	"github.com/srcfl/ftw/go/internal/control"
 	"github.com/srcfl/ftw/go/internal/telemetry"
 )
@@ -96,5 +98,34 @@ func TestPeakLimitEndpointWithoutFuseAcceptsAnyNonNegative(t *testing.T) {
 	}
 	if st.PeakLimitW != 20000 {
 		t.Errorf("PeakLimitW = %.0f, want 20000", st.PeakLimitW)
+	}
+}
+
+// GET /api/status shows the clock hour's import budget left and the import
+// limit beside the ceiling, and null while the ceiling is off. Before the
+// first meter reading of an hour, the whole hour's budget is left.
+func TestStatusShowsImportHourBudget(t *testing.T) {
+	srv, st := newPeakLimitServer(t)
+	srv.deps.CapMu, srv.deps.CfgMu, srv.deps.Cfg = &sync.RWMutex{}, &sync.RWMutex{}, &config.Config{}
+	status := func() map[string]any {
+		t.Helper()
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/status", nil))
+		var body map[string]any
+		if rr.Code != http.StatusOK || json.Unmarshal(rr.Body.Bytes(), &body) != nil {
+			t.Fatalf("status = %d, body: %s", rr.Code, rr.Body.String())
+		}
+		return body
+	}
+	body := status()
+	for _, key := range []string{"peak_import_hour_left_wh", "peak_import_limit_w"} {
+		if v, ok := body[key]; !ok || v != nil {
+			t.Fatalf("%s = %v with the ceiling off, want null", key, v)
+		}
+	}
+	st.PeakImportCeilingW = 7500
+	body = status()
+	if body["peak_import_hour_left_wh"] != 7500.0 || body["peak_import_limit_w"] != 7500.0 {
+		t.Fatalf("left %v Wh, limit %v W; want 7,500 each", body["peak_import_hour_left_wh"], body["peak_import_limit_w"])
 	}
 }

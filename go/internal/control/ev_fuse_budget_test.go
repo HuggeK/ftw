@@ -56,6 +56,8 @@ type evMeterSite struct {
 	config                       memConfigStore // survives a restart
 	sessionWh                    float64
 	ceilingW                     float64
+	unplugged                    bool
+	onBoot, beforeTick           func() // after each boot; before each controller tick
 }
 
 // memConfigStore stands in for state.db across a simulated Core restart.
@@ -66,7 +68,12 @@ func (m memConfigStore) SaveConfig(key, value string) error   { m[key] = value; 
 
 func newEVMeterSite(t *testing.T, ceilingW, houseW float64) *evMeterSite {
 	t.Helper()
-	s := &evMeterSite{t: t, now: time.Now().Truncate(time.Second), store: telemetry.NewStore(),
+	return newEVMeterSiteAt(t, ceilingW, houseW, time.Now().Truncate(time.Second))
+}
+
+func newEVMeterSiteAt(t *testing.T, ceilingW, houseW float64, start time.Time) *evMeterSite {
+	t.Helper()
+	s := &evMeterSite{t: t, now: start, store: telemetry.NewStore(),
 		chargerDelay: 5 * time.Second, telemetryDelay: 10 * time.Second, carMaxW: math.Inf(1),
 		config: memConfigStore{}, ceilingW: ceilingW}
 	s.setHouse(houseW)
@@ -91,7 +98,7 @@ func (s *evMeterSite) boot() {
 	s.ctrl = loadpoint.NewController(s.mgr,
 		func(time.Time) (loadpoint.Directive, bool) { return loadpoint.Directive{}, false },
 		func(string) (loadpoint.EVSample, bool) {
-			return loadpoint.EVSample{Connected: true, RequestActive: true, PowerW: s.reportedW, PowerAt: s.reportedAt,
+			return loadpoint.EVSample{Connected: !s.unplugged, RequestActive: true, PowerW: s.reportedW, PowerAt: s.reportedAt,
 				DeviceID: "easee:EH000001", SessionWh: s.sessionWh, EnergyAt: s.reportedAt}, true
 		},
 		func(_ context.Context, _ string, payload []byte) error {
@@ -117,6 +124,9 @@ func (s *evMeterSite) boot() {
 		return EVFuseBudget(s.store, s.state, s.mgr.States(), s.mgr.Configs(), 17250)
 	})
 	s.ctrl.SetManualHold(cfg.ID, loadpoint.ManualHold{PowerW: 10350, PhaseMode: "3p", Persistent: true})
+	if s.onBoot != nil {
+		s.onBoot()
+	}
 }
 
 func (s *evMeterSite) setHouse(w float64) {
@@ -194,6 +204,9 @@ func (s *evMeterSite) step() {
 		a := s.phaseA()
 		s.emit("meter", telemetry.DerMeter, grid, map[string]any{"l1_a": a[0], "l2_a": a[1], "l3_a": a[2]})
 		s.meterAt = s.now
+	}
+	if s.beforeTick != nil {
+		s.beforeTick()
 	}
 	s.ctrl.TickWithDispatch(context.Background(), s.now, s.now.Sub(s.meterAt) <= time.Minute)
 	s.state.SetEVFuseDemands(s.ctrl.FuseDemands())

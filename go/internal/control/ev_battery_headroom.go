@@ -50,7 +50,8 @@ func clampEVBatteryHeadroom(targets []DispatchTarget, store *telemetry.Store, st
 			latest[target.Driver] = -state.DriverLimits[target.Driver].dischargeCap()
 		}
 	}
-	spare := state.effectiveImportCeilingW(fuseMaxW) - meter.RawW - needW
+	// Battery charge stays under the level the EV may rise to.
+	spare := state.importRiseCeilingW(fuseMaxW) - meter.RawW - needW
 	// During measured export overflow, the existing fuse pipeline may
 	// require charge to reduce export. Magnitudes alone cannot label that
 	// worst phase as import; leave this direction to the existing guard.
