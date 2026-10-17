@@ -67,7 +67,15 @@
       status=v[0];policy=v[1];
       if(!policy.cloud_includes_statistics || !policy.standalone)return;
       var prompt=document.getElementById("project-statistics-prompt");
-      if(!prompt){prompt=node("section");prompt.id="project-statistics-prompt";prompt.setAttribute("aria-label","Project statistics choice");var main=document.querySelector("main")||document.body;main.insertBefore(prompt,main.firstChild);}
+      if(!prompt){
+        prompt=node("section");
+        prompt.id="project-statistics-prompt";
+        prompt.setAttribute("aria-label","Project statistics choice");
+        // The Overview grid has twelve columns; the prompt needs the whole row.
+        prompt.style.gridColumn="1 / -1";
+        var main=document.querySelector("main")||document.body;
+        main.insertBefore(prompt,main.firstChild);
+      }
       paint(prompt,false);
       document.querySelectorAll("[data-project-statistics-settings]").forEach(function(host){paint(host,true);});
     }).catch(function(){});

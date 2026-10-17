@@ -7,7 +7,7 @@ import {setImmediate} from 'node:timers/promises';
 const source=readFileSync(new URL('./project-statistics.js',import.meta.url),'utf8');
 function page(cloud=false,authorised=true) {
   class Element {
-    constructor(tag){this.tag=tag;this.children=[];this.events={};this.ownText='';}
+    constructor(tag){this.tag=tag;this.children=[];this.events={};this.style={};this.ownText='';}
     appendChild(e){this.children.push(e);return e;}
     insertBefore(e){this.children.unshift(e);}
     set textContent(v){this.ownText=v;this.children=[];}
