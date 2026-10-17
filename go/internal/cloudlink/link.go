@@ -241,15 +241,16 @@ type Link struct {
 	// sender acts within one tick.
 	wake chan struct{}
 
-	mu        sync.Mutex
-	seq       uint64
-	key       *ecdsa.PrivateKey
-	pk        []byte
-	home      string
-	link      *linkRecord
-	grant     *grantRecord
-	notice    string
-	connected bool
+	mu                 sync.Mutex
+	seq                uint64
+	key                *ecdsa.PrivateKey
+	pk                 []byte
+	home               string
+	link               *linkRecord
+	grant              *grantRecord
+	notice             string
+	connected          bool
+	serviceStatsPolicy string
 	// transport is how the uplink travels, or last travelled: quic or
 	// websocket. winners is the race's memory, the transport that opened
 	// first on each network.
@@ -696,7 +697,7 @@ func (l *Link) Stats(req StatsRequest) error {
 		return ErrPurgePending
 	}
 	g := *l.grant
-	if len(g.StatsID) == 0 {
+	if len(g.StatsID) == 0 || g.StatsPolicy != req.Policy {
 		id, err := randomBytes(statsIDBytes)
 		if err != nil {
 			return err
@@ -705,6 +706,12 @@ func (l *Link) Stats(req StatsRequest) error {
 	}
 	g.Purposes = withPurpose(g.Purposes, protocol.CloudPurposeStats, true)
 	g.StatsPolicy, g.By = req.Policy, req.By
+	if g.StatsAtMs == 0 || l.grant.StatsPolicy != req.Policy {
+		g.StatsAtMs = 0
+		if l.clockSynced() {
+			g.StatsAtMs = l.opts.Now().UnixMilli()
+		}
+	}
 	return l.storeLocked(g, "statistics on")
 }
 
@@ -719,7 +726,7 @@ func (l *Link) StopStats(by string) error {
 	}
 	g := *l.grant
 	g.Purposes = withPurpose(g.Purposes, protocol.CloudPurposeStats, false)
-	g.StatsID, g.StatsPolicy, g.By = nil, "", by
+	g.StatsID, g.StatsPolicy, g.StatsAtMs, g.By = nil, "", 0, by
 	return l.storeLocked(g, "statistics off")
 }
 
@@ -814,7 +821,10 @@ func (l *Link) clockSynced() bool {
 // Status is what GET /api/cloud shows.
 type Status struct {
 	// State is the readable copy's: off, on or revoking.
-	State string `json:"state"`
+	State            string `json:"state"`
+	StatisticsPolicy string `json:"statisticsPolicy"`
+	StatisticsActive bool   `json:"statisticsActive"`
+	StatisticsReady  bool   `json:"statisticsReady"`
 	// Link is off, on or ending: whether the box is linked, which the
 	// phones' tunnels need and the readable copy rides on.
 	Link string `json:"link"`
@@ -866,6 +876,11 @@ func (l *Link) Status() Status {
 		BytesLast24h: l.budget.total(l.uptimeMs()), BudgetBytes: budgetBytes,
 		Link: "off", TunBytesLast24h: l.tunBudget.total(l.uptimeMs()), TunBudgetBytes: tunBudgetBytes,
 		TunDropped: l.tunDropped,
+	}
+	s.StatisticsPolicy = cloudwire.StatsPolicy
+	s.StatisticsReady = l.connected && l.serviceStatsPolicy == cloudwire.StatsPolicy
+	if g := l.grant; g != nil {
+		s.StatisticsActive = !g.Revoked && g.StatsAtMs > 0 && g.StatsPolicy == cloudwire.StatsPolicy && len(g.StatsID) == 16 && slices.Contains(g.Purposes, protocol.CloudPurposeStats)
 	}
 	s.BudgetReached = s.BytesLast24h >= budgetBytes
 	if !l.lastSend.IsZero() {

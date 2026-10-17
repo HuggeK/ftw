@@ -34,6 +34,7 @@ type CloudGrant interface {
 func (s *Server) cloudRoutes() {
 	s.handle("GET  /api/cloud", Read, s.handleCloudStatus)
 	s.handle("GET  /api/cloud/preview", Read, s.handleCloudPreview)
+	s.handle("GET /api/cloud/stats-policy", Read, s.handleCloudStatsPolicy)
 	s.handle("POST   /api/cloud/grant", Configure, s.handleCloudGrant, NoStepUp)
 	s.handle("DELETE /api/cloud/grant", Configure, s.handleCloudRevoke, NoStepUp)
 	s.handle("POST   /api/cloud/stats", Configure, s.handleCloudStats, NoStepUp)

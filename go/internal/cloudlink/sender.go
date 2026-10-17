@@ -73,19 +73,21 @@ func (b *budget) total(uptimeMs int64) int64 {
 
 // cadence is one connection's view of what it last sent.
 type cadence struct {
-	full       bool
-	lastFull   time.Time
-	liveKey    string
-	liveAt     time.Time
-	lpLast     *cloudwire.LP
-	lpAt       time.Time
-	carLast    *cloudwire.Cars
-	carAt      time.Time
-	pricesKey  string
-	pricesAt   time.Time
-	anyAt      time.Time // last live or hb
-	rosterAt   time.Time
-	watchUntil time.Time
+	statsHour      int64
+	statsCheckedAt time.Time
+	full           bool
+	lastFull       time.Time
+	liveKey        string
+	liveAt         time.Time
+	lpLast         *cloudwire.LP
+	lpAt           time.Time
+	carLast        *cloudwire.Cars
+	carAt          time.Time
+	pricesKey      string
+	pricesAt       time.Time
+	anyAt          time.Time // last live or hb
+	rosterAt       time.Time
+	watchUntil     time.Time
 	// pendingUntil is when the pairing code the last roster listed runs
 	// out, zero when it listed none.
 	pendingUntil time.Time
@@ -263,6 +265,9 @@ func (w *writer) tick(snap grantSnapshot, st *cadence, now time.Time) error {
 		}
 	}
 
+	if err := w.statistics(snap, st, now); err != nil {
+		return err
+	}
 	period := periodIdle
 	if now.Before(st.watchUntil) {
 		period = periodWatched
@@ -687,7 +692,7 @@ func (l *Link) rosterNumber(snap grantSnapshot) (uint64, cloudwire.Roster) {
 	case g.Revoked:
 		r.Grant.ID = g.ID
 	default:
-		r.Grant = cloudwire.Grant{ID: g.ID, Scopes: g.Scopes, Purposes: g.Purposes, Controller: g.Controller}
+		r.Grant = cloudwire.Grant{ID: g.ID, Scopes: g.Scopes, Purposes: g.Purposes, Controller: g.Controller, StatsID: g.StatsID, StatsPolicy: g.StatsPolicy, StatsSinceMs: g.StatsAtMs}
 	}
 	for _, d := range l.opts.Roster.Devices() {
 		var scopes []string

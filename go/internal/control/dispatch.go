@@ -371,6 +371,12 @@ type State struct {
 	// battery charging yields even when the EV cannot start yet.
 	evFuseDemands    []evFuseDemand
 	evFuseDemandsSet bool
+	// evLimit is the EVs' meter-driven hard cap, kept between site readings.
+	evLimit evMeterLimit
+	// evOffers and batteryCommands are our own recent commands, the only
+	// device input the EV hard limit and the EV/battery split use.
+	evOffers        commandLog
+	batteryCommands map[string]commandLog
 
 	// PI controller (outer, site-level)
 	PI *PIController
@@ -2028,7 +2034,8 @@ func ComputeDispatch(
 	state.FuseEVMaxW = 0
 	state.FuseSaturated = false
 	plannedEVW := scheduledEVPowerW(state)
-	if fuseMaxW > 0 && math.Max(state.EVChargingW, plannedEVW) > 0 {
+	evInMeterW := state.evInMeterW()
+	if fuseMaxW > 0 && math.Max(evInMeterW, plannedEVW) > 0 {
 		// Use the effective import ceiling (fuse minus safety margin,
 		// or tariff peak when tighter) so PeakImportCeilingW throttles
 		// the EV through the same surface as the fuse. Steady-state
@@ -2039,13 +2046,13 @@ func ComputeDispatch(
 		targetTotal := currentTotal + totalCorrection
 		B := math.Max(0, targetTotal)
 		Bn := math.Min(0, targetTotal)
-		E := math.Max(state.EVChargingW, plannedEVW)
-		H := rawGridW - currentTotal - state.EVChargingW
+		E := math.Max(evInMeterW, plannedEVW)
+		H := rawGridW - currentTotal - evInMeterW
 		projectedGrid := H + targetTotal + E
 		if projectedGrid > ceilingW && (B+E) > 0 {
 			if plannedEVW > 0 {
 				// A timed EV goal takes its share before optional battery charge.
-				available := evHeadroomW(ceilingW, rawGridW-currentTotal+Bn, state.EVChargingW)
+				available := evHeadroomW(ceilingW, rawGridW-currentTotal+Bn, evInMeterW)
 				state.FuseEVMaxW = math.Min(E, available)
 				newBattery := Bn + math.Min(B, math.Max(0, available-state.FuseEVMaxW))
 				totalCorrection = newBattery - currentTotal
@@ -2435,6 +2442,13 @@ func recordDispatchTargets(targets []DispatchTarget, state *State, updatePrevTar
 	if recordDispatch {
 		now := state.now()
 		state.LastDispatch = &now
+		if state.batteryCommands == nil {
+			state.batteryCommands = map[string]commandLog{}
+		}
+		for _, t := range targets {
+			state.batteryCommands[t.Driver] = state.batteryCommands[t.Driver].add(now, t.TargetW)
+		}
+		state.evOffers = state.evOffers.add(now, math.Max(0, state.EVCommandedW))
 	}
 	if updatePrevTargets {
 		for _, t := range targets {
@@ -4581,4 +4595,15 @@ func forceFuseDischargeWithSnapshot(
 		out[s.idx].Clamped = true
 	}
 	return out
+}
+
+// evInMeterW is EV load the meter is sure to contain: the operator's declared
+// load plus the lowest managed offer of the last evSettle. This tick's new
+// offer is not in it yet. Charger readings take no part in the fuse share.
+func (s *State) evInMeterW() float64 {
+	low, _, _, ok := s.evOffers.span(s.now())
+	if !ok {
+		low = 0
+	}
+	return s.ManualEVChargingW + math.Max(0, low)
 }
