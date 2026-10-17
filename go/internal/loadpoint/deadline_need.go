@@ -73,15 +73,25 @@ func LimitPower(st State, steps []float64) (minW, maxW float64, out []float64) {
 // CommandedEVPowerW uses the actual offers after every charger clamp. A
 // charger need not have started drawing for its offer to occupy the fuse.
 func CommandedEVPowerW(states []State) float64 {
+	var total float64
+	for _, w := range CommandedEVPowerByDriver(states) {
+		total += math.Max(0, w)
+	}
+	return total
+}
+
+// CommandedEVPowerByDriver is each plugged charger's known offer, 0 W
+// included, so a stopped car is still present. A driver with several
+// loadpoints counts its highest offer.
+func CommandedEVPowerByDriver(states []State) map[string]float64 {
 	byDriver := make(map[string]float64, len(states))
 	for _, st := range states {
-		if st.PluggedIn && st.CommandedKnown && finite(st.CommandedW) && st.CommandedW > byDriver[st.DriverName] {
+		if !st.PluggedIn || !st.CommandedKnown || !finite(st.CommandedW) {
+			continue
+		}
+		if w, seen := byDriver[st.DriverName]; !seen || st.CommandedW > w {
 			byDriver[st.DriverName] = st.CommandedW
 		}
 	}
-	var total float64
-	for _, w := range byDriver {
-		total += w
-	}
-	return total
+	return byDriver
 }

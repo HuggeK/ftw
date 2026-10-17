@@ -3037,7 +3037,7 @@ func main() {
 			ctrl.EVCurtailHeadroomW = evCurtailHeadroomW
 			ctrl.BatteryBoostEVChargingW = boostEVW
 			ctrl.BatteryBoostReserveSoC = boostReserveSoC
-			ctrl.EVCommandedW = loadpoint.CommandedEVPowerW(lpStatesSnapshot)
+			ctrl.SetEVCommanded(lpStatesSnapshot)
 			ctrl.SetEVFuseDemands(evFuseDemands)
 			fuseMaxW := ctrl.SiteFuseAmps * ctrl.SiteFuseVoltage * float64(ctrl.SiteFusePhases)
 			targets := control.ComputeDispatch(tel, ctrl, capsSnap, fuseMaxW)

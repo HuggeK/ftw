@@ -77,7 +77,7 @@ func TestJoinedEVWaitsForMeasuredBatteryBackoffThenResumes(t *testing.T) {
 		emit(config.DriverName, telemetry.DerEV, actualEV)
 		emit("meter", telemetry.DerMeter, houseW+actualBattery+actualEV)
 		controller.TickWithDispatch(context.Background(), now, true)
-		st.EVCommandedW = loadpoint.CommandedEVPowerW(mgr.States())
+		st.SetEVCommanded(mgr.States())
 		st.SetEVFuseDemands(controller.FuseDemands())
 		targets := ComputeDispatch(store, st, caps(map[string]float64{"pixii": 15000}), 17250)
 		if len(targets) != 1 || targets[0].TargetW > 1210.001 {
@@ -257,7 +257,7 @@ func (s *evBatterySite) step() {
 	s.emit("meter", telemetry.DerMeter, s.gridW())
 	s.state.ObserveSiteImport(s.store)
 	s.ctrl.TickWithDispatch(context.Background(), s.now, true)
-	s.state.EVCommandedW = loadpoint.CommandedEVPowerW(s.mgr.States())
+	s.state.SetEVCommanded(s.mgr.States())
 	s.state.SetEVFuseDemands(s.ctrl.FuseDemands())
 	targets := ComputeDispatch(s.store, s.state, caps(map[string]float64{"pixii": 15000}), 17250)
 	if len(targets) != 1 {
@@ -541,9 +541,9 @@ func TestFuseReliefLeavesOnlyCeilingWattsToCommandedEVCut(t *testing.T) {
 		st.SiteFuseAmps, st.SiteFuseVoltage, st.SiteFusePhases, st.SiteFuseSafetyA = 25, 230, 3, 1
 		st.PeakImportCeilingW = 7500
 		if tc.overFor > 0 {
-			st.evLimit.overSince, st.evLimit.overOfferW = now.Add(-tc.overFor), 9660
+			st.evLimit.overSince, st.evLimit.overOffers = now.Add(-tc.overFor), map[string]float64{"easee": 9660}
 		}
-		st.EVCommandedW = tc.commandedW
+		st.SetEVCommanded([]loadpoint.State{{ID: "car", DriverName: "easee", PluggedIn: true, CommandedKnown: true, CommandedW: tc.commandedW}})
 		targets := []DispatchTarget{{Driver: "pixii"}}
 		batteries := map[string]*telemetry.DerReading{"pixii": {}}
 		meter := &telemetry.DerReading{SmoothedW: tc.gridW, Data: tc.data}
@@ -551,5 +551,114 @@ func TestFuseReliefLeavesOnlyCeilingWattsToCommandedEVCut(t *testing.T) {
 		if math.Abs(math.Max(0, got)-tc.wantW) > 1e-6 {
 			t.Errorf("%s: relief %.0f W, want %.0f W", tc.name, got, tc.wantW)
 		}
+	}
+}
+
+// Two managed cars charge under the hour's ceiling, and one is unplugged
+// during an overage. Its offer leaves the pool, but no cut of ours removed
+// it, and the meter may already show it. The battery must not wait for it,
+// though it still waits for a cut sent to the car that stays.
+func TestUnpluggedCarIsNoCutTheBatteryWaitsFor(t *testing.T) {
+	now := time.Date(2026, 10, 17, 16, 30, 0, 0, time.Local)
+	st := NewState(0, 0, "meter")
+	st.clock = func() time.Time { return now }
+	st.SiteFuseAmps, st.SiteFuseVoltage, st.SiteFusePhases, st.SiteFuseSafetyA = 25, 230, 3, 1
+	st.PeakImportCeilingW = 7500
+	store := telemetry.NewStore()
+	configs := []loadpoint.Config{
+		{ID: "a", DriverName: "easee-a", PhaseMode: "3p", MinChargeW: 4140},
+		{ID: "b", DriverName: "easee-b", PhaseMode: "3p", MinChargeW: 4140},
+	}
+	// One control tick: the meter reads gridW, the guard steps on the cars'
+	// offers, the controller leaves car a at aAfterW, then the battery asks
+	// for relief.
+	tick := func(gridW float64, bPlugged bool, aAfterW float64) float64 {
+		now = now.Add(time.Second)
+		a := gridW / 690
+		data, _ := json.Marshal(map[string]any{"l1_a": a, "l2_a": a, "l3_a": a})
+		store.Update("meter", telemetry.DerMeter, gridW, nil, data)
+		store.Get("meter", telemetry.DerMeter).UpdatedAt = now
+		store.RecordDriverSuccess("meter")
+		points := []loadpoint.State{
+			{ID: "a", DriverName: "easee-a", PluggedIn: true, CommandedKnown: true, CommandedW: 5520},
+			{ID: "b", DriverName: "easee-b", PluggedIn: bPlugged, CommandedKnown: true, CommandedW: 5520},
+		}
+		EVFuseBudget(store, st, points, configs, 17250)
+		points[0].CommandedW = aAfterW
+		st.SetEVCommanded(points)
+		targets := []DispatchTarget{{Driver: "pixii"}}
+		batteries := map[string]*telemetry.DerReading{"pixii": {}}
+		return math.Max(0, fuseReliefFromSnapshot(targets, batteries, &telemetry.DerReading{SmoothedW: gridW}, st, 17250, false))
+	}
+	// 400 W over the ceiling, less than a step: the guard waits.
+	if got := tick(7900, true, 5520); math.Abs(got-400) > 1e-6 {
+		t.Fatalf("first overage: relief %.0f W, want 400 W", got)
+	}
+	// Car b is unplugged and the house adds 6 kW: 880 W over, no cut sent.
+	if got := tick(7900-5520+6000, false, 5520); math.Abs(got-880) > 1e-6 {
+		t.Fatalf("after car b left: relief %.0f W, want 880 W; pending cut %.0f W", got, st.pendingEVCutW())
+	}
+	// 2,000 W over, and car a is stopped: that cut may still wait.
+	if got := tick(9500, false, 0); got != 0 {
+		t.Fatalf("after car a's stop: relief %.0f W, want 0 W", got)
+	}
+}
+
+// Core stops car a during an overage of the hour's ceiling, and car b is
+// unplugged 5 s later, before a's stop reaches the meter. b leaving is no
+// cut of ours, but a's stop still is: the battery keeps waiting for it, and
+// the site does not export when it lands.
+func TestCutOnStayingCarStillWaitsWhenAnotherLeaves(t *testing.T) {
+	start := time.Date(2026, 10, 17, 16, 30, 0, 0, time.Local)
+	now := start
+	st := NewState(0, 0, "meter")
+	st.clock = func() time.Time { return now }
+	st.SiteFuseAmps, st.SiteFuseVoltage, st.SiteFusePhases, st.SiteFuseSafetyA = 25, 230, 3, 1
+	st.PeakImportCeilingW = 7500
+	store := telemetry.NewStore()
+	configs := []loadpoint.Config{
+		{ID: "a", DriverName: "easee-a", PhaseMode: "3p", MinChargeW: 4140},
+		{ID: "b", DriverName: "easee-b", PhaseMode: "3p", MinChargeW: 4140},
+	}
+	const houseW = 2000
+	batteryW, lowestMeter := 0.0, math.Inf(1)
+	for tick := 0; tick < 15; tick++ {
+		now = start.Add(time.Duration(tick) * time.Second)
+		bPlugged := tick < 5
+		aDrawW, bDrawW := 10350.0, 4140.0
+		if tick >= 10 {
+			aDrawW = 0 // a's stop, sent on the first tick, lands 10 s later.
+		}
+		if !bPlugged {
+			bDrawW = 0
+		}
+		gridW := houseW + aDrawW + bDrawW + batteryW
+		lowestMeter = math.Min(lowestMeter, gridW)
+		a := gridW / 690
+		data, _ := json.Marshal(map[string]any{"l1_a": a, "l2_a": a, "l3_a": a})
+		store.Update("meter", telemetry.DerMeter, gridW, nil, data)
+		store.Get("meter", telemetry.DerMeter).UpdatedAt = now
+		store.RecordDriverSuccess("meter")
+		aOfferW := 10350.0 // a's offer before this tick
+		if tick > 0 {
+			aOfferW = 0
+		}
+		points := []loadpoint.State{
+			{ID: "a", DriverName: "easee-a", PluggedIn: true, CommandedKnown: true, CommandedW: aOfferW},
+			{ID: "b", DriverName: "easee-b", PluggedIn: bPlugged, CommandedKnown: true, CommandedW: 4140},
+		}
+		EVFuseBudget(store, st, points, configs, 17250)
+		points[0].CommandedW = 0 // Core stops car a on the first tick.
+		st.SetEVCommanded(points)
+		targets := []DispatchTarget{{Driver: "pixii"}}
+		batteries := map[string]*telemetry.DerReading{"pixii": {SmoothedW: batteryW}}
+		relief := fuseReliefFromSnapshot(targets, batteries, &telemetry.DerReading{SmoothedW: gridW}, st, 17250, false)
+		batteryW = -math.Max(0, relief) // The battery follows within a tick.
+		if batteryW < 0 && tick < 10 {
+			t.Fatalf("%ds: battery %.0f W for watts a's stop removes; pending cut %.0f W", tick, batteryW, st.pendingEVCutW())
+		}
+	}
+	if lowestMeter < 0 {
+		t.Fatalf("the site exported %.0f W when a's stop landed", -lowestMeter)
 	}
 }

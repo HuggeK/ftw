@@ -86,15 +86,16 @@ type evMeterLimit struct {
 	readingAt   time.Time // newest site reading seen
 	roomSince   time.Time // first reading of the current run with room to start
 	raised      bool
-	raisedGridW float64   // site import when the last rise was sent
-	overSince   time.Time // first reading of a run over the hour's import limit
-	overOfferW  float64   // the pool's offer when that run began
-	idleWh      float64   // import since roomSince, for the ceiling's start test
+	raisedGridW float64            // site import when the last rise was sent
+	overSince   time.Time          // first reading of a run over the hour's import limit
+	overOffers  map[string]float64 // each charger's offer when that run began
+	idleWh      float64            // import since roomSince, for the ceiling's start test
 }
 
 type evPool struct {
 	offerW, wantW, minW, phases float64
 	offerKnown                  bool
+	offers                      map[string]float64 // per charger driver
 }
 
 // EVFuseBudget returns the managed EVs' common hard cap, which the loadpoint
@@ -159,7 +160,7 @@ func (s *State) stepEVMeterLimit(meter *telemetry.DerReading, gridW float64, poo
 		lim.overSince = time.Time{}
 	} else {
 		if lim.overSince.IsZero() || gap {
-			lim.overSince, lim.overOfferW = at, pool.offerW
+			lim.overSince, lim.overOffers = at, pool.offers
 		}
 		if !r.hourly || gap || -r.limitW >= step || at.Sub(lim.overSince) >= evSettle {
 			cutW = math.Min(cutW, r.limitW)
@@ -315,17 +316,32 @@ func (s *State) pendingBatteryCommandsW(now time.Time) float64 {
 	return pending
 }
 
+// SetEVCommanded stores this tick's final charger offers, after every
+// charger clamp, in total and per driver.
+func (s *State) SetEVCommanded(points []loadpoint.State) {
+	s.EVCommandedW = loadpoint.CommandedEVPowerW(points)
+	s.evCommanded = loadpoint.CommandedEVPowerByDriver(points)
+}
+
 // pendingEVCutW is the EV reduction we sent during the current run over the
-// hour's import limit: the offer when the run began less this tick's offers.
-// Our own commands only. A cut that has reached the meter ends the run, and
-// no run waits longer than evSettle, so a car that draws less than its offer
-// cannot hold an overage through a second cut.
+// hour's import limit: for each charger still plugged, its offer when the
+// run began less its offer this tick. A car that leaves drops out, since no
+// cut of ours removed it; a car that joins has no start offer. Our own
+// commands only. A cut that has reached the meter ends the run, and no run
+// waits longer than evSettle, so a car that draws less than its offer cannot
+// hold an overage through a second cut.
 func (s *State) pendingEVCutW() float64 {
 	lim := &s.evLimit
-	if lim.overSince.IsZero() || s.now().Sub(lim.overSince) >= evSettle || !finiteFuseValue(s.EVCommandedW) {
+	if lim.overSince.IsZero() || s.now().Sub(lim.overSince) >= evSettle {
 		return 0
 	}
-	return math.Max(0, lim.overOfferW-math.Max(0, s.EVCommandedW))
+	var cutW float64
+	for driver, startW := range lim.overOffers {
+		if nowW, plugged := s.evCommanded[driver]; plugged {
+			cutW += math.Max(0, startW-math.Max(0, nowW))
+		}
+	}
+	return cutW
 }
 
 // evPoolFor sums the plugged managed chargers. Before the first command after
@@ -356,6 +372,7 @@ func evPoolFor(state *State, points []loadpoint.State, configs []loadpoint.Confi
 	if !plugged {
 		return pool, false
 	}
+	pool.offers = loadpoint.CommandedEVPowerByDriver(points)
 	if pool.offerKnown {
 		pool.offerW = loadpoint.CommandedEVPowerW(points)
 	}

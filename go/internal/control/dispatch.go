@@ -370,6 +370,9 @@ type State struct {
 	// It reserves site capacity before optional battery charging, even before
 	// an EV ramps up and in modes without an accepted optimizer plan.
 	EVCommandedW float64
+	// evCommanded is the same offers per charger driver; SetEVCommanded
+	// keeps both.
+	evCommanded map[string]float64
 	// evFuseDemands keeps this tick's intent before the fuse clamp so optional
 	// battery charging yields even when the EV cannot start yet.
 	evFuseDemands    []evFuseDemand
