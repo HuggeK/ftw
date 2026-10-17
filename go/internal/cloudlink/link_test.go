@@ -1196,6 +1196,15 @@ func TestABuildWithoutAServiceRefusesStatistics(t *testing.T) {
 	}
 }
 
+// The release pins FTW Cloud's offer key, and the pin parses under its kid.
+func TestReleasePinsTheCloudOfferKey(t *testing.T) {
+	got := ParseOfferKeys(OfferKeys)
+	pub, ok := got["s0xLrCPjFa-AoMMl"]
+	if len(got) != 1 || !ok || protocol.OfferKid(pub) != "s0xLrCPjFa-AoMMl" {
+		t.Fatalf("OfferKeys pins %d keys: %v", len(got), got)
+	}
+}
+
 // A pinned offer key counts only under the kid its key gives it.
 func TestOfferKeysPinOnlyUnderTheirOwnKid(t *testing.T) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)

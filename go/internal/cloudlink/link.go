@@ -63,7 +63,10 @@ var (
 	// https://cloud.ftw.energy/.well-known/ftw-offer-key publishes them.
 	// An entry whose kid is not protocol.OfferKid of its key is dropped.
 	// Empty means this build opens no offer on the box page.
-	OfferKeys = ""
+	//
+	// The one key is cloud.ftw.energy's, alias/ftw-cloud-offer-key in KMS
+	// (eu-north-1), made 17 October 2026. Its private half never leaves KMS.
+	OfferKeys = "s0xLrCPjFa-AoMMl:BEUBb8ul2T01OWM_f1rX6h8Z0yFf8BkvEtUxdHsc_FXGtKv8arbcDZcPeeVOoX6nIxdP2SKYpHky9KSw-cqH-8g"
 )
 
 // ParseOfferKeys reads OfferKeys into kid → SEC1 point. A malformed entry is
