@@ -28,6 +28,10 @@ assert_paths 'drivers/example.lua' \
 assert_paths 'config.example.yaml' \
   'core=true' 'optimizer=false' 'web=false' 'drivers=false' 'compose=false'
 
+# Editing the race command alone must exercise it in CI.
+assert_paths '.github/scripts/race.sh' \
+  'core=true' 'optimizer=false' 'web=false' 'drivers=false' 'compose=false'
+
 assert_paths '.github/workflows/test.yml' \
   'core=true' 'optimizer=true' 'web=true' 'drivers=true' 'compose=true'
 

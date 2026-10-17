@@ -26,3 +26,19 @@ func TestTheClockMarkResetsLower(t *testing.T) {
 		t.Fatalf("mark %d, after a restart %d", w.highMs, again.highMs)
 	}
 }
+
+// The box page's browser looks a code up on the host this build links to,
+// so a local test build with its own FTW Cloud finds its own lookup.
+func TestTheCodeLookupFollowsTheUplink(t *testing.T) {
+	for endpoint, want := range map[string]string{
+		"wss://cloud.ftw.energy/v1/box": "https://cloud.ftw.energy/oauth/requests",
+		"wss://127.0.0.1:18943/v1/box":  "https://127.0.0.1:18943/oauth/requests",
+		"ws://127.0.0.1:18944/v1/box":   "http://127.0.0.1:18944/oauth/requests",
+		"":                              "",
+		"not a url with a host":         "",
+	} {
+		if got := codeLookup(endpoint); got != want {
+			t.Errorf("%q: %q, want %q", endpoint, got, want)
+		}
+	}
+}

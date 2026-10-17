@@ -232,7 +232,7 @@ app_link:
 # default; `enabled: false` turns it off without a restart.
 fleet_ping:
   enabled: true
-  # endpoint: https://relay.ftw.energy/fleet
+  # endpoint: https://cloud.ftw.energy/v1/fleet
 
 # Independently distributed Lua drivers. The signed stable catalog is refreshed
 # by default, but refresh never downloads, activates, or restarts a driver.

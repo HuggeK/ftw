@@ -3,8 +3,12 @@ package api
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/srcfl/ftw/go/internal/apiauth"
@@ -22,6 +26,8 @@ type stubAgents struct {
 	home     string
 	unsynced bool
 	resets   int
+	// noKeys is a build that pins no offer key.
+	noKeys bool
 }
 
 func (a *stubAgents) Agents() []protocol.AgentRow              { return nil }
@@ -54,6 +60,9 @@ func (a *stubAgents) ResetClock(by string) error {
 	a.by = append(a.by, by)
 	return nil
 }
+func (a *stubAgents) Facts() AgentFacts {
+	return AgentFacts{Offers: !a.noKeys, Lookup: "https://cloud.ftw.energy/oauth/requests", Clock: ClockOK, NowMs: 1_000_000}
+}
 func (a *stubAgents) OpenOffer(raw string) (protocol.GrantOffer, error) {
 	signed, err := base64.RawURLEncoding.DecodeString(raw)
 	if err != nil {
@@ -63,7 +72,11 @@ func (a *stubAgents) OpenOffer(raw string) (protocol.GrantOffer, error) {
 	if err := protocol.UnmarshalSigned(signed, &so); err != nil {
 		return protocol.GrantOffer{}, err
 	}
-	return protocol.OpenOffer(a.keys, so, 1_000_000)
+	keys := a.keys
+	if a.noKeys {
+		keys = nil
+	}
+	return protocol.OpenOffer(keys, so, 1_000_000)
 }
 func (a *stubAgents) ReplaceApprovalKey(by, deviceID string, _ []byte) error {
 	a.replaced = append(a.replaced, deviceID)
@@ -85,11 +98,16 @@ func offerBody(t *testing.T, home string) string {
 
 func signedOfferBody(t *testing.T, home string, signer *approvaltest.Signer) string {
 	t.Helper()
-	o, err := protocol.Marshal(protocol.GrantOffer{
+	return offerOf(t, protocol.GrantOffer{
 		V: protocol.GrantOfferVersion, Home: home, Key: make([]byte, 32), Role: apiauth.RoleAgent,
 		Client: "Claude", Scopes: []string{protocol.ScopeLiveRead}, Ops: []string{}, TTLS: 3600, Code: "ABCD",
 		ExpMs: 1_000_000 + 60_000,
-	})
+	}, signer)
+}
+
+func offerOf(t *testing.T, offer protocol.GrantOffer, signer *approvaltest.Signer) string {
+	t.Helper()
+	o, err := protocol.Marshal(offer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,6 +205,139 @@ func TestTheBoxPageTakesASignedOfferAndItsLength(t *testing.T) {
 	}
 }
 
+// The box page shows the owner what the box read in an offer before it
+// grants, and each reason it will not take one, in words of the page's own.
+// Reading an offer grants nothing, so any LAN client may ask.
+func TestTheBoxPageReadsAnOfferBeforeGranting(t *testing.T) {
+	agents := newStubAgents("home-1")
+	s := New(&Deps{Agents: agents})
+	check := func(body string) (int, map[string]any) {
+		w := httptest.NewRecorder()
+		s.handleAgentsOffer(w, localRequest(http.MethodPost, "/api/agents/offer", body))
+		var got map[string]any
+		_ = json.Unmarshal(w.Body.Bytes(), &got)
+		return w.Code, got
+	}
+	full := protocol.GrantOffer{
+		V: protocol.GrantOfferVersion, Key: make([]byte, 32), Role: apiauth.RoleAgent,
+		Client: "Claude", ClientID: "https://claude.ai/oauth/mcp-oauth-client-metadata", ClientHost: "claude.ai", Verified: true,
+		Scopes: []string{protocol.ScopeDispatchHold, protocol.ScopeLiveRead}, Ops: []string{protocol.OpLoadpointHold},
+		Caps: protocol.Caps{HoldS: 1800, MaxW: 11000, PerMin: 6}, TTLS: 2_592_000, Code: "ABCDEFGH", ExpMs: 1_000_000 + 60_000,
+	}
+	code, got := check(offerOf(t, full, offerSigner))
+	if code != http.StatusOK || got["client"] != "Claude" || got["clientHost"] != "claude.ai" || got["verified"] != true ||
+		got["code"] != "ABCDEFGH" || got["ttlS"] != float64(2_592_000) || len(got["ops"].([]any)) != 1 {
+		t.Fatalf("a good offer: %d %v", code, got)
+	}
+	if caps := got["caps"].(map[string]any); caps["holdS"] != float64(1800) || caps["maxW"] != float64(11000) {
+		t.Errorf("caps %v", caps)
+	}
+	if len(agents.added) != 0 {
+		t.Fatal("reading an offer granted it")
+	}
+
+	expired := full
+	expired.ExpMs = 1_000_000
+	other := full
+	other.Home = "another-home"
+	for _, c := range []struct {
+		name, body, reason string
+	}{
+		{"signed by a key the box does not pin", signedOfferBody(t, "", approvaltest.New()), OfferUnsigned},
+		{"expired by the box's clock", offerOf(t, expired, offerSigner), OfferExpired},
+		{"for another home", offerOf(t, other, offerSigner), OfferOtherHome},
+		{"not an offer", `{"offer":"bm90IGFuIG9mZmVy"}`, OfferMalformed},
+	} {
+		code, got := check(c.body)
+		if code != http.StatusBadRequest || got["reason"] != c.reason || got["boxMs"] != float64(1_000_000) {
+			t.Errorf("%s: %d %v", c.name, code, got)
+		}
+	}
+
+	agents.noKeys = true
+	if code, got := check(offerOf(t, full, offerSigner)); code != http.StatusBadRequest || got["reason"] != OfferNoKeys {
+		t.Errorf("a build that pins no offer key: %d %v", code, got)
+	}
+	agents.noKeys = false
+	agents.unsynced = true
+	if code, got := check(offerOf(t, full, offerSigner)); code != http.StatusServiceUnavailable || got["error"] != protocol.ErrUnavailable {
+		t.Errorf("without a clock: %d %v", code, got)
+	}
+
+	// Granting answers with the same reasons.
+	agents.unsynced = false
+	w := httptest.NewRecorder()
+	s.handleAgentsAdd(w, signedIn(localRequest(http.MethodPost, "/api/agents", offerOf(t, expired, offerSigner))))
+	if !strings.Contains(w.Body.String(), `"reason":"expired"`) {
+		t.Errorf("granting an expired offer: %d %s", w.Code, w.Body.String())
+	}
+}
+
+// The list carries what the page checks before it asks for a code, which
+// works once, and the registry's view of agent ops, so the page names
+// nothing by hand.
+func TestTheAgentListCarriesTheBoxFacts(t *testing.T) {
+	s := New(&Deps{Agents: newStubAgents("")})
+	w := httptest.NewRecorder()
+	s.handleAgentsList(w, localRequest(http.MethodGet, "/api/agents", ""))
+	var got struct {
+		Agents   []protocol.AgentRow `json:"agents"`
+		Box      AgentFacts          `json:"box"`
+		Registry struct {
+			AgentOps    map[string]string         `json:"agentOps"`
+			WriteScopes []string                  `json:"writeScopes"`
+			AgentArgs   map[string][]agentArgView `json:"agentArgs"`
+		} `json:"registry"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil || w.Code != http.StatusOK {
+		t.Fatalf("%d %v %s", w.Code, err, w.Body.String())
+	}
+	if got.Agents == nil || !got.Box.Offers || got.Box.Clock != ClockOK || got.Box.Lookup == "" {
+		t.Errorf("box %+v agents %v", got.Box, got.Agents)
+	}
+	if got.Registry.AgentOps[protocol.OpLoadpointHold] != protocol.ScopeDispatchHold ||
+		!slices.Contains(got.Registry.WriteScopes, protocol.ScopeGoalsRequest) {
+		t.Errorf("registry %+v", got.Registry)
+	}
+	args := got.Registry.AgentArgs[protocol.OpLoadpointHold]
+	if len(args) < 2 || args[0].Name != "id" || args[1].Name != "power_w" || args[1].Label == "" ||
+		args[1].Unit != "W" || args[1].Cap != "maxW" {
+		t.Errorf("loadpoint.hold's arguments, in the registry's order: %+v", args)
+	}
+}
+
+// On the box itself the house password does not count, so the list tells the
+// page that this request cannot widen access before the owner spends a code
+// on a grant the box would refuse. Another device signed in can.
+func TestTheListSaysWhetherThisRequestCanWiden(t *testing.T) {
+	resetLANGuesses(t)
+	policy := lanAuthPolicy(testHousePassword)
+	s := New(&Deps{Agents: newStubAgents("")})
+	widen := func(url, remote string) (bool, int) {
+		var after *http.Request
+		serveLANAuth(policy, lanAuthRequest(http.MethodGet, url, remote, "Bearer "+testHousePassword),
+			func(r *http.Request) { after = r })
+		w := httptest.NewRecorder()
+		s.handleAgentsList(w, after)
+		var got struct {
+			Box AgentFacts `json:"box"`
+		}
+		_ = json.Unmarshal(w.Body.Bytes(), &got)
+		add := httptest.NewRecorder()
+		post := after.Clone(after.Context())
+		post.Method = http.MethodPost
+		post.Body = io.NopCloser(strings.NewReader(offerBody(t, "")))
+		s.handleAgentsAdd(add, post)
+		return got.Box.Widen, add.Code
+	}
+	if ok, code := widen("http://127.0.0.1:8080/api/agents", "127.0.0.1:1234"); ok || code != http.StatusForbidden {
+		t.Errorf("on the box itself, with the house password: widen %v, grant %d", ok, code)
+	}
+	if ok, code := widen("http://192.168.1.1:8080/api/agents", "192.168.1.5:1234"); !ok || code != http.StatusCreated {
+		t.Errorf("another device, signed in: widen %v, grant %d", ok, code)
+	}
+}
+
 func TestALostApprovalKeyIsReplacedOnlyWithThePassword(t *testing.T) {
 	agents := newStubAgents("")
 	s := New(&Deps{Agents: agents})
@@ -275,6 +426,7 @@ func TestAgentRoutesAreLocal(t *testing.T) {
 	for _, c := range []struct{ method, path string }{
 		{http.MethodGet, "/api/agents"},
 		{http.MethodGet, "/api/agents/audit"},
+		{http.MethodPost, "/api/agents/offer"},
 		{http.MethodPost, "/api/agents"},
 		{http.MethodPost, "/api/agents/abc/widen"},
 		{http.MethodDelete, "/api/agents/abc"},
@@ -295,6 +447,7 @@ func TestTheAgentRoutesNeedSignInWithLANAuthOn(t *testing.T) {
 	for _, c := range []struct{ method, path string }{
 		{http.MethodGet, "/api/agents"},
 		{http.MethodGet, "/api/agents/audit"},
+		{http.MethodPost, "/api/agents/offer"},
 		{http.MethodDelete, "/api/agents/agent001"},
 		{http.MethodPost, "/api/agent-requests/r1"},
 	} {
@@ -304,5 +457,91 @@ func TestTheAgentRoutesNeedSignInWithLANAuthOn(t *testing.T) {
 	}
 	if rr := serveLANAuth(policy, lanAuthRequest(http.MethodGet, "http://ftw.local:8080/api/agents", "192.168.1.5:1234", "Bearer "+testHousePassword), nil); rr.Code != http.StatusNoContent {
 		t.Errorf("signed in: %d", rr.Code)
+	}
+}
+
+// yearOfferBody is an offer that asks for a year, as FTW Cloud's does.
+func yearOfferBody(t *testing.T, extra string) string {
+	t.Helper()
+	o, err := protocol.Marshal(protocol.GrantOffer{
+		V: protocol.GrantOfferVersion, Key: make([]byte, 32), Role: apiauth.RoleAgent, Client: "Claude",
+		Scopes: []string{protocol.ScopeLiveRead}, Ops: []string{}, TTLS: 365 * 24 * 3600, Code: "ABCD",
+		ExpMs: 1_000_000 + 60_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := protocol.OfferBytes(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := protocol.Marshal(protocol.SignedOffer{O: o, Kid: "k1", Sig: offerSigner.Sign(msg)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return `{"offer":"` + base64.RawURLEncoding.EncodeToString(raw) + `"` + extra + `}`
+}
+
+// A grant with no length named gets 30 days of an offer's year; one past a
+// year, or so long it would wrap, is refused as the box would refuse it,
+// with the latest end it takes.
+func TestTheBoxPageBoundsALength(t *testing.T) {
+	const day = int64(24 * 3600 * 1000)
+	agents := newStubAgents("")
+	s := New(&Deps{Agents: agents})
+	post := func(path, body string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		r := signedIn(localRequest(http.MethodPost, path, body))
+		if strings.HasSuffix(path, "/widen") {
+			r.SetPathValue("id", "agent001")
+			s.handleAgentsWiden(w, r)
+		} else {
+			s.handleAgentsAdd(w, r)
+		}
+		return w
+	}
+	capped := func(w *httptest.ResponseRecorder) bool {
+		var got struct {
+			Error string         `json:"error"`
+			Args  map[string]any `json:"args"`
+		}
+		_ = json.Unmarshal(w.Body.Bytes(), &got)
+		return got.Error == protocol.ErrCapExceeded && got.Args["cap"] == "expiresAtMs" &&
+			got.Args["max"] == float64(1_000_000+365*day)
+	}
+
+	if w := post("/api/agents", yearOfferBody(t, "")); w.Code != http.StatusCreated ||
+		agents.added[0].ExpiresAtMs != 1_000_000+30*day {
+		t.Fatalf("no length named: %d, ends %d", w.Code, agents.added[len(agents.added)-1].ExpiresAtMs)
+	}
+	if w := post("/api/agents", yearOfferBody(t, `,"ttlS":31536000`)); w.Code != http.StatusCreated ||
+		agents.added[1].ExpiresAtMs != 1_000_000+365*day {
+		t.Fatalf("a year: %d", w.Code)
+	}
+	for _, ttl := range []string{"31536001", "18446744073709552"} {
+		if w := post("/api/agents/agent001/widen", `{"epoch":1,"scopes":["ftw.live.read"],"ops":[],"caps":{},"ttlS":`+ttl+`}`); !capped(w) {
+			t.Errorf("renewed for %s s: %d %s", ttl, w.Code, w.Body.String())
+		}
+	}
+	if w := post("/api/agents/agent001/widen", `{"epoch":1,"scopes":["ftw.live.read"],"ops":[],"caps":{},"ttlS":31536000}`); w.Code != http.StatusOK {
+		t.Errorf("renewed for a year: %d %s", w.Code, w.Body.String())
+	}
+	if len(agents.added) != 2 {
+		t.Errorf("a refused length reached the box: %d grants", len(agents.added))
+	}
+}
+
+// The box page reads the longest grant from box.longestMs, and no stray
+// top-level copy of it.
+func TestTheBoxPageListCarriesNoStrayLongest(t *testing.T) {
+	s := New(&Deps{Agents: newStubAgents("")})
+	w := httptest.NewRecorder()
+	s.handleAgentsList(w, localRequest(http.MethodGet, "/api/agents", ""))
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if _, stray := got["longestMs"]; stray {
+		t.Errorf("GET /api/agents carries a top-level longestMs: %s", w.Body.String())
 	}
 }

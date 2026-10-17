@@ -143,7 +143,7 @@ func newDeadmanRig(t *testing.T, epoch int64, source DeadmanSource, now func() t
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	done := make(chan error, 1)
-	go func() { done <- uplink.Run(ctx) }()
+	go func() { done <- uplink.runRelay(ctx) }()
 
 	return &rig{relay: relay, enroll: enroll, uplink: uplink, cancel: cancel, done: done}
 }

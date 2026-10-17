@@ -78,7 +78,8 @@ const (
 // Limits the box enforces on every grant, whatever the grant says.
 const (
 	// AgentMaxMs, SupportMaxMs and ReleaseMaxMs are the longest grants.
-	AgentMaxMs   int64 = 30 * 24 * 60 * 60 * 1000
+	// The box tells owners its own in agent.list, as LongestMs.
+	AgentMaxMs   int64 = 365 * 24 * 60 * 60 * 1000
 	SupportMaxMs int64 = 14 * 24 * 60 * 60 * 1000
 	ReleaseMaxMs int64 = 90 * 24 * 60 * 60 * 1000
 
@@ -370,6 +371,16 @@ type AgentList struct {
 	Agents   []AgentRow        `cbor:"agents" json:"agents"`
 	Requests []Request         `cbor:"requests" json:"requests"`
 	Keys     []ApprovalKeyInfo `cbor:"keys" json:"keys"`
+	// LongestMs is the longest grant the box takes for each role, so a
+	// client offers no length the box would refuse. Owners only.
+	LongestMs map[string]int64 `cbor:"longestMs,omitempty" json:"longestMs,omitempty"`
+}
+
+// LongestMs is the longest grant for each agent role, as agent.list tells
+// owners. A box whose answer leaves it out takes at most 30 days for an
+// agent (docs/agents.md, Mixed versions).
+func LongestMs() map[string]int64 {
+	return map[string]int64{RoleAgent: AgentMaxMs, RoleSupport: SupportMaxMs, RoleRelease: ReleaseMaxMs}
 }
 
 // AuditGet pages through the audit log, newest first.

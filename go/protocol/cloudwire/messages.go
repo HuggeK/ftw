@@ -335,6 +335,20 @@ type Roster struct {
 	// QR code. FTW Cloud's keys part opens an agent's session to it, and
 	// trusts it only as signed here, by the home's key.
 	Noise []byte `cbor:"noise"`
+	// WebPush holds browser farewells encrypted and signed by the box.
+	// The service never forwards these rows to a phone.
+	WebPush []WebPushRow `cbor:"webpush,omitempty"`
+}
+
+// WebPushRow is a pre-encrypted box.unreachable notice for one browser.
+// Epoch binds it to the current device grant. No push key leaves the box.
+type WebPushRow struct {
+	ID       string `cbor:"id"`
+	Device   string `cbor:"dev"`
+	Epoch    uint64 `cbor:"epoch"`
+	Endpoint string `cbor:"endpoint"`
+	CT       []byte `cbor:"ct"`
+	Auth     string `cbor:"auth"`
 }
 
 // Device is one paired phone.

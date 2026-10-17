@@ -63,7 +63,10 @@ var (
 	// https://cloud.ftw.energy/.well-known/ftw-offer-key publishes them.
 	// An entry whose kid is not protocol.OfferKid of its key is dropped.
 	// Empty means this build opens no offer on the box page.
-	OfferKeys = ""
+	//
+	// The one key is cloud.ftw.energy's, alias/ftw-cloud-offer-key in KMS
+	// (eu-north-1), made 17 October 2026. Its private half never leaves KMS.
+	OfferKeys = "s0xLrCPjFa-AoMMl:BEUBb8ul2T01OWM_f1rX6h8Z0yFf8BkvEtUxdHsc_FXGtKv8arbcDZcPeeVOoX6nIxdP2SKYpHky9KSw-cqH-8g"
 )
 
 // ParseOfferKeys reads OfferKeys into kid → SEC1 point. A malformed entry is
@@ -184,9 +187,15 @@ type Tunnel interface {
 	Drop()
 }
 
+// WebPushSource renders and encrypts the notices the service may send when the box is away.
+type WebPushSource interface {
+	WebPushRows() ([]cloudwire.WebPushRow, error)
+}
+
 // Options wires a link. Site, Roster, KV and KeyPath are required.
 type Options struct {
 	Site    Site
+	WebPush WebPushSource
 	Roster  Roster
 	KV      KV
 	KeyPath string
@@ -468,14 +477,17 @@ func (l *Link) RosterChanged() {
 }
 
 // wantsLink reports whether anything needs the link: a phone that may open a
-// tunnel, or a pairing code on the screen. A grant needs it too, and makes it
-// itself.
+// tunnel, an agent an owner let in, or a pairing code on the screen. An agent
+// row has no tunnel, but it reaches the box only through FTW Cloud, which
+// learns of it from the roster; an owner with no phone grants one on the box
+// page. A box that takes no tun cannot serve an agent, so its rows want no
+// link. A grant needs the link too, and makes it itself.
 func (l *Link) wantsLink() bool {
 	if _, _, ok := l.opts.Roster.Pending(); ok {
 		return true
 	}
 	for _, d := range l.opts.Roster.Devices() {
-		if d.Tun {
+		if d.Tun || (d.Agent != nil && l.opts.Tunnel != nil) {
 			return true
 		}
 	}

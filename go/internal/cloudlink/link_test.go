@@ -113,9 +113,11 @@ type fakeRoster struct {
 }
 
 type fakeRosterState struct {
-	mu      sync.Mutex
-	tun     bool
-	gone    bool
+	mu   sync.Mutex
+	tun  bool
+	gone bool
+	// agent adds an assistant's row, which has no tunnel.
+	agent   bool
 	code    []byte
 	expires time.Time
 }
@@ -130,8 +132,14 @@ func (r fakeRoster) Devices() []RosterDevice {
 		}
 		tun = r.state.tun
 	}
-	return []RosterDevice{{ID: "q5Lw0Zb1", Key: bytes.Repeat([]byte{5}, 32), Role: "owner", Epoch: 1,
+	out := []RosterDevice{{ID: "q5Lw0Zb1", Key: bytes.Repeat([]byte{5}, 32), Role: "owner", Epoch: 1,
 		Scopes: []string{protocol.ScopeLiveRead, protocol.ScopeDispatchWrite, protocol.ScopeEventsRead}, Tun: tun}}
+	if r.state != nil && r.state.agent {
+		out = append(out, RosterDevice{ID: "Ag3nt0001", Key: bytes.Repeat([]byte{7}, 32), Role: protocol.RoleAgent,
+			Epoch: 1, Scopes: []string{}, Agent: &cloudwire.Agent{Scopes: []string{protocol.ScopeLiveRead},
+				Ops: []string{}, ExpiresAtMs: 1_791_821_000_000}})
+	}
+	return out
 }
 
 func (r fakeRoster) Noise() []byte { return make([]byte, 32) }
@@ -511,6 +519,57 @@ func TestOffUntilAnOwnerGrants(t *testing.T) {
 	}
 	if _, err := os.Stat(h.keyPath); !os.IsNotExist(err) {
 		t.Fatal("cloud.key exists before any grant")
+	}
+}
+
+// An owner with no phone lets an assistant in on the box page. The agent row
+// has no tunnel, but FTW Cloud learns of it only from the roster, so the box
+// links for it, and an idle link does not end while it stays.
+func TestAnAgentRowLinksTheBox(t *testing.T) {
+	svc := newFakeService(t)
+	h := newHarness(t, svc)
+	h.setRoster(func(r *fakeRosterState) { r.agent = true })
+	r := h.nextRoster(t)
+	agents := 0
+	for _, d := range r.Devices {
+		if d.Agent != nil && !d.Tun {
+			agents++
+		}
+	}
+	if len(r.Devices) != 2 || agents != 1 {
+		t.Fatalf("roster devices %+v", r.Devices)
+	}
+	if st := h.link.Status(); st.Link != "on" || st.Home == "" {
+		t.Fatalf("status %+v", st)
+	}
+	h.link.endIfIdle()
+	h.link.mu.Lock()
+	ending := h.link.link != nil && h.link.link.Ending
+	h.link.mu.Unlock()
+	if ending {
+		t.Fatal("the link began to end while an agent still has access")
+	}
+}
+
+// With the app link off the box takes no tun, so it cannot serve an agent.
+// A row left from before must not dial FTW Cloud, make a home id or send a
+// roster that names its client.
+func TestAnAgentRowLinksNoBoxThatTakesNoTun(t *testing.T) {
+	svc := newFakeService(t)
+	h := newHarnessWith(t, svc, []*ecdsa.PublicKey{&svc.key.PublicKey}, nil, func(o *Options) { o.Tunnel = nil })
+	h.setRoster(func(r *fakeRosterState) { r.agent = true })
+	time.Sleep(300 * time.Millisecond)
+	svc.mu.Lock()
+	conns := svc.conns
+	svc.mu.Unlock()
+	if conns != 0 {
+		t.Fatalf("the box dialled FTW Cloud %d times for an agent it cannot serve", conns)
+	}
+	if st := h.link.Status(); st.Link == "on" || st.Home != "" {
+		t.Fatalf("status %+v", st)
+	}
+	if _, err := os.Stat(h.keyPath); !os.IsNotExist(err) {
+		t.Fatal("cloud.key exists for an agent the box cannot serve")
 	}
 }
 
@@ -1193,6 +1252,15 @@ func TestABuildWithoutAServiceRefusesStatistics(t *testing.T) {
 	}
 	if err := link.Stats(StatsRequest{Policy: "p"}); !errors.Is(err, ErrNoService) {
 		t.Fatalf("statistics: %v", err)
+	}
+}
+
+// The release pins FTW Cloud's offer key, and the pin parses under its kid.
+func TestReleasePinsTheCloudOfferKey(t *testing.T) {
+	got := ParseOfferKeys(OfferKeys)
+	pub, ok := got["s0xLrCPjFa-AoMMl"]
+	if len(got) != 1 || !ok || protocol.OfferKid(pub) != "s0xLrCPjFa-AoMMl" {
+		t.Fatalf("OfferKeys pins %d keys: %v", len(got), got)
 	}
 }
 
