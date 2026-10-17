@@ -528,6 +528,14 @@ func (s *Server) routes() {
 	s.handle("GET  /api/ev/providers", Read, s.handleEVProviders)
 	s.handle("GET  /api/loadpoints", Read, s.handleLoadpoints)
 	s.handle("GET  /api/cars", Read, s.handleCars)
+	// The box page keeps the owner's cars as the owner's app does, with the
+	// same ops (docs/cars.md). They change no hardware, so no step-up.
+	s.handle("POST   /api/cars", Configure, s.handleCarAdd, NoStepUp)
+	s.handle("PATCH  /api/cars/{id}", Configure, s.handleCarUpdate, NoStepUp)
+	s.handle("DELETE /api/cars/{id}", Configure, s.handleCarRemove, NoStepUp)
+	// The one tap. It changes what the charger plans for, so it is
+	// actuation; a phone sends the op.
+	s.handle("POST /api/loadpoints/{id}/car", Actuate, s.handleSessionCarSet, Via(protocol.OpSessionCarSet))
 	// Via names the one field of this body the session can set. The target
 	// level and its deadline still have no command; the passthrough refuses
 	// the whole route either way.
