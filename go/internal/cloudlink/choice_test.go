@@ -1,10 +1,12 @@
 package cloudlink
 
 import (
+	"crypto/ecdsa"
 	"errors"
 	"github.com/srcfl/ftw/go/protocol"
 	"github.com/srcfl/ftw/go/protocol/cloudwire"
 	"log/slog"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -134,5 +136,42 @@ func TestStatisticsClockStartsAfterNTPWithoutBackfill(t *testing.T) {
 	}
 	if l.grant.StatsAtMs != now.Add(-time.Hour).UnixMilli() {
 		t.Fatal("clock moved on reconnect")
+	}
+}
+
+type failingChoiceKV struct {
+	KV
+	armed *atomic.Bool
+	key   string
+}
+
+func (f failingChoiceKV) SaveConfig(key, value string) error {
+	if f.armed.Load() && key == f.key {
+		return errors.New("choice storage unavailable")
+	}
+	return f.KV.SaveConfig(key, value)
+}
+
+func TestWholeCloudOffStopsImmediatelyWhenLaterStorageFails(t *testing.T) {
+	for _, failKey := range []string{statsDecisionKey, linkKey, grantKey} {
+		t.Run(failKey, func(t *testing.T) {
+			var armed atomic.Bool
+			svc := newFakeService(t)
+			h := newHarnessWith(t, svc, []*ecdsa.PublicKey{&svc.key.PublicKey}, nil, func(o *Options) { o.KV = failingChoiceKV{KV: o.KV, armed: &armed, key: failKey} })
+			if err := h.link.Grant(GrantRequest{Scopes: []string{protocol.ScopeLiveRead}, Policy: cloudwire.CloudTermsPolicy, By: "owner"}); err != nil {
+				t.Fatal(err)
+			}
+			h.nextRoster(t)
+			armed.Store(true)
+			if err := h.link.End("owner"); err == nil {
+				t.Fatal("storage failure was not returned")
+			}
+			if h.link.TakesTun() || h.link.Home() != "" || h.link.SessionInfo() != nil || h.link.current().copyOn() || StatisticsChoice(h.kv) {
+				t.Fatal("a failed follow-up write left Cloud sharing active")
+			}
+			if disabled, _ := h.kv.LoadConfig(disabledKey); disabled != "true" {
+				t.Fatal("off choice was not saved")
+			}
+		})
 	}
 }

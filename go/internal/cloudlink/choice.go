@@ -73,28 +73,33 @@ func (l *Link) End(by string) error {
 		return err
 	}
 	l.disabled = true
-	if err := l.opts.KV.SaveConfig(statsDecisionKey, ""); err != nil {
-		return err
+	// The durable off flag is now saved. Stop the live session before any
+	// follow-up write can fail; load() honours this flag after a restart.
+	if l.link != nil {
+		rec := *l.link
+		rec.Ending = true
+		l.link = &rec
 	}
-	if l.link == nil {
-		return nil
-	}
-	rec := *l.link
-	rec.Ending = true
-	if err := saveJSON(l.opts.KV, linkKey, rec); err != nil {
-		return err
-	}
-	l.link = &rec
 	if l.grant != nil {
 		g := *l.grant
 		g.Revoked, g.By = true, by
-		if err := saveJSON(l.opts.KV, grantKey, g); err != nil {
-			return err
-		}
 		l.grant = &g
 	}
 	l.rosterDue = true
 	l.signal()
+	if err := l.opts.KV.SaveConfig(statsDecisionKey, ""); err != nil {
+		return err
+	}
+	if l.link != nil {
+		if err := saveJSON(l.opts.KV, linkKey, *l.link); err != nil {
+			return err
+		}
+	}
+	if l.grant != nil {
+		if err := saveJSON(l.opts.KV, grantKey, *l.grant); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
