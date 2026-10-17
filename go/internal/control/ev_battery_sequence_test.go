@@ -170,11 +170,21 @@ type evBatterySite struct {
 	evW              float64
 	commands, offers []evTimed
 	maxGridW         float64
+	chargerDelay     time.Duration
+	carMaxW          float64       // 0: the car takes its whole offer
+	batteryDelay     time.Duration // 0: the battery follows within a tick
+	batteryCommands  []evTimed
+	meterW, targetW  []evTimed // every site reading and battery target
 }
 
 func newEVBatterySite(t *testing.T, houseW float64) *evBatterySite {
 	t.Helper()
-	s := &evBatterySite{t: t, now: time.Now().Truncate(time.Second), store: telemetry.NewStore(), houseW: houseW}
+	return newEVBatterySiteAt(t, houseW, time.Now().Truncate(time.Second))
+}
+
+func newEVBatterySiteAt(t *testing.T, houseW float64, start time.Time) *evBatterySite {
+	t.Helper()
+	s := &evBatterySite{t: t, now: start, store: telemetry.NewStore(), houseW: houseW, chargerDelay: 5 * time.Second}
 	config := loadpoint.Config{ID: "garage", DriverName: "charger", MinChargeW: 4140, MaxChargeW: 10350,
 		PhaseMode: "3p", AllowedStepsW: []float64{0, 4140, 4830, 5520, 6210, 6900, 7590, 8280, 8970, 9660, 10350}}
 	s.mgr = loadpoint.NewManager()
@@ -200,7 +210,7 @@ func newEVBatterySite(t *testing.T, houseW float64) *evBatterySite {
 			}
 			if cmd.Action == "ev_set_current" {
 				s.offers = append(s.offers, evTimed{s.now, cmd.PowerW})
-				s.commands = append(s.commands, evTimed{s.now.Add(5 * time.Second), cmd.PowerW})
+				s.commands = append(s.commands, evTimed{s.now.Add(s.chargerDelay), cmd.PowerW})
 			}
 			return nil
 		})
@@ -233,11 +243,19 @@ func (s *evBatterySite) step() {
 	s.now = s.now.Add(time.Second)
 	for len(s.commands) > 0 && !s.commands[0].at.After(s.now) {
 		s.evW, s.commands = s.commands[0].w, s.commands[1:]
+		if s.carMaxW > 0 {
+			s.evW = math.Min(s.evW, s.carMaxW)
+		}
+	}
+	for len(s.batteryCommands) > 0 && !s.batteryCommands[0].at.After(s.now) {
+		s.batteryW, s.batteryCommands = s.batteryCommands[0].w, s.batteryCommands[1:]
 	}
 	s.maxGridW = math.Max(s.maxGridW, s.gridW())
+	s.meterW = append(s.meterW, evTimed{s.now, s.gridW()})
 	s.emit("pixii", telemetry.DerBattery, s.batteryW)
 	s.emit("charger", telemetry.DerEV, s.evW)
 	s.emit("meter", telemetry.DerMeter, s.gridW())
+	s.state.ObserveSiteImport(s.store)
 	s.ctrl.TickWithDispatch(context.Background(), s.now, true)
 	s.state.EVCommandedW = loadpoint.CommandedEVPowerW(s.mgr.States())
 	s.state.SetEVFuseDemands(s.ctrl.FuseDemands())
@@ -245,7 +263,12 @@ func (s *evBatterySite) step() {
 	if len(targets) != 1 {
 		s.t.Fatalf("targets %+v", targets)
 	}
-	s.batteryW = targets[0].TargetW // A local battery follows within a tick.
+	s.targetW = append(s.targetW, evTimed{s.now, targets[0].TargetW})
+	if s.batteryDelay <= 0 {
+		s.batteryW = targets[0].TargetW // A local battery follows within a tick.
+		return
+	}
+	s.batteryCommands = append(s.batteryCommands, evTimed{s.now.Add(s.batteryDelay), targets[0].TargetW})
 }
 
 func (s *evBatterySite) run(d time.Duration) {
@@ -259,6 +282,20 @@ func (s *evBatterySite) offer() float64 {
 		return 0
 	}
 	return s.offers[len(s.offers)-1].w
+}
+
+func (s *evBatterySite) hourLimitW() float64 {
+	limitW, _, _ := s.state.importHourLimitsW()
+	return limitW
+}
+
+func since(log []evTimed, at time.Time) []evTimed {
+	for i, e := range log {
+		if !e.at.Before(at) {
+			return log[i:]
+		}
+	}
+	return nil
 }
 
 // A 2 kW house step lands while the battery and the car both charge. EV
@@ -307,5 +344,212 @@ func TestEVFirstHouseStepWhileBatteryAndEVCharge(t *testing.T) {
 	}
 	if s.gridW() > 16560.01 {
 		t.Fatalf("grid %.0f W above 24 A after the step", s.gridW())
+	}
+}
+
+// newIdleBatteryEVSite starts at a clock hour with the battery planned idle,
+// so only the fuse guard moves it.
+func newIdleBatteryEVSite(t *testing.T, houseW, ceilingW float64) *evBatterySite {
+	t.Helper()
+	start := time.Date(2026, 10, 17, 16, 0, 0, 0, time.Local)
+	s := newEVBatterySiteAt(t, houseW, start)
+	s.state.PeakImportCeilingW = ceilingW
+	idle := SlotDirective{SlotStart: start, SlotEnd: start.Add(time.Hour), Strategy: "arbitrage"}
+	s.state.SlotDirective = func(time.Time) (SlotDirective, bool) { return idle, true }
+	return s
+}
+
+// A sunny afternoon under a 7.5 kW import ceiling: PV covers the house and
+// 3 kW of the car, so the car draws 9,660 W, more than the ceiling.
+func newCeilingEVSite(t *testing.T) *evBatterySite {
+	t.Helper()
+	s := newIdleBatteryEVSite(t, -3000, 7500)
+	s.run(5 * time.Minute)
+	if s.offer() != 9660 || s.evW != 9660 || s.batteryW != 0 {
+		t.Fatalf("setup: offer %.0f W draw %.0f W battery %.0f W", s.offer(), s.evW, s.batteryW)
+	}
+	return s
+}
+
+// #1674, Göran (segran2: Easee Cloud, Pixii, 25 A), 17 Oct 2026 14:22:38
+// UTC. An overage of the import ceiling stopped the car, and in the same
+// tick the battery's fuse guard discharged for the same watts. When the stop
+// reached the meter the battery was still discharging, and the site exported
+// about 4 kW for ~10 s. The hour's budget waits for the stop we commanded,
+// so the battery leaves those watts alone and nothing swings into export.
+func TestCeilingOverageLeftToCommandedEVCutDoesNotExport(t *testing.T) {
+	s := newCeilingEVSite(t)
+	s.chargerDelay, s.batteryDelay = 10*time.Second, 3*time.Second
+	stepAt := s.now
+	s.houseW += 7000 // The sun goes and the sauna starts: 13,660 W.
+	s.run(40 * time.Second)
+	lowestMeter, lowestBattery := math.Inf(1), math.Inf(1)
+	for _, m := range since(s.meterW, stepAt) {
+		lowestMeter = math.Min(lowestMeter, m.w)
+	}
+	for _, b := range since(s.targetW, stepAt) {
+		lowestBattery = math.Min(lowestBattery, b.w)
+	}
+	t.Logf("offer %.0f W; lowest meter %.0f W, lowest battery target %.0f W", s.offer(), lowestMeter, lowestBattery)
+	if s.offer() != 0 || s.evW != 0 {
+		t.Fatalf("the car did not stop: offer %.0f W draw %.0f W", s.offer(), s.evW)
+	}
+	if lowestMeter < 0 {
+		t.Fatalf("the site exported %.0f W when the car's stop landed", -lowestMeter)
+	}
+	if lowestBattery < 0 {
+		t.Fatalf("the battery discharged %.0f W for watts the car's stop removes", -lowestBattery)
+	}
+	if s.maxGridW > 16560 {
+		t.Fatalf("grid %.0f W over the fuse while waiting for the car", s.maxGridW)
+	}
+	// The stop went out on the first reading over the ceiling.
+	for _, m := range since(s.meterW, stepAt.Add(time.Second+s.chargerDelay)) {
+		if m.w > 7500 {
+			t.Fatalf("%v: meter %.0f W after the car's stop landed", m.at.Sub(stepAt), m.w)
+		}
+	}
+}
+
+// A cut may hold the hour's overage for evSettle and no longer. A charger
+// that has not followed by then leaves the overage to the battery until the
+// cut shows.
+func TestCeilingOverageGetsBatteryReliefWhenEVCutIsLate(t *testing.T) {
+	s := newCeilingEVSite(t)
+	s.chargerDelay = time.Minute
+	stepAt := s.now
+	s.houseW += 7000
+	s.run(time.Minute) // The stop lands one second later.
+	reliefBy := stepAt.Add(time.Second + evSettle)
+	t.Logf("battery %.0f W from %v; meter %.0f W", since(s.targetW, reliefBy)[0].w, reliefBy.Sub(stepAt), s.gridW())
+	for _, b := range since(s.targetW, reliefBy) {
+		if b.w >= 0 {
+			t.Fatalf("%v: no battery relief %v after the stop was sent (target %.0f W)", b.at.Sub(stepAt), b.at.Sub(stepAt.Add(time.Second)), b.w)
+		}
+	}
+	for _, m := range since(s.meterW, reliefBy.Add(time.Second)) {
+		if m.w > s.hourLimitW()+50 {
+			t.Fatalf("%v: meter %.0f W, the battery did not hold the hour's limit of %.0f W", m.at.Sub(stepAt), m.w, s.hourLimitW())
+		}
+	}
+}
+
+// A cut that has reached the meter removes nothing more. A new overage
+// after it gets battery relief as soon as the smoothed reading shows it.
+func TestCeilingOverageAfterTheCutShowsGetsBatteryRelief(t *testing.T) {
+	s := newCeilingEVSite(t)
+	s.houseW += 7000
+	s.run(15 * time.Second) // The stop landed after 5 s.
+	if s.evW != 0 || s.gridW() > 7500 {
+		t.Fatalf("setup: draw %.0f W meter %.0f W", s.evW, s.gridW())
+	}
+	stepAt := s.now
+	s.houseW += 4500 // 8,500 W, over the hour's limit with the car off.
+	s.run(6 * time.Second)
+	t.Logf("battery %.0f W after 2 s; meter %.0f W, limit %.0f W", since(s.targetW, stepAt.Add(2*time.Second))[0].w, s.gridW(), s.hourLimitW())
+	for _, b := range since(s.targetW, stepAt.Add(2*time.Second)) {
+		if b.w >= 0 {
+			t.Fatalf("%v: no battery relief for an overage no cut removes (target %.0f W)", b.at.Sub(stepAt), b.w)
+		}
+	}
+	if s.gridW() > s.hourLimitW()+50 {
+		t.Fatalf("meter %.0f W over the hour's limit of %.0f W", s.gridW(), s.hourLimitW())
+	}
+}
+
+// The car takes 2 kW of a 10,350 W offer, so a cut only lowers the offer.
+// The overage may wait evSettle for the first cut, not again for the stop
+// that follows it.
+func TestCeilingOverageWaitsOnceWhenTheCarDrawsLessThanItsOffer(t *testing.T) {
+	s := newIdleBatteryEVSite(t, -3000, 7500)
+	s.carMaxW = 2000
+	s.run(5 * time.Minute)
+	if s.offer() != 10350 || s.evW != 2000 {
+		t.Fatalf("setup: offer %.0f W draw %.0f W", s.offer(), s.evW)
+	}
+	stepAt := s.now
+	s.houseW += 12600 // 11,600 W, a cut's worth over the hour's limit.
+	s.run(time.Minute)
+	reliefBy := stepAt.Add(time.Second + evSettle)
+	t.Logf("offer %.0f W; battery %.0f W from %v", s.offer(), since(s.targetW, reliefBy)[0].w, reliefBy.Sub(stepAt))
+	for _, b := range since(s.targetW, reliefBy) {
+		if b.w >= 0 {
+			t.Fatalf("%v: no battery relief after the overage waited %v (target %.0f W)", b.at.Sub(stepAt), evSettle, b.w)
+		}
+	}
+	for _, m := range since(s.meterW, reliefBy.Add(time.Second)) {
+		if m.w > s.hourLimitW()+50 {
+			t.Fatalf("%v: meter %.0f W, the battery did not hold the hour's limit of %.0f W", m.at.Sub(stepAt), m.w, s.hourLimitW())
+		}
+	}
+}
+
+// The fuse never waits for a car. A house step past the heat budget's
+// instant limit (31 A on the 25 A fuse) cuts the car at once and gets
+// battery relief on the first reading, which it keeps until the car's cut
+// shows on the meter. Then the battery lets go, and nothing exports.
+func TestFuseOverageGetsBatteryReliefUntilEVCutShows(t *testing.T) {
+	s := newIdleBatteryEVSite(t, 3000, 0)
+	s.run(5 * time.Minute)
+	if s.offer() != 10350 || s.batteryW != 0 {
+		t.Fatalf("setup: offer %.0f W battery %.0f W", s.offer(), s.batteryW)
+	}
+	stepAt := s.now
+	s.houseW += 8000 // 21,350 W, 31 A on each phase.
+	s.run(15 * time.Second)
+	cutShows := stepAt.Add(time.Second + s.chargerDelay)
+	t.Logf("first battery target %.0f W; offer %.0f W", since(s.targetW, stepAt.Add(time.Second))[0].w, s.offer())
+	for _, b := range since(s.targetW, stepAt.Add(time.Second)) {
+		if b.at.Before(cutShows) && b.w >= 0 {
+			t.Fatalf("%v: no battery relief before the car's cut shows (target %.0f W)", b.at.Sub(stepAt), b.w)
+		}
+	}
+	for _, m := range since(s.meterW, stepAt.Add(2*time.Second)) {
+		if m.w > 17250 || m.w < 0 {
+			t.Fatalf("%v: meter %.0f W, want within the 25 A breaker and no export", m.at.Sub(stepAt), m.w)
+		}
+	}
+	if s.offer() >= 10350 || s.batteryW != 0 {
+		t.Fatalf("after the cut: offer %.0f W battery %.0f W, want a cut car and an idle battery", s.offer(), s.batteryW)
+	}
+}
+
+// Only the hour's import limit leaves watts to an EV cut, only those the cut
+// removes, and only during the first evSettle of the overage it was sent
+// for. The fuse acts on every reading, on each phase too.
+func TestFuseReliefLeavesOnlyCeilingWattsToCommandedEVCut(t *testing.T) {
+	now := time.Date(2026, 10, 17, 16, 30, 0, 0, time.Local)
+	hotPhase := json.RawMessage(`{"l1_a":25,"l2_a":18,"l3_a":18}`)
+	cases := []struct {
+		name              string
+		gridW, commandedW float64
+		overFor           time.Duration // 0: the meter shows no run over the limit
+		data              json.RawMessage
+		wantW             float64
+	}{
+		{"ceiling overage the stop removes", 13660, 0, 5 * time.Second, nil, 0},
+		{"fuse overage", 18000, 0, 5 * time.Second, nil, 18000 - 16560},
+		{"phase over the fuse", 13660, 0, 5 * time.Second, hotPhase, (25 - 24) * 230 * 3},
+		{"ceiling overage beyond the cut", 13660, 4140, 5 * time.Second, nil, 13660 - 7500 - (9660 - 4140)},
+		{"no cut", 13660, 9660, 5 * time.Second, nil, 13660 - 7500},
+		{"overage older than evSettle", 13660, 0, evSettle, nil, 13660 - 7500},
+		{"cut sent before this overage", 13660, 0, 0, nil, 13660 - 7500},
+	}
+	for _, tc := range cases {
+		st := NewState(0, 0, "meter")
+		st.clock = func() time.Time { return now }
+		st.SiteFuseAmps, st.SiteFuseVoltage, st.SiteFusePhases, st.SiteFuseSafetyA = 25, 230, 3, 1
+		st.PeakImportCeilingW = 7500
+		if tc.overFor > 0 {
+			st.evLimit.overSince, st.evLimit.overOfferW = now.Add(-tc.overFor), 9660
+		}
+		st.EVCommandedW = tc.commandedW
+		targets := []DispatchTarget{{Driver: "pixii"}}
+		batteries := map[string]*telemetry.DerReading{"pixii": {}}
+		meter := &telemetry.DerReading{SmoothedW: tc.gridW, Data: tc.data}
+		got := fuseReliefFromSnapshot(targets, batteries, meter, st, 17250, false)
+		if math.Abs(math.Max(0, got)-tc.wantW) > 1e-6 {
+			t.Errorf("%s: relief %.0f W, want %.0f W", tc.name, got, tc.wantW)
+		}
 	}
 }

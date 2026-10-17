@@ -4450,10 +4450,17 @@ func fuseReliefFromSnapshot(
 		currentGrid = meter.SmoothedW
 	}
 
-	// The effective import ceiling includes both the fuse margin and an
-	// optional tariff peak. Per-phase relief remains fuse-only and may act only
-	// while the matching aggregate meter sample is on the import side.
-	overage := predicted - state.effectiveImportCeilingW(fuseMaxW)
+	// The fuse acts on every reading. The hour's import limit is a budget:
+	// the part of its overage that an EV cut we sent will remove waits for
+	// that cut while the meter may not show it yet. Relief for the same watts
+	// would discharge the battery into export once the cut lands (#1674).
+	// Per-phase relief remains fuse-only and may act only while the matching
+	// aggregate meter sample is on the import side.
+	fuseW := math.Max(0, fuseMaxW-state.fuseSafetyMarginW())
+	overage := predicted - fuseW
+	if ceilingW := state.effectiveImportCeilingW(fuseMaxW); ceilingW < fuseW {
+		overage = math.Max(overage, predicted-ceilingW-state.pendingEVCutW())
+	}
 	if currentGrid >= 0 {
 		relief := perPhaseOverageReadingW(meter, state) * float64(state.SiteFusePhases)
 		if relief > 0 && accountPhaseTargetDelta {

@@ -88,6 +88,7 @@ type evMeterLimit struct {
 	raised      bool
 	raisedGridW float64   // site import when the last rise was sent
 	overSince   time.Time // first reading of a run over the hour's import limit
+	overOfferW  float64   // the pool's offer when that run began
 	idleWh      float64   // import since roomSince, for the ceiling's start test
 }
 
@@ -158,7 +159,7 @@ func (s *State) stepEVMeterLimit(meter *telemetry.DerReading, gridW float64, poo
 		lim.overSince = time.Time{}
 	} else {
 		if lim.overSince.IsZero() || gap {
-			lim.overSince = at
+			lim.overSince, lim.overOfferW = at, pool.offerW
 		}
 		if !r.hourly || gap || -r.limitW >= step || at.Sub(lim.overSince) >= evSettle {
 			cutW = math.Min(cutW, r.limitW)
@@ -312,6 +313,19 @@ func (s *State) pendingBatteryCommandsW(now time.Time) float64 {
 		}
 	}
 	return pending
+}
+
+// pendingEVCutW is the EV reduction we sent during the current run over the
+// hour's import limit: the offer when the run began less this tick's offers.
+// Our own commands only. A cut that has reached the meter ends the run, and
+// no run waits longer than evSettle, so a car that draws less than its offer
+// cannot hold an overage through a second cut.
+func (s *State) pendingEVCutW() float64 {
+	lim := &s.evLimit
+	if lim.overSince.IsZero() || s.now().Sub(lim.overSince) >= evSettle || !finiteFuseValue(s.EVCommandedW) {
+		return 0
+	}
+	return math.Max(0, lim.overOfferW-math.Max(0, s.EVCommandedW))
 }
 
 // evPoolFor sums the plugged managed chargers. Before the first command after
