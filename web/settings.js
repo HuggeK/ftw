@@ -400,7 +400,8 @@
 
   function renderTab(tab) {
     var hadBodyFocus = bodyEl.contains(document.activeElement);
-    saveBtn.hidden = tab === "loadpoints" || (tab === "devices" && !!S.chargerSetup);
+    // Access changes nothing in the config: each of its buttons asks the box.
+    saveBtn.hidden = tab === "loadpoints" || tab === "access" || (tab === "devices" && !!S.chargerSetup);
     saveBtn.style.display = saveBtn.hidden ? "none" : "";
     var def = S.tabs[tab];
     if (!def) {

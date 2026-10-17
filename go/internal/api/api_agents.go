@@ -5,8 +5,10 @@ package api
 // An owner phone manages agents over its session, each grant signed by its
 // approval key. On the home network the box is itself the authority, so
 // these routes ask for no signature. They ask for something else: widening
-// access needs the box itself or the house password. With api.lan_auth off,
-// which is the default, every device on the home network is an owner with no
+// access needs another device on the home network, signed in with the house
+// password. The box itself never counts, password or not: a driver's Lua and
+// the session passthrough reach it from inside. With api.lan_auth off, which
+// is the default, every device on the home network is an owner with no
 // sign-in at all, and granting a remote agent from there would let any of
 // them open the house to the outside. Narrowing stays open to any LAN
 // client, as DELETE /api/cloud/grant does.
@@ -51,11 +53,48 @@ type AgentAdmin interface {
 	// ResetClock makes the box trust its clock again after it once ran
 	// ahead, and ends every agent's grant.
 	ResetClock(by string) error
+	// Facts are what the box page checks before it asks the owner for a
+	// code, which works once.
+	Facts() AgentFacts
 }
+
+// AgentFacts say whether this box can take a grant now, and where the owner's
+// browser looks a code up.
+type AgentFacts struct {
+	// Offers says this build pins an FTW Cloud offer key. A build that pins
+	// none opens no offer.
+	Offers bool `json:"offers"`
+	// Lookup is FTW Cloud's code lookup. The owner's browser asks it, and
+	// posts the signed offer it gets here.
+	Lookup string `json:"lookup"`
+	// Clock is ClockOK, ClockUnsynced or ClockBehind.
+	Clock string `json:"clock"`
+	// NowMs is the box's wall clock, and MarkMs the highest wall time it
+	// has seen.
+	NowMs  int64 `json:"nowMs"`
+	MarkMs int64 `json:"markMs"`
+	// Widen says this request would pass the gate for widening access: a
+	// LAN client signed in with the house password, never the box itself.
+	// The list sets it per request, so the page stops before a code is
+	// spent on a grant the box would refuse.
+	Widen bool `json:"widen"`
+}
+
+// The agent clock as the box page reports it.
+const (
+	ClockOK = "ok"
+	// ClockUnsynced is a clock NTP has not set.
+	ClockUnsynced = "unsynced"
+	// ClockBehind is a set clock below the highest time the box has seen.
+	// Agents stay locked out until it passes that time again, or an owner
+	// resets the mark.
+	ClockBehind = "behind"
+)
 
 func (s *Server) agentRoutes() {
 	s.handle("GET    /api/agents", Local, s.handleAgentsList)
 	s.handle("GET    /api/agents/audit", Local, s.handleAgentsAudit)
+	s.handle("POST   /api/agents/offer", Local, s.handleAgentsOffer)
 	s.handle("POST   /api/agents", Local, s.handleAgentsAdd)
 	s.handle("POST   /api/agents/{id}/widen", Local, s.handleAgentsWiden)
 	s.handle("DELETE /api/agents/{id}", Local, s.handleAgentsRevoke)
@@ -80,9 +119,9 @@ func (s *Server) handleAgentsClockReset(w http.ResponseWriter, r *http.Request) 
 }
 
 // agentsGate admits a client on the home network, and with widen only one
-// signed in with the house password, from any address: a driver's Lua and
-// the session passthrough can both reach the box from inside it, so loopback
-// proves nothing. It returns the caller's name for the audit log.
+// signed in with the house password. Loopback never is: the sign-in is not
+// read there, since a driver's Lua and the session passthrough can both reach
+// the box from inside it. It returns the caller's name for the audit log.
 func (s *Server) agentsGate(w http.ResponseWriter, r *http.Request, widen bool) (string, bool) {
 	if s.deps == nil || s.deps.Agents == nil {
 		writeAppLinkError(w, http.StatusServiceUnavailable, "agents are not available on this box")
@@ -134,13 +173,56 @@ func agentError(w http.ResponseWriter, err error) {
 	writeJSON(w, status, map[string]any{"error": r.Code, "args": r.Args})
 }
 
+// agentsPage is agent.list as the box page reads it, with the box's facts and
+// the registry's view of agent ops, so the page names nothing by hand.
+type agentsPage struct {
+	protocol.AgentList
+	Box      AgentFacts     `json:"box"`
+	Registry agentsRegistry `json:"registry"`
+}
+
+type agentsRegistry struct {
+	// AgentOps maps each op an agent may name to the scope that opens it.
+	AgentOps map[string]string `json:"agentOps"`
+	// WriteScopes change something, now or once an owner says yes.
+	WriteScopes []string `json:"writeScopes"`
+	// AgentArgs are each op's arguments, in the registry's order, with the
+	// label an owner reads.
+	AgentArgs map[string][]agentArgView `json:"agentArgs"`
+}
+
+type agentArgView struct {
+	Name  string `json:"name"`
+	Label string `json:"label"`
+	Kind  string `json:"kind"`
+	Unit  string `json:"unit,omitempty"`
+	// Cap names the grant's cap that bounds the argument too.
+	Cap string `json:"cap,omitempty"`
+}
+
+func registryForPage() agentsRegistry {
+	args := map[string][]agentArgView{}
+	for op, list := range protocol.RegistryAgentArgs {
+		for _, a := range list {
+			args[op] = append(args[op], agentArgView{Name: a.Name, Label: a.Label, Kind: a.Kind, Unit: a.Unit, Cap: a.Cap})
+		}
+	}
+	return agentsRegistry{AgentOps: protocol.RegistryAgentOps, WriteScopes: protocol.WriteScopes, AgentArgs: args}
+}
+
 func (s *Server) handleAgentsList(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.agentsGate(w, r, false); !ok {
 		return
 	}
 	a := s.deps.Agents
-	writeJSON(w, http.StatusOK, protocol.AgentList{
-		Agents: nonNil(a.Agents()), Requests: nonNil(a.Requests()), Keys: nonNil(a.ApprovalKeys()),
+	facts := a.Facts()
+	facts.Widen, _ = lanSecretFrom(r.Context())
+	writeJSON(w, http.StatusOK, agentsPage{
+		AgentList: protocol.AgentList{
+			Agents: nonNil(a.Agents()), Requests: nonNil(a.Requests()), Keys: nonNil(a.ApprovalKeys()),
+		},
+		Box:      facts,
+		Registry: registryForPage(),
 	})
 }
 
@@ -186,18 +268,8 @@ func (s *Server) handleAgentsAdd(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "body is not a grant"})
 		return
 	}
-	offer, err := s.deps.Agents.OpenOffer(body.Offer)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "offer is not signed, has expired or is not readable"})
-		return
-	}
-	if home := s.deps.Agents.Home(); offer.Home != "" && offer.Home != home {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "offer is for another box"})
-		return
-	}
-	now, synced := s.deps.Agents.Wall()
-	if !synced {
-		agentError(w, protocol.Refuse(protocol.ErrUnavailable, map[string]any{"subsystem": "clock"}))
+	offer, now, ok := s.openOffer(w, body.Offer)
+	if !ok {
 		return
 	}
 	if !withinOffer(offer, body) {
@@ -228,6 +300,88 @@ func (s *Server) handleAgentsAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, row)
+}
+
+// Why the box will not take an offer, for the page to say in its own words.
+const (
+	OfferNoKeys    = "no_offer_keys"
+	OfferUnsigned  = "unsigned"
+	OfferExpired   = "expired"
+	OfferMalformed = "malformed"
+	OfferOtherHome = "other_home"
+)
+
+// openOffer reads an offer as the box would grant it. When it will not, it
+// answers why and returns false. A clock the box cannot trust comes first:
+// without one every offer would read as expired.
+func (s *Server) openOffer(w http.ResponseWriter, raw string) (protocol.GrantOffer, int64, bool) {
+	a := s.deps.Agents
+	now, synced := a.Wall()
+	if !synced {
+		agentError(w, protocol.Refuse(protocol.ErrUnavailable, map[string]any{"subsystem": "clock"}))
+		return protocol.GrantOffer{}, 0, false
+	}
+	refuse := func(reason, text string) (protocol.GrantOffer, int64, bool) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": text, "reason": reason, "boxMs": now})
+		return protocol.GrantOffer{}, 0, false
+	}
+	offer, err := a.OpenOffer(raw)
+	switch {
+	case errors.Is(err, protocol.ErrOfferSignature) && !a.Facts().Offers:
+		return refuse(OfferNoKeys, "this build of FTW pins no FTW Cloud offer key, so it takes no offer")
+	case errors.Is(err, protocol.ErrOfferSignature):
+		return refuse(OfferUnsigned, "no offer key this box knows signed the offer")
+	case errors.Is(err, protocol.ErrOfferExpired):
+		return refuse(OfferExpired, "the offer has expired by this box's clock")
+	case err != nil:
+		return refuse(OfferMalformed, "the offer is not readable")
+	}
+	if home := a.Home(); offer.Home != "" && offer.Home != home {
+		return refuse(OfferOtherHome, "the offer is for another home")
+	}
+	return offer, now, true
+}
+
+// offerView is a signed offer as the box read it, for the owner to check
+// before granting.
+type offerView struct {
+	Role       string        `json:"role"`
+	Client     string        `json:"client"`
+	ClientID   string        `json:"clientId"`
+	ClientHost string        `json:"clientHost"`
+	Verified   bool          `json:"verified"`
+	Ticket     string        `json:"ticket"`
+	Scopes     []string      `json:"scopes"`
+	Ops        []string      `json:"ops"`
+	Caps       protocol.Caps `json:"caps"`
+	TTLS       uint64        `json:"ttlS"`
+	Code       string        `json:"code"`
+	ExpMs      int64         `json:"expMs"`
+}
+
+// handleAgentsOffer opens a signed offer for the box page, so the owner sees
+// what the box read in it, or why it will not take it, before granting. It
+// grants nothing, so it asks only what reading the agents asks.
+func (s *Server) handleAgentsOffer(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.agentsGate(w, r, false); !ok {
+		return
+	}
+	var body struct {
+		Offer string `json:"offer"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "body needs offer"})
+		return
+	}
+	o, _, ok := s.openOffer(w, body.Offer)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, offerView{
+		Role: o.Role, Client: o.Client, ClientID: o.ClientID, ClientHost: o.ClientHost, Verified: o.Verified,
+		Ticket: o.Ticket, Scopes: nonNil(o.Scopes), Ops: nonNil(o.Ops), Caps: o.Caps, TTLS: o.TTLS,
+		Code: o.Code, ExpMs: o.ExpMs,
+	})
 }
 
 // withinOffer reports whether what the owner chose on the page gives no more

@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"log/slog"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -87,6 +88,13 @@ func (w *wallMark) reset(st *state.Store, nowMs int64) error {
 		return nil
 	}
 	return st.SaveConfig(wallHighKey, strconv.FormatInt(nowMs, 10))
+}
+
+// mark is the highest wall time the box has seen.
+func (w *wallMark) mark() int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.highMs
 }
 
 // save keeps the mark, at most once a sweep.
@@ -436,6 +444,40 @@ func (b boxPageAgents) OpenOffer(raw string) (protocol.GrantOffer, error) {
 		return protocol.GrantOffer{}, protocol.ErrOfferExpired
 	}
 	return protocol.OpenOffer(cloudlink.ParseOfferKeys(cloudlink.OfferKeys), so, now)
+}
+
+// Facts tell the box page whether it can take a grant now, before the owner
+// spends a code that works once.
+func (b boxPageAgents) Facts() api.AgentFacts {
+	now, ok := agentClock()
+	f := api.AgentFacts{
+		Offers: len(cloudlink.ParseOfferKeys(cloudlink.OfferKeys)) > 0,
+		Lookup: codeLookup(cloudlink.Endpoint),
+		NowMs:  now.UnixMilli(),
+		MarkMs: agentWall.mark(),
+	}
+	switch {
+	case ok:
+		f.Clock = api.ClockOK
+	case cloudlink.ClockSynced() && f.NowMs < f.MarkMs:
+		f.Clock = api.ClockBehind
+	default:
+		f.Clock = api.ClockUnsynced
+	}
+	return f
+}
+
+// codeLookup is FTW Cloud's code lookup on the host this build links to.
+func codeLookup(endpoint string) string {
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	scheme := "https"
+	if u.Scheme == "ws" {
+		scheme = "http"
+	}
+	return scheme + "://" + u.Host + "/oauth/requests"
 }
 
 // ReplaceApprovalKey sets a phone's approval key from the box page.

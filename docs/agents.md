@@ -557,8 +557,9 @@ above and its approval key, and an agent can never reach them.
 
 | Route | Who |
 |---|---|
-| `GET /api/agents` | A client on the LAN. Rows, requests and keys |
+| `GET /api/agents` | A client on the LAN. Rows, requests and keys, the box's facts and the registry's agent ops |
 | `GET /api/agents/audit?before=&n=` | A client on the LAN |
+| `POST /api/agents/offer {offer}` | A client on the LAN. The offer as the box reads it; grants nothing |
 | `POST /api/agents {offer, scopes, ops, caps, ttlS}` | A LAN client signed in with the house password |
 | `POST /api/agents/{id}/widen {epoch, scopes, ops, caps, ttlS}` | The same |
 | `POST /api/agent-requests/{reqId} {approve: true}` | The same |
@@ -569,6 +570,19 @@ above and its approval key, and an agent can never reach them.
 
 - A request that brings a house password, and a wrong one, is refused on
   every route, the narrowing ones too.
+- **The page checks before it asks for a code,** since a code works once.
+  `GET /api/agents` carries `box {offers, lookup, clock, nowMs, markMs,
+  widen}`: whether this build pins an offer key, FTW Cloud's code lookup on
+  the host this build links to, whether the clock is `ok`, `unsynced` or
+  `behind` its mark, and whether this request could widen access. It also
+  carries `registry {agentOps, writeScopes,
+  agentArgs}`, so the page names no scope, op or argument by hand.
+- **The box says why it will not take an offer.** `POST /api/agents/offer`
+  and `POST /api/agents` answer an offer the box will not take with 400 and
+  `{error, reason, boxMs}`: `reason` is `no_offer_keys`, `unsigned`,
+  `expired`, `malformed` or `other_home`. A clock the box cannot trust is
+  `E_UNAVAILABLE {subsystem: "clock"}` first, since every offer would
+  otherwise read as expired.
 - `clock-reset` is for a clock that once ran ahead. The box never trusts a
   wall time below the highest it has seen, so until the clock passes that
   time again every agent is locked out. The reset makes now the mark and
@@ -581,9 +595,13 @@ above and its approval key, and an agent can never reach them.
   browser, fetches the signed offer from FTW Cloud's code lookup and posts
   it here. The owner may grant less: `scopes`, `ops`, `caps` and `ttlS`
   replace the offer's when given.
-- **Every route that widens access needs the house password,** from any
-  address, loopback included: a driver's Lua and the session passthrough can
-  both reach the box from inside it.
+- **Every route that widens access needs another device on the home
+  network, signed in with the house password.** The box never reads the
+  sign-in from loopback, so a browser on the box, or one through an SSH
+  tunnel to it, cannot widen access with or without the password: a
+  driver's Lua and the session passthrough can both reach the box from
+  inside it. `box.widen` in `GET /api/agents` says whether this request
+  would pass, so the page stops before a code is spent.
 - **Drivers never reach the box's API.** A driver's HTTP, TCP or WebSocket
   connection to a port the API listens on is refused, whether it goes to a
   loopback address or to an address of the box. The check runs on the

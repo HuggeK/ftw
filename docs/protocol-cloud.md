@@ -28,8 +28,9 @@ for both live in `go/protocol`, under Apache-2.0
 ## Parties and connections
 
 - **Box:** FTW Core linked to FTW Cloud. A box links when it first shows a
-  pairing code or an owner turns the readable copy on, and stays linked while
-  any phone may reach it (see [Link](#link)).
+  pairing code, an owner lets an agent in or an owner turns the readable copy
+  on, and stays linked while any phone or agent may reach it (see
+  [Link](#link)).
 - **Service:** `ftwcloudd`, at `cloud.ftw.energy`.
 - **Phone:** the iPhone app, paired with the box over Noise as today.
 - **Extension:** a widget, notification service extension or Live Activity
@@ -1114,12 +1115,15 @@ box, which the box sends from its first pairing on.
 ### Link
 
 - A box links when it first shows a QR pairing code, when a device that may
-  open a tunnel is paired, or when an owner turns the readable copy on. It
-  makes `cloud.key` then, and the home id with it.
+  open a tunnel is paired, when an owner lets an agent in, or when an owner
+  turns the readable copy on. It makes `cloud.key` then, and the home id with
+  it. An agent row has no tunnel, but FTW Cloud learns of it only from the
+  roster, and an owner with no phone grants one on the box page
+  ([agents.md](agents.md)).
 - A linked box sends its roster and takes `tun`. It sends no readings until
   the owner turns the readable copy on.
-- The link ends when no paired device may open a tunnel, no code is shown
-  and the readable copy is off. The box then sends
+- The link ends when no paired device may open a tunnel, no agent row is
+  left, no code is shown and the readable copy is off. The box then sends
   `bye {why: "revoked", purge: true}` and deletes `cloud.key` on the
   `purged {what: "home"}` receipt. The next link has a new home id.
 - A build that names no service never links.
