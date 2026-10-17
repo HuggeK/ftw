@@ -24,7 +24,14 @@ func TestResumeAcknowledgementWaitsForMeasuredCharge(t *testing.T) {
 	sample := samples["easee"]
 	sample.PowerW = 6900
 	samples["easee"] = sample
-	c.Tick(context.Background(), now.Add(130*time.Second))
+	for _, seconds := range []int{130, 135, 140} {
+		sample.PowerAt = now.Add(time.Duration(seconds) * time.Second)
+		samples["easee"] = sample
+		c.Tick(context.Background(), sample.PowerAt)
+	}
+	if _, exists := c.resumeOffers[cfg.ID]; exists {
+		t.Fatal("sustained measured charging did not clear recovery proof")
+	}
 	sample.PowerW = 0
 	samples["easee"] = sample
 	c.Tick(context.Background(), now.Add(160*time.Second))

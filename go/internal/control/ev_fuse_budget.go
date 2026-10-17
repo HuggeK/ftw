@@ -88,7 +88,7 @@ func coherentEVBalance(store *telemetry.Store, state *State, meter *telemetry.De
 	balance := evFuseBalance{gridW: meter.RawW, siteAt: meter.UpdatedAt}
 	siteAt := meter.UpdatedAt
 	from := now.Add(-telemetry.ControlWindowDuration)
-	windows := store.ControlWindows(from, now)
+	windows := store.ConfirmedControlWindows(from, now)
 	batteries := pendingBatterySeriesForFuse(store, state, windows, now)
 	sites := windows[state.SiteMeterDriver+":"+telemetry.DerMeter.String()].Points
 	if current, ok := qualifiedFuseObservation(meter, now); ok {
