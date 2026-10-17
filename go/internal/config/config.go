@@ -274,7 +274,7 @@ func (f *FleetPing) On() bool {
 // this address after FTW moved the collector, and the aggregate would
 // quietly lose every box that had ever saved its settings.
 func (f *FleetPing) Resolved() string {
-	if f == nil || f.Endpoint == "" || strings.TrimSpace(f.Endpoint) == "https://relay.ftw.energy/fleet/report" {
+	if f == nil || f.Endpoint == "" || strings.TrimSpace(f.Endpoint) == "https://relay.ftw.energy/fleet" {
 		return DefaultFleetPingEndpoint
 	}
 	return f.Endpoint

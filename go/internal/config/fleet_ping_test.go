@@ -131,7 +131,7 @@ func TestFleetPingSwitchNeedsNoRestartButTheEndpointDoes(t *testing.T) {
 }
 
 func TestAnExplicitRetiredFleetCollectorResolvesToCloud(t *testing.T) {
-	f := &FleetPing{Enabled: true, Endpoint: "https://relay.ftw.energy/fleet/report"}
+	f := &FleetPing{Enabled: true, Endpoint: "https://relay.ftw.energy/fleet"}
 	if f.Resolved() != DefaultFleetPingEndpoint {
 		t.Fatal(f.Resolved())
 	}
