@@ -67,6 +67,7 @@ func (l *Link) once(ctx context.Context, snap grantSnapshot) (time.Duration, err
 	up := l.connected
 	upFor := time.Since(l.upAt)
 	l.connected = false
+	l.serviceStatsPolicy = ""
 	if time.Since(connectedAt) >= backoffCap {
 		l.attempt = 0
 	}
@@ -303,6 +304,7 @@ func (l *Link) serve(ctx context.Context, conn uplinkConn, snap grantSnapshot) e
 	tunOut, tunBulk := make(chan []byte, tunQueue), make(chan []byte, tunBulkQueue)
 	l.mu.Lock()
 	l.connected = true
+	l.serviceStatsPolicy = ok.StatsPolicy
 	l.upAt = time.Now()
 	l.transport = transportOf(conn)
 	l.shardHops, l.hostFails = 0, 0

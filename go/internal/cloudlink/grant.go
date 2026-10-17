@@ -71,6 +71,7 @@ type grantRecord struct {
 	StatsID []byte `json:"statsId,omitempty"`
 	// StatsPolicy names the consent text the owner read for statistics.
 	StatsPolicy string `json:"statsPolicy,omitempty"`
+	StatsAtMs   int64  `json:"statsAtMs,omitempty"`
 	// Revoked means the owner turned the readable copy off and the service
 	// has not yet confirmed that the copy is gone. The record stays until it
 	// has; the link and its key stay after.

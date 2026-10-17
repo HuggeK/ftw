@@ -362,6 +362,7 @@ with two different values, so neither side's check passes through it.
    | `ekm` | bstr, 32 B | The service's exporter value for this TLS session |
    | `have` | map text→text | Tile id to etag, for the tiles the service holds |
    | `rosterSeq` | uint | The roster number the service holds |
+   | `statsPolicy` | text, optional | The statistics policy this service is approved to ingest. Missing means no statistics; the box sends none |
 
    `caps` and `grantId` describe the connection as it starts. The readable
    copy can turn on or off while the link stays up, so the service takes
@@ -728,6 +729,9 @@ every call.
 | `id` | bstr, 16 B or empty | Grant id. Empty while the readable copy is off |
 | `scopes` | [text] | A subset of `cloud_scopes`. Empty while the copy is off or being withdrawn |
 | `purposes` | [text] | A subset of `cloud_purposes`: `serve` while the copy is on, and `stats` while the owner contributes to statistics. Empty while the copy is off or being withdrawn |
+| `statsId` | bstr, 16 B, optional | Random id for the separately accepted statistics policy; omitted when off |
+| `statsPolicy` | text, optional | Exact policy the owner accepted |
+| `statsSinceMs` | uint, optional | Consent start in UTC milliseconds; only later closed hours may contribute |
 | `controller` | text | The data controller: `sourceful` unless a partner pairing flow sets another. No such flow exists yet |
 
 A grant has three shapes. With an id and `serve`, the readable copy is on.
@@ -745,26 +749,32 @@ each time it receives such a roster. With no id, there is no copy.
 Only a QR code is listed. A spoken code has 40 bits, and its hash would let
 the service find it offline; it pairs over the relay or the home network.
 
-**`stats`**, only while `grant.purposes` contains `stats`.
+**`stats`**
+
+Signed box to service only. Never forwarded to phones or agents. The box
+sends at most one report per closed UTC hour, after fresh consent to
+`ftw-project-stats-2026-10-v1`. Older policies send nothing.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `statsId` | bstr, 16 B | Random, drawn by the box at consent |
-| `policy` | text | Version of the consent text the owner accepted |
-| `zone` | text | Price zone |
-| `has` | [text] | Which of `battery`, `pv` and `ev_charger` the site has |
-| `hours` | [Hour] | At most 168 per message |
+| `statsId` | bstr, 16 B | Must match the current signed grant |
+| `policy` | text | Exact statistics policy version |
+| `hourMs` | uint | Closed UTC hour start, no older than 24 hours and not before consent |
+| `metrics` | map(text, uint) | Allowlisted values, rounded to 10; missing means unknown |
 
-**Hour.** `startMs`, then Wh totals for the site, rounded to 10 Wh, under the
-energy ledger's flow names: `grid_import`, `grid_export`, `pv_generation`,
-`battery_charge`, `battery_discharge`, `consumer_use`, `vehicle_charge` and
-`vehicle_discharge`. A flow the site lacks is absent.
+Keys: `battery_capacity_wh`, `flexible_power_w`, `pv_rated_w`,
+`grid_import_wh`, `grid_export_wh`, `pv_generation_wh`, `battery_charge_wh`,
+`battery_discharge_wh`, `vehicle_charge_wh`, `vehicle_discharge_wh`. Each
+value is at most 1,000,000. Flexible power sums configured battery and charger
+limits, with shared inverter groups counted once; it does not prove physical
+control. Energy is recorded ledger energy and may cover only part of an hour.
+No names, hardware ids, location, prices or live readings leave this path.
 
-The service refuses `stats` for a `statsId` it has deleted, so an old grant
-record cannot turn a withdrawn consent back on.
-
-**`stats.withdraw`** `{statsId}`. The service deletes that id's rows within
-24 hours.
+The service upserts by home and hour, keeps these consented rows for 13 months,
+and deletes them when it receives statistics withdrawal or a home purge.
+Only cells with at least 20 homes and no home above 30 percent of the sum
+are public. The public view counts reporting installations, never people.
+Partner-controlled sites do not send.
 
 **`notice`**, whenever the box is linked, with the readable copy on or off.
 
@@ -1394,6 +1404,7 @@ consent text.
 | Route | Who may call it |
 |---|---|
 | `GET /api/cloud` | An owner's session, or a client on the LAN. State, scopes, purposes, bytes sent in the last 24 hours of uptime, whether the byte budget is reached |
+| `GET /api/cloud/stats-policy` | The same. Exact fields, purpose and group rules for a fresh consent |
 | `GET /api/cloud/preview` | The same. The exact bytes that leave the house |
 | `POST /api/cloud/grant {scopes, policy}` | An owner's session. On the LAN, only from loopback or with the house password. On a grant already on, it changes the scopes and keeps the key, home id and `grantKey` |
 | `POST /api/cloud/stats {policy}` | The same gate, as a separate consent. 409 while the grant is off or a revoke waits for its receipt |
@@ -1408,11 +1419,11 @@ app's, so the grant screen claims no more than an owner's session.
   or off, push nothing. Every change writes an audit line on the box. A grant,
   a change of scopes and a statistics change each send a new roster.
 - `POST /api/cloud/stats` draws a `statsId` the first time and keeps it while
-  statistics stay on. Turning statistics on again after a withdrawal draws a
-  new one.
+  statistics stay on under the same policy. A new policy draws a new id.
+  Turning statistics on again after a withdrawal draws a new one.
 - `DELETE /api/cloud/stats` removes `stats` from the purposes at once. The
-  box keeps the `statsId` until `purged {what: "stats"}` arrives, so that
-  `stats.withdraw` can name it.
+  box forgets its stats id and sends a roster without statistics metadata.
+  Cloud deletes the rows when it receives that signed roster.
 
 ## Revocation and deletion
 
@@ -1432,9 +1443,9 @@ app's, so the grant screen claims no more than an owner's session.
   `cloud.key` and sends only `hello` and `bye` on each connect. With a valid
   `purged` it deletes the key. A box of an earlier release still ends its
   grant this way.
-- **Statistics withdrawal:** `stats.withdraw`. The service deletes the rows
-  within 24 hours and sends `purged {what: "stats"}` when done, on the same or
-  a later connection.
+- **Statistics withdrawal:** a signed roster without the statistics consent
+  deletes the home's unpublished rows before accepting another report. If
+  the box is offline, this happens on reconnect.
 - **Silence:** after an hour without the box's socket, the service serves only
   `lastSeenMs` and no readings. When the roster runs out, it closes sessions
   and refuses reads. After 30 days it drops tokens and APNs registrations.

@@ -48,7 +48,7 @@ var Fields = map[string][]string{
 	"Agent":      {"scopes", "ops", "caps", "expiresAtMs", "principal"},
 	"Caps":       {"holdS", "maxW", "perMin"},
 	"Principal":  {"client", "clientId", "ticket"},
-	"Grant":      {"id", "scopes", "purposes", "controller"},
+	"Grant":      {"id", "scopes", "purposes", "controller", "statsId", "statsPolicy", "statsSinceMs"},
 	"Pending":    {"hash", "ttlS"},
 	"WebPushRow": {"id", "dev", "epoch", "endpoint", "ct", "auth"},
 
@@ -58,6 +58,7 @@ var Fields = map[string][]string{
 	// client an owner gave access, on agent.added while the copy carries
 	// events, which FTW Cloud's own consent page showed.
 	MsgNotice: {"kind", "client"},
+	MsgStats:  {"statsId", "policy", "hourMs", "metrics"},
 
 	// tun carries no header and no signature: d is Noise ciphertext its two
 	// ends authenticate, and the service reads only dev and sid.
@@ -79,6 +80,7 @@ var Bodies = map[string]any{
 	MsgRoster: Roster{},
 	MsgBye:    Bye{},
 	MsgNotice: Notice{},
+	MsgStats:  Stats{},
 }
 
 // Unheaded are the box's messages without the common header.

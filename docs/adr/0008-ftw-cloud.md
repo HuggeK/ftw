@@ -263,8 +263,8 @@ later step stands on it and ships on its own.
 | C8 Statistics | Ingest, backfill, cell rules | DPIA signed; withdrawal purges within 24 hours |
 
 The statistics switch ships with the start flow in C4. The box records consent
-and `statsId` from then on, nothing is sent until C8, and the backfill covers
-the gap. The lawyer also confirms that order: if the DPIA in C8 changes the
+and `statsId` from then on. The October project policy below needs new
+consent and sends only later hours; it does not backfill the earlier gap. The lawyer also confirms that order: if the DPIA in C8 changes the
 rules, the app asks again. A public launch needs C2–C4 and the legal work.
 
 ## Alternatives considered
@@ -293,3 +293,31 @@ rules, the app asks again. A public launch needs C2–C4 and the legal work.
 | Claims or defaults drift back | Claim tests; a missing grant reads as off |
 | A paid app meets App Store purchase rules | Decide the payment path before charging |
 | AGPL code in the App Store | An App Store exception in `ftw-app` before outside code arrives |
+
+### Project statistics policy, October 2026
+
+`ftw-project-stats-2026-10-v1` adds configured battery capacity, flexible
+power and solar ratings to the closed-hour energy scope. This needs fresh
+consent; an earlier statistics choice sends none of these fields. The owner
+can read the policy through `GET /api/cloud/stats-policy`, then accept its
+exact id through the existing owner-only statistics API. Stats stay off by
+default. Changing the policy rotates the random stats id and starts a new
+consent window. Hours before that window never contribute.
+
+The public view counts installations reporting in the last 24 closed hours.
+It sums the recorded hours, which may be incomplete; it does not claim all
+FTW users, full-day production or measured control capacity. Configured
+limits remain distinct from measured command results. Unknown values stay
+absent. Cloud keeps the consented hourly rows for 13 months and publishes
+only the existing group thresholds. Withdrawal deletes unpublished rows
+when Cloud receives the signed roster; offline withdrawal takes effect on
+reconnect. Published group totals remain. Native consent UI must adopt the
+new policy before it can enable this scope.
+
+C8 stays off until its signed DPIA is recorded. The service starts with no
+approved statistics policy. Only an explicit operator setting enables the
+exact policy in signed `hello_ok`; Core sends no hours without that signal,
+even if an owner previously chose to contribute. The owner policy response
+reports this readiness so native clients can explain the wait. Pausing the
+service policy stops collection while withdrawal and retention still run.
+Deploying this code does not sign the DPIA or accept a household's consent.
