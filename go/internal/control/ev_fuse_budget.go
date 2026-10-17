@@ -127,6 +127,12 @@ func coherentEVBalance(store *telemetry.Store, state *State, meter *telemetry.De
 		if site.At.Before(from) || site.At.After(now) || !finiteFuseValue(site.PowerW) {
 			continue
 		}
+		// Without a positive managed EV observation, an older high site
+		// sample has no replacement credit to align. Use the latest site
+		// fallback instead of retaining demand from a completed EV stop.
+		if len(series) == 0 && !site.At.Equal(siteAt) {
+			continue
+		}
 		credit, coherent := 0.0, true
 		for _, ev := range series {
 			w, ok := bracketedEVPowerAt(ev.points, site.At, ev.latest)
@@ -144,8 +150,12 @@ func coherentEVBalance(store *telemetry.Store, state *State, meter *telemetry.De
 			return balance
 		}
 	}
-	// No common bracket exists. A battery already observed before this
-	// latest site read uses the same baseline as the latest-site guard.
+	// No common bracket exists. Keep the EV credit already qualified at
+	// this latest site instant; dropping it here would count the same EV
+	// as household demand in a second bound on the very same site reading.
+	balance.poolW = balance.latestPoolW
+	// A battery already observed before this latest site read uses the
+	// same baseline as the latest-site guard.
 	// A first battery observation AFTER the site read cannot establish how
 	// much earlier discharge the meter contains: retain its full fallback.
 	balance.pendingW = 0
