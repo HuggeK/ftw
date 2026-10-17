@@ -105,6 +105,7 @@ release-workflow-test:
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_package_legacy_linux.py'
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_native_release_order.py'
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_native_schema.py'
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_write_native_release_notes.py'
 	bash scripts/test-upload-release-assets.sh
 	bash -n scripts/check-ghcr-write-access.sh scripts/test-ghcr-write-access.sh
 	bash -n scripts/test-exact-image-promotion.sh scripts/build-core.sh

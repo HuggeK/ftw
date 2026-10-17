@@ -53,11 +53,6 @@ jobs:
           test "${GITHUB_REF}" = refs/heads/master
           test -n "${GH_TOKEN}"
           [[ "${CHANNEL}" = beta || "${CHANNEL}" = stable ]]
-          latest=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)
-          if [[ ! "${latest}" =~ ^v2\.[0-9]+\.[0-9]+$ ]]; then
-            echo "public latest must stay on a 2.x stable release (found ${latest})" >&2
-            exit 1
-          fi
           gh api --paginate --slurp \
             "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
             > "${RUNNER_TEMP}/native-release-pages.json"
@@ -66,6 +61,7 @@ jobs:
           # Stable checks out an older beta's source below, which may lack
           # this checker; keep the current one.
           cp scripts/check-native-schema.py "${RUNNER_TEMP}/check-native-schema.py"
+          cp scripts/write-native-release-notes.py "${RUNNER_TEMP}/write-native-release-notes.py"
           if [ "${CHANNEL}" = stable ]; then
             if [[ ! "${TAG}" =~ ^v0\.[0-9]+\.[0-9]+$ ]] ||
                [[ ! "${SOURCE_BETA}" =~ ^v0\.[0-9]+\.[0-9]+-beta\.[0-9]+$ ]] ||
@@ -186,13 +182,11 @@ jobs:
               "sha256": assets,
           }
           (release / "ftw-native-release.json").write_text(json.dumps(receipt, indent=2) + "\n")
-          notes = f"Native FTW {receipt['tag']} from {receipt['commit']}.\n\n"
-          if receipt["source_beta"]:
-              notes += f"Promoted from site-tested {receipt['source_beta']}.\n\n"
-          notes += f"<!-- ftw-state-schema-v2:{receipt['state_schema']} -->\n"
-          (release / "notes.md").write_text(notes)
           PY
-      - name: Anchor immutable tag and publish without moving legacy latest
+          python3 "${RUNNER_TEMP}/write-native-release-notes.py" \
+            "${RUNNER_TEMP}/native-release/ftw-native-release.json" CHANGELOG.md \
+            "${RUNNER_TEMP}/native-release/notes.md" --repo "${GITHUB_REPOSITORY}"
+      - name: Anchor immutable tag and publish the selected channel
         if: ${{ !inputs.dry_run }}
         env:
           CHANNEL: ${{ inputs.channel }}
@@ -264,12 +258,7 @@ jobs:
               "${release_dir}/ftw-native-release.json"
           if jq -e '.isDraft == true' <<<"${release_info}" >/dev/null; then
             gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" \
-              --draft=false --latest=false --verify-tag
-          fi
-          latest=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)
-          if [[ ! "${latest}" =~ ^v2\.[0-9]+\.[0-9]+$ ]]; then
-            echo "native publication changed the old latest slot to ${latest}" >&2
-            exit 1
+              --draft=false --latest=false --verify-tag --notes-file "${release_dir}/notes.md"
           fi
       - name: Report verified dry run
         if: ${{ inputs.dry_run }}
