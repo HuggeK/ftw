@@ -1,7 +1,6 @@
 package control
 
 import (
-	"encoding/json"
 	"log/slog"
 	"math"
 	"time"
@@ -99,12 +98,13 @@ type evPool struct {
 
 // EVFuseBudget returns the managed EVs' common hard cap, which the loadpoint
 // controller divides between cars. Callers hold the control lock, and the
-// shared freshness gate must already allow dispatch. An overage on the latest
-// site reading cuts at once. Inside the limits the cap holds; it rises one
-// step only on a fresh reading with room for two, once the meter has shown
-// the last change. An idle pool starts only after the meter has kept showing
-// room for its minimum plus a step. Each reading acts once, so a silent
-// meter can never raise or restart a charge.
+// shared freshness gate must already allow dispatch. A fuse overage in total
+// import cuts at once; a phase overage cuts once that phase's heat budget is
+// spent, or at once above fuseInstantFactor. Otherwise the cap holds; it
+// rises one step only on a fresh reading with room for two, once the meter
+// has shown the last change. An idle pool starts only after the meter has
+// kept showing room for its minimum plus a step. Each reading acts once, so
+// a silent meter can never raise or restart a charge.
 func EVFuseBudget(store *telemetry.Store, state *State, points []loadpoint.State, configs []loadpoint.Config, fuseMaxW float64) (float64, bool) {
 	if store == nil || state == nil || !finiteFuseValue(fuseMaxW) || fuseMaxW <= 0 {
 		return 0, true
@@ -117,6 +117,7 @@ func EVFuseBudget(store *telemetry.Store, state *State, points []loadpoint.State
 	if !finiteFuseValue(gridW) {
 		return 0, true
 	}
+	state.stepFuseHeat(meter)
 	lim := &state.evLimit
 	pool, plugged := evPoolFor(state, points, configs)
 	if !plugged {
@@ -148,10 +149,11 @@ func (s *State) stepEVMeterLimit(meter *telemetry.DerReading, gridW float64, poo
 	}
 	r := s.evMeterRoom(meter, gridW, pool.phases, fuseMaxW)
 	step := evPhaseMarginA * s.SiteFuseVoltage * pool.phases
-	// The fuse cuts on every reading. The hour's budget absorbs a short
-	// overage of less than a step: it cuts once the overage has lasted
-	// evSettle, so one reading over the ceiling changes nothing.
-	cutW := r.fuseW
+	// The fuse cuts on every reading, by its heat budget where the meter
+	// reports phase currents. The hour's budget absorbs a short overage of
+	// less than a step: it cuts once the overage has lasted evSettle, so one
+	// reading over the ceiling changes nothing.
+	cutW := r.fuseCutW
 	if r.limitW >= 0 {
 		lim.overSince = time.Time{}
 	} else {
@@ -169,7 +171,8 @@ func (s *State) stepEVMeterLimit(meter *telemetry.DerReading, gridW float64, poo
 		if lim.capW < prev {
 			lim.changedAt, lim.raised = now, false
 			slog.Info("EV hard limit: site meter over limit", "grid_w", gridW, "worst_phase_a", r.worstA,
-				"import_limit_w", s.effectiveImportCeilingW(fuseMaxW), "overage_w", -cutW, "offer_w", peakW, "cap_w", lim.capW)
+				"fuse_heat_a", s.fuseHeat.worstA(), "import_limit_w", s.effectiveImportCeilingW(fuseMaxW),
+				"overage_w", -cutW, "offer_w", peakW, "cap_w", lim.capW)
 		}
 		return
 	}
@@ -252,7 +255,8 @@ func (s *State) stepEVIdleStart(r evMeterRoom, gridW float64, pool evPool, first
 // evMeterRoom is the measured room in EV watts. The fuse's part holds on
 // every reading. The import ceiling's parts are +Inf while it is off.
 type evMeterRoom struct {
-	fuseW       float64 // below the fuse less its margin and the worst phase
+	fuseW       float64 // below the fuse less its margin and the worst phase, read or heat; rises and starts
+	fuseCutW    float64 // what the fuse needs cut now, negative; see fuseHeat
 	limitW      float64 // below the hour's import limit; negative is an overage
 	riseW       float64 // below the level an increase may reach
 	startLevelW float64 // import an idle start may reach: the rise level, at most the ceiling
@@ -262,8 +266,8 @@ type evMeterRoom struct {
 }
 
 func (s *State) evMeterRoom(meter *telemetry.DerReading, gridW, phases, fuseMaxW float64) evMeterRoom {
-	inf := math.Inf(1)
-	r := evMeterRoom{fuseW: math.Max(0, fuseMaxW-s.fuseSafetyMarginW()) - gridW, limitW: inf, riseW: inf, startLevelW: inf}
+	inf, totalW := math.Inf(1), math.Max(0, fuseMaxW-s.fuseSafetyMarginW())-gridW
+	r := evMeterRoom{fuseW: totalW, fuseCutW: totalW, limitW: inf, riseW: inf, startLevelW: inf}
 	if limitW, riseW, ok := s.importHourLimitsW(); ok {
 		r.limitW, r.riseW = limitW-gridW, riseW-gridW
 		// A car that could run only on one hour's slack would stop when
@@ -271,14 +275,19 @@ func (s *State) evMeterRoom(meter *telemetry.DerReading, gridW, phases, fuseMaxW
 		r.startLevelW = math.Min(riseW, s.PeakImportCeilingW)
 		r.hourly = s.importHourMeasured()
 	}
-	worst, present, valid := worstPhaseA(meter, s)
+	amps, present, valid := phaseCurrentsA(meter, s)
 	if present && !valid {
 		return r
 	}
 	r.measured = true
 	if present {
-		r.fuseW = math.Min(r.fuseW, (s.SiteFuseAmps-evPhaseMarginA-worst)*s.SiteFuseVoltage*phases)
-		r.worstA = worst
+		limitA := s.SiteFuseAmps - evPhaseMarginA
+		for _, a := range amps {
+			r.worstA = math.Max(r.worstA, a)
+		}
+		r.fuseW = math.Min(r.fuseW, (limitA-s.fuseHeat.levelA(amps))*s.SiteFuseVoltage*phases)
+		// The phases measure the fuse itself; total import stands in only without them.
+		r.fuseCutW = -s.fuseHeat.overA(amps, limitA, fuseInstantFactor*s.SiteFuseAmps) * s.SiteFuseVoltage * phases
 	}
 	return r
 }
@@ -286,25 +295,11 @@ func (s *State) evMeterRoom(meter *telemetry.DerReading, gridW, phases, fuseMaxW
 // worstPhaseA reads the site's configured phases. present is false when the
 // meter reports no phase currents; valid is false when they cannot be used.
 func worstPhaseA(meter *telemetry.DerReading, state *State) (worstA float64, present, valid bool) {
-	// DER data uses snake case; separate fields retain absent-vs-zero.
-	var data struct {
-		L1 *float64 `json:"l1_a"`
-		L2 *float64 `json:"l2_a"`
-		L3 *float64 `json:"l3_a"`
+	amps, present, valid := phaseCurrentsA(meter, state)
+	for _, a := range amps {
+		worstA = math.Max(worstA, a)
 	}
-	if json.Unmarshal(meter.Data, &data) != nil || (data.L1 == nil && data.L2 == nil && data.L3 == nil) {
-		return 0, false, false
-	}
-	if !finiteFuseValue(state.SiteFuseAmps) || !finiteFuseValue(state.SiteFuseVoltage) || state.SiteFuseAmps <= 0 || state.SiteFuseVoltage <= 0 || state.SiteFusePhases < 1 || state.SiteFusePhases > 3 {
-		return 0, true, false
-	}
-	for _, amps := range []*float64{data.L1, data.L2, data.L3}[:state.SiteFusePhases] {
-		if amps == nil || !finiteFuseValue(*amps) {
-			return 0, true, false
-		}
-		worstA = math.Max(worstA, math.Abs(*amps))
-	}
-	return worstA, true, true
+	return worstA, present, valid
 }
 
 // pendingBatteryCommandsW is battery increase we ordered that the meter may

@@ -261,10 +261,10 @@ func (s *evBatterySite) offer() float64 {
 	return s.offers[len(s.offers)-1].w
 }
 
-// A 2 kW house step lands while the battery and the car both charge. The
-// battery dispatch and the EV guard answer the same overage, so the car is
-// cut too. EV first: the car must not stop, the battery must yield, and the
-// car must get back to its offer within a minute.
+// A 2 kW house step lands while the battery and the car both charge. EV
+// first: the car must not stop and the battery must yield. The battery
+// answers within a tick, inside the fuse's heat budget, so the car keeps its
+// offer; a car that is cut must get back to it within a minute.
 func TestEVFirstHouseStepWhileBatteryAndEVCharge(t *testing.T) {
 	s := newEVBatterySite(t, 3000)
 	s.run(3*time.Minute + 30*time.Second)
@@ -291,14 +291,18 @@ func TestEVFirstHouseStepWhileBatteryAndEVCharge(t *testing.T) {
 			backAt = s.now
 		}
 	}
-	t.Logf("EV %.0f -> lowest %.0f W, back after %v; battery %.0f -> %.0f W", evBefore, lowest, backAt.Sub(stepAt), batteryBefore, s.batteryW)
+	back := "never cut"
+	if !backAt.IsZero() {
+		back = "back after " + backAt.Sub(stepAt).String()
+	}
+	t.Logf("EV %.0f -> lowest %.0f W, %s; battery %.0f -> %.0f W", evBefore, lowest, back, batteryBefore, s.batteryW)
 	if lowest <= 0 {
 		t.Fatal("the house step stopped the car")
 	}
 	if s.batteryW > batteryBefore-2000+.01 {
 		t.Fatalf("battery %.0f -> %.0f W did not yield the step", batteryBefore, s.batteryW)
 	}
-	if backAt.IsZero() || backAt.Sub(stepAt) > time.Minute {
+	if lowest < evBefore && (backAt.IsZero() || backAt.Sub(stepAt) > time.Minute) {
 		t.Fatalf("EV not back at %.0f W within a minute (now %.0f W)", evBefore, s.offer())
 	}
 	if s.gridW() > 16560.01 {

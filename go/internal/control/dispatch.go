@@ -376,6 +376,8 @@ type State struct {
 	evFuseDemandsSet bool
 	// evLimit is the EVs' meter-driven hard cap, kept between site readings.
 	evLimit evMeterLimit
+	// fuseHeat is the main fuse's heat per phase, from site readings only.
+	fuseHeat fuseHeat
 	// evOffers and batteryCommands are our own recent commands, the only
 	// device input the EV hard limit and the EV/battery split use.
 	evOffers        commandLog
