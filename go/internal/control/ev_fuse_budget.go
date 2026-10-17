@@ -25,6 +25,7 @@ func finiteFuseValue(w float64) bool { return !math.IsNaN(w) && !math.IsInf(w, 0
 type evFuseBalance struct {
 	gridW, poolW, pendingW      float64
 	latestPoolW, latestPendingW float64
+	latestGridW                 float64
 	siteAt                      time.Time
 	evEvidence                  []evFuseEvidence
 }
@@ -74,7 +75,7 @@ func EVFuseBudget(store *telemetry.Store, state *State, points []loadpoint.State
 			"physical_fuse_w", fuseMaxW, "configured_import_ceiling_w", state.PeakImportCeilingW,
 			"common_ceiling_w", commonCeiling, "latest_ceiling_w", latestCeiling,
 			"common_grid_w", balance.gridW, "common_ev_credit_w", balance.poolW, "common_pending_battery_w", balance.pendingW,
-			"latest_grid_w", meter.RawW, "latest_ev_credit_w", balance.latestPoolW, "latest_pending_battery_w", balance.latestPendingW,
+			"latest_grid_w", balance.latestGridW, "latest_ev_credit_w", balance.latestPoolW, "latest_pending_battery_w", balance.latestPendingW,
 			"ev_credit_evidence", balance.evEvidence,
 			"common_cap_w", cap, "latest_site_cap_w", latestCap, "phase_bound_known", phaseKnown, "phase_cap_w", phaseCap, "final_cap_w", finalCap)
 	}
@@ -88,6 +89,7 @@ func EVFuseBudget(store *telemetry.Store, state *State, points []loadpoint.State
 // filtered load estimate participates in the hard limit.
 func coherentEVBalance(store *telemetry.Store, state *State, meter *telemetry.DerReading, points []loadpoint.State, now time.Time) evFuseBalance {
 	balance := evFuseBalance{gridW: meter.RawW, siteAt: meter.UpdatedAt}
+	balance.latestGridW = balance.gridW
 	siteAt := meter.UpdatedAt
 	from := now.Add(-telemetry.ControlWindowDuration)
 	windows := store.ConfirmedControlWindows(from, now)
@@ -113,7 +115,7 @@ func coherentEVBalance(store *telemetry.Store, state *State, meter *telemetry.De
 		r := store.Get(point.DriverName, telemetry.DerEV)
 		h := store.DriverHealth(point.DriverName)
 		current, ok := qualifiedFuseObservation(r, now)
-		evidence := fuseEVEvidence(point.DriverName, r, h, current, ok, now)
+		evidence := evFuseEvidence{ControlPowerEvidence: telemetry.DescribeControlPower(point.DriverName, r, h, current, ok, now)}
 		balance.evEvidence = append(balance.evEvidence, evidence)
 		if !ok || h == nil || !h.TelemetryLive() || current.PowerW <= 0 {
 			continue // Unknown EV power stays inside the measured site demand.
