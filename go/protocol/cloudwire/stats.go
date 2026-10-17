@@ -2,9 +2,11 @@ package cloudwire
 
 import "slices"
 
-// StatsPolicy requires fresh consent: the earlier hourly-energy policy did
-// not include configured equipment capacity or power limits.
-const StatsPolicy = "ftw-project-stats-2026-10-v1"
+// StatsPolicy names the scope included in the current Cloud terms, or
+// accepted through the separate local statistics question. Earlier choices
+// never accept this policy. Collection still requires service approval.
+const StatsPolicy = "ftw-project-stats-2026-10-v2"
+const CloudTermsPolicy = "ftw-cloud-2026-10-v2"
 const MsgStats = "stats"
 const StatsHourMS = int64(3_600_000)
 const StatsMinimumHomes = 20

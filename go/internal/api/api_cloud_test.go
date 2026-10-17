@@ -34,6 +34,8 @@ func (c *stubCloud) Grant(req cloudlink.GrantRequest) error {
 	c.granted = append(c.granted, req)
 	return c.err
 }
+func (c *stubCloud) End(by string) error { return c.Revoke(by) }
+
 func (c *stubCloud) Revoke(by string) error {
 	c.revoked = append(c.revoked, by)
 	return nil
@@ -281,6 +283,7 @@ func TestAViewerReachesNoCloudRoute(t *testing.T) {
 		{http.MethodGet, "/api/cloud/preview", "", s.handleCloudPreview},
 		{http.MethodPost, "/api/cloud/grant", grantBody, s.handleCloudGrant},
 		{http.MethodDelete, "/api/cloud/grant", "", s.handleCloudRevoke},
+		{http.MethodDelete, "/api/cloud", "", s.handleCloudEnd},
 		{http.MethodPost, "/api/cloud/stats", statsBody, s.handleCloudStats},
 		{http.MethodDelete, "/api/cloud/stats", "", s.handleCloudStopStats},
 	} {
@@ -385,4 +388,16 @@ func (k *cloudKV) SaveConfig(key, value string) error {
 	defer k.mu.Unlock()
 	k.m[key] = value
 	return nil
+}
+
+func TestWholeCloudOffUsesTheExistingNarrowingAccessRule(t *testing.T) {
+	for _, req := range []*http.Request{sessionRequest(http.MethodDelete, "/api/cloud", ""), localRequest(http.MethodDelete, "/api/cloud", "")} {
+		c := &stubCloud{}
+		s := New(&Deps{Cloud: c})
+		w := httptest.NewRecorder()
+		s.handleCloudEnd(w, req)
+		if w.Code != http.StatusOK || len(c.revoked) != 1 {
+			t.Fatal("whole Cloud off failed", w.Code)
+		}
+	}
 }

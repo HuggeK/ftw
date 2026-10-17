@@ -7,11 +7,12 @@ import (
 	"time"
 
 	"github.com/srcfl/ftw/go/internal/state"
+	"github.com/srcfl/ftw/go/protocol"
 	"github.com/srcfl/ftw/go/protocol/cloudwire"
 )
 
-// CloudStatistics contains only the fields named by the separate statistics
-// consent. Configuration and ledger ids never cross this boundary.
+// CloudStatistics contains only the fields named by the versioned project
+// statistics terms. Configuration and ledger ids never cross this boundary.
 func (s *Server) CloudStatistics(ctx context.Context, now time.Time) (cloudwire.Stats, bool) {
 	hour := now.UTC().Truncate(time.Hour).Add(-time.Hour)
 	out := cloudwire.Stats{HourMS: hour.UnixMilli(), Metrics: map[string]int64{}}
@@ -128,13 +129,17 @@ func (s *Server) handleCloudStatsPolicy(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"available":                  available,
 		"policy":                     cloudwire.StatsPolicy,
+		"cloud_scopes":               protocol.CloudScopes,
+		"cloud_policy":               cloudwire.CloudTermsPolicy,
+		"cloud_includes_statistics":  true,
+		"standalone":                 true,
 		"purpose":                    "Publish group totals for FTW use and energy; improve planning. No ads or household decisions.",
 		"fields":                     cloudwire.StatsMetricKeys,
-		"meaning":                    "One opted-in installation, configured flexible power and solar ratings, battery capacity, and recorded closed-hour energy. Configured limits do not prove physical control. Missing readings are unknown.",
+		"meaning":                    "One reporting installation, configured flexible power and solar ratings, battery capacity, and recorded closed-hour energy. Configured limits do not prove physical control. Missing readings are unknown.",
 		"resolution":                 "Closed UTC hours, energy rounded to 10 Wh, capacities and limits rounded to 10 Wh or W. No names, addresses, device ids or location.",
-		"retention":                  "13 months. Switching statistics off deletes unpublished household rows; published group totals remain.",
+		"retention":                  "13 months. Leaving Cloud or stopping local sharing deletes unpublished household rows; published group totals remain.",
 		"publication_minimum_homes":  cloudwire.StatsMinimumHomes,
 		"publication_max_home_share": 0.3,
-		"controller":                 "sourceful", "default": "off", "optional": true,
+		"controller":                 "sourceful", "local_default": "ask_yes", "local_optional": true, "cloud_required": true,
 	})
 }

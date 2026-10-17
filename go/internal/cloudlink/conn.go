@@ -438,7 +438,7 @@ func (l *Link) read(conn uplinkConn, snap grantSnapshot, events chan<- cloudwire
 			if len(env.Sig) != 0 || cloudwire.Unmarshal(env.B, &t) != nil || len(t.D) > cloudwire.TunDataMax {
 				return fmt.Errorf("%w: a tun the box cannot read", errService)
 			}
-			if l.opts.Tunnel != nil {
+			if l.TakesTun() {
 				l.opts.Tunnel.Deliver(t)
 			}
 		case cloudwire.MsgWatch, cloudwire.MsgResync:
@@ -523,7 +523,7 @@ func (l *Link) SendTun(t cloudwire.Tun, bulk bool) error {
 		q = l.tunBulk
 	}
 	switch {
-	case q == nil:
+	case q == nil || l.disabled || l.grant.statisticsOnly():
 		l.tunDropped++
 		return ErrNoUplink
 	case err != nil || l.tunBudget.total(l.uptimeMs()) >= tunBudgetBytes:
