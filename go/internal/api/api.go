@@ -1251,6 +1251,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"control_feedback":    s.controlFeedback(time.Now()),
 		"slot_delivery_stats": ctrl.SlotDeliveryStats,
 	}
+	// The ceiling that switching on applies, so a client shows the box's
+	// value instead of keeping its own (#1674). Null until one was on.
+	resp["peak_import_ceiling_last_w"] = s.peakImportCeilingLastW(ctrl.PeakImportCeilingW)
 	// The operator's cap for storing live PV surplus, 0 when unset. Dispatch
 	// prefers it to the plan's per-slot cap, so the Plan card needs it to say
 	// where extra sun goes.
@@ -1836,12 +1839,54 @@ func (s *Server) handleSetPeakImportCeiling(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	s.deps.CtrlMu.Lock()
-	s.deps.Ctrl.PeakImportCeilingW = req.PeakImportCeilingW
+	prevW := s.deps.Ctrl.PeakImportCeilingW
 	s.deps.CtrlMu.Unlock()
 	if s.deps.State != nil {
-		_ = s.deps.State.SaveConfig("peak_import_ceiling_w", strconv.FormatFloat(req.PeakImportCeilingW, 'f', 1, 64))
+		values := map[string]string{"peak_import_ceiling_w": strconv.FormatFloat(req.PeakImportCeilingW, 'f', 1, 64)}
+		// Switching off keeps the ceiling that was on, so switching back on
+		// restores the box's tariff, not a value a browser kept (#1674).
+		lastW := req.PeakImportCeilingW
+		if lastW == 0 {
+			lastW = prevW
+		}
+		if lastW > 0 {
+			values[peakImportCeilingLastKey] = strconv.FormatFloat(lastW, 'f', 1, 64)
+		}
+		// Save before applying, so the box never runs a ceiling that a
+		// restart would undo.
+		if err := s.deps.State.SaveConfigValues(values); err != nil {
+			slog.Warn("failed to persist peak_import_ceiling_w", "err", err)
+			writeJSON(w, 500, map[string]string{"error": "save failed: " + err.Error()})
+			return
+		}
 	}
+	s.deps.CtrlMu.Lock()
+	s.deps.Ctrl.PeakImportCeilingW = req.PeakImportCeilingW
+	s.deps.CtrlMu.Unlock()
 	writeJSON(w, 200, map[string]any{"status": "ok", "peak_import_ceiling_w": req.PeakImportCeilingW})
+}
+
+// peakImportCeilingLastKey holds the last import ceiling that was on.
+const peakImportCeilingLastKey = "peak_import_ceiling_last_w"
+
+// peakImportCeilingLastW is the ceiling switching on applies: the current one
+// while on, else the last one that was on. Nil when none ever was.
+func (s *Server) peakImportCeilingLastW(currentW float64) *float64 {
+	if currentW > 0 {
+		return &currentW
+	}
+	if s.deps.State == nil {
+		return nil
+	}
+	v, ok := s.deps.State.LoadConfig(peakImportCeilingLastKey)
+	if !ok {
+		return nil
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f <= 0 {
+		return nil
+	}
+	return &f
 }
 
 // ---- /api/ev_charging ----

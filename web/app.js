@@ -290,19 +290,10 @@
   // visual cue that there's work to commit. Cleared on successful POST.
   let peakLimitDirty = false;
   let gridTargetDirty = false;
-  // Last non-zero peak ceiling, remembered so unchecking + rechecking
-  // the enable toggle restores the previous value instead of resetting
-  // to the default. Keyed by localStorage so it survives reloads.
-  function readLastPeakLimitW() {
-    try {
-      const v = localStorage.getItem("ftw-peak-import-ceiling-w");
-      const n = v == null ? null : Number(v);
-      return Number.isFinite(n) && n > 0 ? n : 5000;
-    } catch (e) { return 5000; }
-  }
-  function writeLastPeakLimitW(w) {
-    try { localStorage.setItem("ftw-peak-import-ceiling-w", String(w)); } catch (e) {}
-  }
+  // The last peak ceiling that was on, as the box serves it: what switching
+  // the toggle back on applies. A copy kept in the browser once applied an
+  // old test value (#1674), so only the box keeps it.
+  let peakLimitLastW = null;
   const fuseUse = $("fuse-use");
   const fuseFill = $("fuse-fill");
   const fusePhases = $("fuse-phases");
@@ -871,6 +862,7 @@
     const peakSrcW = data.peak_import_ceiling_w != null
       ? data.peak_import_ceiling_w
       : data.peak_limit_w;
+    peakLimitLastW = data.peak_import_ceiling_last_w > 0 ? data.peak_import_ceiling_last_w : null;
     if (peakLimitSlider && !peakLimitDirty && peakSrcW != null) {
       const enabled = peakSrcW > 0;
       if (peakLimitEnableToggle) {
@@ -878,13 +870,13 @@
         if (peakLimitEnableLabel) peakLimitEnableLabel.textContent = enabled ? "On" : "Off";
       }
       peakLimitSlider.disabled = !enabled;
-      const display = enabled ? peakSrcW : readLastPeakLimitW();
+      // Off, the slider shows what switching on applies.
+      const display = enabled ? peakSrcW : peakLimitLastW || Number(peakLimitSlider.defaultValue);
       peakLimitSlider.value = display;
       // Don't decorate the value with " (off)" — the toggle is the
       // single source of truth for enabled/disabled, doubling that
       // signal is the kind of redundancy the shared design system warns about.
       peakLimitValue.textContent = formatW(display);
-      if (enabled) writeLastPeakLimitW(peakSrcW);
       if (peakLimitSend) peakLimitSend.disabled = true; // pristine
     }
     // Energy today
@@ -2665,9 +2657,9 @@
   }
 
   // Peak slider: same dirty pattern, plus an enable/disable checkbox.
-  // Off → POST 0 (backend reads 0 = disabled). On → POST slider value.
-  // The slider is disabled when the toggle is off so the operator can't
-  // accidentally drag a dead control.
+  // Off → POST 0 (backend reads 0 = disabled). On → POST the box's last
+  // ceiling. The slider is disabled when the toggle is off so the operator
+  // can't accidentally drag a dead control.
   if (peakLimitSlider) {
     peakLimitSlider.addEventListener("input", function () {
       const w = Number(peakLimitSlider.value);
@@ -2681,15 +2673,20 @@
       const enabled = peakLimitEnableToggle.checked;
       if (peakLimitEnableLabel) peakLimitEnableLabel.textContent = enabled ? "On" : "Off";
       if (peakLimitSlider) peakLimitSlider.disabled = !enabled;
-      // Show the value the toggle is about to enable (last known)
-      // without committing — the operator still has to press Save
-      // unless the toggle is being switched OFF, which is a destructive
-      // change worth one extra click confirmation. Wait — the spec
-      // calls for the toggle itself to be the on/off control, so flip
-      // straight through: post immediately on toggle change.
-      const w = enabled ? Number(peakLimitSlider.value) || readLastPeakLimitW() : 0;
-      if (enabled && peakLimitSlider) peakLimitSlider.value = w;
-      if (peakLimitValue) peakLimitValue.textContent = formatW(w);
+      if (enabled && !peakLimitLastW) {
+        // The box has never had a ceiling on, so there is none to restore:
+        // the owner picks one and Save applies it.
+        peakLimitDirty = true;
+        if (peakLimitSend) peakLimitSend.disabled = false;
+        return;
+      }
+      // On applies the ceiling the box last had on, shown as it applies;
+      // off applies 0. The toggle is the switch, so neither waits for Save.
+      const w = enabled ? peakLimitLastW : 0;
+      if (enabled) {
+        if (peakLimitSlider) peakLimitSlider.value = w;
+        if (peakLimitValue) peakLimitValue.textContent = formatW(w);
+      }
       peakLimitEnableToggle.disabled = true;
       setPeakImportCeiling(w)
         .then(function () { peakLimitDirty = false; if (peakLimitSend) peakLimitSend.disabled = true; })
@@ -2700,7 +2697,6 @@
   if (peakLimitSend) {
     peakLimitSend.addEventListener("click", function () {
       const w = Number(peakLimitSlider.value);
-      writeLastPeakLimitW(w);
       peakLimitSend.disabled = true;
       setPeakImportCeiling(w)
         .then(function () { peakLimitDirty = false; })

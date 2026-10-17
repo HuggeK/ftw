@@ -1295,6 +1295,11 @@ body.ftw-app .slider-group-compact input[type="range"]:disabled {
 body.ftw-app .slider-group-compact:has(input[type="range"]:disabled) .slider-current {
   color: var(--fg-muted);
 }
+/* Save lights up only when there is a value to apply. */
+body.ftw-app .slider-group-compact .btn-send:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
 body.ftw-app .slider-current {
   font-family: var(--mono);
   font-size: 12px;
