@@ -369,76 +369,54 @@ from the same SQLite snapshot so older Core versions also read current settings.
 
 ## Remote access boundary
 
-Remote access is the FTW app and nothing else. The box holds one outbound WSS
-connection to `wss://relay.ftw.energy`, and beside it a second socket for a
-watch's one-shot exchanges; there is no inbound listener, no NAT-traversal
-layer, no cloud account and no browser-managed site directory.
-See [ADR 0006](adr/0006-app-uplink.md) for why Home Link was removed rather
-than kept alongside it.
+The web client and native iOS app use FTW Cloud. The box keeps one outbound
+connection to `cloud.ftw.energy`, over QUIC or WSS. Browsers use WSS. Each
+client's own Noise IK session still ends at the box and travels as `tun` inside
+the Cloud connection. Core opens no socket to the retired Frankfurt relay and
+advertises no old command exchange. Older box software needs an update; older
+client pairings may need a new QR. There is no legacy bridge.
 
-The path is five packages:
+The path uses these packages:
 
-- [`go/internal/apiauth`](../go/internal/apiauth) — who is asking. One value,
-  one context key and a scope set, importing nothing of the box so that every
-  source of callers can produce one;
-- [`go/internal/appenroll`](../go/internal/appenroll) — the Noise static key,
-  the rotatable rendezvous secret, the single-use pairing code, the QR payload
-  and the list of app keys that have been let in. All of it is boot-time
-  material stored beside `nova.key`, not in SQLite;
-- [`go/internal/appwire`](../go/internal/appwire) — frames, the Noise IK
-  responder and the transport;
-- [`go/internal/appproto`](../go/internal/appproto) — the message layer;
-- [`go/internal/appuplink`](../go/internal/appuplink) — the outbound
-  connection, the per-epoch rendezvous handle and session demultiplexing.
+- [`go/internal/apiauth`](../go/internal/apiauth) names the caller and scopes.
+- [`go/internal/appenroll`](../go/internal/appenroll) holds the box's Noise key,
+  single-use pairing codes, QR payload and enrolled client keys beside
+  `nova.key`.
+- [`go/protocol/appwire`](../go/protocol/appwire) defines frames and Noise IK;
+  [`go/internal/appproto`](../go/internal/appproto) handles client requests.
+- [`go/internal/appuplink`](../go/internal/appuplink) holds the box's Noise
+  sessions and serves them over the Cloud tunnel.
+- [`go/internal/cloudlink`](../go/internal/cloudlink) holds the one Cloud
+  connection, the signed device roster and the optional readable copy.
 
-The properties that matter:
+The QR pins the box's Noise key. A forwarding service cannot impersonate the
+box. This does not protect a web client from code served by a compromised web
+origin. The box is not a WebAuthn relying party and holds no passkey: it admits
+the first session by a code inside Noise and later sessions by the client's
+static key.
 
-- the app's trust anchor arrives optically. The QR payload is a URL fragment,
-  which is never sent in an HTTP request, so a hostile or compelled
-  `app.ftw.energy` can deny service but cannot impersonate a box;
-- the box is not a WebAuthn relying party and stores no user credential. It
-  authorises a first connection by the pairing code inside the Noise handshake
-  and later ones by the app's pinned static key;
-- the relay forwards encrypted frames and holds no keys. The handle the box
-  joins under is derived per epoch from the rendezvous secret, so it rotates
-  hourly and leaves no stable household ID in the protocol. The relay still
-  sees source IP, timing and connection continuity, which can correlate a
-  household across handle rotations;
-- the machine identity in [`go/internal/gatewayidentity`](../go/internal/gatewayidentity)
-  is separate and does not authenticate this connection. It resolves to a
-  hardware-protected P-256 key where the hardware exists and a bound software
-  key with the same public-key and signature wire contract otherwise, with a
-  deterministic adjective-color-animal display name derived from the stable
-  18-hex gateway ID. The name is a label, never an authenticator;
-- authority is unchanged by the transport. A command carries an expiry and
-  preconditions, and core revalidates against fresh state before acting. Core
-  remains authoritative for telemetry freshness, validation, clamps, planning
-  and dispatch. An unavailable relay leaves local control and local recovery
-  intact.
+The service sees a stable home id, public keys, roster roles and scopes, pairing
+code hashes, source addresses and traffic timing. It cannot read the inner
+Noise session. A separate owner grant enables a signed, readable copy for
+Cloud features; that grant is off by default. An authorized cloud agent has
+its own Noise endpoint and the box checks its grant on every request. Neither
+transport access nor a readable-copy grant grants an agent control.
 
-Proposed, not shipped: [ADR 0008](adr/0008-ftw-cloud.md) adds FTW Cloud, a
-second outbound connection to `cloud.ftw.energy`. A box links when it is first
-paired. The link carries each phone's own session with the box as `tun`,
-ciphertext the service cannot read or forge, so a phone reaches the box with
-the relay unreachable; and, when an owner turns it on, a signed, readable copy
-of what the owner enabled. The box admits a session through the tunnel by the
-key its handshake proves, exactly as over the relay, and keeps one session per
-device across both. The relay path above stays while every client moves.
-[protocol-cloud.md](protocol-cloud.md) specifies its wire format.
+Lane 0 frames keep their fixed length. On the Cloud tunnel the box sends on
+each reading and on a beat. Commands retain their expiry, preconditions and
+Core checks. Loss of Cloud leaves local control, stored goals and local
+recovery running.
 
-[ADR 0009](adr/0009-watch-exchange.md) lets an Apple Watch work without the
-phone. watchOS allows no WebSocket, so each step is one HTTPS request. Commands
-go to the box through the relay's exchange: the box keeps a second socket,
-`/r/<epoch>/<handle>/exchange`, under the uplink's handle, and the relay hands
-it one Noise message per request behind an id of its own. The box holds those
-sessions in a table of eight, apart from the phones' sessions, which hold one
-slot per device, so a watch never pushes a phone out; each ends after four exchanges, a minute idle or three
-minutes. Every frame on it is lane 0 apart from `hello_ok`, and every answer is
-two frames, so a read, a command and a refusal have one length. A command
-answers no sooner than 400 ms after it arrives, so an applied one and a refused
-one take the same time unless the EV save runs longer. Reads go to
-FTW Cloud in one request, which has not shipped. The watch is a device of its
-own and never holds more than the phone that added it.
+Browser offline notices travel in bounded, service-only roster rows. The box
+encrypts the notice and signs a short-lived VAPID authorization; Cloud checks
+the current device and epoch before sending after an outage. Anonymous daily
+fleet reports use the separate `/v1/fleet` route, which keeps only daily totals
+for 90 days. Escrow remains a separate service. See
+[protocol-cloud.md](protocol-cloud.md) for the wire and privacy limits.
+
+The native Watch uses its phone for box commands. Its Cloud one-shot reads and
+push registrations do not open a box command exchange. [ADR 0009](adr/0009-watch-exchange.md)
+records the old relay design; Core no longer advertises or connects that path.
 
 ### Who is let in, and as what
 
@@ -454,7 +432,7 @@ not change shape and the app's scanner needs to know nothing about sharing. A
 guest scans what an owner scans and learns what they are from `hello_ok`. What
 stops a code being replayed is unchanged and holds for both: it is spent at the
 first success, it expires, it survives five wrong guesses and is then burned,
-and it rides encrypted inside Noise handshake message 1, so the relay carrying
+and it rides encrypted inside Noise handshake message 1, so the service carrying
 it never sees it.
 
 Two rules protect a household from locking itself out, and both live in
