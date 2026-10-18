@@ -299,8 +299,14 @@ type lanAuthLoginRequest struct {
 }
 
 func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
+	var req lanAuthLoginRequest
+	if err := readJSON(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid body: " + err.Error()})
+		return
+	}
 	// Serialize admission with password changes, so an old-password login
-	// cannot add a session after the password route revoked the old ones.
+	// cannot add a session after revocation. Do not hold this lock while
+	// reading an unauthenticated client's body: it also guards Settings.
 	s.configWriteMu.Lock()
 	defer s.configWriteMu.Unlock()
 	if s.deps.State == nil || s.deps.Cfg == nil || s.deps.CfgMu == nil {
@@ -316,11 +322,6 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	if !lanPasswordConfigured(s.deps.State) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "LAN password is not configured"})
-		return
-	}
-	var req lanAuthLoginRequest
-	if err := readJSON(r, &req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid body: " + err.Error()})
 		return
 	}
 	st := s.deps.State
