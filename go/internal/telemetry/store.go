@@ -297,6 +297,7 @@ type Store struct {
 	commands            map[string]CommandEvidence
 	controlObservations map[string][]ControlObservation
 	homeObservations    map[string][]ControlObservation // display estimates only
+	homeSourceTime      map[string]bool                 // reported source time, otherwise receipt time
 
 	processNoise     float64
 	measurementNoise float64

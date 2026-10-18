@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"math"
+	"time"
 )
 
 // Estimates supplement, never overwrite, the original measurements and quality.
@@ -19,7 +20,11 @@ const loadEstimateSchema = `CREATE TABLE IF NOT EXISTS history_load_estimates (
 // episode before any of its intervals can supplement the original history.
 const loadEstimatePendingSchema = `CREATE TABLE IF NOT EXISTS history_load_estimate_pending (
  from_ms INTEGER PRIMARY KEY,to_ms INTEGER NOT NULL,load_w REAL NOT NULL) WITHOUT ROWID`
-const maxLoadEstimateEpisodeMS int64 = 30_000
+
+// LoadEstimateRecoveryWindow bounds a recovered balance episode, including a
+// minute-scale cloud lag. It is a history estimate budget, not a sensor delay.
+const LoadEstimateRecoveryWindow = 2 * time.Minute
+const maxLoadEstimateEpisodeMS = int64(LoadEstimateRecoveryWindow / time.Millisecond)
 const maxLoadEstimateTickMS int64 = 15_000
 
 func residualHouseholdW(p *HistoryPoint) (float64, bool) {

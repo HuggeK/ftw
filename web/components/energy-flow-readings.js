@@ -42,15 +42,21 @@ export function fmtKwhShort(kwh) {
 export function homeEstimateNote(estimate, live = true) {
   if (!estimate) return "";
   if (!live) return "Home use estimate paused · no live data";
-  if (num(estimate.watts) === null) return "Home use estimate unavailable · waiting for matching readings";
+  if (num(estimate.watts) === null) {
+    if (estimate.reason === "charger_source_time_unavailable") return "Home use estimate unavailable · charger source time unknown";
+    const sourceAge = num(estimate.source_age_ms);
+    return "Home use estimate unavailable · waiting for source observations" +
+      (sourceAge > 0 ? ` · last source report ${Math.ceil(sourceAge / 1000)} s old` : "");
+  }
   const age = num(estimate.age_ms);
   const from = num(estimate.from_ms), to = num(estimate.to_ms);
-  if (age === null || age < 0 || age > 35000 || from === null || to === null || to <= from) {
+  if (age === null || age < 0 || age > 185000 || from === null || to === null || to <= from) {
     return "Home use estimate unavailable · readings are too old";
   }
-  const low = num(estimate.timing_min_w), high = num(estimate.timing_max_w);
-  const range = low === null || high === null ? "" : ` · timing range ${(low / 1000).toFixed(1)}–${(high / 1000).toFixed(1)} kW`;
-  return `Estimated home use ${(estimate.watts / 1000).toFixed(1)} kW · ${Math.round((to - from) / 1000)} s mean · ${Math.ceil(age / 1000)} s old${range}. Sensor accuracy and unknown delays are not included.`;
+  const low = num(estimate.window_min_w), high = num(estimate.window_max_w);
+  const range = low === null || high === null ? "" : ` · window range ${(low / 1000).toFixed(1)}–${(high / 1000).toFixed(1)} kW`;
+  const basis = {source:"reported source times", receipt:"receipt times only", mixed:"source and receipt times"}[estimate.timing_basis] || "timing unknown";
+  return `Estimated home use ${(estimate.watts / 1000).toFixed(1)} kW · ${Math.round((to - from) / 1000)} s mean · reported age ${Math.ceil(age / 1000)} s · ${basis}${range}. Clock alignment and sensor delay are unverified; the range is not an error bound.`;
 }
 
 function planetColor(role, watts, thresholdW) {

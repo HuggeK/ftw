@@ -65,10 +65,10 @@ func TestLoadEstimateRejectsLongUncertainAndOfflineEpisodes(t *testing.T) {
 			recovery := int64(10000)
 			switch scenario {
 			case "long_episode":
-				for sec := 10; sec <= 40; sec += 5 {
+				for sec := 10; sec <= 130; sec += 5 {
 					dashboardTick(t, s, fmt.Sprint(sec), replayLoadPoint(base+int64(sec)*1000, -1000))
 				}
-				recovery = 45000
+				recovery = 135000
 			case "long_tick":
 				recovery = 25000
 			case "missing_source":
@@ -200,4 +200,29 @@ func TestMissingSoCDoesNotInflateEstimatedPowerCoverage(t *testing.T) {
 		t.Fatal(d, err)
 	}
 	near(t, "signed energy without SoC", d.LoadWh, 1000*600.0/3600)
+}
+
+func TestLoadEstimateCanCloseOneMinuteImbalance(t *testing.T) {
+	s := freshStore(t)
+	if err := s.EnableHistoryAggregation(); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().UTC().Truncate(24 * time.Hour).UnixMilli()
+	var signedWS float64
+	for sec := 0; sec <= 375; sec += 5 {
+		w := 4000.0
+		if sec >= 305 && sec <= 360 {
+			w = -4000
+		}
+		p := replayLoadPoint(base+int64(sec)*1000, w)
+		dashboardTick(t, s, fmt.Sprint(sec), p)
+		if sec > 0 {
+			signedWS += w * 5
+		}
+	}
+	d, err := s.DailyEnergy(base, base+420000)
+	if err != nil || d.Missing != EstimatedLoad {
+		t.Fatal(d, err)
+	}
+	near(t, "signed minute-lag energy", d.LoadWh, signedWS/3600)
 }

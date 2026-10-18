@@ -8,19 +8,22 @@ import (
 
 const homeWindow = 10 * time.Second
 const homeMaxGap = 30 * time.Second
+const homeLookback = 3 * time.Minute
 
 // HomeEstimate describes a past interval, never a new instantaneous measurement.
-// MinW/MaxW bound the timing ambiguity between the observed extrema. They are
-// not a confidence interval for sensor accuracy or unknown transport delays.
+// MinW/MaxW describe variation in the reported window, not error bounds.
+// Reported source clocks and local receipt clocks are not verified as aligned.
 type HomeEstimate struct {
-	Watts  *float64 `json:"watts"`
-	MinW   *float64 `json:"timing_min_w"`
-	MaxW   *float64 `json:"timing_max_w"`
-	FromMS int64    `json:"from_ms"`
-	ToMS   int64    `json:"to_ms"`
-	AgeMS  int64    `json:"age_ms"`
-	Method string   `json:"method"`
-	Reason string   `json:"reason,omitempty"`
+	Watts       *float64 `json:"watts"`
+	MinW        *float64 `json:"window_min_w"`
+	MaxW        *float64 `json:"window_max_w"`
+	FromMS      int64    `json:"from_ms"`
+	ToMS        int64    `json:"to_ms"`
+	AgeMS       int64    `json:"age_ms"`
+	Method      string   `json:"method"`
+	TimingBasis string   `json:"timing_basis"`
+	SourceAgeMS int64    `json:"source_age_ms"`
+	Reason      string   `json:"reason,omitempty"`
 }
 
 // Keep a separate bounded buffer: neither control evidence nor raw readings may
@@ -32,46 +35,63 @@ func (s *Store) recordHomeObservation(driver string, kind DerType, w float64, da
 	k := key(driver, kind)
 	if s.homeObservations == nil {
 		s.homeObservations = map[string][]ControlObservation{}
+		s.homeSourceTime = map[string]bool{}
 	}
 	p, ok := ControlPowerObservation(w, data, now)
-	if !ok {
+	var timing struct {
+		ControlPowerObservedAt string               `json:"control_power_observed_at"`
+		PowerObservedAt        string               `json:"power_observed_at"`
+		ForecastPower          *ForecastPowerSample `json:"forecast_power"`
+	}
+	_ = json.Unmarshal(data, &timing)
+	sourceTime := timing.ControlPowerObservedAt != "" || timing.PowerObservedAt != "" || timing.ForecastPower != nil
+	if !ok || ((kind == DerEV || kind == DerV2X) && !sourceTime) {
 		delete(s.homeObservations, k)
+		delete(s.homeSourceTime, k)
 		return
 	}
+	// A successful cloud request can return an old observation. The driver's
+	// control confirmation is not a new power timestamp and cannot extend it.
+	p.ConfirmedAt = time.Time{}
 	points := s.homeObservations[k]
-	if !s.health[driver].TelemetryLive() {
+	if !s.health[driver].TelemetryLive() || s.homeSourceTime[k] != sourceTime {
 		points = nil
 	}
+	s.homeSourceTime[k] = sourceTime
 	if len(points) > 0 {
 		last := &points[len(points)-1]
-		if p.At.Before(last.At) || p.Seen().Before(last.Seen()) || now.Sub(last.Seen()) > homeMaxGap {
+		if p.At.Before(last.At) || p.At.Sub(last.At) > homeMaxGap {
 			points = nil
 		} else if p.At.Equal(last.At) {
 			if p.PowerW != last.PowerW {
 				delete(s.homeObservations, k)
 				return
 			}
-			// A confirmed change-only sample covers a plateau, not another
-			// independent measurement. An unconfirmed repeat adds no time.
-			last.ConfirmedAt = p.ConfirmedAt
+			// A repeated change-only timestamp adds no time, even when a
+			// fresh HTTP reply carries a control confirmation.
 			s.homeObservations[k] = points
 			return
 		}
 	}
 	points = append(points, p)
-	if len(points) > 128 {
-		points = points[len(points)-128:]
+	cutoff := now.Add(-homeLookback - homeWindow)
+	for len(points) > 1 && points[1].At.Before(cutoff) {
+		points = points[1:]
+	}
+	if len(points) > 1024 {
+		points = points[len(points)-1024:]
 	}
 	s.homeObservations[k] = points
 }
 
-// HomeUseEstimate integrates every configured flow over the same ten seconds.
-// Linear interpolation uses source times when supplied, receipt times otherwise.
-// Confirmations extend a constant sample only through the last confirmation.
+// HomeUseEstimate integrates a common ten-second window in the reported clocks.
+// It uses reported source times, or receipt times for local non-charger flows.
+// Clock alignment and device sampling delay remain unverified. Chargers without
+// source time, sparse change-only reports and repeats cannot fill a window.
 // No extrapolation, guessed fixed delay, clipping, or offline gap repair occurs.
 // This path serves display only; ForecastMeasurement and dispatch stay raw.
 func (s *Store) HomeUseEstimate(now time.Time, siteMeter string, opts ForecastOptions) HomeEstimate {
-	out := HomeEstimate{Method: "aligned_balance_10s_v1"}
+	out := HomeEstimate{Method: "reported_time_balance_10s_v2"}
 	if s == nil {
 		out.Reason = "no_telemetry"
 		return out
@@ -84,19 +104,36 @@ func (s *Store) HomeUseEstimate(now time.Time, siteMeter string, opts ForecastOp
 		return out
 	}
 	to := now
+	var sourceClocks, receiptClocks bool
 	for k, source := range r.Sources {
 		points := s.homeObservations[k]
+		if (source.Flow.DerType == DerEV || source.Flow.DerType == DerV2X) && !s.homeSourceTime[k] {
+			out.Reason = "charger_source_time_unavailable"
+			return out
+		}
 		if source.PowerW == nil || len(points) == 0 || !s.health[source.Flow.Driver].TelemetryLive() {
 			out.Reason = "missing_source_window"
 			return out
 		}
 		last := points[len(points)-1]
-		if last.Seen().After(now) || now.Sub(last.Seen()) > homeMaxGap {
+		if s.homeSourceTime[k] && now.Sub(last.At).Milliseconds() > out.SourceAgeMS {
+			out.SourceAgeMS = now.Sub(last.At).Milliseconds()
+		}
+		if last.At.After(now) || now.Sub(last.At) > homeLookback {
 			out.Reason = "stale_source_window"
 			return out
 		}
-		if last.Seen().Before(to) {
-			to = last.Seen()
+		if last.At.Before(to) {
+			to = last.At
+		}
+		sourceClocks = sourceClocks || s.homeSourceTime[k]
+		receiptClocks = receiptClocks || !s.homeSourceTime[k]
+	}
+	out.TimingBasis = "source"
+	if receiptClocks {
+		out.TimingBasis = "receipt"
+		if sourceClocks {
+			out.TimingBasis = "mixed"
 		}
 	}
 	from := to.Add(-homeWindow)
@@ -150,24 +187,10 @@ func homeWindowPower(points []ControlObservation, from, to time.Time) (mean, low
 		covered += right.Sub(left)
 	}
 	for i, p := range points {
-		seen := p.Seen()
-		if i+1 < len(points) && points[i+1].At.Before(seen) {
-			// A late source change can contradict an earlier confirmation.
-			// Do not estimate that overlap, but let newer windows recover.
-			if points[i+1].At.Before(to) && seen.After(from) {
-				return 0, 0, 0, false
-			}
-			seen = points[i+1].At
-		}
-		// A confirmation covers the same unchanged value, even when its
-		// original change timestamp predates this bounded observation ring.
-		if seen.After(p.At) {
-			add(p.At, seen, p.PowerW, p.PowerW)
-		}
 		if i+1 < len(points) {
 			next := points[i+1]
-			if next.At.Sub(seen) <= homeMaxGap {
-				add(seen, next.At, p.PowerW, next.PowerW)
+			if next.At.After(p.At) && next.At.Sub(p.At) <= homeMaxGap {
+				add(p.At, next.At, p.PowerW, next.PowerW)
 			}
 		}
 	}

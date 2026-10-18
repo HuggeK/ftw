@@ -9,7 +9,7 @@ import (
 )
 
 func dailyEnergyCacheReady(dayStart, now time.Time) bool {
-	return !now.Before(dayStart.AddDate(0, 0, 1).Add(time.Minute))
+	return !now.Before(dayStart.AddDate(0, 0, 1).Add(state.LoadEstimateRecoveryWindow + time.Minute))
 }
 
 func (s *Server) qualifyStatusHistory(resp map[string]any, siteMeter string) {

@@ -90,13 +90,13 @@ func TestHomeEstimateChangeOnlyConfirmationAndCachedRepeats(t *testing.T) {
 		homeSample(s, "ev", DerEV, 500, original, at, true)
 	}
 	got := s.HomeUseEstimate(base.Add(20*time.Second), "site", ForecastOptions{})
-	if got.Watts == nil || *got.Watts != 1000 || len(s.homeObservations["ev:ev"]) != 1 {
+	if got.Watts != nil || len(s.homeObservations["ev:ev"]) != 1 {
 		t.Fatal(got)
 	}
 	// Asking repeatedly must not advance the interval or modify its source.
 	for i := 0; i < 100; i++ {
 		again := s.HomeUseEstimate(base.Add(25*time.Second), "site", ForecastOptions{})
-		if again.ToMS != got.ToMS || again.AgeMS != 10000 {
+		if again.Watts != nil || again.ToMS != got.ToMS {
 			t.Fatal(again)
 		}
 	}
@@ -184,18 +184,18 @@ func TestHomeEstimateDoesNotRepairRawNegativeBalance(t *testing.T) {
 	}
 }
 
-func TestHomeEstimateRecoversAfterContradictedConfirmation(t *testing.T) {
+func TestHomeWindowCannotExtendThroughControlConfirmations(t *testing.T) {
 	base := time.Unix(100000, 0)
 	points := []ControlObservation{
 		{At: base, ConfirmedAt: base.Add(20 * time.Second), PowerW: 1000},
 		{At: base.Add(19 * time.Second), ConfirmedAt: base.Add(40 * time.Second), PowerW: 2000},
 	}
-	// A delayed source change contradicts one second of the old plateau.
+	// Control confirmations are HTTP/status evidence, not source brackets.
 	if _, _, _, ok := homeWindowPower(points, base.Add(15*time.Second), base.Add(25*time.Second)); ok {
 		t.Fatal("overlap treated as certain")
 	}
 	mean, _, _, ok := homeWindowPower(points, base.Add(30*time.Second), base.Add(40*time.Second))
-	if !ok || mean != 2000 {
-		t.Fatal("old contradiction prevented recovery", mean, ok)
+	if ok {
+		t.Fatal("confirmation extended source evidence", mean, ok)
 	}
 }
