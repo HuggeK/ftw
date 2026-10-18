@@ -56,6 +56,7 @@ var agentLocalReads = map[string]bool{
 	"/api/ocpp/chargers":       true,
 	"/api/backups/{id}":        true,
 	"/api/agents":              true,
+	"/api/agent-invites":       true,
 	"/api/agents/audit":        true,
 }
 

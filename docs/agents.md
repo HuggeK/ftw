@@ -711,6 +711,75 @@ because removing access is safe. With `api.lan_auth` on, every route here,
 the reads and the narrowing ones too, needs the sign-in, as every protected
 route on the box does.
 
+## Agent invitations
+
+A box with `access.invites` supports `agent.invite.create`,
+`agent.invite.list` and `agent.invite.cancel`. These messages require a current
+owner phone. Creating also requires its P-256 approval signature. An agent
+cannot create invitations, including with `ftw.setup.write`.
+
+The owner chooses scopes, operations, caps, a label, a claim deadline within
+24 hours and a separate access expiry within the agent role's longest grant.
+The label helps the owner find the invitation; it does not verify a person's
+identity. A code grants the first recipient who uses it a separate agent key,
+never the owner's token, key or role. Technical diagnostics include complete
+backups, which can contain saved credentials. Setup and control require an
+explicit choice.
+
+Create carries `{home, id, hash, label, scopes, ops, caps, claimUntilMs,
+expiresAtMs, atMs, sig}`. The client draws a 16-byte random `id` and a 32-byte
+random secret. It signs these fields in that order after the normal approval
+prefix, with caps as `[holdS, maxW, perMin]` and sorted scopes and operations.
+The hash and Noise claim format are in [the Cloud protocol](protocol-cloud.md#agent-invitations-through-the-service).
+The strong publishing proof is base64url of deterministic CBOR `{v: 1, home, box, secret}`.
+Core stores only the verifier, not the secret. The LAN page may send the
+secret in its protected POST so Core can compute the verifier on plain LAN
+HTTP, where browser hashing APIs may be unavailable. It never logs it.
+
+An exact create retry returns the existing receipt, including claimed,
+cancelled or expired states. A changed request with the same id conflicts.
+Clients keep the exact signed request and secret in memory while the code is
+on screen. A lost reply never starts a fresh invitation. A list contains
+metadata and claim receipts, never a code. When the code is no longer held
+locally, the owner can cancel the old invitation and create a new one.
+The app list also returns `nowMs` and `clockReady`. Read the box's time before
+signing a new invitation so phone clock differences cannot exceed the claim
+or grant limits. A known signature refusal may retry the same fields with
+the phone's replacement key; an unknown outcome must keep the exact request.
+
+Cancelling needs no new signature, like revoking an agent, and returns the
+invitation's current state. If claim already won, it returns `claimed` with
+the agent id; the owner removes that ordinary connection instead. A clock
+reset cancels pending invitations as well as ending existing agent grants.
+Core admits at most 16 pending invitations. It retains live claim windows and
+receipts for current agents, plus 32 old receipts, with a 128-row storage
+bound. No expired or cancelled record can reopen a valid code after pruning.
+
+The local routes are `GET/POST /api/agent-invites` and
+`DELETE /api/agent-invites/{id}`. POST uses the same house-password and
+non-loopback LAN gate as an ordinary grant. Signed app messages allow an
+owner to share access away from home. The recipient connects FTW from its
+own assistant, selects **I have an invitation code** on the consent page and
+pastes the code there. Core must be online. The normal signed-roster,
+PKCE and refresh-token flow then applies.
+
+The owner views publish that proof through TLS in JSON to
+`POST https://cloud.ftw.energy/oauth/invitations`, without cookies. Cloud
+checks its home, box and verifier against the current signed roster before
+returning a unique six-character code such as `K7M-4PX`. The code works for
+at most ten minutes, within Core's claim deadline. The granted access can
+last longer. The normal owner views use a ten-minute Core claim window.
+
+Cloud holds the code-to-proof mapping only in memory. Expiry stops use at
+once; its normal minute sweep drops expired mappings. SQLite keeps only a
+keyed digest reservation and expiry, with its MAC key outside that database,
+so a restart cannot give an unexpired code to another home. After a Cloud
+restart the owner can check status and republish the same strong proof to
+get a working code, without another Core grant. A retry before restart gets
+the same code. No secret enters a URL or log. This short-code service
+currently runs on the single OAuth instance; multiple instances require
+routing to the instance holding that mapping.
+
 ## The grant offer
 
 The MCP consent page shows a short code, a QR code and a universal link. The

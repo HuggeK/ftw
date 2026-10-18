@@ -128,6 +128,7 @@ const (
 	CapCloudTun        = "cloud.tun"
 	CapCmdExchange     = "cmd.exchange"
 	CapAccessAgents    = "access.agents"
+	CapAccessInvites   = "access.invites"
 	CapDerCar          = "der.car"
 )
 
@@ -153,6 +154,7 @@ var AllCapabilities = []string{
 	CapCloudTun,
 	CapCmdExchange,
 	CapAccessAgents,
+	CapAccessInvites,
 	CapDerCar,
 }
 

@@ -650,7 +650,7 @@ The service never forwards these to a phone.
 | `ttlS` | uint | 86,400. Counted from when the service received the roster |
 | `devices` | [Device] | Every device paired with the box |
 | `grant` | Grant | What the owner granted |
-| `pending` | [Pending] | The pairing codes the box shows now, at most one |
+| `pending` | [Pending] | One phone QR code and up to 16 agent invitations |
 | `noise` | bstr, 32 B | The box's X25519 Noise static key, the one in its pairing QR code. FTW Cloud's `keys` part opens an agent's session to it, and trusts it only as signed here |
 
 | `webpush` | [WebPushRow], optional | Box-encrypted browser offline notices. Service only; no browser key leaves the box |
@@ -744,10 +744,12 @@ each time it receives such a roster. With no id, there is no copy.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `hash` | bstr, 32 B | SHA-256(`ftw.cloud.pair.v1\0` ‖ home id ‖ pairing code) |
+| `hash` | bstr, 32 B | Phone pairing hash below, or the agent invitation verifier below |
+| `kind` | tstr, optional | Absent for a phone; `agent` admits only the pending-agent invitation path |
 | `ttlS` | uint | Seconds the code has left, counted from when the service received the roster |
 
-Only a QR code is listed. A spoken code has 40 bits, and its hash would let
+For a phone, the hash is SHA-256(`ftw.cloud.pair.v1\0` ‖ home id ‖ pairing code).
+Only a phone QR code is listed. A spoken code has 40 bits, and its hash would let
 the service find it offline; it pairs over the relay or the home network.
 
 A new iPhone may exchange a short code directly with the box on the home
@@ -1122,6 +1124,37 @@ On the app session the phone and the service send `tun {sid, d}`, with no
   does not count against the uplink's own message rate. A box handshake
   through the tunnel costs the box up to four X25519 operations, so the box
   answers at most 12 a minute per device and 240 in all.
+
+### Agent invitations through the service
+
+An owner creates a single-use agent invitation through the signed app session
+or the password-protected box page. The roster carries its verifier with
+`kind: "agent"`, for at most 24 hours. The verifier is
+SHA-256(`ftw.agent.invite.v1\0` ‖ home id ‖ `\0` ‖ 32 random secret bytes).
+No code, label or recipient name enters the roster.
+
+This entry never admits a phone through `/v1/app`. OAuth gives each recipient
+its own pending key in `ftwkeysd`. `store.For(AgentInvite)` opens only a tunnel,
+within the agent-session quota, with no access to the readable copy. Opening
+or losing this tunnel does not spend the verifier. The keys service's separate
+`open.invite` reads only pending keys and accepts only a typed claim with its
+own signed offer for that key. Ordinary `open` still needs a kept key.
+
+Noise message 1 carries `ftw.agent.invite.v1\0` followed by strict CBOR
+`{secret, offer: {o, kid, sig}}`. Core checks the code, current owner, expiry,
+offer signature and the Noise static key, then checks them again after the
+first transport frame proves the key. It atomically saves the consumed
+invitation and the ordinary agent row. Rights and limits intersect the
+owner's invitation and the recipient's request. A retry must match that
+invitation, key and signed offer; it cannot revive a revoked agent.
+
+Core reads its devices and pending entries in one snapshot. Its next signed
+roster removes the invitation hint and lists the new agent. Only this roster
+allows OAuth to keep the key and issue its normal PKCE authorization code.
+The code's claim deadline and the agent's access expiry are separate. The
+box must be online to claim a code. The owner-facing six-character code is a
+short-lived Cloud alias for the strong proof; it never enters a roster or
+replaces the Core verifier. See [Agent invitations](agents.md#agent-invitations).
 
 ### Pairing through the service
 
@@ -1625,6 +1658,7 @@ constants, so `srcfl/ftw-cloud` need not spell them by hand.
 | `live` while watched | On each poll that changed it, at most once per period |
 | Box handshakes through the tunnel | 12 a minute per device, 240 in all |
 | Pending pairing entry | One QR code, for its own ten minutes; admits one handshake |
+| Pending agent invitations | At most 16; claim window at most 24 hours; Core consumes each code after Noise proof |
 | Box session up after TLS | One round trip: its message 1 rides in `now.tun` |
 | Sessions | 16 per home; one per device |
 | Envelopes queued per phone | 256 |

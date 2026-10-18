@@ -54,6 +54,7 @@
   // The box's answers, kept while Settings is open: the grant on screen
   // holds a code that worked once, and switching tabs must not lose it.
   var state = {
+    invites: null, inviteDraft: null,
     list: null,      // GET /api/agents
     unavailable: "", // why the box has no agents, when it has none
     auth: null,      // GET /api/auth/status
@@ -414,10 +415,17 @@
         });
       }),
       fetch("/api/auth/status").then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; }),
+      fetch("/api/agent-invites").then(function(r){ return r.ok ? r.json() : null; }).catch(function(){ return null; }),
     ]).then(function (got) {
       state.unavailable = got[0].unavailable ? "off" : "";
       state.list = got[0].unavailable ? null : got[0];
-      state.auth = got[1];
+      state.auth = got[1]; state.invites = got[2];
+      if(state.inviteDraft && state.inviteDraft.request && state.invites) {
+        var latest=(state.invites.invitations || []).find(function(v){return v.id===state.inviteDraft.request.id;});
+        if(latest) {
+          state.inviteDraft.receipt=latest;
+        }
+      }
     });
   }
 
@@ -452,6 +460,7 @@
     drawHeld();
     drawRequests();
     drawRows();
+    drawInvites();
   }
 
   function drawReady(ctx) {
@@ -596,8 +605,9 @@
   // it on, caps no higher than given, and a length. limits are the most it
   // may be given; current, when set, is a row being changed.
   function grantForm(form, given, registry, current) {
+    var suffix = given.idSuffix || (current ? current.id : "new");
     var split = splitGrant(given.scopes, given.ops, registry);
-    form.appendChild(el("p", { className: "access-heading", text: current ? "It may" : "It asks to" }));
+    form.appendChild(el("p", { className: "access-heading", text: given.heading || (current ? "It may" : "It asks to") }));
     split.reads.forEach(function (scope) {
       form.appendChild(checkRow("read", scope, scopeWords(scope), true));
     });
@@ -608,7 +618,7 @@
 
     if (split.groups.length) {
       var controlOn = !!current;
-      var control = el("input", { type: "checkbox", id: "access-control-" + (current ? current.id : "new") });
+      var control = el("input", { type: "checkbox", id: "access-control-" + suffix });
       control.checked = controlOn;
       var label = current ? "It may control" : "Also let it control";
       form.appendChild(el("label", { className: "checkbox-row access-control-toggle" }, [control, el("span", { text: label })]));
@@ -622,9 +632,9 @@
         g.ops.forEach(function (op) { detail.appendChild(checkRow("op", op, opWords(op), true)); });
         if (g.ops.some(function (op) { return capped(op, registry); })) {
           var holdMin = Math.floor((given.caps.holdS || 0) / 60);
-          detail.appendChild(numberField("access-hold-" + (current ? current.id : "new"), "Longest hold",
+          detail.appendChild(numberField("access-hold-" + suffix, "Longest hold",
             holdMin, holdMin, 1, 1, "minutes"));
-          detail.appendChild(numberField("access-power-" + (current ? current.id : "new"), "Highest power",
+          detail.appendChild(numberField("access-power-" + suffix, "Highest power",
             kwExact(given.caps.maxW), kwExact(given.caps.maxW), 0.001, "any", "kW"));
         }
       });
@@ -639,7 +649,7 @@
     return { perMin: given.caps.perMin || 0 };
   }
 
-  function readChoice(form, current) {
+  function readChoice(form, current, overrideSuffix) {
     var reads = [], ops = [], calls = [];
     form.querySelectorAll('input[name="read"]').forEach(function (b) { if (b.checked) reads.push(b.value); });
     form.querySelectorAll('input[name="call"]').forEach(function (b) { if (b.checked) calls.push(b.value); });
@@ -647,7 +657,7 @@
     if (!control || control.checked) {
       form.querySelectorAll('input[name="op"]').forEach(function (b) { if (b.checked) ops.push(b.value); });
     }
-    var suffix = current ? current.id : "new";
+    var suffix = overrideSuffix || (current ? current.id : "new");
     var hold = document.getElementById("access-hold-" + suffix);
     var power = document.getElementById("access-power-" + suffix);
     var length = form.querySelector('select[name="length"]');
@@ -947,6 +957,144 @@
     });
   }
 
+  function base64Bytes(bytes, url) {
+    var text = btoa(Array.from(bytes, function (b) { return String.fromCharCode(b); }).join(""));
+    return url ? text.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "") : text;
+  }
+
+  // Deterministic CBOR {v, box, home, secret}, as protocol.AgentInviteCode.
+  // This needs no secure-context-only Web Crypto API on the box's LAN page.
+  function inviteCode(receipt, secret) {
+    var box = Uint8Array.from(atob(receipt.box), function (s) { return s.charCodeAt(0); });
+    var home = String(receipt.home || "");
+    if (!/^[a-z2-7]{26}$/.test(home) || box.length !== 32 || secret.length !== 32) throw new Error("The box returned an invalid invitation receipt.");
+    function ascii(s) { return Array.from(s, function (c) { return c.charCodeAt(0); }); }
+    return base64Bytes([0xa4,0x61,0x76,1,0x63].concat(ascii("box"),[0x58,32],Array.from(box),[0x64],ascii("home"),[0x78,26],ascii(home),[0x66],ascii("secret"),[0x58,32],Array.from(secret)), true);
+  }
+
+  function inviteWhen(ms) { return new Date(ms).toLocaleString(undefined,{day:"numeric",month:"short",year:"numeric",hour:"2-digit",minute:"2-digit",timeZoneName:"short"}); }
+
+  var inviteTimer=null;
+  function drawInvites() {
+    var slot = document.getElementById("access-invites");
+    if (!slot) return;
+    if(inviteTimer) clearTimeout(inviteTimer);inviteTimer=null;
+    slot.textContent = "";
+    var info = state.invites;
+    if (!info || !info.invitations) { slot.appendChild(el("p", { text: "Sharing is not available on this box yet." })); return; }
+    slot.appendChild(el("p", { text: "Let someone use their own assistant to help with this home. Choose what they may do. The first person who uses the code gets a separate connection you can remove below." }));
+    var draft = state.inviteDraft;
+    if (draft && draft.receipt) {
+      var v = draft.receipt;
+      if(v.state==="pending" && !v.clockUnavailable && boxNow()>=v.claimUntilMs) v={...v,state:"expired"};
+      if (v.state === "pending" && draft.code && boxNow()<draft.codeExpiresAtMs) {
+        var code = el("input", {type:"text", readonly: "", className:"access-invite-code", "aria-label": "Invitation code", spellcheck: "false" });
+        code.value = draft.code;
+        slot.appendChild(el("p", { text: "For " + cleanText(v.label || "your guest",128) + ". Use before " + inviteWhen(draft.codeExpiresAtMs) + ". Access ends " + inviteWhen(v.expiresAtMs) + "." }));
+        slot.appendChild(code);
+        var copyNote = el("p", { role: "status" });
+        slot.appendChild(el("button", { type: "button", className:"btn-send", text: "Copy invitation code", onclick: function () {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(draft.code).then(function(){ copyNote.textContent="Copied."; }).catch(function(){ code.select(); copyNote.textContent="Code selected. Copy it with your browser."; });
+          } else { code.select(); copyNote.textContent="Code selected. Copy it with your browser."; }
+        } }));
+        slot.appendChild(copyNote);
+        slot.appendChild(el("button", {type:"button",className:"btn-ghost",text:"Check status and code",onclick:function(){
+          publishInvite(draft).catch(function(){}).then(function(){refresh();});
+        }}));
+        inviteTimer=setTimeout(function(){if(document.getElementById("access-invites") && state.inviteDraft===draft) refresh();},5000);
+        slot.appendChild(el("p", { className: "access-quiet", text: "Send it to that person. They connect FTW in their assistant, choose ‘I have an invitation code’ on the FTW connection page, then paste it. Anyone with the unused code can claim these rights. The box must be online when they use it. This page shows it only while you keep it open." }));
+      } else if (v.state === "pending") {
+        slot.appendChild(el("p", {role:"status", text:"Waiting for the box to publish the code. Keep this page open. Retry keeps the same invitation."}));
+        var retry=el("button",{type:"button",className:"btn-send",text:"Get the six-character code",onclick:function(){
+          retry.disabled=true;publishInvite(draft).then(function(){drawInvites();}).catch(function(e){retry.disabled=false;retry.textContent="Retry code: "+e.message;});
+        }});slot.appendChild(retry);
+      } else {
+        slot.appendChild(el("p", { role: "status", text: v.state === "claimed" ? "Access is already given. Remove its connection under Assistants with access if needed." : "This invitation has ended." }));
+      }
+      slot.appendChild(el("button", { type: "button", className:"btn-ghost", text: "Done", onclick: function(){ state.inviteDraft=null; drawInvites(); } }));
+      if(draft.publishError) slot.appendChild(el("p",{role:"status",className:"access-error",text:draft.publishError}));
+    } else if (draft) {
+      drawInviteForm(slot, info, draft);
+    } else {
+      var create = el("button", { type: "button", className:"btn-send", text: "Create an invitation", onclick: function(){ state.inviteDraft={}; drawInvites(); } });
+      create.disabled = !canWiden() || !state.list.box || !state.list.box.offers || state.list.box.clock !== "ok";
+      slot.appendChild(create);
+      if (create.disabled) slot.appendChild(el("p", { className: "access-quiet", text: "Give access in the FTW app, or sign in with the house password on another device on your home network. The box also needs a set clock." }));
+    }
+    (info.invitations || []).forEach(function(v){
+      var item = el("div", { className: "access-card" });
+      var stateText = v.state === "pending" ? (v.clockUnavailable ? "Waiting for the box's clock" : "Waiting to be used") : v.state === "claimed" ? "Claimed by " + cleanName(v.client) + " · connection " + v.agentId : v.state;
+      item.appendChild(el("p", { text: cleanText(v.label || "Guest",128) + " · " + stateText }));
+      var rights=el("details",{},[el("summary",{text:"What the code allows"})]);
+      rights.appendChild(el("ul",{className:"access-may"},(v.scopes || []).map(function(s){return el("li",{text:scopeWords(s)});})));
+      item.appendChild(rights);
+      item.appendChild(el("p", { className: "access-quiet", text: "Code ends " + inviteWhen(v.claimUntilMs) + ". Access ends " + inviteWhen(v.expiresAtMs) + "." }));
+      if (v.state === "pending") {
+        var cancel = el("button", { type: "button", className:"btn-ghost", text: "Cancel invitation", onclick: function(){
+          cancel.disabled=true;
+          fetch("/api/agent-invites/"+encodeURIComponent(v.id),{method:"DELETE"}).then(function(r){return readJSON(r).then(function(body){
+            if(!r.ok) throw new Error(refusalText(body));
+            if(state.inviteDraft && state.inviteDraft.request && state.inviteDraft.request.id===v.id) state.inviteDraft.receipt=body.invitation;
+            if(body.invitation.state==="claimed") item.appendChild(el("p",{role:"status",text:"Access is already given. Remove its connection under Assistants with access."}));
+            return refresh();
+          });}).catch(function(e){item.appendChild(el("p",{role:"alert",text:e.message}));cancel.disabled=false;});
+        }});
+        item.appendChild(cancel);
+        if (!draft || !draft.request || draft.request.id !== v.id) item.appendChild(el("p", { className:"access-quiet", text:"The code cannot be shown again. Cancel this invitation and create a new one if needed." }));
+      }
+      slot.appendChild(item);
+    });
+  }
+
+  function drawInviteForm(slot, info, draft) {
+    var form=el("form", { autocomplete:"off" });
+    var label=el("input", { id:"invite-label", maxlength:"128", placeholder:"For example Hannes" });
+    form.appendChild(el("label", { for:"invite-label",text:"Who is this for?" })); form.appendChild(label);
+    var given={idSuffix:"invite",heading:"The code allows",scopes:info.scopes,ops:info.ops,caps:info.caps};
+    var limits=grantForm(form,given,state.list.registry,null);
+    var length=el("select",{name:"length",id:"invite-access-length"});
+    [1,7,30,365].forEach(function(days){var opt=el("option",{value:String(days*DAY_S),text:lengthText(days*DAY_S)});opt.selected=days===7;length.appendChild(opt);});
+    form.appendChild(el("label",{for:"invite-access-length",text:"Access lasts"}));form.appendChild(length);
+    form.appendChild(el("p",{className:"access-quiet",text:"The six-character code works once and ends within ten minutes. Access lasts as long as you choose above."}));
+    form.appendChild(el("p",{className:"access-quiet",text:"The label helps you find this invitation. It does not check the recipient's identity. Reading technical backups can reveal saved credentials. Setup and control stay off until you choose them."}));
+    var note=el("p",{role:"status",className:"access-note"}); form.appendChild(note);
+    var send=el("button",{type:"submit",className:"btn-send",text:draft.request?"Retry the same invitation":"Create code"});form.appendChild(send);
+    slot.appendChild(form);
+    if(draft.request) { form.querySelectorAll("input, select").forEach(function(e){e.disabled=true;}); note.textContent="Creation is not confirmed. Retry sends the exact same invitation. You can also check the invitation list below."; }
+    form.addEventListener("submit",function(e){
+      e.preventDefault();
+      if(!draft.request) {
+        var choice=readChoice(form,null,"invite"), grant=chosenGrant({reads:choice.reads,calls:choice.calls,ops:choice.ops,holdMin:choice.holdMin,maxKW:choice.maxKW,ttlS:Number(choice.length)},limits.perMin,state.list.registry);
+        var problem=choiceProblem(grant,info.caps); if(problem){note.textContent=problem;return;}
+        var secret=crypto.getRandomValues(new Uint8Array(32));
+        draft.secret=secret;
+        draft.request={id:base64Bytes(crypto.getRandomValues(new Uint8Array(16)),true),home:info.home,secret:base64Bytes(secret,false),label:label.value.trim(),scopes:grant.scopes,ops:grant.ops,caps:grant.caps,claimUntilMs:boxNow()+600000,expiresAtMs:boxNow()+grant.ttlS*1000};
+      }
+      send.disabled=true; note.textContent="Saving the invitation…";
+      form.querySelectorAll("input, select").forEach(function(e){e.disabled=true;});
+      postJSON("/api/agent-invites",draft.request).then(function(r){return readJSON(r).then(function(body){
+        if(!r.ok) throw new Error(refusalText(body));
+        draft.receipt=body.invitation;
+        if(draft.receipt.state==="pending") return publishInvite(draft).catch(function(){}).then(function(){return refresh();});
+        return refresh();
+      });}).catch(function(e){ note.textContent="Creation is not confirmed: "+e.message+". Retry the same invitation.";send.textContent="Retry the same invitation";send.disabled=false; });
+    });
+    slot.appendChild(el("button",{type:"button",className:"btn-ghost",text:"Close",onclick:function(){state.inviteDraft=null;refresh();}}));
+  }
+
+  function publishInvite(draft) {
+    return fetch("https://cloud.ftw.energy/oauth/invitations",{method:"POST",credentials:"omit",headers:{"Content-Type":"application/json"},body:JSON.stringify({invitation:inviteCode(draft.receipt,draft.secret)})}).then(function(r){
+      if(!r.ok) throw new Error("Wait for the box, then try again.");
+      return r.json();
+    }).then(function(body){
+      if(!/^[A-HJ-NP-Z2-9]{3}-[A-HJ-NP-Z2-9]{3}$/.test(body.code) || !(body.expiresAtMs>boxNow())) throw new Error("The code is not ready yet.");
+      draft.code=body.code;draft.codeExpiresAtMs=body.expiresAtMs;draft.publishError="";
+    }).catch(function(e){
+      draft.publishError=e.message || "Wait for the box, then try again.";throw e;
+    });
+  }
+
   var lastCtx = null;
 
   function refresh(ctx) {
@@ -989,7 +1137,8 @@
         '<fieldset id="access-rows-section">' +
         "<legend>Assistants with access</legend>" +
         '<div id="access-rows"><p class="access-quiet">Checking the box…</p></div>' +
-        "</fieldset>"
+        "</fieldset>" +
+        '<fieldset><legend>Share access with a code</legend><div id="access-invites"></div></fieldset>'
       );
     },
 
@@ -1008,6 +1157,7 @@
   };
 
   S.tabs.access._pure = {
+    inviteCode: inviteCode,
     SCOPE_WORDS: SCOPE_WORDS,
     OP_WORDS: OP_WORDS,
     normalizeCode: normalizeCode,

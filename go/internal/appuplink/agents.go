@@ -87,6 +87,14 @@ func (a *AgentAccess) ExpireAgents() []appenroll.Removed {
 
 func (a *AgentAccess) Agents() []protocol.AgentRow { return a.Enroll.Agents() }
 
+func (a *AgentAccess) AgentInvites() []protocol.AgentInvite { return a.Enroll.AgentInvites() }
+func (a *AgentAccess) CreateAgentInvite(deviceID string, m protocol.AgentInviteCreate) (protocol.AgentInvite, error) {
+	return a.Enroll.CreateAgentInvite(approver(deviceID), m)
+}
+func (a *AgentAccess) CancelAgentInvite(id string) (protocol.AgentInvite, error) {
+	return a.Enroll.CancelAgentInvite(id)
+}
+
 func (a *AgentAccess) ApprovalKeys() []protocol.ApprovalKeyInfo { return a.Enroll.ApprovalKeys() }
 
 func (a *AgentAccess) SetApprovalKey(deviceID string, m protocol.ApprovalKeySet) (int64, error) {

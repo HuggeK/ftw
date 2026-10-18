@@ -1878,6 +1878,21 @@ footer {
 }
 .access-code-row .btn-send { margin-top: 0; }
 .access-note { margin: 6px 0 0; font-size: 0.85rem; min-height: 1.2em; }
+#access-invites .access-invite-code {
+  display: block;
+  box-sizing: border-box;
+  width: 10ch;
+  padding: 12px;
+  margin: 12px 0 4px;
+  color: var(--text);
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font: 1.6rem/1.5 var(--mono, monospace);
+  letter-spacing: 0.08em;
+}
+#access-invites button { margin-right: 8px; }
+#access-invites .access-card { overflow-wrap: anywhere; }
 .access-error { margin: 6px 0 0; color: var(--red-e); font-size: 0.85rem; }
 .access-error:empty { display: none; }
 .access-warn { margin: 4px 0; color: var(--amber); font-size: 0.85rem; line-height: 1.4; }

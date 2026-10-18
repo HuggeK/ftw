@@ -49,7 +49,7 @@ var Fields = map[string][]string{
 	"Caps":       {"holdS", "maxW", "perMin"},
 	"Principal":  {"client", "clientId", "ticket"},
 	"Grant":      {"id", "scopes", "purposes", "controller", "termsPolicy", "statsId", "statsPolicy", "statsSinceMs"},
-	"Pending":    {"hash", "ttlS"},
+	"Pending":    {"hash", "kind", "ttlS"},
 	"WebPushRow": {"id", "dev", "epoch", "endpoint", "ct", "auth"},
 
 	MsgBye: {"why", "purge"},

@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/srcfl/ftw/go/internal/apiauth"
+	"github.com/srcfl/ftw/go/protocol"
 	"github.com/srcfl/ftw/go/protocol/appwire"
 )
 
@@ -118,7 +119,8 @@ type stored struct {
 	//
 	// Earlier versions stored a bare list of key strings; load() reads both
 	// so an update never silently unpairs a house.
-	AuthorisedApps []storedApp `json:"authorisedApps"`
+	AuthorisedApps []storedApp    `json:"authorisedApps"`
+	AgentInvites   []storedInvite `json:"agentInvites,omitempty"`
 }
 
 type storedApp struct {
@@ -199,15 +201,20 @@ func deviceID(key string) string {
 type Identity struct {
 	path string
 
+	saveMu sync.Mutex
 	mu     sync.Mutex
 	static appwire.KeyPair
 	// staticSecret is kept beside the key pair because appwire deliberately
 	// exposes only the public half; persisting the private one is this
 	// package's job and nobody else's.
-	staticSecret []byte
-	rendezvous   []byte
-	authorised   map[string]*appMeta
-	pairing      *pairingCode
+	staticSecret      []byte
+	rendezvous        []byte
+	authorised        map[string]*appMeta
+	invites           map[string]storedInvite
+	offerKeys         map[string][]byte
+	prepareInviteHome func() (string, error)
+	onInviteClaimed   func(protocol.AgentInvite, protocol.AgentRow)
+	pairing           *pairingCode
 	// watchPairing is the watch code, in a slot of its own so that adding a
 	// watch never cancels a phone's pending code. See MintWatchCode.
 	watchPairing *pairingCode
@@ -316,6 +323,7 @@ func LoadOrCreate(keyPath string) (*Identity, error) {
 	id := &Identity{
 		path:       path,
 		authorised: map[string]*appMeta{},
+		invites:    map[string]storedInvite{},
 		now:        time.Now,
 		randRead:   rand.Read,
 	}
@@ -363,6 +371,9 @@ func (i *Identity) load(raw []byte) error {
 	i.static = static
 	i.staticSecret = secret
 	i.rendezvous = rendezvous
+	for _, inv := range s.AgentInvites {
+		i.invites[inv.ID] = inv
+	}
 	for _, app := range s.AuthorisedApps {
 		role := app.Role
 		if role == "" {
@@ -438,7 +449,15 @@ func (i *Identity) mint() error {
 // write leaves the old material rather than half of the new. A box that loses
 // its static key is a box every phone in the house has to be re-paired with.
 func (i *Identity) save() error {
+	i.saveMu.Lock()
+	defer i.saveMu.Unlock()
 	i.mu.Lock()
+	defer i.mu.Unlock()
+	return i.persistLocked(i.snapshotLocked())
+}
+
+// The caller holds saveMu then mu through persistence and publication.
+func (i *Identity) snapshotLocked() stored {
 	s := stored{
 		NoiseSecret:      base64.RawURLEncoding.EncodeToString(i.staticSecret),
 		RendezvousSecret: base64.RawURLEncoding.EncodeToString(i.rendezvous),
@@ -460,8 +479,14 @@ func (i *Identity) save() error {
 	sort.Slice(s.AuthorisedApps, func(a, b int) bool {
 		return s.AuthorisedApps[a].Key < s.AuthorisedApps[b].Key
 	})
-	i.mu.Unlock()
+	for _, inv := range i.invites {
+		s.AgentInvites = append(s.AgentInvites, inv)
+	}
+	sort.Slice(s.AgentInvites, func(a, b int) bool { return s.AgentInvites[a].ID < s.AgentInvites[b].ID })
+	return s
+}
 
+func (i *Identity) persistLocked(s stored) error {
 	raw, err := json.Marshal(s)
 	if err != nil {
 		return fmt.Errorf("appenroll: encoding %s: %w", i.path, err)
@@ -680,6 +705,9 @@ func (i *Identity) Check(appStatic, payload []byte) (Grant, func() (Grant, error
 // agent row that has a clock to run by and has not expired: an agent reaches
 // the box through the tunnel and nowhere else.
 func (i *Identity) CheckTunnel(appStatic, payload []byte) (Grant, func() (Grant, error), error) {
+	if protocol.IsAgentInvitePayload(payload) {
+		return i.checkAgentInvite(appStatic, payload)
+	}
 	return i.check(appStatic, payload, true)
 }
 
@@ -1154,6 +1182,11 @@ type RosterEntry struct {
 // Roster lists every paired device, watches included, sorted by id.
 func (i *Identity) Roster() []RosterEntry {
 	i.mu.Lock()
+	defer i.mu.Unlock()
+	return i.rosterLocked()
+}
+
+func (i *Identity) rosterLocked() []RosterEntry {
 	out := make([]RosterEntry, 0, len(i.authorised))
 	for key, meta := range i.authorised {
 		raw, err := base64.RawURLEncoding.DecodeString(key)
@@ -1172,7 +1205,6 @@ func (i *Identity) Roster() []RosterEntry {
 		out = append(out, RosterEntry{ID: grant.DeviceID, Key: raw, Role: meta.role, Epoch: meta.epoch,
 			ParentRole: grant.ParentRole, Agent: grant.Agent})
 	}
-	i.mu.Unlock()
 	sort.Slice(out, func(a, b int) bool { return out[a].ID < out[b].ID })
 	return out
 }

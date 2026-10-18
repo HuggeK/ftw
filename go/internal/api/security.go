@@ -292,6 +292,7 @@ func protectedReadPath(path string) bool {
 		"/api/app-link/status",
 		"/api/agents",
 		"/api/agents/audit",
+		"/api/agent-invites",
 		"/api/ocpp/chargers":
 		return true
 	}
