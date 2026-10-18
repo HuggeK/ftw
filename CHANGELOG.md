@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.153.0
+
+### Minor Changes
+
+- 8e604db: Add a complete configuration schema and durable setup drafts. Draft edits preserve unedited settings and credentials; validation and a confirmed commit use the current Settings revision and save path. This prepares setup through MCP; first-run pairing, MCP writes and code sharing remain separate work.
+  
+  Validation returns normalized settings as a new draft revision for review. The final save checks those exact portable settings before writing to SQLite, including credential bindings. Drafts, Settings saves and reloads preserve exact integer driver identifiers; numbers that would change are rejected with a field path.
+- 30ce5ad: Owners can grant an assistant setup access as a separate choice. MCP reads the box's complete setup schema, resumes a draft, edits one field or list entry, validates and saves the exact draft the user confirms. The box retains its Settings checks, reports pending restarts and preserves a save receipt. A separate confirmed call can restart to apply the exact saved setup, with a live grant and revision check before the restart. Saving does not prove physical measurement or control.
+  
+  Every draft write and final Settings transaction rechecks the live grant and request deadline after preparation. Revoked access and ended requests leave both settings and commit receipts unchanged.
+- 499d5de: Share MCP access with a single-use code. Choose rights and expiry, let the recipient connect with its own key, and cancel invitations or remove access from the box page or app.
+
+### Patch Changes
+
+- 7858d8d: Keep the household consumer available in energy-asset discovery and detail history after switching to source-integrated Load. Detail and site queries use the same interval balance without adding instantaneous consumer energy. Count history result limits by stored intervals, including queries with gaps and older data.
+- 0806ffc: Calculate recorded household Load from source energy over the same interval in Core. Different meter and charger reporting rates no longer depend on a valid instantaneous Load sample. The app, web history and daily totals use the same source balance. Keep signed source energy through aggregation, preserve real gaps, and leave live display and control unchanged.
+
 ## 0.152.1
 
 ### Patch Changes
