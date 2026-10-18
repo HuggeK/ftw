@@ -50,9 +50,9 @@ function usableHomeEstimate(estimate) {
 export function homeEstimateNote(estimate, live = true, powerBalanceW = null) {
   if (!estimate) return "";
   if (!live) return "Home use estimate paused · no live data";
-  if (!usableHomeEstimate(estimate) && powerBalanceW !== null) {
-    return `Estimated home use ${(powerBalanceW / 1000).toFixed(1)} kW · latest power readings; device delays may differ.`;
-  }
+  const current = powerBalanceW === null ? "" :
+    `Estimated home use ${(powerBalanceW / 1000).toFixed(1)} kW · latest power readings; device delays may differ.`;
+  if (current && !usableHomeEstimate(estimate)) return current;
   if (num(estimate.watts) === null) {
     if (estimate.reason === "charger_source_time_unavailable") return "Home use estimate unavailable · charger source time unknown";
     const sourceAge = num(estimate.source_age_ms);
@@ -69,7 +69,7 @@ export function homeEstimateNote(estimate, live = true, powerBalanceW = null) {
   const age = estimate.end_age_ms === 0 ? "ended now" : `ended ${Math.ceil(estimate.end_age_ms / 1000)} s ago`;
   const basis = {counters:"energy counters", power_integral:"sampled power", mixed:"charger energy + sampled power"}[estimate.energy_basis] || "energy estimate";
   const timing = estimate.timing_basis === "source" ? "Device clocks may differ." : "Includes arrival times; device delay is unknown.";
-  return `Estimated home use ${(estimate.watts / 1000).toFixed(1)} kW · ${Math.round((estimate.to_ms - estimate.from_ms) / 1000)} s mean · ${period} · ${age} · ${basis}. ${timing}`;
+  return `${current || "Home use unavailable · no current power balance."} Energy mean ${(estimate.watts / 1000).toFixed(1)} kW · ${Math.round((estimate.to_ms - estimate.from_ms) / 1000)} s window · ${period} · ${age} · ${basis}. ${timing}`;
 }
 
 function planetColor(role, watts, thresholdW) {
@@ -242,12 +242,13 @@ export function flowReadingsFromStatus(status, opts) {
 
   const hasEstimate = status?.load_estimate != null;
   // Core qualifies this balance, including missing flows and stale meters.
-  // An unavailable energy interval must not hide a valid power balance. Never
-  // derive another balance from independently smoothed display readings here.
+  // A past energy interval is separate from Power now: it must neither hide
+  // nor overwrite current household power. Never derive another balance from
+  // independently smoothed display readings here.
   const rawLoad = num(status?.load_w);
   const powerBalanceW = rawLoad !== null && rawLoad >= 0 &&
     (status?.history_quality == null || status.history_quality === "complete") ? rawLoad : null;
-  const loadW = usableHomeEstimate(status?.load_estimate) ? status.load_estimate.watts : powerBalanceW;
+  const loadW = powerBalanceW;
   // Today's share is kWh already in the box, not the live meter. A
   // quiet meter blanks % SELF-POWERED NOW (unknown instantaneous load)
   // but must not hide a day that already happened.
