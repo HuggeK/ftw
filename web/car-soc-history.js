@@ -21,18 +21,43 @@ export function reportedLevelPoints(points = [], now = Date.now()) {
     })).sort((a, b) => a.at - b.at);
 }
 
-export async function readCarLevelHistory(car, range, { fetcher = fetch, signal, now = Date.now() } = {}) {
+async function readJSON(url, { fetcher, signal, timeoutMs = 30000 }) {
+  signal?.throwIfAborted();
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  signal?.addEventListener('abort', abort, { once: true });
+  const timer = setTimeout(abort, timeoutMs);
+  try {
+    const response = await fetcher(url, { signal: controller.signal, cache: 'no-store' });
+    if (!response.ok) throw new Error('History read failed');
+    return await response.json();
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', abort);
+  }
+}
+
+// Empty sources can mean the viewer's car list hid them. Ask the box before
+// saying that the car has none; an authorized empty list is different.
+export async function readHistoryCar(car, { fetcher = fetch, signal } = {}) {
+  if (carLevelSources(car).length) return { car, redacted: false };
+  const data = await readJSON('/api/cars', { fetcher, signal });
+  if (data.redacted) return { car, redacted: true };
+  const found = data.cars?.find(c => c.id === car.id);
+  if (!found) throw new Error('Car no longer available');
+  return { car: { ...car, sources: carLevelSources(found) }, redacted: false };
+}
+
+export async function readCarLevelHistory(car, range, { fetcher = fetch, signal, now = Date.now(), timeoutMs = 30000 } = {}) {
   if (!RANGES.includes(range)) throw new Error('Unknown history range');
   return Promise.all(carLevelSources(car).map(async source => {
     try {
       const query = new URLSearchParams({ driver: source, metric: 'vehicle_soc', range, points: '180' });
-      const response = await fetcher('/api/series?' + query, { signal, cache: 'no-store' });
-      if (!response.ok) throw new Error('History read failed');
-      const data = await response.json();
+      const data = await readJSON('/api/series?' + query, { fetcher, signal, timeoutMs });
       if (!Array.isArray(data.points)) throw new Error('History points missing');
       return { source, points: reportedLevelPoints(data.points, now), failed: false };
     } catch (err) {
-      if (signal?.aborted || err?.name === 'AbortError') throw err;
+      if (signal?.aborted) throw err;
       return { source, points: [], failed: true };
     }
   }));
@@ -127,7 +152,8 @@ function styles(doc) {
   `;
 }
 
-export function openCarLevelHistory(doc, car, { fetcher = fetch } = {}) {
+export function openCarLevelHistory(doc, car, { fetcher = fetch,
+  requestLogin = () => doc.defaultView?.FTWLanAuth?.ensure?.() || Promise.resolve(false) } = {}) {
   styles(doc);
   const dialog = node(doc, 'dialog', doc.body, null, 'car-soc-history');
   const head = node(doc, 'header', dialog);
@@ -151,10 +177,24 @@ export function openCarLevelHistory(doc, car, { fetcher = fetch } = {}) {
     const current = ++sequence;
     controller?.abort(); controller = new AbortController();
     const signal = controller.signal;
-    const timeout = setTimeout(() => controller?.signal === signal && controller.abort(), 30000);
     buttons.forEach(([value, button]) => button.setAttribute('aria-pressed', String(value === range)));
     content.replaceChildren(); node(doc, 'p', content, 'Loading saved levels…', 'soc-note');
     try {
+      const resolved = await readHistoryCar(car, { fetcher, signal });
+      if (closed || current !== sequence) return;
+      if (resolved.redacted) {
+        content.replaceChildren();
+        node(doc, 'p', content, 'Sign in to read this car’s sensor history.', 'soc-note');
+        const login = node(doc, 'button', content, 'Sign in'); login.type = 'button';
+        login.addEventListener('click', async () => {
+          // The house-password form must be above the page, not behind a
+          // native modal. Reopen history after it has finished.
+          dialog.close();
+          if (await requestLogin()) openCarLevelHistory(doc, car, { fetcher, requestLogin });
+        });
+        return;
+      }
+      car = resolved.car;
       const until = Date.now();
       const since = until - (range === '24h' ? 1 : range === '7d' ? 7 : 30) * 86400000;
       const sources = await readCarLevelHistory(car, range, { fetcher, signal, now: until });
@@ -182,7 +222,7 @@ export function openCarLevelHistory(doc, car, { fetcher = fetch } = {}) {
       if (closed || current !== sequence) return;
       content.replaceChildren();
       node(doc, 'p', content, 'The box did not finish reading history. Try the range again.', 'soc-note');
-    } finally { clearTimeout(timeout); }
+    }
   }
   dialog.addEventListener('close', () => {
     closed = true; controller?.abort(); dialog.remove();

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { carLevelSources, pointDescription, readCarLevelHistory, reportedLevelPoints } from './car-soc-history.js';
+import { carLevelSources, pointDescription, readCarLevelHistory, readHistoryCar, reportedLevelPoints } from './car-soc-history.js';
 
 const now = 1792330436520;
 const point = { ts: now - 10000, first_ms: now - 9021, v: 0.57, last: 0.57, min: 0.57, max: 0.57, n: 1, resolution_ms: 10000 };
@@ -79,4 +79,33 @@ test('closing or changing the range cancels in-flight reads', async () => {
 test('no linked source makes no history request and an unknown range is rejected', async () => {
   assert.deepEqual(await readCarLevelHistory({ sources: [] }, '24h', { fetcher: () => { throw new Error('unexpected request'); } }), []);
   await assert.rejects(readCarLevelHistory({ sources: ['sensor'] }, 'forever'), /Unknown history range/);
+});
+
+test('a redacted source list asks for sign-in instead of reporting no sensor', async () => {
+  const car = { id: 'car-one' };
+  const result = await readHistoryCar(car, { fetcher: async url => {
+    assert.equal(url, '/api/cars');
+    return { ok: true, json: async () => ({ cars: [car], redacted: true }) };
+  } });
+  assert.equal(result.redacted, true);
+});
+
+test('after sign-in the protected list supplies sources; a known empty list stays empty', async () => {
+  for (const sources of [[], ['sensor']]) {
+    const result = await readHistoryCar({ id: 'car-one' }, { fetcher: async () => ({ ok: true,
+      json: async () => ({ cars: [{ id: 'car-one', sources }] }) }) });
+    assert.equal(result.redacted, false);
+    assert.deepEqual(result.car.sources, sources);
+  }
+});
+
+test('a source deadline keeps another source’s completed history', async () => {
+  const result = await readCarLevelHistory({ sources: ['good', 'slow'] }, '24h', { now, timeoutMs: 10,
+    fetcher: async (url, { signal }) => {
+      if (url.includes('driver=good')) return { ok: true, json: async () => ({ points: [point] }) };
+      return new Promise((resolve, reject) => signal.addEventListener('abort', () => reject(new DOMException('Timed out', 'AbortError'))));
+    } });
+  assert.equal(result[0].failed, false);
+  assert.equal(result[0].points.length, 1);
+  assert.equal(result[1].failed, true);
 });
