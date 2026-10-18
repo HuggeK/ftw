@@ -27,15 +27,25 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 202, map[string]any{"status": "restarting"})
+	s.queueRestart(nil, nil)
+}
 
+func (s *Server) queueRestart(trigger func(context.Context) error, done func(error)) {
+	if trigger == nil {
+		trigger = s.deps.Restart
+	}
 	go func() {
 		time.Sleep(200 * time.Millisecond)
 		// Don't reuse r.Context() — it's canceled the instant the
 		// response is flushed.
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if err := s.deps.Restart(ctx); err != nil {
+		err := trigger(ctx)
+		if err != nil {
 			slog.Warn("restart trigger failed", "err", err)
+		}
+		if done != nil {
+			done(err)
 		}
 	}()
 }

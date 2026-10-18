@@ -34,6 +34,7 @@
     "ftw.logs.read": "Read the box's logs, with names and secrets taken out",
     "ftw.config.read": "Read the settings, with names and secrets taken out",
     "ftw.diag.run": "Read full technical diagnostics, source, logs and backups; backups can contain saved credentials",
+    "ftw.setup.write": "Save the exact setup draft you confirm and restart to apply it when you confirm",
     "ftw.dispatch.hold": "Act at once, for a few minutes at a time, within these limits",
     "ftw.goals.request": "Ask for lasting changes, each waiting for your yes here",
   };
@@ -109,7 +110,7 @@
   function splitGrant(scopes, ops, registry) {
     var write = (registry && registry.writeScopes) || [];
     var agentOps = (registry && registry.agentOps) || {};
-    var reads = [], groups = [];
+    var reads = [], groups = [], calls = [];
     // In the page's order, which runs from now to the past to the box itself;
     // a scope the page has no words for goes last.
     var order = Object.keys(SCOPE_WORDS);
@@ -119,13 +120,17 @@
         reads.push(scope);
         return;
       }
+      if (((registry && registry.callScopes) || []).indexOf(scope) >= 0) {
+        calls.push(scope);
+        return;
+      }
       var opOrder = Object.keys(OP_WORDS);
       var opRank = function (op) { var i = opOrder.indexOf(op); return i < 0 ? opOrder.length : i; };
       var under = (ops || []).filter(function (op) { return agentOps[op] === scope; })
         .sort(function (a, b) { return opRank(a) - opRank(b); });
       if (under.length) groups.push({ scope: scope, ops: under });
     });
-    return { reads: reads, groups: groups };
+    return { reads: reads, groups: groups, calls: calls };
   }
 
   // An op runs at once, under the grant's caps, when one of its arguments is
@@ -149,6 +154,9 @@
     var agentOps = (registry && registry.agentOps) || {};
     var ops = sortedUnique(choice.ops || []);
     var scopes = (choice.reads || []).slice();
+    (choice.calls || []).forEach(function (scope) {
+      if (((registry && registry.callScopes) || []).indexOf(scope) >= 0) scopes.push(scope);
+    });
     ops.forEach(function (op) { if (agentOps[op]) scopes.push(agentOps[op]); });
     scopes = sortedUnique(scopes);
     var caps = { holdS: 0, maxW: 0, perMin: perMin || 0 };
@@ -593,6 +601,10 @@
     split.reads.forEach(function (scope) {
       form.appendChild(checkRow("read", scope, scopeWords(scope), true));
     });
+    split.calls.forEach(function (scope) {
+      form.appendChild(checkRow("call", scope, scopeWords(scope), !!current));
+      form.appendChild(el("p", { className: "access-quiet", text: "Off until you choose it. This includes equipment names and connection settings. Review and confirm the exact draft before it saves, and confirm any restart separately. Saved equipment settings can affect operation; Core keeps its safety checks." }));
+    });
 
     if (split.groups.length) {
       var controlOn = !!current;
@@ -628,8 +640,9 @@
   }
 
   function readChoice(form, current) {
-    var reads = [], ops = [];
+    var reads = [], ops = [], calls = [];
     form.querySelectorAll('input[name="read"]').forEach(function (b) { if (b.checked) reads.push(b.value); });
+    form.querySelectorAll('input[name="call"]').forEach(function (b) { if (b.checked) calls.push(b.value); });
     var control = form.querySelector('[id^="access-control-"]');
     if (!control || control.checked) {
       form.querySelectorAll('input[name="op"]').forEach(function (b) { if (b.checked) ops.push(b.value); });
@@ -639,7 +652,7 @@
     var power = document.getElementById("access-power-" + suffix);
     var length = form.querySelector('select[name="length"]');
     return {
-      reads: reads, ops: ops,
+      reads: reads, ops: ops, calls: calls,
       holdMin: hold ? hold.value : 0, maxKW: power ? power.value : 0,
       length: length ? length.value : "",
     };
@@ -712,7 +725,7 @@
     card.addEventListener("submit", function (e) {
       e.preventDefault();
       var c = readChoice(card, null);
-      var grant = chosenGrant({ reads: c.reads, ops: c.ops, holdMin: c.holdMin, maxKW: c.maxKW, ttlS: c.length },
+      var grant = chosenGrant({ reads: c.reads, ops: c.ops, calls: c.calls, holdMin: c.holdMin, maxKW: c.maxKW, ttlS: c.length },
         form.perMin, registry);
       var why = choiceProblem(grant, v.caps);
       if (why) {
@@ -778,7 +791,7 @@
       ]));
       var ended = row.expiresAtMs && row.expiresAtMs <= now;
       item.appendChild(el("p", { className: "access-quiet", text: [
-        split.groups.length ? "Reads and controls" : "Reads",
+        split.calls.length ? (split.groups.length ? "Reads, setup and control" : "Reads and setup") : (split.groups.length ? "Reads and controls" : "Reads"),
         ended ? "ran out " + whenText(row.expiresAtMs) : "until " + whenText(row.expiresAtMs),
         agoText(row.lastSeenMs, now),
         row.approvedBy === "lan" ? "let in on this page" : "let in from a phone",
@@ -786,6 +799,7 @@
 
       var list = el("ul", { className: "access-may" });
       split.reads.forEach(function (s) { list.appendChild(el("li", { text: scopeWords(s) })); });
+      split.calls.forEach(function (s) { list.appendChild(el("li", { text: scopeWords(s) })); });
       split.groups.forEach(function (g) {
         g.ops.forEach(function (op) { list.appendChild(el("li", { text: opWords(op) })); });
       });
@@ -841,7 +855,7 @@
       e.preventDefault();
       var c = readChoice(form, row);
       var ttlS = c.length === "keep" ? Math.floor((row.expiresAtMs - boxNow()) / 1000) : Number(c.length);
-      var grant = chosenGrant({ reads: c.reads, ops: c.ops, holdMin: c.holdMin, maxKW: c.maxKW, ttlS: ttlS },
+      var grant = chosenGrant({ reads: c.reads, ops: c.ops, calls: c.calls, holdMin: c.holdMin, maxKW: c.maxKW, ttlS: ttlS },
         f.perMin, registry);
       var why = choiceProblem(grant, { holdS: (row.caps || {}).holdS || 0, maxW: (row.caps || {}).maxW || 0 });
       if (why) {

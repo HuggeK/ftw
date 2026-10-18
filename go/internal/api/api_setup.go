@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/srcfl/ftw/go/internal/config"
+	"github.com/srcfl/ftw/go/internal/localzone"
 	"github.com/srcfl/ftw/go/internal/onboarding"
 )
 
@@ -61,16 +62,19 @@ func (s *Server) setupRoutes() {
 	s.handle("POST /api/setup/reset", Configure, s.handleSetupReset)
 	s.handle("POST /api/setup/validate", Configure, s.handleSetupValidate)
 	s.handle("POST /api/setup/commit", Configure, s.handleSetupCommit)
+	s.handle("POST /api/setup/restart", Configure, s.handleSetupRestart)
 }
 
 func (s *Server) handleSetupSchema(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
+		"driver_catalog": s.driverCatalogReply(), "price_zones": priceZoneItems(), "runtime_timezone": localzone.Name(),
 		"schema": onboarding.Schema(), "drivers": "/api/drivers/catalog", "price_areas": "/api/prices/zones",
 		"workflow": []string{
 			"Read the current draft. Ask only for missing facts and choices.",
 			"Discover equipment only when the user asks; reading a draft does not scan.",
 			"Patch the current draft revision. Omitted fields and saved credentials remain on the box.",
 			"Arrays replace the whole array. Read and retain all existing entries before editing one.",
+			"For large lists use JSON Patch add/replace/remove operations against this exact revision; an index never refers to a later draft.",
 			"Validate the exact draft, show its changes and assumptions, then ask the user to confirm before commit.",
 			"Validation can normalize fields into a new draft revision and checksum. Review that returned configuration and its warnings; an earlier confirmation cannot save the changed draft.",
 			"Saving configuration does not prove hardware operation. Check fresh measurements and bounded control tests separately.",
@@ -101,6 +105,10 @@ func (s *Server) setupLive() (*config.Config, error) {
 
 func (s *Server) setupError(w http.ResponseWriter, err error) {
 	status := http.StatusUnprocessableEntity
+	var denied *setupAccessError
+	if errors.As(err, &denied) {
+		status = denied.status
+	}
 	if errors.Is(err, onboarding.ErrConflict) {
 		status = http.StatusConflict
 	}
@@ -180,8 +188,9 @@ func (s *Server) writeSetupDraft(w http.ResponseWriter, live *config.Config, d o
 }
 
 type setupEdit struct {
-	Revision int64           `json:"revision"`
-	Patch    json.RawMessage `json:"patch"`
+	Revision   int64           `json:"revision"`
+	Patch      json.RawMessage `json:"patch"`
+	Operations json.RawMessage `json:"operations"`
 }
 
 func setupJSON(w http.ResponseWriter, r *http.Request, v any) bool {
@@ -209,7 +218,19 @@ func (s *Server) handleSetupEdit(w http.ResponseWriter, r *http.Request) {
 		s.setupError(w, err)
 		return
 	}
-	d, err := s.setup.Edit(live, q.Revision, q.Patch)
+	if !setupAuthority(w, r) {
+		return
+	}
+	var d onboarding.Draft
+	if len(q.Operations) > 0 && len(q.Patch) > 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "send either patch or operations"})
+		return
+	}
+	if len(q.Operations) > 0 {
+		d, err = s.setup.EditOperationsWithCheck(live, q.Revision, q.Operations, setupWriteCheck(r))
+	} else {
+		d, err = s.setup.EditWithCheck(live, q.Revision, q.Patch, setupWriteCheck(r))
+	}
 	if err != nil {
 		s.setupError(w, err)
 		return
@@ -229,7 +250,10 @@ func (s *Server) handleSetupReset(w http.ResponseWriter, r *http.Request) {
 		s.setupError(w, err)
 		return
 	}
-	d, err := s.setup.Restart(live, q.Revision)
+	if !setupAuthority(w, r) {
+		return
+	}
+	d, err := s.setup.RestartWithCheck(live, q.Revision, setupWriteCheck(r))
 	if err != nil {
 		s.setupError(w, err)
 		return
@@ -258,7 +282,10 @@ func (s *Server) handleSetupValidate(w http.ResponseWriter, r *http.Request) {
 		s.setupError(w, onboarding.ErrConflict)
 		return
 	}
-	d, err := s.setup.Validate(live, q.Revision, q.SHA256)
+	if !setupAuthority(w, r) {
+		return
+	}
+	d, err := s.setup.ValidateWithCheck(live, q.Revision, q.SHA256, setupWriteCheck(r))
 	if err != nil {
 		s.setupError(w, err)
 		return
@@ -326,7 +353,10 @@ func (s *Server) handleSetupCommit(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		s.handlePostConfigWith(w, request, true, func(path string, cfg *config.Config) error {
-			return s.deps.SaveConfigWithValues(path, cfg, map[string]string{onboarding.CommitKey: string(record)}, raw)
+			if err := setupWriteCheck(request)(); err != nil {
+				return err
+			}
+			return s.deps.SaveConfigWithValues(path, cfg, map[string]string{onboarding.CommitKey: string(record)}, raw, setupWriteCheck(request))
 		}, func(cfg *config.Config, _ []string) {
 			s.writeSetupCommit(w, cfg.Revision, &receipt)
 		})

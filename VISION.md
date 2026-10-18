@@ -10,6 +10,15 @@ primitives an agent or another automation needs in order to work with the
 home's energy system. Home Assistant, MQTT and a database the owner runs for
 their own analysis sit on top. Core does not absorb those tools.
 
+An owner must be able to set up the full system through an authorized
+assistant, starting with a new box. The conversation should ask only for
+missing facts and choices, keep an unfinished draft on the box, and separate
+saved settings from measured and verified operation. The owner must also be
+able to share a revocable grant with another person's own assistant through
+a code. Everyday status and history must stay direct, without a setup
+interview. These are requirements; the [agent-led setup proposal](docs/adr/0011-agent-led-setup.md)
+names the delivery and evidence still needed.
+
 This is the product direction set by Fredrik. It guides design and review;
 it does not claim that every outcome below has shipped. The
 [roadmap](docs/roadmap.md) names the work and evidence needed to reach it.

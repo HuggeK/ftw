@@ -114,6 +114,11 @@ func initial(live *config.Config) (Draft, error) {
 // the whole array; the client must read it before editing an entry.
 // Partial drafts may fail Config.Validate while still having valid types.
 func (s *Service) Edit(live *config.Config, expected int64, patch json.RawMessage) (Draft, error) {
+	return s.EditWithCheck(live, expected, patch, nil)
+}
+
+// EditWithCheck rechecks the caller after preparation, before the durable write.
+func (s *Service) EditWithCheck(live *config.Config, expected int64, patch json.RawMessage, beforeSave func() error) (Draft, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	d, found, err := s.current()
@@ -186,6 +191,11 @@ func (s *Service) Edit(live *config.Config, expected int64, patch json.RawMessag
 	if err != nil || len(raw) > MaxDraftBytes {
 		return Draft{}, errors.New("setup draft is too large")
 	}
+	if beforeSave != nil {
+		if err := beforeSave(); err != nil {
+			return Draft{}, err
+		}
+	}
 	if err := s.store.SaveConfig(draftKey, string(raw)); err != nil {
 		return Draft{}, fmt.Errorf("save setup draft: %w", err)
 	}
@@ -223,6 +233,11 @@ func keepDraftCredentialOwners(cfg, previous *config.Config) error {
 // Validate saves any normalization as a new draft for the user to review.
 // An invalid partial draft stays unchanged; reading never calls this method.
 func (s *Service) Validate(live *config.Config, revision int64, sha string) (Draft, error) {
+	return s.ValidateWithCheck(live, revision, sha, nil)
+}
+
+// ValidateWithCheck rechecks the caller after preparation, before the durable write.
+func (s *Service) ValidateWithCheck(live *config.Config, revision int64, sha string, beforeSave func() error) (Draft, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if live == nil {
@@ -254,6 +269,11 @@ func (s *Service) Validate(live *config.Config, revision int64, sha string) (Dra
 	raw, err := json.Marshal(d)
 	if err != nil || len(raw) > MaxDraftBytes {
 		return Draft{}, errors.New("setup draft is too large")
+	}
+	if beforeSave != nil {
+		if err := beforeSave(); err != nil {
+			return Draft{}, err
+		}
 	}
 	if err := s.store.SaveConfig(draftKey, string(raw)); err != nil {
 		return Draft{}, fmt.Errorf("save checked setup draft: %w", err)
@@ -319,6 +339,11 @@ func (s *Service) candidateLocked(liveRevision, revision int64, sha string) (Dra
 // Restart abandons a stale draft only when the caller names its current
 // revision. It stores a new draft from live settings, never an empty config.
 func (s *Service) Restart(live *config.Config, expected int64) (Draft, error) {
+	return s.RestartWithCheck(live, expected, nil)
+}
+
+// RestartWithCheck rechecks the caller after preparation, before the durable write.
+func (s *Service) RestartWithCheck(live *config.Config, expected int64, beforeSave func() error) (Draft, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	old, found, err := s.current()
@@ -336,6 +361,11 @@ func (s *Service) Restart(live *config.Config, expected int64) (Draft, error) {
 	raw, err := json.Marshal(d)
 	if err != nil || len(raw) > MaxDraftBytes {
 		return Draft{}, errors.New("setup draft is too large")
+	}
+	if beforeSave != nil {
+		if err := beforeSave(); err != nil {
+			return Draft{}, err
+		}
 	}
 	if err := s.store.SaveConfig(draftKey, string(raw)); err != nil {
 		return Draft{}, err

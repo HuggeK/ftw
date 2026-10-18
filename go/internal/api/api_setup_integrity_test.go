@@ -201,9 +201,9 @@ func TestSetupFinalSaveRefusesLateMutationBeforeAnySQLWrite(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatal(w.Body.String())
 	}
-	s.deps.SaveConfigWithValues = func(path string, candidate *config.Config, values map[string]string, reviewedJSON []byte) error {
+	s.deps.SaveConfigWithValues = func(path string, candidate *config.Config, values map[string]string, reviewedJSON []byte, beforeSave func() error) error {
 		candidate.Site.Name = "Not reviewed"
-		return config.SaveStoredReviewedWithValues(s.deps.State, path, candidate, values, reviewedJSON)
+		return config.SaveStoredReviewedWithCheck(s.deps.State, path, candidate, values, reviewedJSON, beforeSave)
 	}
 	w, _ = setupCall(t, s, http.MethodPost, "/api/setup/commit", setupIntegrityCheck(draft))
 	if w.Code != http.StatusConflict || cfg.Revision != beforeRevision || cfg.Site.Name != "Before" {

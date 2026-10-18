@@ -238,7 +238,7 @@ func SaveStored(st *state.Store, path string, cfg *Config) error {
 // SaveStoredWithValues commits a settings change and its companion records
 // in the same SQLite transaction, for example a setup commit receipt.
 func SaveStoredWithValues(st *state.Store, path string, cfg *Config, values map[string]string) error {
-	return saveStoredValues(st, path, cfg, "", values, nil)
+	return saveStoredValues(st, path, cfg, "", values, nil, nil)
 }
 
 // DropRetiredSettings rewrites stored settings that still carry settings of a
@@ -267,7 +267,7 @@ func DropRetiredSettings(st *state.Store, path string, cfg *Config) ([]string, e
 }
 
 func saveStored(st *state.Store, path string, cfg *Config, sourceHash string) error {
-	return saveStoredValues(st, path, cfg, sourceHash, nil, nil)
+	return saveStoredValues(st, path, cfg, sourceHash, nil, nil, nil)
 }
 
 // ErrReviewedConfigChanged means a save would differ from the reviewed document.
@@ -276,13 +276,19 @@ var ErrReviewedConfigChanged = errors.New("configuration changed after review; v
 // SaveStoredReviewedWithValues checks the portable document after all save-time
 // normalization, before committing either settings or companion records.
 func SaveStoredReviewedWithValues(st *state.Store, path string, cfg *Config, values map[string]string, reviewedJSON []byte) error {
+	return SaveStoredReviewedWithCheck(st, path, cfg, values, reviewedJSON, nil)
+}
+
+// SaveStoredReviewedWithCheck checks authority after all save preparation,
+// immediately before committing the reviewed settings and companion records.
+func SaveStoredReviewedWithCheck(st *state.Store, path string, cfg *Config, values map[string]string, reviewedJSON []byte, beforeSave func() error) error {
 	if len(reviewedJSON) == 0 {
 		return errors.New("reviewed configuration is required")
 	}
-	return saveStoredValues(st, path, cfg, "", values, reviewedJSON)
+	return saveStoredValues(st, path, cfg, "", values, reviewedJSON, beforeSave)
 }
 
-func saveStoredValues(st *state.Store, path string, cfg *Config, sourceHash string, values map[string]string, reviewedJSON []byte) error {
+func saveStoredValues(st *state.Store, path string, cfg *Config, sourceHash string, values map[string]string, reviewedJSON []byte, beforeSave func() error) error {
 	if cfg.ConfigDatabase == "" {
 		return errors.New("settings database is not initialized")
 	}
@@ -359,6 +365,11 @@ func saveStoredValues(st *state.Store, path string, cfg *Config, sourceHash stri
 			return errors.New("companion settings record conflicts with configuration or credentials")
 		}
 		credentials[key] = value
+	}
+	if beforeSave != nil {
+		if err := beforeSave(); err != nil {
+			return err
+		}
 	}
 	revision, err := st.SaveConfiguration(raw, cfg.Revision, credentials)
 	if err != nil {

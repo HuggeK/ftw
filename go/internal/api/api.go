@@ -130,7 +130,7 @@ type Deps struct {
 	SelfTune             *selftune.Coordinator
 	DtS                  float64                                   // control interval seconds (for model τ / age displays)
 	SaveConfig           func(path string, c *config.Config) error // injection for testability
-	SaveConfigWithValues func(path string, c *config.Config, values map[string]string, reviewedJSON []byte) error
+	SaveConfigWithValues func(path string, c *config.Config, values map[string]string, reviewedJSON []byte, beforeSave func() error) error
 	// ConfigApplier is main.go's config-applied callback — the same
 	// closure the configreload watcher runs (registry reload with SoC
 	// bounds, capacities, inverter groups, fuse and mpc/loadmodel
@@ -260,10 +260,11 @@ type Deps struct {
 // Server wraps the http.ServeMux and adds shared middleware (logging,
 // no-cache headers on static assets).
 type Server struct {
-	configWriteMu sync.Mutex // Covers persistence and apply for every config writer.
-	deps          *Deps
-	mux           *http.ServeMux
-	setup         *onboarding.Service
+	configWriteMu        sync.Mutex // Covers persistence and apply for every config writer.
+	deps                 *Deps
+	mux                  *http.ServeMux
+	setup                *onboarding.Service
+	setupRestartRevision int64 // Protected by configWriteMu; a lost reply must not queue another restart.
 
 	// dailyCache memoizes per-local-day energy totals keyed by "YYYY-MM-DD".
 	// Past days are immutable once the day ends, so we only ever recompute
@@ -332,8 +333,8 @@ func New(deps *Deps) *Server {
 	}
 	s.setup = onboarding.NewWithSecrets(deps.State, s.preserveSetupSecrets, filepath.Dir(deps.ConfigPath))
 	if deps.SaveConfigWithValues == nil && deps.State != nil {
-		deps.SaveConfigWithValues = func(path string, cfg *config.Config, values map[string]string, reviewedJSON []byte) error {
-			return config.SaveStoredReviewedWithValues(deps.State, path, cfg, values, reviewedJSON)
+		deps.SaveConfigWithValues = func(path string, cfg *config.Config, values map[string]string, reviewedJSON []byte, beforeSave func() error) error {
+			return config.SaveStoredReviewedWithCheck(deps.State, path, cfg, values, reviewedJSON, beforeSave)
 		}
 	}
 	if deps.Registry != nil {
@@ -1726,6 +1727,11 @@ func (s *Server) handlePostConfigWith(w http.ResponseWriter, r *http.Request, re
 
 	// Persist atomically (Password has yaml:"-" so it won't appear in YAML)
 	if err := save(s.deps.ConfigPath, &newCfg); err != nil {
+		var denied *setupAccessError
+		if errors.As(err, &denied) {
+			writeJSON(w, denied.status, map[string]string{"error": denied.Error()})
+			return
+		}
 		status := http.StatusInternalServerError
 		if errors.Is(err, config.ErrReviewedConfigChanged) {
 			status = http.StatusConflict
@@ -1984,6 +1990,10 @@ func (s *Server) handleDrivers(w http.ResponseWriter, r *http.Request) {
 // drivers/ directory, parsed from each .lua file's DRIVER metadata.
 // Used by the Settings UI to offer an "Add from catalog" dropdown.
 func (s *Server) handleDriversCatalog(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.driverCatalogReply())
+}
+
+func (s *Server) driverCatalogReply() map[string]any {
 	// Default is next to the config file; overridable via -drivers for
 	// deployments (Docker) where drivers live in the image, not the data volume.
 	dir := s.deps.DriverDir
@@ -2001,8 +2011,7 @@ func (s *Server) handleDriversCatalog(w http.ResponseWriter, r *http.Request) {
 		drivers.CatalogSource{Dir: dir, Source: "bundled"},
 	)
 	if err != nil {
-		writeJSON(w, 200, map[string]any{"path": dir, "entries": []any{}, "error": err.Error()})
-		return
+		return map[string]any{"path": dir, "entries": []any{}, "error": err.Error()}
 	}
 	if s.deps.DriverRepository != nil {
 		entries = s.deps.DriverRepository.EnrichCatalog(entries)
@@ -2041,7 +2050,7 @@ func (s *Server) handleDriversCatalog(w http.ResponseWriter, r *http.Request) {
 			entries[i].Chosen = s.deps.DriverRepository.Chosen(entries[i].Path, entries[i].Version)
 		}
 	}
-	writeJSON(w, 200, map[string]any{"path": dir, "entries": entries})
+	return map[string]any{"path": dir, "entries": entries}
 }
 
 // POST /api/drivers/{name}/restart — stop + re-add the driver so it
@@ -2636,6 +2645,10 @@ func (s *Server) handlePrices(w http.ResponseWriter, r *http.Request) {
 //
 // Response: {"zones": [{code, country, currency, name}]}
 func (s *Server) handlePriceZones(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, 200, map[string]any{"zones": priceZoneItems()})
+}
+
+func priceZoneItems() []map[string]string {
 	all := prices.Zones()
 	items := make([]map[string]string, 0, len(all))
 	for _, z := range all {
@@ -2646,7 +2659,7 @@ func (s *Server) handlePriceZones(w http.ResponseWriter, _ *http.Request) {
 			"name":     z.Name(),
 		})
 	}
-	writeJSON(w, 200, map[string]any{"zones": items})
+	return items
 }
 
 // ---- /api/forecast ----

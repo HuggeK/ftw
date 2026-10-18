@@ -480,6 +480,7 @@ type apiWriter struct {
 	recheck func() *ErrorBody
 
 	header    http.Header
+	status    int
 	buf       []byte
 	seq       uint32
 	written   int64
@@ -523,6 +524,7 @@ func (w *apiWriter) WriteHeader(status int) {
 	}
 
 	w.wroteHead = true
+	w.status = status
 	w.sendErr = w.h.sendBulk(MsgAPIHead, &w.id, APIHeadMsg{
 		Status:  status,
 		Headers: carriedHeaders(w.header),
