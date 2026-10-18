@@ -418,7 +418,11 @@ func TestLANAuthNilVerifyIsOff(t *testing.T) {
 
 func newLANAuthServer(t *testing.T) *Server {
 	t.Helper()
-	statePath := filepath.Join(t.TempDir(), "state.db")
+	return newLANAuthServerAt(t, filepath.Join(t.TempDir(), "state.db"))
+}
+
+func newLANAuthServerAt(t *testing.T, statePath string) *Server {
+	t.Helper()
 	st, err := state.Open(statePath)
 	if err != nil {
 		t.Fatal(err)
