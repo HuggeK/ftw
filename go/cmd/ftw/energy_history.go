@@ -8,7 +8,7 @@ import (
 	"github.com/srcfl/ftw/go/internal/telemetry"
 )
 
-const observedConsumerAssetID = "site/observed-consumer"
+const observedConsumerAssetID = state.ObservedConsumerAssetID
 
 type energyIdentityLookup func(string) state.Device
 

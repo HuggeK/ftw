@@ -199,14 +199,27 @@ func TestPersistTelemetryTickUsesPersistenceFreshness(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			consumerSaved := false
+			consumerListed := false
 			for _, asset := range assets {
 				if asset.AssetID == observedConsumerAssetID {
-					consumerSaved = asset.LastSeenMS == sampleAt.UnixMilli()
+					consumerListed = true
+					if asset.Kind != state.AssetObservedConsumer || !asset.ReadOnly || asset.LastSeenMS < sampleAt.UnixMilli() {
+						t.Fatal("consumer metadata lost its kind, read-only status or snapshot time")
+					}
 				}
 			}
-			if consumerSaved {
-				t.Fatal("instantaneous consumer observation entered interval history")
+			if consumerListed != tc.wantSaved {
+				t.Fatalf("consumer listed=%v, want %v", consumerListed, tc.wantSaved)
+			}
+			consumer, _, err := st.LoadEnergyHistory(state.EnergyHistoryQuery{
+				AssetID: observedConsumerAssetID, SinceMS: tickMS - 1,
+				UntilMS: time.Now().Add(5 * time.Minute).UnixMilli(), BucketMS: state.EnergyLedgerBucketMS, Limit: 10,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(consumer) != 0 {
+				t.Fatal("single instantaneous reading entered consumer interval history")
 			}
 		})
 	}

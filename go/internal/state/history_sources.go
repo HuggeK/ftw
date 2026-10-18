@@ -66,6 +66,12 @@ func (s *Store) recordSourceEnergyTx(ctx context.Context, tx *sql.Tx, p *History
 	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO history_source_cursor VALUES('from',?)`, at); err != nil {
 		return err
 	}
+	if p.Sources.Missing&MissingPower == 0 {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO energy_assets(asset_id,device_id,kind,label,read_only,first_seen_ms,last_seen_ms) VALUES(?,'',?,'Observed load',1,?,?)
+ ON CONFLICT(asset_id) DO UPDATE SET last_seen_ms=MAX(last_seen_ms,excluded.last_seen_ms)`, ObservedConsumerAssetID, AssetObservedConsumer, at, at); err != nil {
+			return err
+		}
+	}
 	if last.At == 0 {
 		last.Start = at
 	}
@@ -174,6 +180,12 @@ type sourceLoadBucket struct {
 // Whole source minutes only: never prorate a stored bucket across a gap or a
 // price boundary. Signed minutes survive until this requested interval sums.
 func (s *Store) sourceLoadBuckets(ctx context.Context, from, to, width int64) ([]sourceLoadBucket, error) {
+	return s.sourceLoadBucketsLimited(ctx, from, to, width, 0)
+}
+
+// A positive limit counts complete, valid buckets, not empty time slots.
+// Ordered streaming bounds memory even when an older prefix has no data.
+func (s *Store) sourceLoadBucketsLimited(ctx context.Context, from, to, width int64, limit int) ([]sourceLoadBucket, error) {
 	rows, err := s.history.QueryContext(ctx, `SELECT e.start_ms,e.resolution_ms,e.first_ms,e.last_ms,e.covered_ms,e.n,
  e.import_wh-e.export_wh+e.pv_wh-e.bat_charge_wh+e.bat_discharge_wh-e.ev_wh,COALESCE(q.missing,0)
  FROM history_source_energy e LEFT JOIN history_quality q ON q.kind='source_energy' AND q.start_ms=e.start_ms AND q.resolution_ms=e.resolution_ms
@@ -182,7 +194,21 @@ func (s *Store) sourceLoadBuckets(ctx context.Context, from, to, width int64) ([
 		return nil, err
 	}
 	defer rows.Close()
-	byStart := map[int64]*sourceLoadBucket{}
+	var out []sourceLoadBucket
+	var b *sourceLoadBucket
+	finish := func() bool {
+		if b == nil {
+			return false
+		}
+		// A partial tail stays live-only; never pad missing time with zero.
+		if b.covered != b.width || b.first != b.start || b.last != b.start+b.width || b.wh < 0 || !finiteHistoryValue(b.wh) {
+			b.missing |= MissingLoad
+		}
+		if limit == 0 || b.covered > 0 && b.missing&MissingPower == 0 {
+			out = append(out, *b)
+		}
+		return limit > 0 && len(out) >= limit
+	}
 	for rows.Next() {
 		var r sourceLoadBucket
 		if err := rows.Scan(&r.start, &r.width, &r.first, &r.last, &r.covered, &r.n, &r.wh, &r.missing); err != nil {
@@ -193,10 +219,11 @@ func (s *Store) sourceLoadBuckets(ctx context.Context, from, to, width int64) ([
 			start = from
 		}
 		w := max(width, r.width)
-		b := byStart[start]
-		if b == nil {
+		if b == nil || b.start != start {
+			if finish() {
+				return out, nil
+			}
 			b = &sourceLoadBucket{start: start, width: w, first: r.first, last: r.last}
-			byStart[start] = b
 		}
 		if r.first < from || r.last > to || r.first < start || r.last > start+w {
 			b.missing |= MissingLoad
@@ -212,16 +239,7 @@ func (s *Store) sourceLoadBuckets(ctx context.Context, from, to, width int64) ([
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	out := make([]sourceLoadBucket, 0, len(byStart))
-	for _, b := range byStart {
-		// Only a complete common interval is a chart mean. A partial tail
-		// stays live-only, never diluted by padding unobserved time with zero.
-		if b.covered != b.width || b.first != b.start || b.last != b.start+b.width || b.wh < 0 || !finiteHistoryValue(b.wh) {
-			b.missing |= MissingLoad
-		}
-		out = append(out, *b)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].start < out[j].start })
+	finish()
 	return out, nil
 }
 
@@ -283,18 +301,14 @@ func (s *Store) applySourceLoadHistory(ctx context.Context, points []HistoryPoin
 }
 
 func (s *Store) applySourceLoadLedger(ctx context.Context, q EnergyHistoryQuery, points []EnergyLedgerPoint) ([]EnergyLedgerPoint, bool, error) {
-	if q.AssetID != "" {
+	if q.AssetID != "" && q.AssetID != ObservedConsumerAssetID {
 		return points, false, nil
 	}
 	cut, ok, err := s.sourceEnergyFrom(ctx)
 	if err != nil || !ok || q.UntilMS <= cut {
 		return points, false, err
 	}
-	readTo := q.UntilMS
-	if q.BucketMS < (q.UntilMS-q.SinceMS)/int64(q.Limit+1) {
-		readTo = q.SinceMS + int64(q.Limit+1)*q.BucketMS
-	}
-	buckets, err := s.sourceLoadBuckets(ctx, q.SinceMS, readTo, q.BucketMS)
+	buckets, err := s.sourceLoadBucketsLimited(ctx, q.SinceMS, q.UntilMS, q.BucketMS, q.Limit+1)
 	if err != nil {
 		return nil, false, err
 	}
@@ -318,17 +332,22 @@ func (s *Store) applySourceLoadLedger(ctx context.Context, q EnergyHistoryQuery,
 		}
 		out = append(out, p)
 	}
-	truncated := false
 	for _, b := range buckets {
-		if b.covered == 0 || b.missing&MissingPower != 0 {
-			continue
+		asset := "system"
+		if q.AssetID != "" {
+			asset = q.AssetID
 		}
-		if (b.start-q.SinceMS)/q.BucketMS >= int64(q.Limit) {
-			truncated = true
-			continue
-		}
-		out = append(out, EnergyLedgerPoint{SchemaVersion: EnergyLedgerSchemaVersion, AssetID: "system", Flow: FlowConsumerUse, BucketStartMS: b.start, BucketLenMS: b.width, EnergyWh: b.wh, Source: "power_telemetry", Quality: "integrated", Provenance: "source_interval_balance_v1", SampleCount: b.n})
+		out = append(out, EnergyLedgerPoint{SchemaVersion: EnergyLedgerSchemaVersion, AssetID: asset, Flow: FlowConsumerUse, BucketStartMS: b.start, BucketLenMS: b.width, EnergyWh: b.wh, Source: "power_telemetry", Quality: "integrated", Provenance: "source_interval_balance_v1", SampleCount: b.n})
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].BucketStartMS < out[j].BucketStartMS })
-	return out, truncated, nil
+	rank := 0
+	for i, p := range out {
+		if i == 0 || p.BucketStartMS != out[i-1].BucketStartMS {
+			rank++
+		}
+		if rank > q.Limit {
+			return out[:i], true, nil
+		}
+	}
+	return out, false, nil
 }
