@@ -248,6 +248,31 @@ describe('a charger whose car the box cannot name asks', () => {
     assert.deepEqual(sent, [['/api/loadpoints/gar%20age/car', 'POST', { session: 's1', car_id: kia.id }]]);
     assert.deepEqual(res, { ok: false, text: 'That plug-in has ended.' });
   });
+
+  it('keeps an old tap response out of a later plug-in', async () => {
+    let finish;
+    const which = createWhichCar(fakeDoc(), { onTap: () => new Promise(resolve => { finish = resolve; }) });
+    which.update(askingLp, cars, [askingLp], true);
+    const pending = buttons(which.el).find(b => b.textContent === 'Model Y').click();
+    assert.match(which.el.textContent, /Saving/);
+    const next = { ...askingLp, session: 'next-plug-in' };
+    which.update(next, cars, [next], true);
+    assert.doesNotMatch(which.el.textContent, /Saving/);
+    assert.equal(buttons(which.el).find(b => b.textContent === 'Model Y').disabled, false);
+    finish({ ok: false, text: 'That plug-in has ended.' });
+    await pending;
+    assert.doesNotMatch(which.el.textContent, /That plug-in has ended/);
+  });
+
+  it('clears a completed refusal when a different plug-in arrives', async () => {
+    const which = createWhichCar(fakeDoc(), { onTap: async () => ({ ok: false, text: 'That plug-in has ended.' }) });
+    which.update(askingLp, cars, [askingLp], true);
+    await buttons(which.el).find(b => b.textContent === 'Model Y').click();
+    assert.match(which.el.textContent, /That plug-in has ended/);
+    const next = { ...askingLp, session: 'next-plug-in' };
+    which.update(next, cars, [next], true);
+    assert.doesNotMatch(which.el.textContent, /That plug-in has ended/);
+  });
 });
 
 describe('the card of cars', () => {
@@ -280,12 +305,27 @@ describe('the card of cars', () => {
     const card = createCarsCard(doc, el, { onOpenCharger: lp => opened.push(lp.driver_name) });
     const lp = { id: 'garage', driver_name: 'easee', plugged_in: true, session: 's1', car_id: tesla.id, car_identified_by: 'tap' };
     card.update({ cars: [tesla, volvo], loadpoints: [lp], fetchedAt: 1, now: 1 });
-    const open = buttons(el);
+    const open = buttons(el).filter(b => b.textContent === 'Check charging');
     assert.equal(open.length, 1);
     assert.equal(open[0].textContent, 'Check charging');
     await open[0].click();
     assert.deepEqual(opened, ['easee']);
     assert.match(el.textContent, /You chose it/);
+  });
+
+  it('opens saved sensor history for an unplugged car without using its estimate', async () => {
+    const doc = fakeDoc();
+    const el = doc.createElement('section');
+    const opened = [];
+    const card = createCarsCard(doc, el, { onOpenHistory: car => opened.push(car) });
+    card.update({ cars: [{ ...tesla, soc_permille: 790, soc_estimate: true, sources: ['sensor-one'] }], fetchedAt: 1, now: 1 });
+    const history = buttons(el).find(b => b.textContent === 'Battery history');
+    assert.ok(history);
+    await history.click();
+    assert.equal(opened[0].id, tesla.id);
+    assert.deepEqual(opened[0].sources, ['sensor-one']);
+    assert.equal('soc_permille' in opened[0], false);
+    assert.equal('current_soc' in opened[0], false);
   });
 });
 

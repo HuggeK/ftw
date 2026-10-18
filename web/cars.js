@@ -6,6 +6,8 @@
 // Names that come from outside, a car's name or a charger's id, only ever go
 // into the page as text.
 
+import { carLevelSources, openCarLevelHistory } from './car-soc-history.js';
+
 const SOURCE_WORDS = { vehicle: 'From the car', manual: 'Set by hand', assumed: 'Assumed at plug-in' };
 
 // How the box knows which car is on a charger (car_identified_by).
@@ -163,8 +165,17 @@ export function createWhichCar(doc, { onTap }) {
   const note = node(doc, 'p', 'car-which-note', el);
   note.setAttribute('aria-live', 'polite');
   let expanded = false, busy = false, last = null, shown = '';
+  let plugIn = '', generation = 0;
   open.addEventListener('click', () => { expanded = !expanded; if (last) update(...last); });
   function update(lp, cars, loadpoints, fresh) {
+    const nextPlugIn = JSON.stringify([lp.id, lp.session, !!lp.plugged_in]);
+    if (nextPlugIn !== plugIn) {
+      plugIn = nextPlugIn;
+      generation++;
+      expanded = false;
+      busy = false;
+      note.textContent = '';
+    }
     last = [lp, cars, loadpoints, fresh];
     const list = fresh ? choices(lp, cars, loadpoints) : [];
     const isAsking = asking(lp);
@@ -188,8 +199,10 @@ export function createWhichCar(doc, { onTap }) {
       b.disabled = busy || current;
       if (current) b.setAttribute('aria-pressed', 'true');
       b.addEventListener('click', async () => {
+        const requestGeneration = generation;
         busy = true; note.textContent = 'Saving…'; update(...last);
         const res = await onTap(lp, id).catch(() => ({ ok: false, text: 'The box did not answer. Try again.' }));
+        if (requestGeneration !== generation) return;
         busy = false; expanded = false;
         note.textContent = res.ok ? '' : res.text;
         update(...last);
@@ -223,7 +236,7 @@ export function carTiles(cars = [], loadpoints = [], sinceS = 0, chargersFresh =
       : lp ? `On ${lp.id}` : maybe.length ? `On ${maybe.map(o => o.id).join(' or ')}?` : 'Not plugged in';
     const on = !!lp && !quiet;
     return {
-      id: car.id, name: car.name, where,
+      id: car.id, name: car.name, sources: carLevelSources(car), where,
       level: level.value, estimate: level.estimate, source: level.source, facts: facts.join(' · '),
       charger: on ? { id: lp.id, driver_name: lp.driver_name } : null, knownBy: on ? knownByText(lp, names) : '',
     };
@@ -232,7 +245,7 @@ export function carTiles(cars = [], loadpoints = [], sinceS = 0, chargersFresh =
 
 // createCarsCard fills the dashboard's card of cars, el, which the page
 // holds in its place in the overview.
-export function createCarsCard(doc, el, { onOpenCharger } = {}) {
+export function createCarsCard(doc, el, { onOpenCharger, onOpenHistory = car => openCarLevelHistory(doc, car) } = {}) {
   el.replaceChildren();
   const head = node(doc, 'div', 'overview-card-head', el);
   const titles = node(doc, 'div', '', head);
@@ -262,10 +275,12 @@ export function createCarsCard(doc, el, { onOpenCharger } = {}) {
       node(doc, 'div', 'car-tile-level' + (t.estimate ? ' is-estimate' : ''), tile, t.level);
       node(doc, 'div', 'car-tile-source', tile, t.source);
       node(doc, 'div', 'car-tile-facts', tile, t.facts);
-      if (!t.charger) return;
       const foot = node(doc, 'div', 'car-tile-foot', tile);
+      const history = node(doc, 'button', 'car-tile-open', foot, 'Battery history');
+      history.type = 'button'; history.dataset.historyCar = t.id;
+      history.addEventListener('click', () => onOpenHistory(t));
+      if (!t.charger || !onOpenCharger) return;
       node(doc, 'span', '', foot, t.knownBy);
-      if (!onOpenCharger) return;
       const b = node(doc, 'button', 'car-tile-open', foot, 'Check charging');
       b.type = 'button';
       b.dataset.openCar = t.id;
