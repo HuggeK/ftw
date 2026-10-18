@@ -30,7 +30,8 @@ const registry = {
     "car.goal.set": "ftw.goals.request",
     "car.soc.set": "ftw.goals.request",
   },
-  writeScopes: ["ftw.dispatch.write", "ftw.mode.write", "ftw.dispatch.hold", "ftw.goals.request"],
+  writeScopes: ["ftw.dispatch.write", "ftw.mode.write", "ftw.dispatch.hold", "ftw.goals.request", "ftw.setup.write"],
+  callScopes: ["ftw.setup.write"],
   agentArgs: {
     "loadpoint.hold": [
       { name: "id", label: "Charger", kind: "loadpoint" },
@@ -131,6 +132,15 @@ describe("names from outside", () => {
 });
 
 describe("what the owner grants", () => {
+  it("keeps setup separate from reads and only grants the explicit choice", () => {
+    const split = P.splitGrant(["ftw.config.read", "ftw.setup.write"], [], registry);
+    assert.deepEqual(split.reads, ["ftw.config.read"]);
+    assert.deepEqual(split.groups, []);
+    assert.deepEqual(split.calls, ["ftw.setup.write"]);
+    const base = { reads: split.reads, ops: [], ttlS: 86400 };
+    assert.deepEqual(P.chosenGrant(base, 0, registry).scopes, ["ftw.config.read"]);
+    assert.deepEqual(P.chosenGrant({ ...base, calls: split.calls }, 0, registry).scopes, ["ftw.config.read", "ftw.setup.write"]);
+  });
   const offer = {
     scopes: ["ftw.config.read", "ftw.dispatch.hold", "ftw.goals.request", "ftw.live.read", "ftw.plan.read"],
     ops: ["car.goal.set", "loadpoint.hold", "site.mode.set"],

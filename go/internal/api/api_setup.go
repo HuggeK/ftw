@@ -62,6 +62,7 @@ func (s *Server) setupRoutes() {
 	s.handle("POST /api/setup/reset", Configure, s.handleSetupReset)
 	s.handle("POST /api/setup/validate", Configure, s.handleSetupValidate)
 	s.handle("POST /api/setup/commit", Configure, s.handleSetupCommit)
+	s.handle("POST /api/setup/restart", Configure, s.handleSetupRestart)
 }
 
 func (s *Server) handleSetupSchema(w http.ResponseWriter, _ *http.Request) {

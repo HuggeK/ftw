@@ -185,7 +185,7 @@ const (
 	ScopeConfigRead = "ftw.config.read"
 	// ScopeDiagRun — Full technical diagnostics and read API.
 	ScopeDiagRun = "ftw.diag.run"
-	// ScopeSetupWrite — Prepare and save system setup after the user confirms the checked draft.
+	// ScopeSetupWrite — Save confirmed system setup and restart to apply it after user confirmation.
 	ScopeSetupWrite = "ftw.setup.write"
 	// ScopeDispatchHold — Hold energy assets for a capped time.
 	ScopeDispatchHold = "ftw.dispatch.hold"
@@ -395,12 +395,14 @@ const MsgSetupValidate = "setup.validate"
 
 const MsgSetupCommit = "setup.commit"
 
+const MsgSetupRestart = "setup.restart"
+
 // RegistryAgentCalls maps typed setup calls to their required grants.
 var RegistryAgentCalls = map[string]string{
 	// Read this build's complete setup schema.
-	"setup.schema": "ftw.config.read",
+	"setup.schema": "ftw.diag.run",
 	// Resume the masked setup draft.
-	"setup.status": "ftw.config.read",
+	"setup.status": "ftw.diag.run",
 	// Patch the exact current setup draft.
 	"setup.edit": "ftw.setup.write",
 	// Start a new draft from current settings.
@@ -409,6 +411,8 @@ var RegistryAgentCalls = map[string]string{
 	"setup.validate": "ftw.setup.write",
 	// Save the exact checked and confirmed draft.
 	"setup.commit": "ftw.setup.write",
+	// Restart to apply the exact saved setup after user confirmation.
+	"setup.restart": "ftw.setup.write",
 }
 
 // Error codes. The box sends the code and machine-readable args; the app

@@ -260,10 +260,11 @@ type Deps struct {
 // Server wraps the http.ServeMux and adds shared middleware (logging,
 // no-cache headers on static assets).
 type Server struct {
-	configWriteMu sync.Mutex // Covers persistence and apply for every config writer.
-	deps          *Deps
-	mux           *http.ServeMux
-	setup         *onboarding.Service
+	configWriteMu        sync.Mutex // Covers persistence and apply for every config writer.
+	deps                 *Deps
+	mux                  *http.ServeMux
+	setup                *onboarding.Service
+	setupRestartRevision int64 // Protected by configWriteMu; a lost reply must not queue another restart.
 
 	// dailyCache memoizes per-local-day energy totals keyed by "YYYY-MM-DD".
 	// Past days are immutable once the day ends, so we only ever recompute

@@ -202,6 +202,7 @@ type agentsRegistry struct {
 	AgentOps map[string]string `json:"agentOps"`
 	// WriteScopes change something, now or once an owner says yes.
 	WriteScopes []string `json:"writeScopes"`
+	CallScopes  []string `json:"callScopes"`
 	// AgentArgs are each op's arguments, in the registry's order, with the
 	// label an owner reads.
 	AgentArgs map[string][]agentArgView `json:"agentArgs"`
@@ -217,13 +218,21 @@ type agentArgView struct {
 }
 
 func registryForPage() agentsRegistry {
+	calls := []string{}
+	for _, scope := range protocol.RegistryAgentCalls {
+		if slices.Contains(protocol.WriteScopes, scope) {
+			calls = append(calls, scope)
+		}
+	}
+	slices.Sort(calls)
+	calls = slices.Compact(calls)
 	args := map[string][]agentArgView{}
 	for op, list := range protocol.RegistryAgentArgs {
 		for _, a := range list {
 			args[op] = append(args[op], agentArgView{Name: a.Name, Label: a.Label, Kind: a.Kind, Unit: a.Unit, Cap: a.Cap})
 		}
 	}
-	return agentsRegistry{AgentOps: protocol.RegistryAgentOps, WriteScopes: protocol.WriteScopes, AgentArgs: args}
+	return agentsRegistry{AgentOps: protocol.RegistryAgentOps, WriteScopes: protocol.WriteScopes, CallScopes: calls, AgentArgs: args}
 }
 
 func (s *Server) handleAgentsList(w http.ResponseWriter, r *http.Request) {

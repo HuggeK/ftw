@@ -34,7 +34,7 @@ func (h *Handler) onSetupCall(env Envelope) error {
 		defer free()
 		ctx, cancel := context.WithTimeout(h.ctx, protocol.AgentAPIReadTimeout)
 		defer cancel()
-		check := func() *ErrorBody {
+		authority := func() *ErrorBody {
 			if _, refusal, _ := h.agentGate(); refusal != nil {
 				return refusal
 			}
@@ -42,10 +42,13 @@ func (h *Handler) onSetupCall(env Envelope) error {
 			if !ok || !caller.Scopes.Has(protocol.RegistryAgentCalls[env.T]) {
 				return &ErrorBody{Code: ErrScopeDenied, Args: map[string]any{"needScope": protocol.RegistryAgentCalls[env.T]}}
 			}
+			return nil
+		}
+		check := func() *ErrorBody {
 			if ctx.Err() != nil {
 				return &ErrorBody{Code: ErrUnavailable}
 			}
-			return nil
+			return authority()
 		}
 		if refusal := check(); refusal != nil {
 			_ = h.sendError(&id, *refusal)
@@ -61,7 +64,9 @@ func (h *Handler) onSetupCall(env Envelope) error {
 				}
 			}()
 			gateway.ServeAgentSetup(writer, req, env.T, call, func() error {
-				if refusal := check(); refusal != nil {
+				// An accepted restart rechecks the live grant after the reply.
+				// That check must survive this short request's completion.
+				if refusal := authority(); refusal != nil {
 					return protocol.Refuse(refusal.Code, refusal.Args)
 				}
 				return nil

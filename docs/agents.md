@@ -1,6 +1,7 @@
 # Agents and support access
 
-Proposed. Nothing here has shipped. This document is normative: "must" is a
+This document defines the agent contract. Some operations remain proposed;
+the connected box reports what its build supports. The contract is normative: "must" is a
 requirement on the box, FTW Cloud or the app. It extends the app protocol
 ([srcfl/ftw-webapp docs/protocol.md](https://github.com/srcfl/ftw-webapp/blob/main/docs/protocol.md))
 and the [FTW Cloud protocol](protocol-cloud.md). Names in `code` that are
@@ -27,10 +28,11 @@ act. Each check runs again on every call, so a revoke or an expiry bites at
 the next call whatever FTW Cloud does.
 
 **What FTW Cloud sees.** It holds the agent's key, so it can read every
-answer an agent gets. Answers to agents therefore name nothing: sources,
-chargers and cars go by opaque ids the box cuts with a key of its own, logs
-and configuration are redacted on the box, and an agent has no `sub` stream,
-whose source table carries names.
+answer an agent gets. Typed routine reads use opaque source, charger and car ids and redact logs
+and configuration. Full technical diagnostics preserve names, addresses,
+source code, exact measurements and exports, including backups that can hold
+saved credentials. The owner-approved diagnostic scope covers those reads
+without extra endpoint grants. An agent has no `sub` stream.
 
 ## Principals
 
@@ -75,16 +77,18 @@ these:
 |---|---|
 | `ftw.logs.read` | Read a log excerpt that the box redacts before it leaves |
 | `ftw.config.read` | Read the configuration, redacted on the box |
-| `ftw.diag.run` | Run checks that change nothing |
+| `ftw.diag.run` | Read full technical diagnostics and exports; backups can contain saved credentials |
+| `ftw.setup.write` | Read and edit full setup drafts, save the exact confirmed draft and restart to apply it after confirmation |
 | `ftw.dispatch.hold` | Hold a charger for a capped time; the hold ends unless renewed |
 | `ftw.goals.request` | Ask for a durable change, which waits for an owner |
 | `ftw.update.request` | Reserved: no op uses it yet |
 
 The roles `agent` and `support` carry at most `ftw.live.read`,
 `ftw.history.read`, `ftw.plan.read`, `ftw.health.read`, `ftw.events.read`,
-`ftw.logs.read`, `ftw.config.read`, `ftw.diag.run`, `ftw.dispatch.hold` and
+`ftw.logs.read`, `ftw.config.read`, `ftw.diag.run`, `ftw.setup.write`, `ftw.dispatch.hold` and
 `ftw.goals.request`. A grant names a subset. Agents read by default; an owner
-ticks control to add `ftw.dispatch.hold` or `ftw.goals.request`.
+ticks control to add `ftw.dispatch.hold` or `ftw.goals.request`. Setup has its
+own choice, off by default. Control alone never adds setup access.
 
 ## What an agent may send
 
@@ -411,6 +415,56 @@ The registry's `reads` table names each read and the scope it needs.
 - `logs.get` looks back over the box's whole log ring, its newest 2,000
   lines. `beforeMs` and `afterMs` together pick the lines between them; an
   `afterMs` at or past `beforeMs` gets `E_UNKNOWN_OP {field: "beforeMs"}`.
+
+## Technical reads and setup
+
+`api.read` carries `APIRead` from `go/protocol/agentapi.go` and requires
+`ftw.diag.run`. Start with `/api/diagnostics/catalog` to get this build's
+routes, source links and bug-report workflow. It carries GET reads only.
+Large exports use byte pages and a digest to detect a changed answer.
+Typed routine reads keep the redaction described below.
+
+The registry's `agent_calls` table defines seven setup messages:
+
+| Message | Right | JSON request |
+|---|---|---|
+| `setup.schema` | `ftw.diag.run` | `{}`; returns full typed schema, driver catalogue and price zones |
+| `setup.status` | `ftw.diag.run` | `{}`; returns masked draft, revisions, digest and save receipt |
+| `setup.edit` | `ftw.setup.write` | `{revision, patch}` or `{revision, operations}` |
+| `setup.reset` | `ftw.setup.write` | `{revision}`; starts a new draft from current settings; does not restart Core |
+| `setup.validate` | `ftw.setup.write` | `{revision, base_revision, sha256}` |
+| `setup.commit` | `ftw.setup.write` | `{revision, base_revision, sha256, confirmed}` |
+| `setup.restart` | `ftw.setup.write` | `{saved_revision, sha256, confirmed}`; only the exact saved setup |
+
+Each request is `SetupCall {json: bytes}` from `go/protocol/setup.go`, at most
+10 KiB within one bulk frame. Replies use `api.head/chunk/end`. A merge patch
+replaces whole arrays. JSON Patch `add`, `replace` and `remove` can edit one
+entry without resending a large list. Indexes refer only to the exact draft
+revision; a concurrent edit conflicts. Core rejects unknown config fields.
+
+A read never discovers equipment or applies settings. The agent asks for
+missing facts in small groups, accepts unknown answers, validates the exact
+draft and shows changes and restart needs before asking the user to confirm.
+Commit binds both revisions and the digest, checks the live grant again at
+the final save, then uses the normal Settings transaction and applier. The
+receipt commits with Settings; retrying that exact save returns the receipt.
+Replies distinguish saved, applied, restart pending and hardware verification.
+A later draft or setup save keeps earlier restart needs until a real process
+restart. A confirmed `setup.restart` checks the saved receipt, live revision
+and live grant again just before signalling the existing graceful restart.
+A lost reply leaves the outcome unknown; read setup status and the receipt
+before retrying the same operation. A restart request never proves application.
+
+Setup reads use the existing full diagnostic grant because they retain names,
+addresses and connection details while masking credentials. They do not widen
+an old redacted `ftw.config.read` grant. Replies to setup writes carry the same
+masked draft under the owner's new, explicit setup grant.
+
+Setup keeps the agent's identity. It opens no general HTTP writes, access
+grants, Cloud consent, house-password changes or direct hardware commands.
+Saved equipment settings can affect operation under Core's safety checks.
+Physical measurement and control need separate evidence. First-run claiming,
+the guided interview and sharing codes follow [ADR 0011](adr/0011-agent-led-setup.md).
 
 ## Redaction on the box
 

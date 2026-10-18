@@ -88,7 +88,7 @@ func TestSetupGatewayKeepsTheAgentIdentityAndRejectsGeneralAPIWrites(t *testing.
 
 func TestNarrowSetupReadIncludesTheMetadataItNeeds(t *testing.T) {
 	s, _ := setupTestServer(t)
-	w, result := agentSetupCall(t, s, protocol.MsgSetupSchema, map[string]any{}, []string{protocol.ScopeConfigRead}, func() error { return nil })
+	w, result := agentSetupCall(t, s, protocol.MsgSetupSchema, map[string]any{}, []string{protocol.ScopeDiagRun}, func() error { return nil })
 	if w.Code != http.StatusOK || result["driver_catalog"] == nil || result["runtime_timezone"] == "" {
 		t.Fatal(w.Body.String())
 	}
@@ -104,5 +104,22 @@ func TestNarrowSetupReadIncludesTheMetadataItNeeds(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("setup's price choices differ from the normal API")
+	}
+}
+
+func TestSetupReadsDoNotBroadenAnExistingRedactedConfigGrant(t *testing.T) {
+	s, _ := setupTestServer(t)
+	for _, message := range []string{protocol.MsgSetupSchema, protocol.MsgSetupStatus} {
+		w, _ := agentSetupCall(t, s, message, map[string]any{}, []string{protocol.ScopeConfigRead}, func() error { return nil })
+		if w.Code != http.StatusForbidden {
+			t.Fatal("old redacted grant gained full setup data", message, w.Body.String())
+		}
+		w, result := agentSetupCall(t, s, message, map[string]any{}, []string{protocol.ScopeDiagRun}, func() error { return nil })
+		if w.Code != http.StatusOK {
+			t.Fatal(w.Body.String())
+		}
+		if message == protocol.MsgSetupStatus && result["config"].(map[string]any)["site"].(map[string]any)["name"] != "Before" {
+			t.Fatal("technical setup lost the device names it needs", result)
+		}
 	}
 }

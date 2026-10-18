@@ -14,6 +14,10 @@ import (
 type setupAuthorityKey struct{}
 
 func setupAuthority(w http.ResponseWriter, r *http.Request) bool {
+	if r.Context().Err() != nil {
+		writeJSON(w, http.StatusRequestTimeout, map[string]string{"error": "Setup request ended. Read the current status before retrying."})
+		return false
+	}
 	if check, ok := r.Context().Value(setupAuthorityKey{}).(func() error); ok {
 		if err := check(); err != nil {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "Setup access ended. Read the current status after connecting again."})
@@ -52,6 +56,8 @@ func (s *Server) ServeAgentSetup(w http.ResponseWriter, r *http.Request, message
 		path, handle = "/api/setup/validate", s.handleSetupValidate
 	case protocol.MsgSetupCommit:
 		path, handle = "/api/setup/commit", s.handleSetupCommit
+	case protocol.MsgSetupRestart:
+		path, handle = "/api/setup/restart", s.handleSetupRestart
 	}
 	r.URL = &url.URL{Path: path}
 	r.RequestURI = path
