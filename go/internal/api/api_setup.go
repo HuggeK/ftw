@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -22,7 +23,7 @@ func setupRestartPending(receipt *onboarding.Receipt) bool {
 	return receipt != nil && len(receipt.RestartReasons) > 0 && (receipt.ProcessID == "" || receipt.ProcessID == setupProcessID)
 }
 
-func (s *Server) preserveSetupSecrets(incoming, previous *config.Config) {
+func (s *Server) preserveSetupSecrets(incoming, previous *config.Config) error {
 	// Bind each driver's secrets before applying any display-name fallback.
 	// Separate pairs also handle two drivers swapping their names in a draft.
 	withoutDrivers := *previous
@@ -43,6 +44,14 @@ func (s *Server) preserveSetupSecrets(incoming, previous *config.Config) {
 			break
 		}
 	}
+	for _, driver := range incoming.Drivers {
+		for key, value := range driver.Config {
+			if text, ok := value.(string); ok && text == maskedPlaceholder {
+				return fmt.Errorf("driver %q: enter or clear %s after changing the driver; its masked value belongs to the earlier configuration", driver.Name, key)
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Server) setupRoutes() {
@@ -63,6 +72,7 @@ func (s *Server) handleSetupSchema(w http.ResponseWriter, _ *http.Request) {
 			"Patch the current draft revision. Omitted fields and saved credentials remain on the box.",
 			"Arrays replace the whole array. Read and retain all existing entries before editing one.",
 			"Validate the exact draft, show its changes and assumptions, then ask the user to confirm before commit.",
+			"Validation can normalize fields into a new draft revision and checksum. Review that returned configuration and its warnings; an earlier confirmation cannot save the changed draft.",
 			"Saving configuration does not prove hardware operation. Check fresh measurements and bounded control tests separately.",
 		},
 		"normal_use": "Use status, history and control tools for everyday questions. Setup is a separate workflow.",
@@ -81,7 +91,7 @@ func (s *Server) setupLive() (*config.Config, error) {
 		return nil, err
 	}
 	var cfg config.Config
-	if err := json.Unmarshal(raw, &cfg); err != nil {
+	if err := config.DecodeJSON(raw, &cfg); err != nil {
 		return nil, err
 	}
 	cfg.Revision = revision
@@ -113,15 +123,29 @@ func (s *Server) handleSetupDraft(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) writeSetupDraft(w http.ResponseWriter, live *config.Config, d onboarding.Draft) {
 	var candidate config.Config
-	if err := json.Unmarshal(d.Config, &candidate); err != nil {
+	if err := config.DecodeJSON(d.Config, &candidate); err != nil {
 		s.setupError(w, err)
 		return
 	}
+	var validating config.Config
+	if err := config.DecodeJSON(d.Config, &validating); err != nil {
+		s.setupError(w, err)
+		return
+	}
+	validating.ResolveDriverPaths(filepath.Dir(s.deps.ConfigPath))
+	validating.UnresolveDriverPaths(filepath.Dir(s.deps.ConfigPath))
+	validation := ""
+	if err := config.PrepareDraftCredentials(&validating, live); err != nil {
+		validation = err.Error()
+	} else if err := validating.Validate(); err != nil {
+		validation = err.Error()
+	}
 	masked := candidate.MaskSecrets()
 	maskDriverConfigSecrets(&masked, s.driverSecretKeys())
-	validation := ""
-	if err := candidate.Validate(); err != nil {
-		validation = err.Error()
+	normalizedJSON, err := json.Marshal(&validating)
+	if err != nil {
+		s.setupError(w, err)
+		return
 	}
 	receipt, err := s.setup.Receipt()
 	if err != nil {
@@ -131,7 +155,7 @@ func (s *Server) writeSetupDraft(w http.ResponseWriter, live *config.Config, d o
 	saved := receipt != nil && receipt.DraftRevision == d.Revision && receipt.SHA256 == d.SHA256
 	restartPending := setupRestartPending(receipt)
 	applied := saved && receipt.SavedRevision == live.Revision && !restartPending
-	restartReasons := config.RestartRequiredFor(live, &candidate)
+	restartReasons := config.RestartRequiredFor(live, &validating)
 	if saved {
 		restartReasons = receipt.RestartReasons
 	} else if restartPending {
@@ -144,11 +168,14 @@ func (s *Server) writeSetupDraft(w http.ResponseWriter, live *config.Config, d o
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"revision": d.Revision, "base_revision": d.BaseRevision, "live_revision": live.Revision,
-		"sha256": d.SHA256, "config": masked, "stale": !saved && d.BaseRevision != live.Revision,
+		"normalized_from_revision": d.NormalizedFromRevision, "validation_warnings": d.ValidationWarnings,
+		"normalized": d.NormalizedFromRevision > 0,
+		"sha256":     d.SHA256, "config": masked, "stale": !saved && d.BaseRevision != live.Revision,
 		"valid": validation == "", "validation_error": validation,
-		"saved": saved, "applied": applied, "hardware_verified": false, "last_commit": receipt,
+		"normalization_required": validation == "" && !bytes.Equal(normalizedJSON, d.Config),
+		"saved":                  saved, "applied": applied, "hardware_verified": false, "last_commit": receipt,
 		"restart_pending": restartPending, "restart_reasons": restartReasons,
-		"next_step": "Continue this draft, or create a new draft from current settings after a completed save.",
+		"next_step": "Review the returned draft after validation, including a new revision, checksum or normalization warnings. Save only that exact reviewed revision. After a completed save, a new draft starts from current settings.",
 	})
 }
 
@@ -231,11 +258,7 @@ func (s *Server) handleSetupValidate(w http.ResponseWriter, r *http.Request) {
 		s.setupError(w, onboarding.ErrConflict)
 		return
 	}
-	if _, err := s.setup.Checked(live.Revision, q.Revision, q.SHA256); err != nil {
-		s.setupError(w, err)
-		return
-	}
-	d, err := s.setup.Read(live)
+	d, err := s.setup.Validate(live, q.Revision, q.SHA256)
 	if err != nil {
 		s.setupError(w, err)
 		return
@@ -302,8 +325,8 @@ func (s *Server) handleSetupCommit(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return err
 		}
-		s.handlePostConfigWith(w, request, func(path string, cfg *config.Config) error {
-			return s.deps.SaveConfigWithValues(path, cfg, map[string]string{onboarding.CommitKey: string(record)})
+		s.handlePostConfigWith(w, request, true, func(path string, cfg *config.Config) error {
+			return s.deps.SaveConfigWithValues(path, cfg, map[string]string{onboarding.CommitKey: string(record)}, raw)
 		}, func(cfg *config.Config, _ []string) {
 			s.writeSetupCommit(w, cfg.Revision, &receipt)
 		})

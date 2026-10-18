@@ -129,7 +129,7 @@ func TestSetupFailedSaveLeavesLiveAndStoredConfigUntouched(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatal(w.Body.String())
 	}
-	s.deps.SaveConfigWithValues = func(string, *config.Config, map[string]string) error { return http.ErrHandlerTimeout }
+	s.deps.SaveConfigWithValues = func(string, *config.Config, map[string]string, []byte) error { return http.ErrHandlerTimeout }
 	w, _ = setupCall(t, s, http.MethodPost, "/api/setup/commit", map[string]any{"revision": draft["revision"], "base_revision": draft["base_revision"], "sha256": draft["sha256"], "confirmed": true})
 	if w.Code != http.StatusInternalServerError || cfg.Site.Name != "Before" {
 		t.Fatal("failed commit changed live settings")

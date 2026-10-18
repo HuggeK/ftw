@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 
 	"github.com/srcfl/ftw/go/internal/config"
@@ -32,11 +33,13 @@ type Storage interface {
 // Draft is an uncommitted configuration. Config can contain credentials;
 // a transport must mask them before returning it to a client.
 type Draft struct {
-	Version      int             `json:"version"`
-	Revision     int64           `json:"revision"`
-	BaseRevision int64           `json:"base_revision"`
-	Config       json.RawMessage `json:"config"`
-	SHA256       string          `json:"sha256"`
+	Version                int             `json:"version"`
+	Revision               int64           `json:"revision"`
+	BaseRevision           int64           `json:"base_revision"`
+	Config                 json.RawMessage `json:"config"`
+	SHA256                 string          `json:"sha256"`
+	NormalizedFromRevision int64           `json:"normalized_from_revision,omitempty"`
+	ValidationWarnings     []string        `json:"validation_warnings,omitempty"`
 }
 
 // Service serializes draft changes. Live config saves remain the caller's
@@ -44,15 +47,23 @@ type Draft struct {
 type Service struct {
 	mu              sync.Mutex
 	store           Storage
-	preserveSecrets func(incoming, previous *config.Config)
+	preserveSecrets func(incoming, previous *config.Config) error
+	baseDir         string
 }
 
-func New(store Storage) *Service { return NewWithSecrets(store, nil) }
+func New(store Storage) *Service { return NewWithSecrets(store, nil, "") }
 
 // NewWithSecrets adds the running driver's secret metadata to the common
 // config secret handling. The callback must be safe to call during an edit.
-func NewWithSecrets(store Storage, preserve func(incoming, previous *config.Config)) *Service {
-	return &Service{store: store, preserveSecrets: preserve}
+func NewWithSecrets(store Storage, preserve func(incoming, previous *config.Config) error, baseDir string) *Service {
+	return &Service{store: store, preserveSecrets: preserve, baseDir: baseDir}
+}
+
+func (s *Service) portablePaths(cfg *config.Config) {
+	if s.baseDir != "" {
+		cfg.ResolveDriverPaths(s.baseDir)
+		cfg.UnresolveDriverPaths(s.baseDir)
+	}
 }
 
 func (s *Service) current() (Draft, bool, error) {
@@ -140,15 +151,25 @@ func (s *Service) Edit(live *config.Config, expected int64, patch json.RawMessag
 	if err != nil {
 		return Draft{}, err
 	}
+	s.portablePaths(cfg)
+	s.portablePaths(previous)
 	if cfg.API.LANAuth != previous.API.LANAuth {
 		return Draft{}, errors.New("api.lan_auth changes through the house-password action on the box, not a setup draft")
 	}
+	if err := keepDraftCredentialOwners(cfg, previous); err != nil {
+		return Draft{}, err
+	}
 	if s.preserveSecrets != nil {
-		s.preserveSecrets(cfg, previous)
+		if err := s.preserveSecrets(cfg, previous); err != nil {
+			return Draft{}, err
+		}
 	} else {
 		cfg.PreserveMaskedSecrets(previous)
 	}
 	if err := config.PrepareDraftCredentials(cfg, previous); err != nil {
+		return Draft{}, err
+	}
+	if err := config.PrepareDraftCredentials(cfg, live); err != nil {
 		return Draft{}, err
 	}
 	// Canonicalize through the current type. Do not default or validate yet:
@@ -157,6 +178,8 @@ func (s *Service) Edit(live *config.Config, expected int64, patch json.RawMessag
 	if err != nil {
 		return Draft{}, err
 	}
+	d.NormalizedFromRevision = 0
+	d.ValidationWarnings = nil
 	d.Revision++
 	d.SHA256 = digest(d.Config, d.BaseRevision)
 	raw, err := json.Marshal(d)
@@ -169,8 +192,78 @@ func (s *Service) Edit(live *config.Config, expected int64, patch json.RawMessag
 	return d, nil
 }
 
-// Checked returns a normalized, valid candidate only when the caller names
-// the exact current draft and live base. It neither persists nor applies it.
+// Credential owners come from the box. A masked list may retain or omit
+// one, but it cannot replace a bound identity with a caller-chosen value.
+func keepDraftCredentialOwners(cfg, previous *config.Config) error {
+	owners := make(map[string]bool)
+	for _, d := range previous.Drivers {
+		if d.CredentialOwner != "" {
+			owners[d.CredentialOwner] = true
+		}
+	}
+	for i := range cfg.Drivers {
+		d := &cfg.Drivers[i]
+		d.CredentialOwner = strings.TrimSpace(d.CredentialOwner)
+		if d.CredentialOwner != "" {
+			if !owners[d.CredentialOwner] {
+				return fmt.Errorf("driver %q: credential_owner is read-only; retain the current identity or omit it for a new driver", d.Name)
+			}
+			continue
+		}
+		for _, old := range previous.Drivers {
+			if d.Name == old.Name && d.Lua == old.Lua {
+				d.CredentialOwner = old.CredentialOwner
+				break
+			}
+		}
+	}
+	return nil
+}
+
+// Validate saves any normalization as a new draft for the user to review.
+// An invalid partial draft stays unchanged; reading never calls this method.
+func (s *Service) Validate(live *config.Config, revision int64, sha string) (Draft, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if live == nil {
+		return Draft{}, errors.New("live configuration is unavailable")
+	}
+	d, cfg, err := s.candidateLocked(live.Revision, revision, sha)
+	if err != nil {
+		return Draft{}, err
+	}
+	if err := config.PrepareDraftCredentials(cfg, live); err != nil {
+		return Draft{}, err
+	}
+	s.portablePaths(cfg)
+	if err := cfg.Validate(); err != nil {
+		return Draft{}, fmt.Errorf("configuration is incomplete or invalid: %w", err)
+	}
+	normalized, err := json.Marshal(cfg)
+	if err != nil {
+		return Draft{}, err
+	}
+	if bytes.Equal(normalized, d.Config) {
+		return d, nil
+	}
+	d.Config = normalized
+	d.NormalizedFromRevision = d.Revision
+	d.ValidationWarnings = append([]string(nil), cfg.LoadpointWarnings...)
+	d.Revision++
+	d.SHA256 = digest(d.Config, d.BaseRevision)
+	raw, err := json.Marshal(d)
+	if err != nil || len(raw) > MaxDraftBytes {
+		return Draft{}, errors.New("setup draft is too large")
+	}
+	if err := s.store.SaveConfig(draftKey, string(raw)); err != nil {
+		return Draft{}, fmt.Errorf("save checked setup draft: %w", err)
+	}
+	return d, nil
+}
+
+// Checked returns the exact valid configuration the user reviewed. A caller
+// must first validate and review a draft that still needs normalization.
+// It neither persists nor applies anything.
 func (s *Service) Checked(liveRevision, revision int64, sha string) (*config.Config, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -190,21 +283,37 @@ func (s *Service) ApplyChecked(liveRevision, revision int64, sha string, apply f
 }
 
 func (s *Service) checkedLocked(liveRevision, revision int64, sha string) (*config.Config, error) {
-	d, found, err := s.current()
+	d, cfg, err := s.candidateLocked(liveRevision, revision, sha)
 	if err != nil {
 		return nil, err
 	}
-	if !found || d.BaseRevision != liveRevision || d.Revision != revision || d.SHA256 != sha {
-		return nil, ErrConflict
-	}
-	cfg, err := decodeConfig(d.Config)
-	if err != nil {
-		return nil, err
-	}
+	s.portablePaths(cfg)
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("configuration is incomplete or invalid: %w", err)
 	}
+	normalized, err := json.Marshal(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if !bytes.Equal(normalized, d.Config) {
+		return nil, fmt.Errorf("%w: run setup_validate and review its returned draft before saving", ErrConflict)
+	}
 	return cfg, nil
+}
+
+func (s *Service) candidateLocked(liveRevision, revision int64, sha string) (Draft, *config.Config, error) {
+	d, found, err := s.current()
+	if err != nil {
+		return Draft{}, nil, err
+	}
+	if !found || d.BaseRevision != liveRevision || d.Revision != revision || d.SHA256 != sha {
+		return Draft{}, nil, ErrConflict
+	}
+	cfg, err := decodeConfig(d.Config)
+	if err != nil {
+		return Draft{}, nil, err
+	}
+	return d, cfg, nil
 }
 
 // Restart abandons a stale draft only when the caller names its current
@@ -246,13 +355,8 @@ func decodeConfig(raw []byte) (*config.Config, error) {
 		return nil, errors.New("setup config is too large")
 	}
 	var cfg config.Config
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&cfg); err != nil {
+	if err := config.DecodeStrictJSON(raw, &cfg); err != nil {
 		return nil, fmt.Errorf("setup config: %w", err)
-	}
-	if err := dec.Decode(new(any)); err != io.EOF {
-		return nil, errors.New("setup config must contain one JSON object")
 	}
 	return &cfg, nil
 }

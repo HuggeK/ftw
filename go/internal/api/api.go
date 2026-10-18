@@ -130,7 +130,7 @@ type Deps struct {
 	SelfTune             *selftune.Coordinator
 	DtS                  float64                                   // control interval seconds (for model τ / age displays)
 	SaveConfig           func(path string, c *config.Config) error // injection for testability
-	SaveConfigWithValues func(path string, c *config.Config, values map[string]string) error
+	SaveConfigWithValues func(path string, c *config.Config, values map[string]string, reviewedJSON []byte) error
 	// ConfigApplier is main.go's config-applied callback — the same
 	// closure the configreload watcher runs (registry reload with SoC
 	// bounds, capacities, inverter groups, fuse and mpc/loadmodel
@@ -330,10 +330,10 @@ func New(deps *Deps) *Server {
 		drafts:        newDriverDrafts(),
 		marks:         make(map[string]routeMark),
 	}
-	s.setup = onboarding.NewWithSecrets(deps.State, s.preserveSetupSecrets)
+	s.setup = onboarding.NewWithSecrets(deps.State, s.preserveSetupSecrets, filepath.Dir(deps.ConfigPath))
 	if deps.SaveConfigWithValues == nil && deps.State != nil {
-		deps.SaveConfigWithValues = func(path string, cfg *config.Config, values map[string]string) error {
-			return config.SaveStoredWithValues(deps.State, path, cfg, values)
+		deps.SaveConfigWithValues = func(path string, cfg *config.Config, values map[string]string, reviewedJSON []byte) error {
+			return config.SaveStoredReviewedWithValues(deps.State, path, cfg, values, reviewedJSON)
 		}
 	}
 	if deps.Registry != nil {
@@ -703,15 +703,41 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 const maxJSONBody = 1 << 20
 
 func readJSON(r *http.Request, v any) error {
-	defer r.Body.Close()
-	body, err := io.ReadAll(http.MaxBytesReader(nil, r.Body, maxJSONBody))
+	body, err := readJSONBody(r)
 	if err != nil {
 		return err
 	}
-	if len(body) == 0 {
-		return errors.New("empty body")
-	}
 	return json.Unmarshal(body, v)
+}
+
+// Settings contain opaque vendor identifiers. Other API payloads keep their
+// existing decoder and numeric types.
+func readSettingsJSON(r *http.Request, v any) error {
+	body, err := readJSONBody(r)
+	if err != nil {
+		return err
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	if err := dec.Decode(new(any)); err != io.EOF {
+		return errors.New("send one settings object")
+	}
+	return nil
+}
+
+func readJSONBody(r *http.Request) ([]byte, error) {
+	defer r.Body.Close()
+	body, err := io.ReadAll(http.MaxBytesReader(nil, r.Body, maxJSONBody))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) == 0 {
+		return nil, errors.New("empty body")
+	}
+	return body, nil
 }
 
 // ---- /api/health ----
@@ -1625,21 +1651,25 @@ func restoreDriverConfigSecrets(incoming, existing *config.Config, secretsByLua 
 }
 
 func (s *Server) handlePostConfig(w http.ResponseWriter, r *http.Request) {
-	s.handlePostConfigWith(w, r, s.deps.SaveConfig, nil)
+	s.handlePostConfigWith(w, r, false, s.deps.SaveConfig, nil)
 }
 
-func (s *Server) handlePostConfigWith(w http.ResponseWriter, r *http.Request, save func(string, *config.Config) error, saved func(*config.Config, []string)) {
+func (s *Server) handlePostConfigWith(w http.ResponseWriter, r *http.Request, reviewed bool, save func(string, *config.Config) error, saved func(*config.Config, []string)) {
 	s.configWriteMu.Lock()
 	defer s.configWriteMu.Unlock()
 	var posted struct {
 		config.Config
 		AppLink json.RawMessage `json:"app_link"`
 	}
-	if err := readJSON(r, &posted); err != nil {
+	if err := readSettingsJSON(r, &posted); err != nil {
 		writeJSON(w, 400, map[string]string{"error": "invalid config: " + err.Error()})
 		return
 	}
 	newCfg := posted.Config
+	if err := newCfg.DecodeDriverNumbers(); err != nil {
+		writeJSON(w, 400, map[string]string{"error": "invalid config: " + err.Error()})
+		return
+	}
 	if posted.AppLink != nil {
 		if bytes.Equal(bytes.TrimSpace(posted.AppLink), []byte("null")) {
 			newCfg.AppLink = &config.AppLink{Enabled: false}
@@ -1648,7 +1678,7 @@ func (s *Server) handlePostConfigWith(w http.ResponseWriter, r *http.Request, sa
 			return
 		}
 	}
-	if newCfg.EVCharger != nil && newCfg.EVCharger.Password == maskedPlaceholder {
+	if !reviewed && newCfg.EVCharger != nil && newCfg.EVCharger.Password == maskedPlaceholder {
 		newCfg.EVCharger.Password = ""
 	}
 	// Preserve secrets the UI sent back as empty (masked) values.
@@ -1658,13 +1688,22 @@ func (s *Server) handlePostConfigWith(w http.ResponseWriter, r *http.Request, sa
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "Settings changed. Close and reopen Settings before saving."})
 		return
 	}
-	newCfg.PreserveMaskedSecrets(s.deps.Cfg)
-	// Restore catalog-declared driver secrets (api_token etc.) the UI
-	// returned as maskedPlaceholder or empty. Same semantics as
-	// PreserveMaskedSecrets but scoped to keys the driver itself
-	// declared via DRIVER.config_secrets — keeps config-package
-	// catalog-agnostic.
-	restoreDriverConfigSecrets(&newCfg, s.deps.Cfg, s.driverSecretKeys())
+	if reviewed {
+		// Setup already resolved masks against the draft's stable owners.
+		// Only private runtime state comes from the live configuration here.
+		newCfg.ConfigDatabase = s.deps.Cfg.ConfigDatabase
+		newCfg.Revision = s.deps.Cfg.Revision
+		newCfg.LANPasswordHash = s.deps.Cfg.LANPasswordHash
+		newCfg.ModbusProxyWriteOwners = s.deps.Cfg.ModbusProxyWriteOwners
+	} else {
+		newCfg.PreserveMaskedSecrets(s.deps.Cfg)
+		// Restore catalog-declared driver secrets (api_token etc.) the UI
+		// returned as maskedPlaceholder or empty. Same semantics as
+		// PreserveMaskedSecrets but scoped to keys the driver itself
+		// declared via DRIVER.config_secrets — keeps config-package
+		// catalog-agnostic.
+		restoreDriverConfigSecrets(&newCfg, s.deps.Cfg, s.driverSecretKeys())
+	}
 	s.deps.CfgMu.RUnlock()
 
 	if err := newCfg.Validate(); err != nil {
@@ -1687,7 +1726,11 @@ func (s *Server) handlePostConfigWith(w http.ResponseWriter, r *http.Request, sa
 
 	// Persist atomically (Password has yaml:"-" so it won't appear in YAML)
 	if err := save(s.deps.ConfigPath, &newCfg); err != nil {
-		writeJSON(w, 500, map[string]string{"error": "save failed: " + err.Error()})
+		status := http.StatusInternalServerError
+		if errors.Is(err, config.ErrReviewedConfigChanged) {
+			status = http.StatusConflict
+		}
+		writeJSON(w, status, map[string]string{"error": "save failed: " + err.Error()})
 		return
 	}
 	// Apply the committed config through the same path as all Settings writers.
