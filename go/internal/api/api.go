@@ -312,6 +312,7 @@ type Server struct {
 
 // New creates a new API server.
 func New(deps *Deps) *Server {
+	restoreLANSessions(deps.State)
 	if deps.Version == "" {
 		deps.Version = "dev"
 	}

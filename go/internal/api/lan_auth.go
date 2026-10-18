@@ -3,10 +3,12 @@ package api
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -27,7 +29,7 @@ const (
 
 	lanSessionCookieName = "ftw_lan"
 	lanSessionBytes      = 32
-	lanSessionTTL        = 12 * time.Hour
+	lanSessionTTL        = 30 * 24 * time.Hour
 
 	// Encoded in the stored hash so a later bump still verifies old rows.
 	lanArgonTime    uint32 = 3
@@ -81,12 +83,13 @@ func lanSessionValid(token string) bool {
 	}
 	lanSessionMu.Lock()
 	defer lanSessionMu.Unlock()
-	sess, ok := lanSessions[token]
+	digest := lanSessionDigest(token)
+	sess, ok := lanSessions[digest]
 	if !ok {
 		return false
 	}
 	if !sess.expires.After(lanSessionNow()) {
-		delete(lanSessions, token)
+		delete(lanSessions, digest)
 		return false
 	}
 	return true
@@ -99,7 +102,7 @@ func issueLANSession() (string, error) {
 	}
 	token := hex.EncodeToString(raw)
 	lanSessionMu.Lock()
-	lanSessions[token] = lanSession{expires: lanSessionNow().Add(lanSessionTTL)}
+	lanSessions[lanSessionDigest(token)] = lanSession{expires: lanSessionNow().Add(lanSessionTTL)}
 	lanSessionMu.Unlock()
 	return token, nil
 }
@@ -109,8 +112,29 @@ func dropLANSession(token string) {
 		return
 	}
 	lanSessionMu.Lock()
-	delete(lanSessions, token)
+	delete(lanSessions, lanSessionDigest(token))
 	lanSessionMu.Unlock()
+}
+
+func lanSessionDigest(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+func restoreLANSessions(st *state.Store) {
+	if st == nil {
+		return
+	}
+	lanSessionMu.Lock()
+	defer lanSessionMu.Unlock()
+	sessions, err := st.LoadLANSessions(lanSessionNow().UnixMilli())
+	if err != nil {
+		slog.Warn("LAN sessions could not be restored")
+		return
+	}
+	for _, session := range sessions {
+		lanSessions[session.Digest] = lanSession{expires: time.UnixMilli(session.ExpiresMS)}
+	}
 }
 
 func dropAllLANSessions() {
@@ -275,6 +299,10 @@ type lanAuthLoginRequest struct {
 }
 
 func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
+	// Serialize admission with password changes, so an old-password login
+	// cannot add a session after the password route revoked the old ones.
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	if s.deps.State == nil || s.deps.Cfg == nil || s.deps.CfgMu == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "config store unavailable"})
 		return
@@ -296,8 +324,13 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	st := s.deps.State
+	encoded, found, err := st.ConfigValue(lanAuthPasswordKey)
+	if err != nil || !found {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "password store unavailable"})
+		return
+	}
 	if !admitLANSecret(func(secret string) bool {
-		return VerifyStoredLANSecret(st, secret)
+		return verifyLANPassword(encoded, secret)
 	}, req.Password) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid password"})
 		return
@@ -307,12 +340,24 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not create session"})
 		return
 	}
+	lanSessionMu.Lock()
+	now := lanSessionNow()
+	lanSessionMu.Unlock()
+	if err := st.SaveLANSession(lanSessionDigest(token), now.Add(lanSessionTTL).UnixMilli(), now.UnixMilli(), encoded); err != nil {
+		dropLANSession(token)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "could not save session"})
+		return
+	}
 	setLANSessionCookie(w, token, int(lanSessionTTL/time.Second))
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 	if token, ok := lanSessionCookieValue(r); ok {
+		if s.deps.State == nil || s.deps.State.DeleteLANSession(lanSessionDigest(token)) != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "could not revoke session"})
+			return
+		}
 		dropLANSession(token)
 	}
 	// MaxAge < 0 emits Max-Age=0 so the browser drops ftw_lan.
@@ -409,6 +454,10 @@ func (s *Server) handleAuthPassword(w http.ResponseWriter, r *http.Request) {
 	*s.deps.Cfg = cfgCopy
 	s.deps.CfgMu.Unlock()
 	dropAllLANSessions()
+	if err := s.deps.State.DeleteAllLANSessions(); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "could not revoke sessions"})
+		return
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":     "ok",
