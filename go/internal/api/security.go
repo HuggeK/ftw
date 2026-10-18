@@ -154,7 +154,8 @@ func lanAuthExempt(path string) bool {
 }
 
 func decideLANCaller(r *http.Request, policy MutationPolicy, houseOK bool) apiauth.Caller {
-	if !lanAuthOn(policy) || isLoopbackClient(r.RemoteAddr) || houseOK {
+	if !lanAuthOn(policy) || isLoopbackClient(r.RemoteAddr) || houseOK ||
+		validBearerToken(r.Header.Get("Authorization"), policy.Token) {
 		return localCaller(r)
 	}
 	return lanViewerCaller(r)

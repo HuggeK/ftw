@@ -1,6 +1,8 @@
 package api
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -9,9 +11,37 @@ import (
 	"testing"
 	"time"
 
+	"github.com/srcfl/ftw/go/internal/apiauth"
 	"github.com/srcfl/ftw/go/internal/config"
 	"github.com/srcfl/ftw/go/internal/state"
 )
+
+func TestLANPasswordKeepsExplicitRemoteAPITokenOwner(t *testing.T) {
+	resetLANGuesses(t)
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		t.Fatal("create local test token failed")
+	}
+	policy := lanAuthPolicy(testHousePassword)
+	policy.RequireTokenForRemote = true
+	policy.Token = hex.EncodeToString(raw)
+	for _, valid := range []bool{true, false} {
+		bearer := policy.Token
+		if !valid {
+			bearer = "invalid-" + bearer
+		}
+		req := lanAuthRequest(http.MethodGet, "http://ftw.example.com/api/cars", "203.0.113.1:5123", "Bearer "+bearer)
+		var caller apiauth.Caller
+		serveLANAuth(policy, req, func(r *http.Request) { caller, _ = apiauth.FromRequest(r) })
+		want := apiauth.RoleViewer
+		if valid {
+			want = apiauth.RoleOwner
+		}
+		if caller.Role != want {
+			t.Fatal("LAN password setting changed explicit API-token authority")
+		}
+	}
+}
 
 func reopenLANServer(t *testing.T, server *Server, path string) *Server {
 	t.Helper()
