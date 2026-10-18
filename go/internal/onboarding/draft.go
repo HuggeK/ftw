@@ -25,7 +25,7 @@ var ErrConflict = errors.New("setup changed; read the current draft before editi
 // Storage is the box's durable settings store. A failed write must leave
 // the previous value intact.
 type Storage interface {
-	LoadConfig(string) (string, bool)
+	ConfigValue(string) (string, bool, error)
 	SaveConfig(string, string) error
 }
 
@@ -42,17 +42,27 @@ type Draft struct {
 // Service serializes draft changes. Live config saves remain the caller's
 // responsibility, including a final compare-and-save of BaseRevision.
 type Service struct {
-	mu    sync.Mutex
-	store Storage
+	mu              sync.Mutex
+	store           Storage
+	preserveSecrets func(incoming, previous *config.Config)
 }
 
-func New(store Storage) *Service { return &Service{store: store} }
+func New(store Storage) *Service { return NewWithSecrets(store, nil) }
+
+// NewWithSecrets adds the running driver's secret metadata to the common
+// config secret handling. The callback must be safe to call during an edit.
+func NewWithSecrets(store Storage, preserve func(incoming, previous *config.Config)) *Service {
+	return &Service{store: store, preserveSecrets: preserve}
+}
 
 func (s *Service) current() (Draft, bool, error) {
 	if s.store == nil {
 		return Draft{}, false, errors.New("setup storage is unavailable")
 	}
-	raw, ok := s.store.LoadConfig(draftKey)
+	raw, ok, err := s.store.ConfigValue(draftKey)
+	if err != nil {
+		return Draft{}, false, fmt.Errorf("read setup draft: %w", err)
+	}
 	if !ok || raw == "" {
 		return Draft{}, false, nil
 	}
@@ -126,6 +136,14 @@ func (s *Service) Edit(live *config.Config, expected int64, patch json.RawMessag
 	if err != nil {
 		return Draft{}, err
 	}
+	previous, err := decodeConfig(d.Config)
+	if err != nil {
+		return Draft{}, err
+	}
+	cfg.PreserveMaskedSecrets(previous)
+	if s.preserveSecrets != nil {
+		s.preserveSecrets(cfg, previous)
+	}
 	// Canonicalize through the current type. Do not default or validate yet:
 	// both would hide missing answers or reject an unfinished installation.
 	d.Config, err = json.Marshal(cfg)
@@ -149,6 +167,22 @@ func (s *Service) Edit(live *config.Config, expected int64, patch json.RawMessag
 func (s *Service) Checked(liveRevision, revision int64, sha string) (*config.Config, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.checkedLocked(liveRevision, revision, sha)
+}
+
+// ApplyChecked keeps the draft fixed while the caller compares and saves
+// its live base. The callback must enforce the live configuration revision.
+func (s *Service) ApplyChecked(liveRevision, revision int64, sha string, apply func(*config.Config) error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cfg, err := s.checkedLocked(liveRevision, revision, sha)
+	if err != nil {
+		return err
+	}
+	return apply(cfg)
+}
+
+func (s *Service) checkedLocked(liveRevision, revision int64, sha string) (*config.Config, error) {
 	d, found, err := s.current()
 	if err != nil {
 		return nil, err

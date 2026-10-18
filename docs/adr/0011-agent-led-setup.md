@@ -38,10 +38,15 @@ to a request to read today's energy use.
    each edit. A new conversation can resume it. Apply patches to the current
    typed config, preserving fields and saved secrets that the caller did not
    change. A stale revision must conflict rather than overwrite another edit.
+   Return the next question, missing facts, field sources and units as
+   structured data. A schema of field types alone is not a question plan.
+   Keep new credentials in the draft when a client edits a masked list again.
 5. **Check and save.** Validate with Core's existing config checks. Show the
    proposed changes, assumptions, effects and required restarts. The owner
    confirms the proposed configuration in the conversation. Commit the exact
    checked revision through the same durable save and reload path as Settings.
+   Commit a receipt in the same transaction. If the reply is lost, a retry
+   must report the saved revision rather than ask the user to save it again.
 6. **Verify the installation.** Start with measurement. Require a fresh site
    meter, confirmed fuse and phase mapping before active dispatch. A driver
    that reports data has not thereby proved control. Offer bounded control
@@ -52,6 +57,12 @@ to a request to read today's energy use.
    Core keeps every existing safety check. Finish with what works, what is
    still estimated and what needs attention. Losing the assistant never
    removes saved goals or stops local operation.
+
+Use small groups of questions, allow "I don't know", and explain how to find
+the fuse rating and phase count. Distinguish saved, connected, measuring,
+tested and active control. A device failure must not force the user to
+discard working parts of the installation. A conflict should show which
+fields changed and allow answers to be carried forward.
 
 The workflow covers the full supported config, including driver connection
 fields, price and grid tariffs, weather, battery windows, vehicles and
@@ -89,6 +100,8 @@ electricity use, whether that figure includes EV charging or electric heat,
 heating type, usual occupancy, and known solar nameplate capacity. A user who
 does not know these values must still be able to finish setup. Roof geometry
 is optional expert input, never a prerequisite.
+Ask whether an annual figure means purchased electricity or total use:
+solar self-consumption makes those different quantities.
 
 Use existing weather, solar scale and heating inputs where they fit. A load
 prior derived from annual energy must exclude separately forecast EV use and
@@ -119,6 +132,12 @@ what rights they received, when access ends and how to revoke it. Revoking a
 grant ends its open sessions; cancelling an unclaimed code prevents later use.
 The code itself has a short claim window, distinct from the granted access's
 lifetime. Store only a verifier, limit failed attempts, and never log the code.
+The owner creates an invitation; the recipient selects "I have an invitation"
+when connecting their own client. This is distinct from today's flow where
+the owner types a code that their assistant generated. Show the owner's label,
+the client and claim time. Possession of a code does not verify a person's
+real identity. Treat expired, cancelled, already used and network failure as
+different states with a clear next step.
 
 Cloud may carry a claim but cannot widen the owner's selected rights. A code
 cannot name another home or mint owner access. Setup cannot issue a sharing

@@ -52,6 +52,7 @@ import (
 	"github.com/srcfl/ftw/go/internal/mpc"
 	"github.com/srcfl/ftw/go/internal/notifications"
 	"github.com/srcfl/ftw/go/internal/ocpp"
+	"github.com/srcfl/ftw/go/internal/onboarding"
 	"github.com/srcfl/ftw/go/internal/prices"
 	"github.com/srcfl/ftw/go/internal/pvmodel"
 	"github.com/srcfl/ftw/go/internal/scanner"
@@ -118,17 +119,18 @@ type Deps struct {
 	// minimal embeddings; the /api/cloud routes then say it is unavailable.
 	Cloud CloudGrant
 
-	CfgMu         *sync.RWMutex
-	Cfg           *config.Config
-	ConfigPath    string
-	DriverDir     string // where to scan for Lua drivers (default: <config-dir>/drivers)
-	UserDriverDir string // persistent user-drivers overlay; searched before DriverDir
-	Models        map[string]*battery.Model
-	ModelsMu      *sync.Mutex
-	ModelWrites   *state.ControlWrites
-	SelfTune      *selftune.Coordinator
-	DtS           float64                                   // control interval seconds (for model τ / age displays)
-	SaveConfig    func(path string, c *config.Config) error // injection for testability
+	CfgMu                *sync.RWMutex
+	Cfg                  *config.Config
+	ConfigPath           string
+	DriverDir            string // where to scan for Lua drivers (default: <config-dir>/drivers)
+	UserDriverDir        string // persistent user-drivers overlay; searched before DriverDir
+	Models               map[string]*battery.Model
+	ModelsMu             *sync.Mutex
+	ModelWrites          *state.ControlWrites
+	SelfTune             *selftune.Coordinator
+	DtS                  float64                                   // control interval seconds (for model τ / age displays)
+	SaveConfig           func(path string, c *config.Config) error // injection for testability
+	SaveConfigWithValues func(path string, c *config.Config, values map[string]string) error
 	// ConfigApplier is main.go's config-applied callback — the same
 	// closure the configreload watcher runs (registry reload with SoC
 	// bounds, capacities, inverter groups, fuse and mpc/loadmodel
@@ -261,6 +263,7 @@ type Server struct {
 	configWriteMu sync.Mutex // Covers persistence and apply for every config writer.
 	deps          *Deps
 	mux           *http.ServeMux
+	setup         *onboarding.Service
 
 	// dailyCache memoizes per-local-day energy totals keyed by "YYYY-MM-DD".
 	// Past days are immutable once the day ends, so we only ever recompute
@@ -326,6 +329,14 @@ func New(deps *Deps) *Server {
 		controlStates: make(map[string]*controlDriverState),
 		drafts:        newDriverDrafts(),
 		marks:         make(map[string]routeMark),
+	}
+	s.setup = onboarding.NewWithSecrets(deps.State, func(incoming, previous *config.Config) {
+		restoreDriverConfigSecrets(incoming, previous, s.driverSecretKeys())
+	})
+	if deps.SaveConfigWithValues == nil && deps.State != nil {
+		deps.SaveConfigWithValues = func(path string, cfg *config.Config, values map[string]string) error {
+			return config.SaveStoredWithValues(deps.State, path, cfg, values)
+		}
 	}
 	if deps.Registry != nil {
 		// Registry removal is the lifecycle boundary for a driver generation.
@@ -441,6 +452,7 @@ func (s *Server) routes() {
 	s.handle("GET  /api/fleet-ping", Read, s.handleFleetPing)
 	s.cloudRoutes()
 	s.agentRoutes()
+	s.setupRoutes()
 	s.handle("POST /api/mode", Actuate, s.handleSetMode, Via(appproto.OpSetMode))
 	s.handle("GET  /api/planner/prefs", Read, s.handleGetPlannerPrefs)
 	s.handle("POST /api/planner/prefs", Actuate, s.handleSetPlannerPrefs, Via(appproto.OpPlannerPrefsSet))
@@ -1615,6 +1627,10 @@ func restoreDriverConfigSecrets(incoming, existing *config.Config, secretsByLua 
 }
 
 func (s *Server) handlePostConfig(w http.ResponseWriter, r *http.Request) {
+	s.handlePostConfigWith(w, r, s.deps.SaveConfig)
+}
+
+func (s *Server) handlePostConfigWith(w http.ResponseWriter, r *http.Request, save func(string, *config.Config) error) {
 	s.configWriteMu.Lock()
 	defer s.configWriteMu.Unlock()
 	var posted struct {
@@ -1672,7 +1688,7 @@ func (s *Server) handlePostConfig(w http.ResponseWriter, r *http.Request) {
 	restartReasons := config.RestartRequiredFor(&oldCfg, &newCfg)
 
 	// Persist atomically (Password has yaml:"-" so it won't appear in YAML)
-	if err := s.deps.SaveConfig(s.deps.ConfigPath, &newCfg); err != nil {
+	if err := save(s.deps.ConfigPath, &newCfg); err != nil {
 		writeJSON(w, 500, map[string]string{"error": "save failed: " + err.Error()})
 		return
 	}

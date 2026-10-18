@@ -193,6 +193,21 @@ func TestDamagedDraftIsNotSilentlyReplaced(t *testing.T) {
 	}
 }
 
+func TestUnavailableStorageDoesNotLookLikeANewInstallation(t *testing.T) {
+	live := testLive(t)
+	store := draftStore(t)
+	s := New(store)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Read(live); err == nil {
+		t.Fatal("closed storage looked like an empty draft")
+	}
+	if _, err := s.Receipt(); err == nil {
+		t.Fatal("closed storage looked like an uncommitted draft")
+	}
+}
+
 func TestSchemaCoversAllPublicConfigFieldsWithoutRuntimeAuthority(t *testing.T) {
 	live := testLive(t)
 	raw, err := json.Marshal(live)

@@ -215,6 +215,12 @@ func SaveStored(st *state.Store, path string, cfg *Config) error {
 	return saveStored(st, path, cfg, "")
 }
 
+// SaveStoredWithValues commits a settings change and its companion records
+// in the same SQLite transaction, for example a setup commit receipt.
+func SaveStoredWithValues(st *state.Store, path string, cfg *Config, values map[string]string) error {
+	return saveStoredValues(st, path, cfg, "", values)
+}
+
 // DropRetiredSettings rewrites stored settings that still carry settings of a
 // removed feature. Ask why kept an OpenRouter key there; nothing reads it, so
 // it must not stay in state.db and every backup. Device Support repositories,
@@ -241,6 +247,10 @@ func DropRetiredSettings(st *state.Store, path string, cfg *Config) ([]string, e
 }
 
 func saveStored(st *state.Store, path string, cfg *Config, sourceHash string) error {
+	return saveStoredValues(st, path, cfg, sourceHash, nil)
+}
+
+func saveStoredValues(st *state.Store, path string, cfg *Config, sourceHash string, values map[string]string) error {
 	if cfg.ConfigDatabase == "" {
 		return errors.New("settings database is not initialized")
 	}
@@ -303,6 +313,12 @@ func saveStored(st *state.Store, path string, cfg *Config, sourceHash string) er
 	}
 	credentials["ev_charger_password"] = password
 	credentials["lan_auth_password"] = cfg.LANPasswordHash
+	for key, value := range values {
+		if _, credential := credentials[key]; credential || key == "settings/config_v1" {
+			return errors.New("companion settings record conflicts with configuration or credentials")
+		}
+		credentials[key] = value
+	}
 	revision, err := st.SaveConfiguration(raw, cfg.Revision, credentials)
 	if err != nil {
 		return err
