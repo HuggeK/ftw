@@ -603,7 +603,7 @@
     });
     split.calls.forEach(function (scope) {
       form.appendChild(checkRow("call", scope, scopeWords(scope), !!current));
-      form.appendChild(el("p", { className: "access-quiet", text: "Off until you choose it. The assistant may save setup after you review and confirm its exact draft in the conversation. Saved equipment settings can affect operation; Core keeps its safety checks." }));
+      form.appendChild(el("p", { className: "access-quiet", text: "Off until you choose it. This includes equipment names and connection settings. Review and confirm the exact draft before it saves, and confirm any restart separately. Saved equipment settings can affect operation; Core keeps its safety checks." }));
     });
 
     if (split.groups.length) {
