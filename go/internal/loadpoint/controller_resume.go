@@ -22,51 +22,57 @@ type resumeOffer struct {
 // one timestamp still cannot advance either delivery or no-draw proof.
 const resumeObservationGap = 15 * time.Second
 
+// Commands may block while Stop or a new plug session arrives. Use this
+// check after either charger dispatch or a vehicle start attempt.
+func (c *Controller) currentChargeSample(now time.Time, cfg Config, previous EVSample) (EVSample, time.Time, bool) {
+	if hold, held := c.GetManualHold(cfg.ID, now); held && hold.PowerW == 0 {
+		return EVSample{}, now, false
+	}
+	if c.tel == nil {
+		return previous, now, true
+	}
+	sample, live := c.tel(cfg.DriverName)
+	if !live || !sample.Connected || sample.ConnectionUnknown || sample.DeviceID != previous.DeviceID ||
+		sample.SessionID != previous.SessionID || sample.ConnectionGeneration != previous.ConnectionGeneration {
+		return sample, now, false
+	}
+	if checkedAt := time.Now(); sample.PowerAt.After(now) && !sample.PowerAt.After(checkedAt) {
+		now = checkedAt
+	}
+	return sample, now, true
+}
+
+func chargerIdleForWake(sample EVSample, now time.Time) bool {
+	return !sample.PowerUnavailable && finite(sample.PowerW) && sample.PowerW < DeliveringW &&
+		!sample.PowerAt.After(now) && (sample.PowerAt.IsZero() || now.Sub(sample.PowerAt) <= sample.PowerWindow())
+}
+
 // recoverOfferedCharge resumes our zero offer, or a known plug session that
 // still asks for charge after two minutes of accepted positive offers without
 // delivery. The current limit must succeed before this optional resume. Only
 // measured delivery ends recovery; an acknowledgement is not a charge.
 func (c *Controller) recoverOfferedCharge(ctx context.Context, cfg Config, sample EVSample, offerW float64, now time.Time) {
 	if c.resumeOffers == nil {
-		c.resumeOffers = make(map[string]resumeOffer)
+		c.resumeOffers = make(map[string]*resumeOffer)
 	}
 	proof := resumeOffer{driver: cfg.DriverName, device: sample.DeviceID, session: sample.SessionID, generation: sample.ConnectionGeneration}
-	previous, exists := c.resumeOffers[cfg.ID]
-	if previous.driver != proof.driver || previous.device != proof.device || previous.session != proof.session || previous.generation != proof.generation {
+	previous := c.resumeOffers[cfg.ID]
+	if previous != nil && (previous.driver != proof.driver || previous.device != proof.device || previous.session != proof.session || previous.generation != proof.generation) {
 		delete(c.resumeOffers, cfg.ID)
-		exists = false
+		previous = nil
 	}
 	if offerW <= 0 {
 		proof.zeroOffer = true
-		c.resumeOffers[cfg.ID] = proof
+		c.resumeOffers[cfg.ID] = &proof
 		return
 	}
-	// The current write can block while a Stop or socket change arrives.
-	// Recheck before reopening the contactor, using the newest observation.
-	if hold, held := c.GetManualHold(cfg.ID, now); held && hold.PowerW == 0 {
-		delete(c.resumeOffers, cfg.ID)
-		return
-	}
-	if c.tel != nil {
-		latest, live := c.tel(cfg.DriverName)
-		if !live || !latest.Connected || latest.ConnectionUnknown || latest.DeviceID != sample.DeviceID ||
-			latest.SessionID != sample.SessionID || latest.ConnectionGeneration != sample.ConnectionGeneration {
-			delete(c.resumeOffers, cfg.ID)
-			return
-		}
-		sample = latest
-		// A poll may have arrived during the current write. Judge it against
-		// the time after that call, while still rejecting future source times.
-		if checkedAt := time.Now(); sample.PowerAt.After(now) && !sample.PowerAt.After(checkedAt) {
-			now = checkedAt
-		}
-	}
-	if !exists {
+	if previous == nil {
 		if proof.device == "" || proof.session == "" || !sample.RequestActive {
 			return
 		}
-		previous = proof
+		previous = &proof
 		previous.noDrawSince = now
+		c.resumeOffers[cfg.ID] = previous
 	}
 	if !previous.zeroOffer && !sample.RequestActive {
 		delete(c.resumeOffers, cfg.ID)
@@ -90,7 +96,6 @@ func (c *Controller) recoverOfferedCharge(ctx context.Context, cfg Config, sampl
 	if !fresh || !finite(sample.PowerW) {
 		previous.deliverySince, previous.deliveryAt = time.Time{}, time.Time{}
 		previous.noDrawSince, previous.noDrawAt = time.Time{}, time.Time{}
-		c.resumeOffers[cfg.ID] = previous
 		return
 	}
 	if sample.PowerW >= floor {
@@ -100,8 +105,6 @@ func (c *Controller) recoverOfferedCharge(ctx context.Context, cfg Config, sampl
 		previous.deliveryAt = observedAt
 		if observedAt.Sub(previous.deliverySince) >= 10*time.Second {
 			delete(c.resumeOffers, cfg.ID)
-		} else {
-			c.resumeOffers[cfg.ID] = previous
 		}
 		return // Already drawing: observe it rather than sending another resume.
 	}
@@ -112,12 +115,10 @@ func (c *Controller) recoverOfferedCharge(ctx context.Context, cfg Config, sampl
 			previous.noDrawSince = now
 		}
 		previous.noDrawAt = observedAt
-		c.resumeOffers[cfg.ID] = previous
 		if previous.noDrawAt.Sub(previous.noDrawSince) < 2*time.Minute {
 			return
 		}
 	}
-	c.resumeOffers[cfg.ID] = previous
 	if now.Before(previous.nextAttempt) {
 		return
 	}
@@ -125,14 +126,12 @@ func (c *Controller) recoverOfferedCharge(ctx context.Context, cfg Config, sampl
 		if previous.acknowledgedAttempts == 3 {
 			slog.Warn("loadpoint resume acknowledged but no charge observed", "lp", cfg.ID, "driver", cfg.DriverName)
 			previous.acknowledgedAttempts++
-			c.resumeOffers[cfg.ID] = previous
 		}
 		return
 	}
 	if err := c.sendDispatchWithDeadline(ctx, cfg.DriverName, []byte(`{"action":"ev_resume"}`)); err != nil {
 		previous.retryDelay = min(time.Minute, max(5*time.Second, 2*previous.retryDelay))
 		previous.nextAttempt = now.Add(previous.retryDelay)
-		c.resumeOffers[cfg.ID] = previous
 		slog.Warn("loadpoint resume failed", "lp", cfg.ID, "driver", cfg.DriverName,
 			"retry_at", previous.nextAttempt, "err", err)
 		return
@@ -145,5 +144,4 @@ func (c *Controller) recoverOfferedCharge(ctx context.Context, cfg Config, sampl
 		"attempt", previous.acknowledgedAttempts, "offer_w", offerW, "observed_w", sample.PowerW, "power_at", sample.PowerAt)
 	previous.nextAttempt = now.Add(30 * time.Second)
 	previous.retryDelay = 0
-	c.resumeOffers[cfg.ID] = previous
 }

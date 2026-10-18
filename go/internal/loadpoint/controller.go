@@ -41,7 +41,7 @@ type Controller struct {
 	// registry owns cross-command serialization and lifecycle cancellation.
 	commandTimeout  time.Duration
 	wallboxCycleSeq atomic.Uint64
-	resumeOffers    map[string]resumeOffer // owned by the dispatch tick
+	resumeOffers    map[string]*resumeOffer // owned by the dispatch tick
 	energySamples   map[string]*meteredEnergy
 
 	// fuseEVMax is this tick's EV share of the site fuse. nil means no cap.
@@ -1605,8 +1605,6 @@ func (c *Controller) tickOne(ctx context.Context, now time.Time, lpCfg Config, s
 	if sendErr != nil {
 		slog.Warn("loadpoint dispatch", "lp", lpCfg.ID,
 			"driver", lpCfg.DriverName, "err", sendErr)
-	}
-	if sendErr != nil {
 		// Never start wake work from a command that did not complete. In
 		// particular, a timeout may still be unwinding inside the registry;
 		// its per-driver owner restores default before another command runs.
@@ -1621,6 +1619,16 @@ func (c *Controller) tickOne(ctx context.Context, now time.Time, lpCfg Config, s
 		// wake side effects of a dispatch that Core has just rejected.
 		return
 	}
+	// The current write can block while Stop or new charger data arrives.
+	// Reuse the same session check for recovery and vehicle wake work.
+	latest, checkedAt, live := c.currentChargeSample(now, lpCfg, sample)
+	if !live {
+		if offerW > 0 {
+			delete(c.resumeOffers, lpCfg.ID)
+		}
+		return
+	}
+	sample, now = latest, checkedAt
 	// Establish the safe current before reopening a paused session. The
 	// charger may still retain a higher limit from before our standdown.
 	if haveOffer && offerW > 0 {
@@ -1639,10 +1647,11 @@ func (c *Controller) maybeWakeVehicle(ctx context.Context, now time.Time, lpCfg 
 	if c == nil || c.send == nil {
 		return
 	}
+	var live bool
+	sample, now, live = c.currentChargeSample(now, lpCfg, sample)
 	// Vehicle APIs can lag the charger by minutes. Do not interrupt measured
 	// delivery, or turn missing charger power into evidence of a sleeping car.
-	if sample.PowerUnavailable || !finite(sample.PowerW) || sample.PowerW >= DeliveringW ||
-		sample.PowerAt.After(now) || (!sample.PowerAt.IsZero() && now.Sub(sample.PowerAt) > sample.PowerWindow()) {
+	if !live || !chargerIdleForWake(sample, now) {
 		return
 	}
 	pw, _ := cmd["power_w"].(float64)
@@ -1753,6 +1762,10 @@ func (c *Controller) maybeWakeVehicle(ctx context.Context, now time.Time, lpCfg 
 	// driver implementing the standard ev_pause / ev_resume actions
 	// gets this for free.
 	//
+	latest, checkedAt, live := c.currentChargeSample(now, lpCfg, sample)
+	if !live || !chargerIdleForWake(latest, checkedAt) {
+		return
+	}
 	c.cycleWallbox(lpID, lpCfg.DriverName)
 }
 

@@ -86,7 +86,7 @@ func TestPositiveOfferRecoveryWithoutPriorZero(t *testing.T) {
 }
 
 func TestRecoveryRechecksStopAndSessionAfterCurrentWrite(t *testing.T) {
-	for _, boundary := range []string{"stop", "unplug", "session", "unknown", "started drawing"} {
+	for _, boundary := range []string{"stop", "unplug", "session", "unknown", "started drawing", "stop during resume", "drawing during resume"} {
 		t.Run(boundary, func(t *testing.T) {
 			now := time.Now()
 			cfg := Config{ID: "garage", DriverName: "easee", MinChargeW: 4140, MaxChargeW: 10350}
@@ -96,6 +96,7 @@ func TestRecoveryRechecksStopAndSessionAfterCurrentWrite(t *testing.T) {
 			sender := &fakeSender{}
 			c := newTestController(t, []Config{cfg}, dir, samples, sender)
 			c.Tick(context.Background(), now)
+			c.SetVehicleStatus(func(string) (string, string, bool) { return "tesla", "Stopped", true })
 			dir.LoadpointEnergyWh[cfg.ID] = 10350
 			c.send = func(ctx context.Context, driver string, payload []byte) error {
 				var command struct {
@@ -104,6 +105,15 @@ func TestRecoveryRechecksStopAndSessionAfterCurrentWrite(t *testing.T) {
 				}
 				if err := json.Unmarshal(payload, &command); err != nil {
 					return err
+				}
+				if command.Action == "ev_resume" {
+					switch boundary {
+					case "stop during resume":
+						c.SetManualHold(cfg.ID, ManualHold{PowerW: 0, Persistent: true})
+					case "drawing during resume":
+						sample.PowerW = 4712
+					}
+					samples[cfg.DriverName] = sample
 				}
 				if command.Action == "ev_set_current" && command.PowerW > 0 {
 					switch boundary {
@@ -123,8 +133,15 @@ func TestRecoveryRechecksStopAndSessionAfterCurrentWrite(t *testing.T) {
 				return sender.Send(ctx, driver, payload)
 			}
 			c.Tick(context.Background(), now.Add(5*time.Second))
-			if countAction(sender.calls, "ev_resume") != 0 {
+			wantResumes := 0
+			if boundary == "stop during resume" || boundary == "drawing during resume" {
+				wantResumes = 1
+			}
+			if countAction(sender.calls, "ev_resume") != wantResumes {
 				t.Fatalf("resume crossed %s during current write", boundary)
+			}
+			if countAction(sender.calls, "charge_start") != 0 || countAction(sender.calls, "ev_pause") != 0 {
+				t.Fatalf("vehicle wake crossed %s during current write", boundary)
 			}
 		})
 	}

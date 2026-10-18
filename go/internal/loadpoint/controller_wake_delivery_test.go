@@ -2,6 +2,7 @@ package loadpoint
 
 import (
 	"context"
+	"errors"
 	"math"
 	"testing"
 	"testing/synctest"
@@ -89,4 +90,46 @@ func TestAcceptedVehicleStartDoesNotPauseCharger(t *testing.T) {
 			t.Fatalf("got %d vehicle starts", starts)
 		}
 	})
+}
+
+func TestWakeRechecksAfterVehicleStartRefusal(t *testing.T) {
+	for _, boundary := range []string{"stop", "unplug", "session", "unknown", "charging", "missing power"} {
+		t.Run(boundary, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				now := time.Now()
+				sender := &outcomeSender{errFor: map[string]error{"tesla": errors.New("vehicle refused start")}}
+				c, cfg, _ := outcomeFixture(t, now, sender)
+				sample := EVSample{Connected: true, RequestActive: true, DeviceID: "charger", SessionID: "one", PowerAt: now}
+				c.tel = func(string) (EVSample, bool) { return sample, true }
+				c.SetVehicleStatus(func(string) (string, string, bool) { return "tesla", "Stopped", true })
+				c.send = func(ctx context.Context, driver string, payload []byte) error {
+					if driver == "tesla" {
+						switch boundary {
+						case "stop":
+							c.SetManualHold(cfg.ID, ManualHold{PowerW: 0, Persistent: true})
+						case "unplug":
+							sample.Connected = false
+						case "session":
+							sample.SessionID = "two"
+						case "unknown":
+							sample.ConnectionUnknown = true
+						case "charging":
+							sample.PowerW = 4712
+						case "missing power":
+							sample.PowerUnavailable = true
+						}
+					}
+					return sender.Send(ctx, driver, payload)
+				}
+				c.Tick(context.Background(), now)
+				time.Sleep(wallboxCycleGap)
+				synctest.Wait()
+				for _, call := range sender.sent() {
+					if call.action == "ev_pause" || call.action == "ev_resume" {
+						t.Fatalf("charger cycle crossed %s during vehicle start: %+v", boundary, call)
+					}
+				}
+			})
+		})
+	}
 }

@@ -205,14 +205,10 @@ func ManualStatusFrom(h ManualHold, held bool, st State, ch ChargerReading, now 
 		m.State = ManualSent
 	case st.CurrentPowerW >= manualChargingFloorW:
 		m.State = ManualCharging
-		if clamp {
-			m.LimitReason = st.CommandedReason
-		}
 	case limitMatches && m.CommandedW >= manualChargingFloorW && elapsed >= manualAcceptGrace:
 		m.State = ManualNotDrawing
 	case clamp:
 		m.State = ManualLimited
-		m.LimitReason = st.CommandedReason
 	case limitMatches && elapsed >= manualAcceptGrace:
 		m.State = ManualNotDrawing
 	case limitMatches:

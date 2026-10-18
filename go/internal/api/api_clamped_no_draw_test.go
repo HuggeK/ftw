@@ -26,7 +26,7 @@ func TestPositiveEVClampDoesNotHideNoPowerResponse(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := ControlFeedback{Kind: "ev", RequestedA: watts(15), OfferedA: watts(10), SentW: watts(tc.sent), ActualW: watts(tc.actual), ObservedAtMs: now.UnixMilli(), DeviceReason: "limited by dynamic charger current"}
-			cmd := telemetry.CommandEvidence{Result: "accepted", Since: now.Add(-tc.age), PowerMismatchSince: now.Add(-tc.age)}
+			cmd := telemetry.CommandEvidence{Result: "accepted", Since: now.Add(-tc.age), NoPowerSince: now.Add(-tc.age), NoPowerAt: now}
 			classifyControlFeedback(&f, cmd, true, tc.fresh, tc.core, &connected, now)
 			setControlStatus(&f)
 			if f.Reason != tc.want {
