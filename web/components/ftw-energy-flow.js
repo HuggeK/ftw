@@ -1190,11 +1190,11 @@ class FtwEnergyFlow extends FtwElement {
         ${aggLayerSvg}
         ${indLayerSvg}
 
-        <!-- House load uses the same value in both views. An estimated
-             interval mean carries an approximation mark. Clicking opens
+        <!-- House load uses the same value in both views. An estimate
+             carries an approximation mark. Clicking opens
              the house reading through ftw-planet-click with role load. -->
         <g class="ef-hub ef-clickable" data-role="load" data-name="" data-id=""
-           tabindex="0" role="button" aria-label="${loadKnown ? (loadEstimated ? "House load, estimated mean" : "House load, live") : "House load, no data"}">
+           tabindex="0" role="button" aria-label="${loadKnown ? (loadEstimated ? "House load, estimated" : "House load, live") : "House load, no data"}">
           <circle cx="${CX}" cy="${P.cy}" r="${P.hubR}"
                   fill="var(--hero-house-fill)"
                   stroke="var(--hero-house-stroke)" stroke-width="1.5"/>

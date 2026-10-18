@@ -47,9 +47,12 @@ function usableHomeEstimate(estimate) {
     to < 8640000000000000 && age !== null && age >= 0 && age <= 180000;
 }
 
-export function homeEstimateNote(estimate, live = true) {
+export function homeEstimateNote(estimate, live = true, powerBalanceW = null) {
   if (!estimate) return "";
   if (!live) return "Home use estimate paused · no live data";
+  if (!usableHomeEstimate(estimate) && powerBalanceW !== null) {
+    return `Estimated home use ${(powerBalanceW / 1000).toFixed(1)} kW · latest power readings; device delays may differ.`;
+  }
   if (num(estimate.watts) === null) {
     if (estimate.reason === "charger_source_time_unavailable") return "Home use estimate unavailable · charger source time unknown";
     const sourceAge = num(estimate.source_age_ms);
@@ -238,7 +241,13 @@ export function flowReadingsFromStatus(status, opts) {
   }
 
   const hasEstimate = status?.load_estimate != null;
-  const loadW = hasEstimate ? (usableHomeEstimate(status.load_estimate) ? status.load_estimate.watts : null) : num(status && status.load_w);
+  // Core qualifies this balance, including missing flows and stale meters.
+  // An unavailable energy interval must not hide a valid power balance. Never
+  // derive another balance from independently smoothed display readings here.
+  const rawLoad = num(status?.load_w);
+  const powerBalanceW = rawLoad !== null && rawLoad >= 0 &&
+    (status?.history_quality == null || status.history_quality === "complete") ? rawLoad : null;
+  const loadW = usableHomeEstimate(status?.load_estimate) ? status.load_estimate.watts : powerBalanceW;
   // Today's share is kWh already in the box, not the live meter. A
   // quiet meter blanks % SELF-POWERED NOW (unknown instantaneous load)
   // but must not hide a day that already happened.
@@ -250,7 +259,7 @@ export function flowReadingsFromStatus(status, opts) {
   return {
     load: loadW === null ? null : loadW / 1000,
     loadEstimated: hasEstimate,
-    homeEstimateNote: homeEstimateNote(status?.load_estimate, opts?.live !== false),
+    homeEstimateNote: homeEstimateNote(status?.load_estimate, opts?.live !== false, powerBalanceW),
     planets: withControlMarks(planets, status?.control_feedback, opts?.live !== false),
     selfPoweredPctToday,
   };
