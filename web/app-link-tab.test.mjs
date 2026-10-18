@@ -119,7 +119,7 @@ describe("the app tab", () => {
     vm.runInContext(fleetSource, sandbox);
 
     win.FTWSettings.tabs.app.afterSave();
-    assert.deepEqual(asked, ["/api/fleet-ping"]);
+    assert.deepEqual(asked, ["/api/fleet-ping", "/api/app-link/status"]);
   });
 
   it("does not leave a standalone Fleet ping destination behind", () => {

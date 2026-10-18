@@ -9,8 +9,8 @@
 // request, so none of it reaches Sourceful. That is what lets the app trust
 // this box specifically rather than whatever the relay introduces it to.
 //
-// The payload is never written into innerHTML and never offered as text to
-// copy. It is a credential; the only path it should take is the camera.
+// The payload is a credential. A link or explicit copy keeps it in the URL
+// fragment; it never goes into innerHTML, a query, a log or remote storage.
 (function () {
   var S = (window.FTWSettings = window.FTWSettings || { tabs: {} });
   S.tabs = S.tabs || {};
@@ -43,8 +43,8 @@
       if (!saved) return "Running. It stops at the next restart.";
       return null; // The caller shows the pairing count instead.
     }
-    if (saved) return "Saved. Press Save, then restart, to finish turning it on.";
-    return "Off. Turn it on above, save, and restart.";
+    if (saved) return "Not running yet. Choose Save and restart FTW below to turn it on.";
+    return "Off. Turn it on above, then choose Save and restart FTW.";
   }
 
   function agoText(ms) {
@@ -225,6 +225,7 @@
         // mints the same code from the same endpoint.
         var buttons = [
           document.getElementById("app-link-pair"),
+          document.getElementById("app-link-code"),
           document.getElementById("app-link-share"),
         ];
         var setEnabled = function (on) {
@@ -237,6 +238,8 @@
         }
         var note = describe(saved, s.enabled);
         setStatus(note === null ? pairedText(s.paired_devices) : note);
+        var restart = document.getElementById("app-link-restart");
+        if (restart) restart.className = saved !== s.enabled ? "btn-send" : "btn-ghost";
         setEnabled(s.enabled);
         if (s.enabled) refreshDevices();
       })
@@ -297,6 +300,7 @@
     var label = "Cannot scan? Read a code out instead";
     var btn = document.createElement("button");
     btn.type = "button";
+    btn.className = "btn-ghost";
     btn.textContent = label;
     btn.addEventListener("click", function () {
       requestCode({ role: role, kind: "spoken" }, btn, "Making a code…", label);
@@ -310,9 +314,6 @@
     slot.textContent = "";
     sayWhatItLetsIn(slot, pairing.role);
 
-    // A box code is meant to be read down a phone, so it is shown as text and
-    // nothing else. The QR payload never is: it is a credential, and the only
-    // path it should take is a camera.
     if (pairing.code) {
       var spoken = document.createElement("p");
       spoken.className = "mono app-box-code";
@@ -324,10 +325,17 @@
       // What to do, not what to tap. The button that takes this code lives in
       // the app, in another repository, and a label quoted here would go on
       // being quoted long after the app renamed it.
-      how.textContent = "Read this out. On the other phone, choose to type a code " +
-        "rather than scan one. " + expiryText(pairing) + " Five wrong tries and it " +
+      how.textContent = "In FTW for iPhone, choose Enter pairing code while on your home Wi-Fi. " +
+        "Enter this code and the box address shown below. " + expiryText(pairing) + " Five wrong tries and it " +
         "stops working, so ask for a new one rather than guessing.";
       slot.appendChild(how);
+      if (window.location && window.location.origin) {
+        var address = document.createElement("p");
+        address.textContent = "Box address: " + window.location.origin;
+        slot.appendChild(address);
+        copyButton(slot, "Copy pairing code and address", window.location.origin + "#" + pairing.code);
+      }
+      if (slot.scrollIntoView) slot.scrollIntoView({ block: "nearest" });
       return;
     }
 
@@ -335,6 +343,15 @@
     // it, whenever the encoder finishes.
     var picture = document.createElement("div");
     slot.appendChild(picture);
+    if (/^https:\/\/app\.ftw\.energy\/p#v[23]\./.test(pairing.url)) {
+      var open = document.createElement("a");
+      open.href = pairing.url;
+      open.rel = "noreferrer";
+      open.className = "btn-send";
+      open.textContent = "Open in FTW on this iPhone";
+      slot.appendChild(open);
+      copyButton(slot, "Copy pairing link", pairing.url);
+    }
     slot.appendChild(spokenFallback(pairing.role));
 
     // Loaded on demand: this tab is opened once per phone, and every other
@@ -356,6 +373,81 @@
         picture.appendChild(err);
         if (slot.scrollIntoView) slot.scrollIntoView({ block: "nearest" });
       });
+  }
+
+  function copyButton(slot, label, text) {
+    var button = document.createElement("button");
+    button.type = "button";
+    button.className = "btn-ghost";
+    button.textContent = label;
+    button.addEventListener("click", function () {
+      var clipboard = window.navigator && window.navigator.clipboard;
+      function manualCopy() {
+        var field = document.createElement("input");
+        field.type = "text";
+        field.readOnly = true;
+        field.value = text;
+        field.setAttribute("aria-label", label);
+        slot.appendChild(field);
+        field.focus();
+        field.select();
+        button.textContent = "Select the text above and copy it";
+      }
+      if (!clipboard) return manualCopy();
+      clipboard.writeText(text).then(function () { button.textContent = "Copied"; }).catch(manualCopy);
+    });
+    slot.appendChild(button);
+  }
+
+  async function restartAppLink(ctx, button) {
+    if (!confirm("Save settings and restart FTW? Energy control pauses until FTW is back.")) return;
+    var status = document.getElementById("app-link-restart-status");
+    button.disabled = true;
+    status.textContent = "Saving settings…";
+    resumePairing(true);
+    try {
+      var result = await ctx.saveConfig();
+      // Keep the shell's existing dialog and progress when saving opens it.
+      var restart = document.getElementById("restart-now");
+      if (result && result.restart_required && restart) {
+        restart.click();
+        button.disabled = false;
+        status.textContent = "Follow the restart progress above.";
+        return;
+      }
+      var response = await fetch("/api/restart", { method: "POST" });
+      if (!response.ok) {
+        var failure = await response.json();
+        throw new Error(failure.error || "Restart was refused.");
+      }
+      status.textContent = "Restarting FTW. Waiting for the box to return…";
+      var until = Date.now() + 90000;
+      function waitForBox() {
+        fetch("/api/health?_=" + Date.now(), { cache: "no-store" })
+          .then(function (r) {
+            if (!r.ok) throw new Error("not ready");
+            status.textContent = "FTW is back. Opening pairing…";
+            window.location.reload();
+          })
+          .catch(function () {
+            if (Date.now() < until) return setTimeout(waitForBox, 1000);
+            status.textContent = "FTW has not returned yet. Check the box, then reload this page.";
+            button.disabled = false;
+          });
+      }
+      setTimeout(waitForBox, 1500);
+    } catch (error) {
+      resumePairing(false);
+      status.textContent = "Could not restart FTW: " + error.message;
+      button.disabled = false;
+    }
+  }
+
+  function resumePairing(on) {
+    try {
+      if (on) window.sessionStorage.setItem("ftw.pairing.resume", "1");
+      else window.sessionStorage.removeItem("ftw.pairing.resume");
+    } catch (_) { /* Pairing still works if the browser disallows storage. */ }
   }
 
   // One code at a time, whatever kind it is: asking for a guest pass cancels
@@ -401,6 +493,9 @@
         button.disabled = false;
         button.textContent = doneText;
         refreshStatus(pairingCtx);
+        // Restoring the label can wrap the action row on an iPhone. Scroll
+        // after that layout change so the code and Copy button stay in view.
+        if (slot.scrollIntoView) slot.scrollIntoView({ block: "nearest" });
       });
   }
 
@@ -415,6 +510,7 @@
       // own restart boundary; fleet sharing takes effect as soon as it saves.
       var panel = S.fleetPing;
       if (panel && panel.afterSave) panel.afterSave();
+      refreshStatus(pairingCtx);
     },
 
     render: function (ctx) {
@@ -430,6 +526,13 @@
             requestCode({ role: "owner" }, pairButton, "Making a code…", "Show a new code");
           });
         }
+
+        var codeButton = document.getElementById("app-link-code");
+        if (codeButton) codeButton.addEventListener("click", function () {
+          requestCode({ role: "owner", kind: "spoken" }, codeButton, "Making a code…", "Use a pairing code");
+        });
+        var restartButton = document.getElementById("app-link-restart");
+        if (restartButton) restartButton.addEventListener("click", function () { restartAppLink(ctx, restartButton); });
 
         var shareButton = document.getElementById("app-link-share");
         if (shareButton) {
@@ -452,8 +555,9 @@
       }, 0);
 
       return (
+        '<link rel="stylesheet" href="/settings/app-pairing.css">' +
         '<div data-project-statistics-settings></div>' +
-        "<fieldset><legend>The FTW app</legend>" +
+        '<fieldset class="app-pairing"><legend>The FTW app</legend>' +
         '<p class="hint">This is not the Sourceful (Zap) app. The FTW app at ' +
         "app.ftw.energy talks to this box when you are away. On the same Wi-Fi you " +
         "can just open this page in a browser — no pairing needed. Readings and " +
@@ -462,13 +566,15 @@
         '<label><input type="checkbox" id="app-link-enabled" ' +
         'data-checkbox-path="app_link.enabled"' + (enabled ? " checked" : "") +
         "> Let the FTW app connect to this box</label>" +
-        '<p class="hint">Takes effect after a restart — the box offers one when ' +
-        "you save.</p>" +
+        '<p class="hint">Changing this setting needs a restart. FTW pauses energy control briefly while it restarts.</p>' +
+        '<button type="button" class="btn-send" id="app-link-restart">Save and restart FTW…</button>' +
+        '<p id="app-link-restart-status" class="hint" role="status"></p>' +
         '<p id="app-link-status" class="hint">checking…</p>' +
         '<div id="app-link-devices"></div>' +
         '<div class="app-link-actions">' +
-        '<button type="button" id="app-link-pair" disabled>Show pairing code</button>' +
-        '<button type="button" id="app-link-share" hidden>Let someone see this home</button>' +
+        '<button type="button" class="btn-ghost" id="app-link-pair" disabled>Show pairing code</button>' +
+        '<button type="button" class="btn-ghost" id="app-link-code" disabled>Use a pairing code</button>' +
+        '<button type="button" class="btn-ghost" id="app-link-share" hidden>Let someone see this home</button>' +
         "</div>" +
         // The slot sits right under the buttons that fill it. It used to sit
         // after the hint paragraphs below, which put the answer — QR, spoken
@@ -481,16 +587,22 @@
         "once and expires in a few minutes, so ask for a new one when you need it. " +
         "Everything the app needs is in the code itself, which is why the app can " +
         "be sure it is talking to this box.</p>" +
-        '<p class="hint">A code can be read out instead of scanned. The offer sits ' +
-        "under whichever code is on screen and lets in exactly the same access. It " +
-        "is for a phone that has been here before and is being set up again — a " +
-        "phone that has never seen this box has to scan, because only the square " +
-        "carries what it needs to find this box and be sure it is this one. Only " +
-        "one code is live at a time, so asking for any of them stops the last " +
-        "one.</p>" +
+        '<p class="hint">Only one iPhone? Open the pairing link on this phone, ' +
+        "or choose Use a pairing code and enter it in the iPhone app while on your home Wi-Fi. " +
+        "If you set a house password, the app asks for it too. You can also choose a screenshot " +
+        "of the QR in the iPhone app. Only one code works at a time; making a new code cancels the last one.</p>" +
         "</fieldset>" +
         fleetPanel(ctx)
       );
     },
   };
+
+  // A restart reloads the whole page. Return to this step rather than leave
+  // the person on the dashboard looking for their unfinished pairing.
+  try {
+    if (window.sessionStorage.getItem("ftw.pairing.resume") === "1" && S.open) {
+      resumePairing(false);
+      setTimeout(function () { S.open("app"); }, 0);
+    }
+  } catch (_) { /* Settings can still be opened by hand. */ }
 })();
