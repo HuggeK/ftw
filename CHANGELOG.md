@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.152.1
+
+### Patch Changes
+
+- e7a214d: Let LAN login and logout wait for a busy settings writer before reading session state. Log only a fixed error category if a session still cannot be saved.
+
 ## 0.152.0
 
 ### Minor Changes
