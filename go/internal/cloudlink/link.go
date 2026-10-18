@@ -241,15 +241,17 @@ type Link struct {
 	// sender acts within one tick.
 	wake chan struct{}
 
-	mu        sync.Mutex
-	seq       uint64
-	key       *ecdsa.PrivateKey
-	pk        []byte
-	home      string
-	link      *linkRecord
-	grant     *grantRecord
-	notice    string
-	connected bool
+	mu                 sync.Mutex
+	seq                uint64
+	key                *ecdsa.PrivateKey
+	pk                 []byte
+	home               string
+	link               *linkRecord
+	grant              *grantRecord
+	disabled           bool
+	notice             string
+	connected          bool
+	serviceStatsPolicy string
 	// transport is how the uplink travels, or last travelled: quic or
 	// websocket. winners is the race's memory, the transport that opened
 	// first on each network.
@@ -391,6 +393,8 @@ func (l *Link) load() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.link, l.grant, l.key, l.pk, l.home, l.notice = nil, nil, nil, nil, "", ""
+	disabled, _ := l.opts.KV.LoadConfig(disabledKey)
+	l.disabled = disabled == "true"
 	if r, err := loadJSON[receipt](l.opts.KV, purgedKey); err == nil && r != nil {
 		l.purgedAt = r.AtMs
 	}
@@ -438,6 +442,12 @@ func (l *Link) load() error {
 		l.log.Warn("FTW Cloud is off: cloud.key is not the key the link was made with")
 		return nil
 	}
+	if l.disabled {
+		link.Ending = true
+		if g != nil {
+			g.Revoked = true
+		}
+	}
 	l.link, l.key, l.pk, l.home = link, key, pk, cloudwire.HomeID(pk)
 	switch {
 	case g == nil:
@@ -483,6 +493,12 @@ func (l *Link) RosterChanged() {
 // page. A box that takes no tun cannot serve an agent, so its rows want no
 // link. A grant needs the link too, and makes it itself.
 func (l *Link) wantsLink() bool {
+	l.mu.Lock()
+	blocked := l.disabled || (l.grant != nil && l.grant.statisticsOnly())
+	l.mu.Unlock()
+	if blocked {
+		return false
+	}
 	if _, _, ok := l.opts.Roster.Pending(); ok {
 		return true
 	}
@@ -592,7 +608,19 @@ func (l *Link) Grant(req GrantRequest) error {
 		return ErrLinkEnding
 	case l.grant != nil:
 		g := *l.grant
+		fresh := g.Policy != req.Policy
 		g.Scopes, g.Policy, g.By = scopes, req.Policy, req.By
+		g.Purposes = withPurpose(g.Purposes, protocol.CloudPurposeServe, true)
+		if req.Policy == cloudwire.CloudTermsPolicy {
+			if err := l.includeStatistics(&g, fresh); err != nil {
+				l.mu.Unlock()
+				return err
+			}
+		}
+		if err := l.enableLinkChoice(); err != nil {
+			l.mu.Unlock()
+			return err
+		}
 		if err := saveJSON(l.opts.KV, grantKey, g); err != nil {
 			l.mu.Unlock()
 			return err
@@ -626,6 +654,17 @@ func (l *Link) Grant(req GrantRequest) error {
 	if l.clockSynced() {
 		g.AtMs = time.Now().UnixMilli()
 	}
+	if req.Policy == cloudwire.CloudTermsPolicy {
+		if err := l.includeStatistics(&g, true); err != nil {
+			l.mu.Unlock()
+			return err
+		}
+	}
+	if err := l.enableLinkChoice(); err != nil {
+		l.mu.Unlock()
+		return err
+	}
+
 	if err := saveJSON(l.opts.KV, grantKey, g); err != nil {
 		l.mu.Unlock()
 		return err
@@ -645,6 +684,12 @@ func (l *Link) Grant(req GrantRequest) error {
 // record stays until the service's signed receipt arrives. The link, the
 // home id and the tunnel stay.
 func (l *Link) Revoke(by string) error {
+	l.mu.Lock()
+	whole := l.grant != nil && (l.grant.Policy == cloudwire.CloudTermsPolicy || l.grant.statisticsOnly())
+	l.mu.Unlock()
+	if whole {
+		return l.End(by)
+	}
 	l.mu.Lock()
 	if l.grant == nil || l.grant.Revoked {
 		l.mu.Unlock()
@@ -691,12 +736,15 @@ func (l *Link) Stats(req StatsRequest) error {
 	defer l.mu.Unlock()
 	switch {
 	case l.grant == nil:
-		return ErrNotGranted
+		if req.Policy != cloudwire.StatsPolicy {
+			return ErrNotGranted
+		}
+		return l.startStatisticsOnly(req)
 	case l.grant.Revoked:
 		return ErrPurgePending
 	}
 	g := *l.grant
-	if len(g.StatsID) == 0 {
+	if len(g.StatsID) == 0 || g.StatsPolicy != req.Policy {
 		id, err := randomBytes(statsIDBytes)
 		if err != nil {
 			return err
@@ -705,6 +753,12 @@ func (l *Link) Stats(req StatsRequest) error {
 	}
 	g.Purposes = withPurpose(g.Purposes, protocol.CloudPurposeStats, true)
 	g.StatsPolicy, g.By = req.Policy, req.By
+	if g.StatsAtMs == 0 || l.grant.StatsPolicy != req.Policy {
+		g.StatsAtMs = 0
+		if l.clockSynced() {
+			g.StatsAtMs = l.opts.Now().UnixMilli()
+		}
+	}
 	return l.storeLocked(g, "statistics on")
 }
 
@@ -712,14 +766,30 @@ func (l *Link) Stats(req StatsRequest) error {
 // again draws a new one.
 func (l *Link) StopStats(by string) error {
 	l.mu.Lock()
+	if l.grant != nil && !l.grant.Revoked && l.grant.Policy == cloudwire.CloudTermsPolicy {
+		l.mu.Unlock()
+		return ErrCloudNeedsStatistics
+	}
+	only := l.grant != nil && l.grant.statisticsOnly()
+	l.mu.Unlock()
+	if only {
+		if err := l.End(by); err != nil {
+			return err
+		}
+		return l.opts.KV.SaveConfig(statsDecisionKey, cloudwire.StatsPolicy)
+	}
+	l.mu.Lock()
 	defer l.mu.Unlock()
+	if err := l.opts.KV.SaveConfig(statsDecisionKey, cloudwire.StatsPolicy); err != nil {
+		return err
+	}
 	if l.grant == nil || l.grant.Revoked ||
 		(len(l.grant.StatsID) == 0 && !slices.Contains(l.grant.Purposes, protocol.CloudPurposeStats)) {
 		return nil
 	}
 	g := *l.grant
 	g.Purposes = withPurpose(g.Purposes, protocol.CloudPurposeStats, false)
-	g.StatsID, g.StatsPolicy, g.By = nil, "", by
+	g.StatsID, g.StatsPolicy, g.StatsAtMs, g.By = nil, "", 0, by
 	return l.storeLocked(g, "statistics off")
 }
 
@@ -813,8 +883,15 @@ func (l *Link) clockSynced() bool {
 
 // Status is what GET /api/cloud shows.
 type Status struct {
+	CloudPolicy                string `json:"cloudPolicy"`
+	CloudTermsAccepted         bool   `json:"cloudTermsAccepted"`
+	StatisticsOnly             bool   `json:"statisticsOnly"`
+	StatisticsDecisionRequired bool   `json:"statisticsDecisionRequired"`
 	// State is the readable copy's: off, on or revoking.
-	State string `json:"state"`
+	State            string `json:"state"`
+	StatisticsPolicy string `json:"statisticsPolicy"`
+	StatisticsActive bool   `json:"statisticsActive"`
+	StatisticsReady  bool   `json:"statisticsReady"`
 	// Link is off, on or ending: whether the box is linked, which the
 	// phones' tunnels need and the readable copy rides on.
 	Link string `json:"link"`
@@ -867,6 +944,19 @@ func (l *Link) Status() Status {
 		Link: "off", TunBytesLast24h: l.tunBudget.total(l.uptimeMs()), TunBudgetBytes: tunBudgetBytes,
 		TunDropped: l.tunDropped,
 	}
+	s.CloudPolicy = cloudwire.CloudTermsPolicy
+	decision, _ := l.opts.KV.LoadConfig(statsDecisionKey)
+	s.StatisticsDecisionRequired = decision != cloudwire.StatsPolicy
+	if l.grant != nil && !l.grant.Revoked && l.grant.StatsPolicy == cloudwire.StatsPolicy && len(l.grant.StatsID) == 16 {
+		s.StatisticsDecisionRequired = false
+	}
+	s.StatisticsOnly = l.grant.statisticsOnly()
+	s.CloudTermsAccepted = l.grant != nil && !l.grant.Revoked && l.grant.Policy == cloudwire.CloudTermsPolicy
+	s.StatisticsPolicy = cloudwire.StatsPolicy
+	s.StatisticsReady = l.connected && l.serviceStatsPolicy == cloudwire.StatsPolicy
+	if g := l.grant; g != nil {
+		s.StatisticsActive = !g.Revoked && g.StatsAtMs > 0 && g.StatsPolicy == cloudwire.StatsPolicy && len(g.StatsID) == 16 && slices.Contains(g.Purposes, protocol.CloudPurposeStats)
+	}
 	s.BudgetReached = s.BytesLast24h >= budgetBytes
 	if !l.lastSend.IsZero() {
 		s.LastSendAgeMs = time.Since(l.lastSend).Milliseconds()
@@ -880,6 +970,9 @@ func (l *Link) Status() Status {
 	if g := l.grant; g != nil {
 		s.State, s.Scopes, s.Purposes = "on", g.Scopes, g.Purposes
 		s.GrantedAtMs, s.GrantedBy, s.Policy = g.AtMs, g.By, g.Policy
+		if g.statisticsOnly() {
+			s.State = "statistics"
+		}
 		if g.Revoked {
 			s.State = "revoking"
 		}
@@ -892,7 +985,7 @@ func (l *Link) Status() Status {
 func (l *Link) Home() string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.link == nil || l.link.Ending {
+	if l.link == nil || l.link.Ending || l.disabled || l.grant.statisticsOnly() {
 		return ""
 	}
 	return l.home
@@ -904,7 +997,11 @@ func (l *Link) Available() bool { return len(l.opts.ServiceKeys) > 0 }
 
 // TakesTun reports whether the link carries the phones' own sessions as tun,
 // so a phone that knows the home id can reach the box without the relay.
-func (l *Link) TakesTun() bool { return l.Available() && l.opts.Tunnel != nil }
+func (l *Link) TakesTun() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.Available() && l.opts.Tunnel != nil && !l.disabled && !l.grant.statisticsOnly()
+}
 
 // SessionInfo is what a phone needs, over its Noise session with the box, to
 // reach this home through FTW Cloud: the home id, the key that signs the
@@ -915,6 +1012,9 @@ func (l *Link) TakesTun() bool { return l.Available() && l.opts.Tunnel != nil }
 // The tables name every driver and loadpoint the box knows now. One that
 // appears later has no name on a phone until its next session.
 func (l *Link) SessionInfo() *protocol.CloudSession {
+	if l.Home() == "" {
+		return nil
+	}
 	snap := l.current()
 	if snap.link == nil || snap.link.Ending || len(snap.pk) != cloudwire.PublicKeyBytes {
 		return nil
@@ -985,11 +1085,16 @@ func (l *Link) current() grantSnapshot {
 }
 
 // copyOn reports whether the readable copy is on and not being withdrawn.
-func (snap grantSnapshot) copyOn() bool { return snap.g != nil && !snap.g.Revoked }
+func (g *grantRecord) statisticsOnly() bool {
+	return g != nil && !g.Revoked && slices.Contains(g.Purposes, protocol.CloudPurposeStats) && !slices.Contains(g.Purposes, protocol.CloudPurposeServe)
+}
+func (snap grantSnapshot) copyOn() bool {
+	return snap.g != nil && !snap.g.Revoked && slices.Contains(snap.g.Purposes, protocol.CloudPurposeServe)
+}
 
 // grantID is the grant hello names: the readable copy's, or none.
 func (snap grantSnapshot) grantID() []byte {
-	if !snap.copyOn() {
+	if snap.g == nil || snap.g.Revoked {
 		return nil
 	}
 	return snap.g.ID

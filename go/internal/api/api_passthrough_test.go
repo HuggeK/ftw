@@ -571,13 +571,18 @@ func TestReadingTheConfigIsAllowedForAnyRole(t *testing.T) {
 				t.Fatalf("headers = %v, want the content type", head.Headers)
 			}
 
+			// The end first: a chunk can still be on its way when the head
+			// has landed, and the end is the frame that says none is.
+			end := decode[appproto.APIEnd](t, rig.frames.await(t, appproto.MsgAPIEnd))
 			var out []byte
 			for _, env := range rig.frames.snapshot() {
 				if env.T == appproto.MsgAPIChunk {
 					out = append(out, decode[appproto.APIChunk](t, env).Data...)
 				}
 			}
-			rig.frames.await(t, appproto.MsgAPIEnd)
+			if end.Truncated || end.Bytes != int64(len(out)) {
+				t.Fatalf("end = %+v, but %d bytes arrived", end, len(out))
+			}
 
 			var answer struct {
 				Modes []struct {

@@ -76,6 +76,7 @@ type Registry struct {
 	} `yaml:"agent_args"`
 	Reads []struct {
 		Msg   string `yaml:"msg"`
+		Const string `yaml:"const"`
 		Scope string `yaml:"scope"`
 		Desc  string `yaml:"desc"`
 	} `yaml:"reads"`
@@ -419,6 +420,11 @@ func writeAgentArgs(b *bytes.Buffer, reg Registry) {
 
 // writeReads emits each read an agent may send with the scope it needs.
 func writeReads(b *bytes.Buffer, reg Registry) {
+	for _, r := range reg.Reads {
+		if r.Const != "" {
+			fmt.Fprintf(b, "const %s = %q\n\n", r.Const, r.Msg)
+		}
+	}
 	b.WriteString("// RegistryReads maps each read an agent may send to the scope it needs.\n")
 	b.WriteString("var RegistryReads = map[string]string{\n")
 	for _, r := range reg.Reads {

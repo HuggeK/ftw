@@ -98,12 +98,17 @@ func TestSharedPhaseBudgetDoesNotIntegrateSameOverload(t *testing.T) {
 	c := newTestController(t, []Config{cfg}, nil, samples, sender)
 	c.SetSiteFuse(SiteFuse{MaxAmps: 25, Voltage: 230, PhaseCnt: 3})
 	c.SetManualHold(cfg.ID, ManualHold{PowerW: 10350, PhaseMode: "3p", Persistent: true})
-	c.SetPerPhaseMeterAmps(func() (float64, float64, float64, bool) { return 27, 20, 20, true })
-	c.SetFuseEVMax(func() (float64, bool) { return 6210, true })
+	// Our own 12 A offer is established before the overload; a reading
+	// from the car is never what the guard credits.
+	worstA, otherA, budgetW := 12.0, 12.0, 8280.0
+	c.SetPerPhaseMeterAmps(func() (float64, float64, float64, bool) { return worstA, otherA, otherA, true })
+	c.SetFuseEVMax(func() (float64, bool) { return budgetW, true })
+	c.Tick(context.Background(), now.Add(-5*time.Second))
+	worstA, otherA, budgetW = 27, 20, 6210
 	for tick := 0; tick < 12; tick++ {
 		c.Tick(context.Background(), now.Add(time.Duration(tick)*5*time.Second))
 		set, ok := lastSetCurrent(sender.calls)
-		// Metered EV=12 A, worst site phase=27 A. A 9 A EV offer
+		// Offered EV=12 A, worst site phase=27 A. A 9 A EV offer
 		// leaves that phase at 24 A, below the 25 A fuse. Re-reading
 		// the same sample cannot justify a second accumulated trim.
 		if !ok || set.power != 6210 {

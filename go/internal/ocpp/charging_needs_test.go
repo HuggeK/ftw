@@ -33,7 +33,7 @@ func connectStationForNeeds(t *testing.T, srv *Server, port int, id string) ocpp
 		t.Fatalf("charging station connect: %v", err)
 	}
 	var once sync.Once
-	t.Cleanup(func() { once.Do(cs.Stop) })
+	stopAfterServer(t, srv, func() { once.Do(cs.Stop) })
 
 	if _, err := cs.BootNotification(provisioning.BootReasonPowerUp, "Dawn", "Charge Amps"); err != nil {
 		t.Fatalf("boot: %v", err)

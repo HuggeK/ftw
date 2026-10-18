@@ -186,9 +186,9 @@
   }
 
   // How long a grant may last: the lengths the page offers, none longer than
-  // the offer asked for.
+  // maxS, the least of what the offer asked for and what the box takes.
   function lengthOptions(maxS) {
-    var out = [DAY_S, 7 * DAY_S, 30 * DAY_S].filter(function (s) { return s <= maxS; });
+    var out = [DAY_S, 7 * DAY_S, 30 * DAY_S, 90 * DAY_S, 365 * DAY_S].filter(function (s) { return s <= maxS; });
     if (!out.length && maxS >= 60) out.push(maxS);
     return out;
   }
@@ -201,7 +201,17 @@
     return week.length ? week[week.length - 1] : options[0];
   }
 
+  // The longest grant the box takes for a role, in seconds, as its facts
+  // say. A box that says nothing took 30 days for an assistant, 14 for
+  // Sourceful and 90 for the release check.
+  var UNSTATED_S = { agent: 30 * DAY_S, support: 14 * DAY_S, release: 90 * DAY_S };
+  function longestS(box, role) {
+    var ms = Number(((box && box.longestMs) || {})[role]);
+    return ms > 0 ? Math.floor(ms / 1000) : UNSTATED_S[role] || 30 * DAY_S;
+  }
+
   function lengthText(s) {
+    if (s === 365 * DAY_S) return "1 year";
     if (s % DAY_S === 0) return s === DAY_S ? "1 day" : s / DAY_S + " days";
     if (s >= 3600) return Math.round(s / 3600) + " hours";
     return Math.round(s / 60) + " minutes";
@@ -671,7 +681,7 @@
       ". Check that it matches the assistant's page." }));
 
     var form = grantForm(card, v, registry, null);
-    var lengths = lengthOptions(v.ttlS || 0);
+    var lengths = lengthOptions(Math.min(v.ttlS || 0, longestS(state.list && state.list.box, v.role)));
     var chosen = defaultLength(lengths);
     var select = el("select", { name: "length", id: "access-length" });
     lengths.forEach(function (s) {
@@ -815,7 +825,7 @@
     var select = el("select", { name: "length", id: "access-length-" + row.id });
     var left = Math.floor((row.expiresAtMs - now) / 1000);
     if (left > 60) select.appendChild(el("option", { value: "keep", text: "Keep the end, " + whenText(row.expiresAtMs) }));
-    [DAY_S, 7 * DAY_S, 30 * DAY_S].forEach(function (s) {
+    lengthOptions(longestS(state.list && state.list.box, row.role)).forEach(function (s) {
       select.appendChild(el("option", { value: String(s), text: lengthText(s) + " from now" }));
     });
     form.appendChild(el("label", { for: select.id, text: "How long" }));
@@ -993,6 +1003,8 @@
     choiceProblem: choiceProblem,
     lengthOptions: lengthOptions,
     defaultLength: defaultLength,
+    longestS: longestS,
+    lengthText: lengthText,
     kwExact: kwExact,
     readiness: readiness,
     lookupFailureText: lookupFailureText,

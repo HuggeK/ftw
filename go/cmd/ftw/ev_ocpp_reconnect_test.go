@@ -92,16 +92,21 @@ func TestOCPPReconnectDoesNotUnplugOrResumeOldStart(t *testing.T) {
 				bus.Subscribe(events.KindChargingConnected, func(events.Event) { connectedEvents++ })
 				bus.Publish(events.HealthTick{Health: map[string]telemetry.DriverHealth{"garage": {Status: telemetry.StatusOk, LastSuccess: &now}}, Now: now})
 				commands := []float64{}
+				sendCount := 0
 				ctrl := loadpoint.NewController(manager, func(time.Time) (loadpoint.Directive, bool) { return loadpoint.Directive{}, false }, func(name string) (loadpoint.EVSample, bool) {
 					return currentEVSample(tel.Get(name, telemetry.DerEV), tel.DriverHealth(name), time.Minute, time.Now(), srv.Handler().IsOnline(name), currentOCPPDeviceID(srv.Handler(), name))
 				}, func(_ context.Context, _ string, p []byte) error {
 					var d struct {
-						Power float64 `json:"power_w"`
+						Power  float64 `json:"power_w"`
+						Action string  `json:"action"`
 					}
 					if e := json.Unmarshal(p, &d); e != nil {
 						return e
 					}
-					commands = append(commands, d.Power)
+					sendCount++
+					if d.Action == "ev_set_current" {
+						commands = append(commands, d.Power)
+					}
 					return nil
 				})
 				ctrl.SetSiteFuse(loadpoint.SiteFuse{MaxAmps: 16, Voltage: 230, PhaseCnt: 3})
@@ -111,7 +116,7 @@ func TestOCPPReconnectDoesNotUnplugOrResumeOldStart(t *testing.T) {
 				ctrl.SetManualHold("garage", loadpoint.ManualHold{Persistent: true, PowerW: power})
 				tick()
 				before, _ := manager.State("garage")
-				commandCount := len(commands)
+				commandCount := sendCount
 				cp.Stop()
 				await(func() bool {
 					r := tel.Get("garage", telemetry.DerEV)
@@ -128,7 +133,7 @@ func TestOCPPReconnectDoesNotUnplugOrResumeOldStart(t *testing.T) {
 					if !ok || hold.PowerW != 0 || !st.PluggedIn || st.ManualRestoreUnconfirmed != (power > 0) {
 						t.Fatalf("unknown socket lost safety: hold=%+v state=%+v", hold, st)
 					}
-					if len(commands) != commandCount {
+					if sendCount != commandCount {
 						t.Fatal("unknown cable dispatched a command")
 					}
 					if st.UpdatedAtMs != before.UpdatedAtMs {

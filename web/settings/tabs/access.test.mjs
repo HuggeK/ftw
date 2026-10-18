@@ -186,6 +186,25 @@ describe("what the owner grants", () => {
     assert.deepEqual(P.lengthOptions(3600), [3600]);
   });
 
+  it("offers up to a year where the box takes one, and 30 days where it says nothing", () => {
+    const day = 86400;
+    const box = { longestMs: { agent: 365 * day * 1000, support: 14 * day * 1000 } };
+    assert.equal(P.longestS(box, "agent"), 365 * day);
+    assert.equal(P.longestS(box, "support"), 14 * day);
+    assert.equal(P.longestS({}, "agent"), 30 * day);
+    assert.equal(P.longestS(null, "agent"), 30 * day);
+    assert.equal(P.longestS({}, "support"), 14 * day);
+    assert.equal(P.longestS({}, "release"), 90 * day);
+    assert.deepEqual(P.lengthOptions(Math.min(365 * day, P.longestS(box, "agent"))),
+      [day, 7 * day, 30 * day, 90 * day, 365 * day]);
+    assert.deepEqual(P.lengthOptions(Math.min(365 * day, P.longestS({}, "agent"))), [day, 7 * day, 30 * day]);
+    // Renewing Sourceful offers nothing past its 14 days.
+    assert.deepEqual(P.lengthOptions(P.longestS(box, "support")), [day, 7 * day]);
+    assert.equal(P.lengthText(365 * day), "1 year");
+    // The page still starts at a week.
+    assert.equal(P.defaultLength(P.lengthOptions(365 * day)), 7 * day);
+  });
+
   it("chooses a week unless the offer asks for less", () => {
     assert.equal(P.defaultLength(P.lengthOptions(30 * 86400)), 7 * 86400);
     assert.equal(P.defaultLength(P.lengthOptions(3 * 86400)), 86400);

@@ -18,7 +18,7 @@ func TestLostHardwareProofPausesOldStartButAllowsANewExplicitStart(t *testing.T)
 		t.Helper()
 		c.Tick(context.Background(), now)
 		now = now.Add(time.Second)
-		if n := len(sender.calls); n == 0 || sender.calls[n-1].power != want {
+		if last, ok := lastSetCurrent(sender.calls); !ok || last.power != want {
 			t.Fatalf("commands=%+v, want latest power %v", sender.calls, want)
 		}
 	}
@@ -362,7 +362,7 @@ func TestManualStartWithoutHardwareCannotFollowAnotherSocket(t *testing.T) {
 		t.Helper()
 		c.Tick(context.Background(), now)
 		now = now.Add(time.Second)
-		if sender.calls[len(sender.calls)-1].power != want {
+		if last, ok := lastSetCurrent(sender.calls); !ok || last.power != want {
 			t.Fatalf("commands=%+v, want %v", sender.calls, want)
 		}
 	}

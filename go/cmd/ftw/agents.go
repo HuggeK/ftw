@@ -451,10 +451,11 @@ func (b boxPageAgents) OpenOffer(raw string) (protocol.GrantOffer, error) {
 func (b boxPageAgents) Facts() api.AgentFacts {
 	now, ok := agentClock()
 	f := api.AgentFacts{
-		Offers: len(cloudlink.ParseOfferKeys(cloudlink.OfferKeys)) > 0,
-		Lookup: codeLookup(cloudlink.Endpoint),
-		NowMs:  now.UnixMilli(),
-		MarkMs: agentWall.mark(),
+		Offers:    len(cloudlink.ParseOfferKeys(cloudlink.OfferKeys)) > 0,
+		Lookup:    codeLookup(cloudlink.Endpoint),
+		NowMs:     now.UnixMilli(),
+		MarkMs:    agentWall.mark(),
+		LongestMs: protocol.LongestMs(),
 	}
 	switch {
 	case ok:

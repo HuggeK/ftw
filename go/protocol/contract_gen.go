@@ -183,7 +183,7 @@ const (
 	ScopeLogsRead = "ftw.logs.read"
 	// ScopeConfigRead — Configuration the box redacts.
 	ScopeConfigRead = "ftw.config.read"
-	// ScopeDiagRun — Checks that change nothing.
+	// ScopeDiagRun — Full technical diagnostics and read API.
 	ScopeDiagRun = "ftw.diag.run"
 	// ScopeDispatchHold — Hold energy assets for a capped time.
 	ScopeDispatchHold = "ftw.dispatch.hold"
@@ -348,6 +348,8 @@ var RegistryAgentArgs = map[string][]AgentArg{
 	},
 }
 
+const MsgAPIRead = "api.read"
+
 // RegistryReads maps each read an agent may send to the scope it needs.
 var RegistryReads = map[string]string{
 	// live.get — Readings and freshness now.
@@ -374,6 +376,8 @@ var RegistryReads = map[string]string{
 	"config.get": "ftw.config.read",
 	// diag.run — A check that changes nothing.
 	"diag.run": "ftw.diag.run",
+	// api.read — Read the full technical diagnostic API.
+	"api.read": "ftw.diag.run",
 }
 
 // Error codes. The box sends the code and machine-readable args; the app

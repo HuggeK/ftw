@@ -31,6 +31,12 @@ test("the energy cards and overview mark subtotals and clear the mark after a co
   assert.equal(elements.get("e-pv").textContent, "1.00 kWh");
   assert.equal(elements.get("e-pv").title, "");
   assert.equal(elements.get("energy-today-quality").hidden, true);
+  updateEnergyToday({...complete, history_quality: "estimated"}, root);
+  assert.equal(elements.get("e-load").textContent, "≈ 2.00 kWh");
+  assert.equal(elements.get("e-pv").textContent, "1.00 kWh");
+  assert.match(elements.get("e-load").title, /Estimated/);
+  assert.equal(elements.get("energy-today-quality").hidden, false);
+  assert.match(elements.get("energy-today-quality").textContent, /Home use includes estimates/);
   updateEnergyToday(null, root);
   assert.equal(elements.get("e-pv").textContent, "Unknown");
   assert.equal(elements.get("energy-today-quality").textContent, "Today's energy is not available yet.");

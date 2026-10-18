@@ -16,27 +16,29 @@ function knownWh(value) {
 
 export function energyTodayReading(today, key) {
   const total = today?.[key];
-  if (knownWh(total)) return {wh: total, partial: false};
+  if (knownWh(total)) return key === "load_wh" && today?.history_quality === "estimated"
+    ? {wh: total, partial: false, estimated: true} : {wh: total, partial: false};
   const measured = today?.measured?.[key];
   if (knownWh(measured)) return {wh: measured, partial: true};
   return {wh: null, partial: false};
 }
 
 export function formatEnergyToday(today, key, withUnit = true) {
-  const {wh, partial} = energyTodayReading(today, key);
+  const {wh, partial, estimated} = energyTodayReading(today, key);
   if (wh === null) return "Unknown";
   const kwh = wh / 1000;
   const digits = kwh >= 100 ? 0 : kwh >= 10 ? 1 : 2;
-  return `${partial ? "≥ " : ""}${kwh.toFixed(digits)}${withUnit ? " kWh" : ""}`;
+  return `${estimated ? "≈ " : partial ? "≥ " : ""}${kwh.toFixed(digits)}${withUnit ? " kWh" : ""}`;
 }
 
 export function updateEnergyToday(today, root = document) {
   for (const [id, key] of Object.entries(ENERGY_FIELDS)) {
     const el = root.getElementById(id);
     if (!el) continue;
-    const {partial} = energyTodayReading(today, key);
+    const {partial, estimated} = energyTodayReading(today, key);
     el.textContent = formatEnergyToday(today, key);
-    el.title = partial ? "Recorded energy only; missing readings are excluded." : "";
+    el.title = estimated ? "Estimated from source energy during brief balance failures."
+      : partial ? "Recorded energy only; missing readings are excluded." : "";
   }
   const group = root.getElementById("e-pv")?.closest(".energy-group");
   if (!group) return;
@@ -49,8 +51,10 @@ export function updateEnergyToday(today, root = document) {
   }
   const keys = new Set(Object.values(ENERGY_FIELDS));
   const incomplete = [...keys].some(key => !knownWh(today?.[key]));
-  note.hidden = !incomplete;
+  const estimated = today?.history_quality === "estimated";
+  note.hidden = !incomplete && !estimated;
   note.textContent = today
     ? "Gaps in today's readings. ≥ shows recorded energy only."
     : "Today's energy is not available yet.";
+  if (estimated) note.textContent = (incomplete ? note.textContent + " " : "") + "Home use includes estimates for brief balance failures.";
 }

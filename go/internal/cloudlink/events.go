@@ -250,6 +250,9 @@ func (l *Link) Notice(kind, client string) bool {
 
 // sendNotices sends what waits, oldest first.
 func (w *writer) sendNotices(snap grantSnapshot) error {
+	if snap.g.statisticsOnly() {
+		return nil
+	}
 	l := w.link
 	l.mu.Lock()
 	queued := l.notices

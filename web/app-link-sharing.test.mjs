@@ -30,6 +30,9 @@ function element(tag) {
     addEventListener(name, fn) {
       this.listeners[name] = fn;
     },
+    setAttribute(name, value) { this[name] = value; },
+    focus() {},
+    select() {},
     click() {
       if (this.listeners.click) this.listeners.click();
     },
@@ -71,11 +74,14 @@ const IDS = [
   "app-link-pair",
   "app-link-share",
   "app-link-enabled",
+  "app-link-code",
+  "app-link-restart",
+  "app-link-restart-status",
 ];
 
 // load runs app.js, renders the tab, and hands back the DOM it wired itself
 // into along with every request it made.
-function load({ devices = [], pairing = null, spoken = null, refuse = null } = {}) {
+function load({ devices = [], pairing = null, spoken = null, refuse = null, saveConfig = async () => ({ restart_required: false }), confirmRestart = true, resume = false, shellRestart = false } = {}) {
   const byId = new Map();
   for (const id of IDS) {
     byId.set(id, element(id.startsWith("app-link-devices") || id.endsWith("slot") ? "div" : "button"));
@@ -89,10 +95,20 @@ function load({ devices = [], pairing = null, spoken = null, refuse = null } = {
 
   const calls = [];
   const confirmed = [];
+  const copied = [];
+  const opened = [];
+  const session = new Map(resume ? [["ftw.pairing.resume", "1"]] : []);
+  let shellRestarts = 0;
+  if (shellRestart) {
+    const restart = element("button");
+    restart.addEventListener("click", () => shellRestarts++);
+    byId.set("restart-now", restart);
+  }
+  let reloaded = false;
   const answer = (body, ok = true) => Promise.resolve({ ok, json: () => Promise.resolve(body) });
 
   const sandbox = {
-    window: { FTWSettings: { tabs: {} } },
+    window: { FTWSettings: { tabs: {}, open(tab) { opened.push(tab); } }, sessionStorage: { getItem: (key) => session.get(key), setItem: (key, value) => session.set(key, value), removeItem: (key) => session.delete(key) }, location: { origin: "http://ftw.local:8080", reload() { reloaded = true; } }, navigator: { clipboard: { async writeText(value) { copied.push(value); } } } },
     setTimeout: (fn) => {
       fn();
       return 0;
@@ -103,7 +119,7 @@ function load({ devices = [], pairing = null, spoken = null, refuse = null } = {
     // that only said yes let it go blank without a test noticing.
     confirm: (question) => {
       confirmed.push(question);
-      return true;
+      return confirmRestart;
     },
     fetch: (path, opts) => {
       calls.push({ path, opts });
@@ -139,8 +155,8 @@ function load({ devices = [], pairing = null, spoken = null, refuse = null } = {
   vm.runInContext(source, sandbox);
 
   const tab = sandbox.window.FTWSettings.tabs.app;
-  const html = tab.render({ config: { app_link: { enabled: true } } });
-  return { html, calls, confirmed, el: (id) => byId.get(id) };
+  const html = tab.render({ config: { app_link: { enabled: true } }, saveConfig });
+  return { html, calls, confirmed, copied, opened, session, shellRestarts: () => shellRestarts, reloaded: () => reloaded, el: (id) => byId.get(id) };
 }
 
 // Lets the promise chains inside the tab settle. Two turns, because a button
@@ -449,19 +465,16 @@ describe("the code on screen", () => {
     );
   });
 
-  // A typed code carries the code and nothing else. The box's own key and its
-  // rendezvous secret travel only in the square, so a phone that has never
-  // seen this box cannot be read its way in — and the page has to say so
-  // rather than offer a path that cannot work.
-  it("says a code read out will not do for a phone that has never been here", () => {
+  it("explains first pairing on one iPhone, with the local code and house password", () => {
     const { html } = load({ devices: [{ id: "aaaa1111", role: "owner" }] });
-    assert.match(html, /read out instead of scanned/i);
-    assert.match(html, /never seen this box has to scan/i);
+    assert.match(html, /Only one iPhone/);
+    assert.match(html, /home Wi-Fi/);
+    assert.match(html, /house password/);
+    assert.doesNotMatch(html, /never seen this box has to scan/i);
   });
 
   it("never prints a scannable payload as text", async () => {
-    // The QR payload is a credential. The only path it should take is a
-    // camera, so it must not appear anywhere a person could copy it.
+    // The credential stays out of visible text until an explicit copy.
     const payload = "https://app.ftw.energy/p#v2.secret.key.material.here";
     const { el } = load({
       devices: [{ id: "aaaa1111", role: "owner" }],
@@ -473,5 +486,73 @@ describe("the code on screen", () => {
     await settle();
 
     assert.doesNotMatch(el("app-link-slot").words(), /secret\.key\.material/);
+  });
+});
+
+describe("pairing and restart on one iPhone", () => {
+  it("opens the full pairing link and copies it only on request", async () => {
+    const link = "https://app.ftw.energy/p#v3.box.code.hint.secret.home";
+    const { el, copied } = load({ pairing: { url: link, expires_at_ms: Date.now() + 600000 } });
+    await settle();
+    el("app-link-pair").click();
+    await settle();
+    const slot = el("app-link-slot");
+    assert.equal(slot.children.find((c) => c.tagName === "a").href, link);
+    assert.deepEqual(copied, []);
+    slot.buttons().find((b) => b.textContent === "Copy pairing link").click();
+    await settle();
+    assert.deepEqual(copied, [link]);
+  });
+
+  it("offers the short code directly and copies the box address with it", async () => {
+    const { el, copied, calls } = load({ spoken: { code: "K7M2-9QRT", expires_at_ms: Date.now() + 300000 } });
+    await settle();
+    el("app-link-code").click();
+    await settle();
+    assert.deepEqual(JSON.parse(calls.find((c) => c.path === "/api/app-link/pairing").opts.body), { role: "owner", kind: "spoken" });
+    assert.match(el("app-link-slot").words(), /http:\/\/ftw.local:8080/);
+    el("app-link-slot").buttons().find((b) => b.textContent === "Copy pairing code and address").click();
+    await settle();
+    assert.deepEqual(copied, ["http://ftw.local:8080#K7M2-9QRT"]);
+  });
+
+  it("saves before restarting and waits for the box before reloading", async () => {
+    const order = [];
+    const page = load({ saveConfig: async () => { order.push("save"); return { restart_required: false }; } });
+    page.el("app-link-restart").click();
+    await settle();
+    assert.deepEqual(order, ["save"]);
+    assert.match(page.confirmed[0], /Energy control pauses/);
+    assert.ok(page.calls.some((c) => c.path === "/api/restart" && c.opts.method === "POST"));
+    assert.ok(page.calls.some((c) => c.path.startsWith("/api/health?")));
+    assert.equal(page.reloaded(), true);
+    assert.equal(page.session.get("ftw.pairing.resume"), "1");
+  });
+
+  it("uses the shell's restart once when Save already opened its dialog", async () => {
+    const page = load({ shellRestart: true, saveConfig: async () => ({ restart_required: true }) });
+    page.el("app-link-restart").click();
+    await settle();
+    assert.equal(page.shellRestarts(), 1);
+    assert.equal(page.calls.some((c) => c.path === "/api/restart"), false);
+  });
+
+  it("returns to the app tab once after the restart reload", () => {
+    const page = load({ resume: true });
+    assert.deepEqual(page.opened, ["app"]);
+    assert.equal(page.session.has("ftw.pairing.resume"), false);
+  });
+
+  it("keeps the restart action available after a refusal, and does nothing on cancel", async () => {
+    const refused = load({ refuse: { method: "POST", error: "restart not configured" } });
+    refused.el("app-link-restart").click();
+    await settle();
+    assert.match(refused.el("app-link-restart-status").textContent, /restart not configured/);
+    assert.equal(refused.el("app-link-restart").disabled, false);
+    assert.equal(refused.reloaded(), false);
+    const canceled = load({ confirmRestart: false });
+    canceled.el("app-link-restart").click();
+    await settle();
+    assert.equal(canceled.calls.some((c) => c.path === "/api/restart"), false);
   });
 });
