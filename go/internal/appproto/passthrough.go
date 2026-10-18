@@ -475,6 +475,9 @@ type apiWriter struct {
 	ctx  context.Context
 	max  int64
 	free func()
+	// recheck is set only for a scoped diagnostic read. It runs before
+	// each response frame so a narrowed grant stops a read in flight.
+	recheck func() *ErrorBody
 
 	header    http.Header
 	buf       []byte
@@ -491,6 +494,9 @@ func (w *apiWriter) Header() http.Header { return w.header }
 
 func (w *apiWriter) WriteHeader(status int) {
 	if w.wroteHead || w.refused {
+		return
+	}
+	if w.checkGrant() != nil {
 		return
 	}
 	if w.ctx.Err() != nil {
@@ -573,6 +579,9 @@ func (w *apiWriter) Write(p []byte) (int, error) {
 }
 
 func (w *apiWriter) flush(n int) error {
+	if err := w.checkGrant(); err != nil {
+		return err
+	}
 	chunk := APIChunk{Seq: w.seq, Data: w.buf[:n]}
 	w.seq++
 	if err := w.h.sendBulk(MsgAPIChunk, &w.id, chunk); err != nil {
@@ -580,6 +589,21 @@ func (w *apiWriter) flush(n int) error {
 	}
 	copy(w.buf, w.buf[n:])
 	w.buf = w.buf[:len(w.buf)-n]
+	return nil
+}
+
+func (w *apiWriter) checkGrant() error {
+	if w.recheck == nil {
+		return nil
+	}
+	if refusal := w.recheck(); refusal != nil {
+		w.refused = true
+		w.sendErr = w.h.sendError(&w.id, *refusal)
+		if w.sendErr != nil {
+			return w.sendErr
+		}
+		return errAPIStopped
+	}
 	return nil
 }
 

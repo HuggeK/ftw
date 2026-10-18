@@ -786,6 +786,8 @@ func (h *Handler) onRead(env Envelope) error {
 		}
 	}
 	switch env.T {
+	case protocol.MsgAPIRead:
+		return h.onAPIRead(env)
 	case protocol.MsgHealthGet:
 		return h.onHealthGet(env)
 	case protocol.MsgDriversGet:
