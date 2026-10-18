@@ -282,3 +282,68 @@ func TestCancelledInvitationCannotReturnAfterReceiptPruning(t *testing.T) {
 		t.Fatal("cancelled code admitted a recipient")
 	}
 }
+
+func TestOwnerRestorationNeverRevivesAnInvitation(t *testing.T) {
+	for _, change := range []string{"demote", "revoke"} {
+		t.Run(change, func(t *testing.T) {
+			f := newInviteFixture(t)
+			f.make(t)
+			id := f.b.id
+			pair(t, id, apiauth.RoleOwner)
+			id.mu.Lock()
+			fullKey, _ := id.findLocked(f.b.owner.DeviceID)
+			id.mu.Unlock()
+			ownerKey, err := base64.RawURLEncoding.DecodeString(fullKey)
+			if err != nil {
+				t.Fatal(err)
+			}
+			recipient := appKey(t)
+			payload := f.claim(t, recipient)
+			_, pendingCommit, err := id.CheckTunnel(recipient, payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if change == "demote" {
+				if err := id.SetRole(f.b.owner.DeviceID, apiauth.RoleViewer); err != nil {
+					t.Fatal(err)
+				}
+				if err := id.SetRole(f.b.owner.DeviceID, apiauth.RoleOwner); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if _, err := id.Revoke(f.b.owner.DeviceID, OverASession); err != nil {
+					t.Fatal(err)
+				}
+				code, _, err := id.MintPairingCode(apiauth.RoleOwner, PairingTTL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := id.Authorise(ownerKey, code); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := pendingCommit(); err == nil {
+				t.Fatal("old proof committed after owner restoration")
+			}
+			again, err := LoadOrCreate(filepath.Join(filepath.Dir(id.path), "nova.key"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			again.SetClock(func() (time.Time, bool) { return f.b.now, true })
+			again.SetHome(func() string { return inviteHome })
+			again.SetAgentOfferKeys(map[string][]byte{"test": f.offerKey.Pub()})
+			for _, identity := range []*Identity{id, again} {
+				row := identity.AgentInvites()[0]
+				if row.State != "cancelled" || row.CancelledAtMs != f.b.ms() {
+					t.Fatalf("restored invitation: %+v", row)
+				}
+				if _, _, err := identity.CheckTunnel(recipient, payload); err == nil {
+					t.Fatal("owner restoration revived invitation")
+				}
+				if len(identity.Agents()) != 0 {
+					t.Fatal("cancelled invitation granted access")
+				}
+			}
+		})
+	}
+}

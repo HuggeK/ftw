@@ -37,6 +37,19 @@ func (i *Identity) inviteOwnerLocked(by string) bool {
 	return m != nil && m.role == apiauth.RoleOwner && m.agent == nil
 }
 
+// Cancel pending approvals in the same saved snapshot as the owner's removal
+// or demotion. Restoring that phone must never restore an old invitation.
+func (i *Identity) cancelOwnerInvitesLocked(owner string) {
+	now, _ := i.wallLocked()
+	for id, v := range i.invites {
+		if v.State == "pending" && v.ApprovedBy == owner {
+			v.State = "cancelled"
+			v.CancelledAtMs = now
+			i.invites[id] = v
+		}
+	}
+}
+
 func (i *Identity) inviteViewLocked(v storedInvite, now int64, clock bool) protocol.AgentInvite {
 	r := v.AgentInvite
 	r.Box = bytes.Clone(r.Box)

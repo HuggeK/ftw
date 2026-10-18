@@ -56,13 +56,13 @@ func (s *Server) handleAgentInvites(w http.ResponseWriter, r *http.Request) {
 				writeAppLinkError(w, http.StatusBadRequest, "send one invitation verifier")
 				return
 			}
-			if m.Home == "" {
-				var err error
-				m.Home, err = admin.PrepareAgentInviteHome()
-				if err != nil {
-					agentError(w, err)
-					return
-				}
+			// Reserve even an existing home against concurrent idle teardown.
+			// The browser publishes the home returned in the saved receipt.
+			var err error
+			m.Home, err = admin.PrepareAgentInviteHome()
+			if err != nil {
+				agentError(w, err)
+				return
 			}
 			m.Hash = protocol.AgentInviteHash(m.Home, body.Secret)
 		}

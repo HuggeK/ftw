@@ -997,6 +997,9 @@ func (i *Identity) SetRole(id, role string) error {
 		return ErrLastOwnerProtected
 	}
 	promoted := role == apiauth.RoleOwner
+	if meta.role == apiauth.RoleOwner {
+		i.cancelOwnerInvitesLocked(key)
+	}
 	meta.role = role
 	meta.epoch++
 	// The phone's watches hold what it holds, so their grants changed too.
@@ -1126,6 +1129,7 @@ func (i *Identity) Revoke(id string, from Presence) ([]Removed, error) {
 		i.mu.Unlock()
 		return nil, ErrLastOwnerProtected
 	}
+	i.cancelOwnerInvitesLocked(fullKey)
 	gone := []string{fullKey}
 	for key, other := range i.authorised {
 		// A phone's watches go with it, and so do the agents it approved:
