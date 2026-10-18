@@ -118,9 +118,16 @@ func buildEnergyObservations(st *state.Store, tel *telemetry.Store, ctrl tickPer
 			continue
 		}
 		data := energyNumbers(r.Data)
+		generationW := math.Max(-r.RawW, 0)
+		counter := firstEnergyNumber(data, "generation_wh", "total_generation_wh", "lifetime_wh")
+		// Some PV meters publish zero for an unavailable cumulative register
+		// while reporting generation. Keep the measured power available for
+		// bounded integration; a returning counter re-baselines in the ledger.
+		if counter != nil && *counter == 0 && generationW > 0 {
+			counter = nil
+		}
 		appendDirection(id, deviceID, state.AssetPV, r.Driver,
-			state.FlowPVGeneration, r.UpdatedAt.UnixMilli(), math.Max(-r.RawW, 0),
-			firstEnergyNumber(data, "generation_wh", "total_generation_wh", "lifetime_wh"), false)
+			state.FlowPVGeneration, r.UpdatedAt.UnixMilli(), generationW, counter, false)
 	}
 
 	for _, r := range tel.ReadingsByType(telemetry.DerEV) {

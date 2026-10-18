@@ -221,6 +221,14 @@ func recordEnergyObservationTx(tx *sql.Tx, o EnergyObservation) error {
 		// the fallback interval twice.
 		switch {
 		case !haveCounter:
+			// Power may already cover the preceding intervals before the
+			// first usable counter. Close only its final observed interval;
+			// the new cumulative value is a baseline, not additional energy.
+			if o.PowerW != nil && havePower {
+				if err := integratePower(tx, o, power, *o.PowerW, "counter_resume_fallback"); err != nil {
+					return err
+				}
+			}
 			if err := addLedgerMarker(tx, o, "hardware_counter", "gap", "counter_baseline"); err != nil {
 				return err
 			}

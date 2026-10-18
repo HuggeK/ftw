@@ -82,12 +82,14 @@ func forecastMeasurementTopology(cfg *config.Config, catalog []drivers.CatalogEn
 	}
 	for _, item := range active {
 		d, e := item.driver, item.entry
+		readBattery, hasReadBattery := d.Config["read_battery"].(bool)
+		batteryExpected := (readBattery || d.BatteryCapacityWh > 0 || d.BatteryTelemetryOnly) && (!hasReadBattery || readBattery)
 		if d.IsSiteMeter {
 			add(d, telemetry.DerMeter)
 		}
 		if !item.found {
 			unknown = append(unknown, d.Name+":unknown_driver_capabilities")
-			if d.BatteryCapacityWh > 0 || d.BatteryTelemetryOnly {
+			if batteryExpected {
 				add(d, telemetry.DerBattery)
 			}
 			continue
@@ -98,7 +100,7 @@ func forecastMeasurementTopology(cfg *config.Config, catalog []drivers.CatalogEn
 		} else if ev {
 			add(d, telemetry.DerEV)
 		}
-		if bat && (d.BatteryCapacityWh > 0 || d.BatteryTelemetryOnly) {
+		if bat && batteryExpected {
 			add(d, telemetry.DerBattery)
 		}
 		if pv {
