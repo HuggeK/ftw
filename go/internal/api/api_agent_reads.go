@@ -29,6 +29,7 @@ func (s *Server) ServeAgentRead(w http.ResponseWriter, request *http.Request, re
 	if request.URL.Path == protocol.AgentAPICatalogPath {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"routes": s.agentReadCatalog(), "requiredScope": protocol.ScopeDiagRun,
+			"timeoutMs":       protocol.AgentAPIReadTimeout.Milliseconds(),
 			"maxPageBytes":    protocol.AgentAPIPageBytes,
 			"troubleshooting": s.agentDebugContext(),
 			"queryPolicy":     "Use the existing API's parameters. Query hints are not a restriction.",
@@ -121,7 +122,7 @@ func (s *Server) serveAgentHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		facts := a.Facts()
 		facts.Widen = false
-		writeJSON(w, 200, agentsPage{AgentList: protocol.AgentList{Agents: nonNil(a.Agents()), Requests: nonNil(a.Requests()), Keys: nonNil(a.ApprovalKeys())}, Box: facts, Registry: registryForPage()})
+		writeJSON(w, 200, agentsPage{Agents: nonNil(a.Agents()), Requests: nonNil(a.Requests()), Keys: nonNil(a.ApprovalKeys()), Box: facts, Registry: registryForPage()})
 	case "/api/cloud", "/api/cloud/preview":
 		link, ok := s.cloudLink(w)
 		if !ok {

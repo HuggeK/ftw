@@ -1,7 +1,9 @@
 package appproto
 
 import (
+	"encoding/json"
 	"net/http"
+	"net/url"
 	"testing"
 	"time"
 
@@ -32,6 +34,10 @@ func TestAnAgentDiagnosticReadNeedsOnlyItsDiagnosticGrant(t *testing.T) {
 			called := make(chan struct{}, 1)
 			h.cfg.API = &diagnosticGateway{stubAPI: stubAPI{facts: apiauth.RouteFacts{Tier: apiauth.TierRead}}, read: func(w http.ResponseWriter, request *http.Request) {
 				called <- struct{}{}
+				deadline, ok := request.Context().Deadline()
+				if !ok || time.Until(deadline) < time.Minute {
+					t.Error("diagnostic export inherited the short status-read deadline")
+				}
 				if request.Method != http.MethodGet || request.URL.Path != "/api/energy/history" {
 					t.Error("wrong diagnostic request")
 				}
@@ -84,5 +90,27 @@ func TestRevocationStopsADiagnosticReadBeforeItsAnswer(t *testing.T) {
 	}
 	if rec.has(MsgAPIHead) || len(apiChunks(rec)) != 0 {
 		t.Fatal("a revoked read returned data")
+	}
+}
+
+func TestDiagnosticReadsKeepEncodedDriverNamesInOnePathSegment(t *testing.T) {
+	for _, name := range []string{"EV charger", "EV charger/garage", "battery%name", "/garage", "EV//charger", `battery\garage`} {
+		t.Run(name, func(t *testing.T) {
+			r := newAgentRig(t)
+			row, _ := r.grant(apiauth.RoleAgent, []string{protocol.ScopeDiagRun}, nil, protocol.Caps{}, time.Hour, protocol.Principal{})
+			h, rec := r.agentSession(row)
+			t.Cleanup(h.Close)
+			mux := http.NewServeMux()
+			mux.HandleFunc("GET /api/drivers/{name}/logs", func(w http.ResponseWriter, request *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]string{"driver": request.PathValue("name")})
+			})
+			h.cfg.API = &diagnosticGateway{read: mux.ServeHTTP}
+			deliver(t, h, protocol.MsgAPIRead, ptrU32(1), protocol.APIRead{Path: "/api/drivers/" + url.PathEscape(name) + "/logs"})
+			end := body[APIEnd](t, waitFor(t, rec, MsgAPIEnd))
+			var answer map[string]string
+			if end.Truncated || json.Unmarshal(apiChunks(rec), &answer) != nil || answer["driver"] != name {
+				t.Fatalf("driver name changed: %s", apiChunks(rec))
+			}
+		})
 	}
 }
