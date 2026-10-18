@@ -13,6 +13,7 @@ import (
 
 const (
 	EnergyLedgerSchemaVersion = 1
+	ObservedConsumerAssetID   = "site/observed-consumer"
 	EnergyLedgerBucketMS      = int64(5 * 60 * 1000)
 	energyLedgerMaxPowerGapMS = int64(2 * 60 * 1000)
 	// One megawatt is far above a home site's physical range, but low enough
@@ -407,6 +408,24 @@ func (s *Store) LoadEnergyHistoryContext(ctx context.Context, q EnergyHistoryQue
 	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+	cut, sourceMode, err := s.sourceEnergyFrom(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	if sourceMode && q.UntilMS > cut {
+		var sourceWidth int64
+		if err := s.history.QueryRowContext(ctx, `SELECT COALESCE(MAX(resolution_ms),?) FROM history_source_energy WHERE start_ms>=? AND start_ms<? AND start_ms+resolution_ms>?`, ArchiveResolutionMS, q.SinceMS-maxSourceEnergyWidth, q.UntilMS, q.SinceMS).Scan(&sourceWidth); err != nil {
+			return nil, false, err
+		}
+		// All flows use the stored energy grid. Arbitrary request times and
+		// widths cannot split stored intervals or invalidate every Load bucket.
+		unit := max(EnergyLedgerBucketMS, sourceWidth)
+		if q.BucketMS > math.MaxInt64-unit+1 {
+			return nil, false, ErrHistoryQueryLimit
+		}
+		q.BucketMS = ((q.BucketMS + unit - 1) / unit) * unit
+		q.SinceMS = bucketStart(q.SinceMS, unit)
+	}
 	assetID := q.AssetID
 	rows, err := s.history.QueryContext(ctx, `WITH aggregated AS (
 		SELECT
@@ -425,9 +444,16 @@ func (s *Store) LoadEnergyHistoryContext(ctx context.Context, q EnergyHistoryQue
 		  AND (? = '' OR asset_id = ?)
 		GROUP BY result_asset_id, flow, result_bucket_start, result_bucket_len,
 			source, quality, provenance
+	), usable AS (
+		SELECT * FROM aggregated a
+		WHERE flow <> ? OR NOT EXISTS (
+			SELECT 1 FROM history_source_periods sp
+			WHERE sp.start_ms < a.result_bucket_start + a.result_bucket_len
+			  AND sp.last_ms > a.result_bucket_start
+		)
 	), ranked AS (
 		SELECT *, DENSE_RANK() OVER (ORDER BY result_bucket_start) AS bucket_rank
-		FROM aggregated
+		FROM usable
 	)
 	SELECT schema_version, result_asset_id, flow, result_bucket_start,
 		result_bucket_len, energy_wh, source, quality, provenance, sample_count,
@@ -438,7 +464,7 @@ func (s *Store) LoadEnergyHistoryContext(ctx context.Context, q EnergyHistoryQue
 		EnergyLedgerSchemaVersion, assetID,
 		q.BucketMS, q.SinceMS, q.SinceMS, q.BucketMS, q.BucketMS,
 		q.BucketMS, q.BucketMS,
-		EnergyLedgerSchemaVersion, q.UntilMS, q.SinceMS, assetID, assetID, q.Limit+1)
+		EnergyLedgerSchemaVersion, q.UntilMS, q.SinceMS, assetID, assetID, FlowConsumerUse, q.Limit+1)
 	if err != nil {
 		return nil, false, err
 	}

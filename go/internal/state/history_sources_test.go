@@ -265,6 +265,18 @@ func TestSourceLoadRetentionBackupAndDayBoundary(t *testing.T) {
 		}
 		near(t, "retained Wh", v.wh, 250)
 	}
+	for _, asset := range []string{"", ObservedConsumerAssetID} {
+		p, truncated, err := s.LoadEnergyHistory(EnergyHistoryQuery{AssetID: asset, SinceMS: base + 17123, UntilMS: base + 1800000, BucketMS: 300000, Limit: 10})
+		if err != nil || truncated || len(p) != 2 {
+			t.Fatal("retained source history lost whole intervals", err)
+		}
+		for _, v := range p {
+			if v.BucketLenMS != 900000 || v.BucketStartMS%900000 != 0 {
+				t.Fatal("retained source interval was split")
+			}
+			near(t, "retained native Wh", v.EnergyWh, 250)
+		}
+	}
 	backup := filepath.Join(t.TempDir(), "restored.db")
 	if err := s.copyStateForBackup(context.Background(), backup); err != nil {
 		t.Fatal(err)
@@ -373,4 +385,122 @@ func TestSourceLoadV2XDischargeIsNotNegativeEVCharge(t *testing.T) {
 	}
 	near(t, "V2X house Wh", c.LoadWh, 1000.0/60)
 	near(t, "EV charging Wh", c.EVWh, 0)
+}
+
+func TestSourceLoadKeepsObservedConsumerAssetReads(t *testing.T) {
+	s := sourceStore(t)
+	base := time.Now().UTC().Truncate(24 * time.Hour).UnixMilli()
+	sourceSeries(t, s, base, []float64{-1000, 3000, 1000, 1000, 1000})
+	assets, err := s.EnergyAssets()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, a := range assets {
+		if a.AssetID == ObservedConsumerAssetID && a.Kind == AssetObservedConsumer && a.ReadOnly && a.LastSeenMS == base+300000 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("household source vanished from asset discovery")
+	}
+	for _, asset := range []string{"", ObservedConsumerAssetID} {
+		p, _, err := s.LoadEnergyHistory(EnergyHistoryQuery{AssetID: asset, SinceMS: base, UntilMS: base + 300000, BucketMS: 300000, Limit: 1})
+		if err != nil || len(p) != 1 {
+			t.Fatal("household asset history missing", err)
+		}
+		near(t, "household asset Wh", p[0].EnergyWh, 1000.0/12)
+	}
+}
+
+func TestSourceLoadLimitCountsStoredBucketsAcrossGaps(t *testing.T) {
+	s := sourceStore(t)
+	base := time.Now().UTC().Truncate(24 * time.Hour).UnixMilli()
+	first := base + 3*3600000
+	second := first + 3600000
+	sourceSeries(t, s, first, []float64{1000, 1000, 1000, 1000, 1000})
+	sourceSeries(t, s, second, []float64{1000, 1000, 1000, 1000, 1000})
+	for _, asset := range []string{"", ObservedConsumerAssetID} {
+		for _, limit := range []int{1, 2} {
+			p, truncated, err := s.LoadEnergyHistory(EnergyHistoryQuery{AssetID: asset, SinceMS: base, UntilMS: second + 300000, BucketMS: 300000, Limit: limit})
+			if err != nil || len(p) != limit || truncated != (limit == 1) {
+				t.Fatalf("limit=%d: %d points, truncated=%v: %v", limit, len(p), truncated, err)
+			}
+			if p[0].BucketStartMS != first || limit == 2 && p[1].BucketStartMS != second {
+				t.Fatal("empty prefix or internal gap consumed the result limit")
+			}
+		}
+	}
+}
+
+func TestSourceLoadLimitMergesLegacyBeforeRanking(t *testing.T) {
+	s := sourceStore(t)
+	base := time.Now().UTC().Truncate(24 * time.Hour).UnixMilli()
+	sourceSeries(t, s, base, []float64{-1000, -1000, -1000, -1000, -1000})
+	dashboardTick(t, s, "legacy-period", &HistoryPoint{TsMs: base + 600000, GridW: 1000, LoadW: 1000, JSON: `{}`})
+	sourceSeries(t, s, base+900000, []float64{1000, 1000, 1000, 1000, 1000})
+	for _, at := range []int64{base, base + 600000} {
+		insertLedgerEntryTest(t, s, ObservedConsumerAssetID, FlowConsumerUse, at, 300000, 100, "power_telemetry", "integrated", "legacy", 5)
+	}
+	insertLedgerEntryTest(t, s, "meter", FlowGridImport, base+600000, 300000, 100, "hardware_counter", "measured", "counter", 1)
+	for _, asset := range []string{"", ObservedConsumerAssetID} {
+		p, truncated, err := s.LoadEnergyHistory(EnergyHistoryQuery{AssetID: asset, SinceMS: base, UntilMS: base + 1200000, BucketMS: 300000, Limit: 1})
+		want := 1
+		if asset == "" {
+			want = 2
+		}
+		if err != nil || !truncated || len(p) != want {
+			t.Fatalf("legacy/source merge: %d points, truncated=%v: %v", len(p), truncated, err)
+		}
+		for _, v := range p {
+			if v.BucketStartMS != base+600000 {
+				t.Fatal("overridden consumer bucket hid a later legacy bucket")
+			}
+		}
+	}
+}
+
+func TestSourceLoadLimitFiltersAggregatedLegacyOverlap(t *testing.T) {
+	s := sourceStore(t)
+	base := time.Now().UTC().Truncate(24 * time.Hour).UnixMilli()
+	sourceSeries(t, s, base+300000, []float64{1000, 1000, 1000, 1000, 1000})
+	insertLedgerEntryTest(t, s, ObservedConsumerAssetID, FlowConsumerUse, base, 300000, 100, "power_telemetry", "integrated", "legacy", 5)
+	insertLedgerEntryTest(t, s, ObservedConsumerAssetID, FlowConsumerUse, base+900000, 900000, 100, "power_telemetry", "integrated", "legacy", 5)
+	p, truncated, err := s.LoadEnergyHistory(EnergyHistoryQuery{AssetID: ObservedConsumerAssetID, SinceMS: base, UntilMS: base + 1800000, BucketMS: 900000, Limit: 1})
+	if err != nil || truncated || len(p) != 1 || p[0].BucketStartMS != base+900000 {
+		t.Fatal("aggregated overlap consumed the result limit", err)
+	}
+}
+
+func TestSourceLoadAlignsArbitraryRequestTimes(t *testing.T) {
+	s := sourceStore(t)
+	base := time.Now().UTC().Truncate(24 * time.Hour).UnixMilli()
+	minutes := make([]float64, 30)
+	for i := range minutes {
+		minutes[i] = 1000
+	}
+	sourceSeries(t, s, base, minutes)
+	insertLedgerEntryTest(t, s, "meter", FlowGridImport, base, 300000, 100, "hardware_counter", "measured", "counter", 1)
+	for _, asset := range []string{"", ObservedConsumerAssetID} {
+		for _, width := range []int64{300000, 420000, 900000} {
+			p, truncated, err := s.LoadEnergyHistory(EnergyHistoryQuery{AssetID: asset, SinceMS: base + 137123, UntilMS: base + 1800000, BucketMS: width, Limit: 10})
+			if err != nil || truncated {
+				t.Fatal("unaligned history request failed", err)
+			}
+			consumer := 0
+			for _, v := range p {
+				actualWidth := ((width + 300000 - 1) / 300000) * 300000
+				if v.BucketStartMS%300000 != 0 || v.BucketLenMS != actualWidth {
+					t.Fatal("history flows use different, split-minute intervals")
+				}
+				if v.Flow == FlowConsumerUse {
+					consumer++
+				}
+			}
+			actualWidth := ((width + 300000 - 1) / 300000) * 300000
+			if consumer != int(1800000/actualWidth) {
+				t.Fatal("arbitrary request timestamp hid complete source intervals")
+			}
+		}
+	}
 }
