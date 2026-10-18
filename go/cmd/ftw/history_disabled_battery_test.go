@@ -118,13 +118,15 @@ func TestPVZeroCounterKeepsObservedEnergy(t *testing.T) {
 	}{
 		{"unavailable zero", []float64{0, 0, 0}, 3000, time.Minute, 100},
 		{"positive counter returns", []float64{0, 0, 100, 150}, 3000, time.Minute, 150},
+		{"previous Core zero cursor", []float64{0, 0, 100, 150}, 3000, time.Minute, 150},
 		{"counter resets to zero", []float64{100, 0, 0, 50}, 3000, time.Minute, 150},
 		{"real zero generation", []float64{0, 0, 0}, 0, time.Minute, 0},
 		{"positive coarse counter stays authoritative", []float64{100, 100, 100}, 3000, time.Minute, 0},
 		{"unobserved gap stays missing", []float64{0, 0}, 3000, 5 * time.Minute, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			st, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+			path := filepath.Join(t.TempDir(), "state.db")
+			st, err := state.Open(path)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -142,8 +144,21 @@ func TestPVZeroCounterKeepsObservedEnergy(t *testing.T) {
 				tel.RecordDriverSuccess("solar")
 				tel.Get("solar", telemetry.DerPV).UpdatedAt = time.UnixMilli(at)
 				obs := buildEnergyObservations(st, tel, tickPersistControl{}, state.HistoryPoint{}, testEnergyIdentity(st))
+				if i == 0 && tc.name == "previous Core zero cursor" {
+					// Seed exactly the zero-counter cursor the older Core kept.
+					obs[0].CounterWh = &counter
+				}
 				if err := st.RecordTickWithEnergy(state.HistoryPoint{TsMs: at, JSON: "{}"}, nil, obs); err != nil {
 					t.Fatal(err)
+				}
+				if i == 1 && (tc.name == "positive counter returns" || tc.name == "previous Core zero cursor") {
+					if err := st.Close(); err != nil {
+						t.Fatal(err)
+					}
+					st, err = state.Open(path)
+					if err != nil {
+						t.Fatal(err)
+					}
 				}
 			}
 			points, _, err := st.LoadEnergyHistory(state.EnergyHistoryQuery{AssetID: state.HardwareEnergyAssetID(id, state.AssetPV), SinceMS: base, UntilMS: base + int64(len(tc.counters))*tc.step.Milliseconds(), BucketMS: state.EnergyLedgerBucketMS, Limit: 100})
