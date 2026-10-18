@@ -140,9 +140,13 @@ func (s *Service) Edit(live *config.Config, expected int64, patch json.RawMessag
 	if err != nil {
 		return Draft{}, err
 	}
-	cfg.PreserveMaskedSecrets(previous)
 	if s.preserveSecrets != nil {
 		s.preserveSecrets(cfg, previous)
+	} else {
+		cfg.PreserveMaskedSecrets(previous)
+	}
+	if err := config.PrepareDraftCredentials(cfg, previous); err != nil {
+		return Draft{}, err
 	}
 	// Canonicalize through the current type. Do not default or validate yet:
 	// both would hide missing answers or reject an unfinished installation.

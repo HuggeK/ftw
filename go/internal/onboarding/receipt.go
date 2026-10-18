@@ -11,6 +11,7 @@ const CommitKey = "onboarding/commit_v1"
 // Receipt proves that the named draft reached durable Settings. Whether
 // the running process applied it and hardware works are separate facts.
 type Receipt struct {
+	ProcessID      string   `json:"process_id"`
 	DraftRevision  int64    `json:"draft_revision"`
 	SHA256         string   `json:"sha256"`
 	BaseRevision   int64    `json:"base_revision"`

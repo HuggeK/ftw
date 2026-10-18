@@ -7,16 +7,49 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+	"slices"
 
+	"github.com/google/uuid"
 	"github.com/srcfl/ftw/go/internal/config"
 	"github.com/srcfl/ftw/go/internal/onboarding"
 )
+
+// One identity per process, rather than per API server, so rebuilding the
+// HTTP handler cannot claim that restart-only settings became active.
+var setupProcessID = uuid.NewString()
+
+func setupRestartPending(receipt *onboarding.Receipt) bool {
+	return receipt != nil && len(receipt.RestartReasons) > 0 && (receipt.ProcessID == "" || receipt.ProcessID == setupProcessID)
+}
+
+func (s *Server) preserveSetupSecrets(incoming, previous *config.Config) {
+	// Bind each driver's secrets before applying any display-name fallback.
+	// Separate pairs also handle two drivers swapping their names in a draft.
+	withoutDrivers := *previous
+	withoutDrivers.Drivers = nil
+	incoming.PreserveMaskedSecrets(&withoutDrivers)
+	metadata := s.driverSecretKeys()
+	for i, driver := range incoming.Drivers {
+		for _, old := range previous.Drivers {
+			if driver.Lua != old.Lua || (driver.CredentialOwner != "" && driver.CredentialOwner != old.CredentialOwner) ||
+				(driver.CredentialOwner == "" && driver.Name != old.Name) {
+				continue
+			}
+			old.Name = driver.Name
+			next, before := config.Config{Drivers: []config.Driver{driver}}, config.Config{Drivers: []config.Driver{old}}
+			next.PreserveMaskedSecrets(&before)
+			restoreDriverConfigSecrets(&next, &before, metadata)
+			incoming.Drivers[i] = next.Drivers[0]
+			break
+		}
+	}
+}
 
 func (s *Server) setupRoutes() {
 	s.handle("GET /api/setup/schema", Read, s.handleSetupSchema)
 	s.handle("GET /api/setup/draft", Local, s.handleSetupDraft)
 	s.handle("POST /api/setup/draft", Configure, s.handleSetupEdit)
-	s.handle("POST /api/setup/restart", Configure, s.handleSetupRestart)
+	s.handle("POST /api/setup/reset", Configure, s.handleSetupReset)
 	s.handle("POST /api/setup/validate", Configure, s.handleSetupValidate)
 	s.handle("POST /api/setup/commit", Configure, s.handleSetupCommit)
 }
@@ -96,14 +129,20 @@ func (s *Server) writeSetupDraft(w http.ResponseWriter, live *config.Config, d o
 		return
 	}
 	saved := receipt != nil && receipt.DraftRevision == d.Revision && receipt.SHA256 == d.SHA256
-	applied := saved && receipt.SavedRevision == live.Revision
+	restartPending := saved && setupRestartPending(receipt)
+	applied := saved && receipt.SavedRevision == live.Revision && !restartPending
+	restartReasons := config.RestartRequiredFor(live, &candidate)
+	if saved {
+		restartReasons = receipt.RestartReasons
+	}
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"revision": d.Revision, "base_revision": d.BaseRevision, "live_revision": live.Revision,
 		"sha256": d.SHA256, "config": masked, "stale": !saved && d.BaseRevision != live.Revision,
 		"valid": validation == "", "validation_error": validation,
 		"saved": saved, "applied": applied, "hardware_verified": false, "last_commit": receipt,
-		"restart_reasons": config.RestartRequiredFor(live, &candidate),
+		"restart_pending": restartPending, "restart_reasons": restartReasons,
+		"next_step": "Continue this draft, or create a new draft from current settings after a completed save.",
 	})
 }
 
@@ -145,7 +184,7 @@ func (s *Server) handleSetupEdit(w http.ResponseWriter, r *http.Request) {
 	s.writeSetupDraft(w, live, d)
 }
 
-func (s *Server) handleSetupRestart(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleSetupReset(w http.ResponseWriter, r *http.Request) {
 	var q struct {
 		Revision int64 `json:"revision"`
 	}
@@ -214,9 +253,7 @@ func (s *Server) handleSetupCommit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if previous != nil && previous.DraftRevision == q.Revision && previous.SHA256 == q.SHA256 && previous.BaseRevision == q.BaseRevision {
-		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "saved": true,
-			"applied": live.Revision == previous.SavedRevision, "live_revision": live.Revision,
-			"later_changes": live.Revision > previous.SavedRevision, "commit": previous, "hardware_verified": false})
+		s.writeSetupCommit(w, live.Revision, previous)
 		return
 	}
 	if !q.Confirmed {
@@ -243,19 +280,40 @@ func (s *Server) handleSetupCommit(w http.ResponseWriter, r *http.Request) {
 		request.ContentLength = int64(len(raw))
 		request.Header = r.Header.Clone()
 		request.Header.Set("If-Match", configETag(q.BaseRevision))
-		receipt := onboarding.Receipt{DraftRevision: q.Revision, SHA256: q.SHA256,
+		receipt := onboarding.Receipt{ProcessID: setupProcessID, DraftRevision: q.Revision, SHA256: q.SHA256,
 			BaseRevision: q.BaseRevision, SavedRevision: q.BaseRevision + 1,
 			RestartReasons: config.RestartRequiredFor(live, candidate)}
+		// A later live edit does not rebind listeners or rebuild clients left
+		// pending by an earlier setup commit in this process.
+		if setupRestartPending(previous) {
+			for _, reason := range previous.RestartReasons {
+				if !slices.Contains(receipt.RestartReasons, reason) {
+					receipt.RestartReasons = append(receipt.RestartReasons, reason)
+				}
+			}
+		}
 		record, err := json.Marshal(receipt)
 		if err != nil {
 			return err
 		}
 		s.handlePostConfigWith(w, request, func(path string, cfg *config.Config) error {
 			return s.deps.SaveConfigWithValues(path, cfg, map[string]string{onboarding.CommitKey: string(record)})
+		}, func(cfg *config.Config, _ []string) {
+			s.writeSetupCommit(w, cfg.Revision, &receipt)
 		})
 		return nil
 	})
 	if err != nil {
 		s.setupError(w, err)
 	}
+}
+
+func (s *Server) writeSetupCommit(w http.ResponseWriter, liveRevision int64, receipt *onboarding.Receipt) {
+	pending := setupRestartPending(receipt)
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "ok", "saved": true, "applied": liveRevision == receipt.SavedRevision && !pending,
+		"live_revision": liveRevision, "restart_required": pending, "restart_reasons": receipt.RestartReasons,
+		"later_changes": liveRevision > receipt.SavedRevision, "commit": receipt, "hardware_verified": false,
+	})
 }

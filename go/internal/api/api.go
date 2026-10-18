@@ -330,9 +330,7 @@ func New(deps *Deps) *Server {
 		drafts:        newDriverDrafts(),
 		marks:         make(map[string]routeMark),
 	}
-	s.setup = onboarding.NewWithSecrets(deps.State, func(incoming, previous *config.Config) {
-		restoreDriverConfigSecrets(incoming, previous, s.driverSecretKeys())
-	})
+	s.setup = onboarding.NewWithSecrets(deps.State, s.preserveSetupSecrets)
 	if deps.SaveConfigWithValues == nil && deps.State != nil {
 		deps.SaveConfigWithValues = func(path string, cfg *config.Config, values map[string]string) error {
 			return config.SaveStoredWithValues(deps.State, path, cfg, values)
@@ -1627,10 +1625,10 @@ func restoreDriverConfigSecrets(incoming, existing *config.Config, secretsByLua 
 }
 
 func (s *Server) handlePostConfig(w http.ResponseWriter, r *http.Request) {
-	s.handlePostConfigWith(w, r, s.deps.SaveConfig)
+	s.handlePostConfigWith(w, r, s.deps.SaveConfig, nil)
 }
 
-func (s *Server) handlePostConfigWith(w http.ResponseWriter, r *http.Request, save func(string, *config.Config) error) {
+func (s *Server) handlePostConfigWith(w http.ResponseWriter, r *http.Request, save func(string, *config.Config) error, saved func(*config.Config, []string)) {
 	s.configWriteMu.Lock()
 	defer s.configWriteMu.Unlock()
 	var posted struct {
@@ -1704,6 +1702,10 @@ func (s *Server) handlePostConfigWith(w http.ResponseWriter, r *http.Request, sa
 	slog.Info("config updated via API", "restart_required", len(restartReasons) > 0)
 	if restartReasons == nil {
 		restartReasons = []string{}
+	}
+	if saved != nil {
+		saved(&newCfg, restartReasons)
+		return
 	}
 	writeJSON(w, 200, map[string]any{
 		"status":           "ok",

@@ -177,3 +177,113 @@ func TestSetupReceiptAndSettingsCommitTogether(t *testing.T) {
 		t.Fatal("receipt names a different settings revision")
 	}
 }
+
+func TestSetupNewDraftDriverRenamePreservesCredential(t *testing.T) {
+	s, _ := setupTestServer(t)
+	first := map[string]any{"name": "first meter", "lua": "drivers/test.lua", "is_site_meter": true,
+		"capabilities": map[string]any{"standalone": true}, "config": map[string]any{"api_token": "draft-only-token"}}
+	w, draft := setupCall(t, s, http.MethodPost, "/api/setup/draft", map[string]any{"revision": 0, "patch": map[string]any{"drivers": []any{first}}})
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	drivers := draft["config"].(map[string]any)["drivers"].([]any)
+	drivers[0].(map[string]any)["name"] = "Garage meter"
+	w, draft = setupCall(t, s, http.MethodPost, "/api/setup/draft", map[string]any{"revision": draft["revision"], "patch": map[string]any{"drivers": drivers}})
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	candidate, err := s.setup.Checked(int64(draft["base_revision"].(float64)), int64(draft["revision"].(float64)), draft["sha256"].(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidate.Drivers[0].Config["api_token"] != "draft-only-token" {
+		t.Fatal("renaming the new driver lost its draft-only credential")
+	}
+}
+
+func TestSetupResumeKeepsPendingRestartVisible(t *testing.T) {
+	s, _ := setupTestServer(t)
+	w, draft := setupCall(t, s, http.MethodPost, "/api/setup/draft", map[string]any{"revision": 0, "patch": map[string]any{"api": map[string]any{"port": 8899}}})
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	check := map[string]any{"revision": draft["revision"], "base_revision": draft["base_revision"], "sha256": draft["sha256"], "confirmed": true}
+	w, commit := setupCall(t, s, http.MethodPost, "/api/setup/commit", check)
+	if w.Code != http.StatusOK || commit["restart_required"] != true {
+		t.Fatal("initial response did not identify pending restart")
+	}
+	w, resumed := setupCall(t, s, http.MethodGet, "/api/setup/draft", nil)
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	reasons, ok := resumed["restart_reasons"].([]any)
+	if !ok || len(reasons) == 0 {
+		t.Fatal("resume hid the pending listener restart while returning applied=true")
+	}
+	if resumed["restart_pending"] != true || resumed["applied"] != false {
+		t.Fatal("resume claimed restart-only settings were active", w.Body.String())
+	}
+	w, retried := setupCall(t, New(s.deps), http.MethodPost, "/api/setup/commit", check)
+	if w.Code != http.StatusOK || retried["restart_required"] != true || retried["applied"] != false {
+		t.Fatal("retry hid the pending restart", w.Body.String())
+	}
+	if commit["saved"] != true || commit["commit"] == nil || retried["commit"] == nil {
+		t.Fatal("initial reply and retry must both return a durable receipt")
+	}
+}
+
+func TestSetupSwappedDriverNamesKeepOwnPasswords(t *testing.T) {
+	s, _ := setupTestServer(t)
+	a := map[string]any{"name": "meter A", "lua": "drivers/test.lua", "is_site_meter": true,
+		"capabilities": map[string]any{"standalone": true}, "config": map[string]any{"password": "password-A"}}
+	b := map[string]any{"name": "device B", "lua": "drivers/test.lua",
+		"capabilities": map[string]any{"standalone": true}, "config": map[string]any{"password": "password-B"}}
+	w, draft := setupCall(t, s, http.MethodPost, "/api/setup/draft", map[string]any{"revision": 0, "patch": map[string]any{"drivers": []any{a, b}}})
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	drivers := draft["config"].(map[string]any)["drivers"].([]any)
+	drivers[0].(map[string]any)["name"] = "device B"
+	drivers[1].(map[string]any)["name"] = "meter A"
+	w, draft = setupCall(t, s, http.MethodPost, "/api/setup/draft", map[string]any{"revision": draft["revision"], "patch": map[string]any{"drivers": drivers}})
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	candidate, err := s.setup.Checked(int64(draft["base_revision"].(float64)), int64(draft["revision"].(float64)), draft["sha256"].(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidate.Drivers[0].Config["password"] != "password-A" || candidate.Drivers[1].Config["password"] != "password-B" {
+		t.Fatal("swapping display names crossed the drivers' credentials")
+	}
+}
+
+func TestSetupLaterSetupSaveKeepsEarlierPendingRestart(t *testing.T) {
+	s, _ := setupTestServer(t)
+	w, draft := setupCall(t, s, http.MethodPost, "/api/setup/draft", map[string]any{"revision": 0, "patch": map[string]any{"api": map[string]any{"port": 8899}}})
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	check := map[string]any{"revision": draft["revision"], "base_revision": draft["base_revision"], "sha256": draft["sha256"], "confirmed": true}
+	w, result := setupCall(t, s, http.MethodPost, "/api/setup/commit", check)
+	if w.Code != http.StatusOK || result["restart_required"] != true {
+		t.Fatal("first save had no pending restart")
+	}
+	w, draft = setupCall(t, s, http.MethodPost, "/api/setup/reset", map[string]any{"revision": draft["revision"]})
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	w, draft = setupCall(t, s, http.MethodPost, "/api/setup/draft", map[string]any{"revision": draft["revision"], "patch": map[string]any{"site": map[string]any{"name": "New display name"}}})
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	check = map[string]any{"revision": draft["revision"], "base_revision": draft["base_revision"], "sha256": draft["sha256"], "confirmed": true}
+	w, result = setupCall(t, s, http.MethodPost, "/api/setup/commit", check)
+	if w.Code != http.StatusOK || result["restart_required"] != true || result["applied"] != false {
+		t.Fatal("a later unrelated save forgot the pending runtime change")
+	}
+	w, result = setupCall(t, s, http.MethodGet, "/api/setup/draft", nil)
+	if w.Code != http.StatusOK || result["restart_pending"] != true || result["applied"] != false {
+		t.Fatal("resume forgot the pending restart after the second save")
+	}
+}
