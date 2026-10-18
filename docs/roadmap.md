@@ -58,6 +58,13 @@ using an estimate in planning. A model prediction must never verify itself or
 raise a safety limit. These are acceptance requirements, not shipped support.
 
 Necessary safety, security, recovery and support fixes continue throughout.
+
+Household Load history must balance source energy over the same interval in
+Core. Live updates remain immediate. Different reporting rates must not
+require a valid instantaneous Load sample before energy can be recorded.
+Verify the app, web, daily totals, tariff boundaries, restart and missing
+source cases against the same stored evidence.
+
 Correct misleading value labels when their scope is known; that need not wait
 for the new counterfactual model. Reading and analysis access for agents can
 also support the evidence work before agents receive control authority.

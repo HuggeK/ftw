@@ -14,6 +14,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -22,6 +23,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -3910,6 +3912,20 @@ func snapshotTickPersistControl(ctrl *control.State, ctrlMu *sync.Mutex) tickPer
 
 func persistTelemetryTick(st *state.Store, tel *telemetry.Store, ctrl tickPersistControl, nowMs int64, historyMaxAge time.Duration, identity energyIdentityLookup, options ...telemetry.ForecastOptions) (int, error) {
 	hp, historyAvailable := buildHistoryPoint(tel, ctrl, nowMs, historyMaxAge, options...)
+	if hp.Sources != nil {
+		// Live Load is not an energy observation. The source interval writer
+		// owns historical Load; the chart placeholder stays explicitly unknown.
+		hp.LoadW = 0
+		hp.Missing |= state.MissingLoad
+		var detail map[string]any
+		if json.Unmarshal([]byte(hp.JSON), &detail) == nil {
+			detail["load_house_w"] = nil
+			detail["forecast_measurement_quality"] = "source_interval_pending"
+			if raw, err := json.Marshal(detail); err == nil {
+				hp.JSON = string(raw)
+			}
+		}
+	}
 	samples := tel.FlushSamples()
 	stSamples := make([]state.Sample, len(samples))
 	for i, sm := range samples {
@@ -3919,9 +3935,19 @@ func persistTelemetryTick(st *state.Store, tel *telemetry.Store, ctrl tickPersis
 		}
 	}
 	energyObservations := buildEnergyObservations(st, tel, ctrl, hp, identity)
+	if hp.Sources != nil {
+		var devices []string
+		for _, o := range energyObservations {
+			if o.DeviceID != "" {
+				devices = append(devices, string(o.AssetKind)+":"+o.DeviceID)
+			}
+		}
+		sort.Strings(devices)
+		hp.Sources.Topology += "\ndevices:" + strings.Join(devices, "\n")
+	}
 	filtered := energyObservations[:0]
 	for _, observation := range energyObservations {
-		if (!historyAvailable || hp.Missing&state.MissingLoad != 0) && observation.AssetKind == state.AssetObservedConsumer {
+		if (!historyAvailable || hp.Sources != nil || hp.Missing&state.MissingLoad != 0) && observation.AssetKind == state.AssetObservedConsumer {
 			continue
 		}
 		if observation.AssetKind != state.AssetObservedConsumer {
@@ -4022,7 +4048,42 @@ func buildHistoryPoint(tel *telemetry.Store, ctrl tickPersistControl, nowMs int6
 	}
 	blob, _ := json.Marshal(map[string]any{"drivers": perDriver, "targets": targets, "ev_w": p.Missing.Value(state.MissingEV, balance.EVW), "v2x_w": p.Missing.Value(state.MissingV2X, balance.V2XW), "load_house_w": p.LoadW, "forecast_measurement_quality": quality, "history_reason": balance.Reason})
 	p.JSON = string(blob)
+	liveSources := tel.LiveMeasurementNow(ctrl.SiteMeterDriver, opts)
+	p.Sources = historySources(liveSources)
+	p.Sources.Topology += "\nsettings:" + strconv.FormatInt(opts.HistoryRevision, 10)
+	for _, source := range liveSources.Sources {
+		hasPower = hasPower || source.PowerW != nil
+	}
 	return p, hasPower
+}
+
+func historySources(reading telemetry.ForecastReading) *state.HistorySources {
+	p := &state.HistorySources{AtMS: reading.At.UnixMilli(), GridW: reading.GridW, PVW: reading.PVW, BatteryW: reading.BatteryW, EVW: reading.EVW, V2XW: reading.V2XW}
+	var flows []string
+	for _, source := range reading.Sources {
+		flows = append(flows, source.Flow.Driver+":"+source.Flow.DerType.String()+":"+source.Flow.FlowID)
+	}
+	sort.Strings(flows)
+	p.Topology = strings.Join(flows, "\n")
+	for kind, flag := range map[telemetry.DerType]state.HistoryMissing{telemetry.DerMeter: state.MissingGrid, telemetry.DerPV: state.MissingPV, telemetry.DerBattery: state.MissingBattery, telemetry.DerEV: state.MissingEV, telemetry.DerV2X: state.MissingV2X} {
+		if !reading.Known[kind] {
+			p.Missing |= flag
+		}
+	}
+	// A negative instantaneous residual does not invalidate its independent
+	// sources. Missing configuration and duplicate electrical flows do.
+	if reading.Reason != "" && reading.Reason != "invalid_balance" {
+		p.Missing |= state.MissingLoad
+	}
+	for flag, w := range map[state.HistoryMissing]*float64{state.MissingGrid: &p.GridW, state.MissingPV: &p.PVW, state.MissingBattery: &p.BatteryW, state.MissingEV: &p.EVW, state.MissingV2X: &p.V2XW} {
+		if math.IsNaN(*w) || math.IsInf(*w, 0) {
+			p.Missing |= flag
+		}
+		if p.Missing&flag != 0 {
+			*w = 0
+		}
+	}
+	return p
 }
 
 func restoreLatestMPCDiagnostic(st *state.Store, svc *mpc.Service, now time.Time) {

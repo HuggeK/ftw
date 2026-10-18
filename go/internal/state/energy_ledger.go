@@ -466,7 +466,16 @@ func (s *Store) LoadEnergyHistoryContext(ctx context.Context, q EnergyHistoryQue
 		}
 		out = append(out, p)
 	}
-	return out, truncated, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	rows.Close()
+	var sourceTruncated bool
+	out, sourceTruncated, err = s.applySourceLoadLedger(ctx, q, out)
+	if err != nil {
+		return nil, false, err
+	}
+	return out, truncated || sourceTruncated, nil
 }
 
 // PruneEnergyLedger keeps five-minute detail for 30 days, hourly totals for

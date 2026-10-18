@@ -1393,6 +1393,7 @@ func (s *Store) batteryModelKey(driverName string) string {
 
 // HistoryPoint is one row of the history table.
 type HistoryPoint struct {
+	Sources      *HistorySources `json:",omitempty"`
 	Missing      HistoryMissing
 	N            int64 `json:"n,omitempty"`
 	ResolutionMS int64 `json:"resolution_ms,omitempty"`
@@ -1497,6 +1498,31 @@ func (s *Store) loadArchiveHistory(ctx context.Context, sinceMs, untilMs int64, 
 	if s.history == nil || untilMs < sinceMs {
 		return nil, nil
 	}
+	// Source energy is retained by minute. Do not paint a minute's mean as
+	// separate ten-second Load observations in either history client.
+	cut, sourceMode, err := s.sourceEnergyFrom(ctx)
+	if err != nil {
+		return nil, err
+	}
+	sourceMode = sourceMode && untilMs >= cut
+	queryFrom := sinceMs
+	bucketMs := int64(0)
+	if maxPoints > 0 {
+		bucketMs = (untilMs - sinceMs + int64(maxPoints)) / int64(maxPoints)
+		bucketMs = max(1, bucketMs)
+	}
+	if sourceMode {
+		if maxPoints > 0 {
+			bucketMs = (untilMs - sinceMs + int64(maxPoints) - 1) / int64(maxPoints)
+		}
+		var sourceWidth int64
+		if err := s.history.QueryRowContext(ctx, `SELECT COALESCE(MAX(resolution_ms),?) FROM history_source_energy WHERE start_ms>=? AND start_ms<? AND start_ms+resolution_ms>?`, ArchiveResolutionMS, sinceMs-maxSourceEnergyWidth, untilMs, sinceMs).Scan(&sourceWidth); err != nil {
+			return nil, err
+		}
+		bucketMs = max(ArchiveResolutionMS, ((bucketMs+ArchiveResolutionMS-1)/ArchiveResolutionMS)*ArchiveResolutionMS)
+		bucketMs = max(sourceWidth, ((bucketMs+sourceWidth-1)/sourceWidth)*sourceWidth)
+		queryFrom = bucketStart(sinceMs, ArchiveResolutionMS)
+	}
 	// Union across all three tiers. Dedupe on ts_ms preferring hot over warm over cold.
 	// COALESCE to 0 so NULL columns (from partial aggregations) scan cleanly.
 	const tierUnion = `
@@ -1516,17 +1542,18 @@ func (s *Store) loadArchiveHistory(ctx context.Context, sinceMs, untilMs int64, 
 			SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY ts_ms ORDER BY tier) AS rn FROM all_rows) WHERE rn=1
 		)
 	`
+	rangeUnion := tierUnion
+	if sourceMode {
+		rangeUnion = strings.ReplaceAll(tierUnion, "ts_ms BETWEEN ? AND ?", "ts_ms >= ? AND ts_ms < ?")
+		rangeUnion = strings.ReplaceAll(rangeUnion, "last_ms BETWEEN ? AND ?", "last_ms >= ? AND last_ms < ?")
+	}
 	var (
-		rows *sql.Rows
-		err  error
+		rows     *sql.Rows
+		queryErr error
 	)
-	if maxPoints > 0 && untilMs >= sinceMs {
+	if bucketMs > 0 && untilMs >= sinceMs {
 		// Ceil the bucket width; SQLite MAX selects JSON from its newest row.
-		bucketMs := (untilMs - sinceMs + int64(maxPoints)) / int64(maxPoints)
-		if bucketMs < 1 {
-			bucketMs = 1
-		}
-		rows, err = s.history.QueryContext(ctx, tierUnion+`, bucketed AS (
+		rows, queryErr = s.history.QueryContext(ctx, rangeUnion+`, bucketed AS (
 			SELECT MAX(ts_ms) AS ts_ms,
 			       SUM(COALESCE(grid_w, 0)*n)/SUM(n) AS grid_w, SUM(COALESCE(pv_w, 0)*n)/SUM(n) AS pv_w,
 			       SUM(COALESCE(bat_w, 0)*n)/SUM(n) AS bat_w, SUM(COALESCE(load_w, 0)*n)/SUM(n) AS load_w,
@@ -1538,9 +1565,9 @@ func (s *Store) loadArchiveHistory(ctx context.Context, sinceMs, untilMs int64, 
  (SELECT json FROM history_hot WHERE ts_ms=b.ts_ms),
 		         (SELECT json FROM history_warm WHERE ts_ms=b.ts_ms),
 		         (SELECT json FROM history_cold WHERE ts_ms=b.ts_ms),'{}'),n,resolution_ms,first_ms,missing
-		FROM bucketed b ORDER BY ts_ms`, sinceMs, untilMs, sinceMs, untilMs, sinceMs, untilMs, sinceMs, untilMs, sinceMs, untilMs, sinceMs, bucketMs)
+		FROM bucketed b ORDER BY ts_ms`, sinceMs, untilMs, sinceMs, untilMs, sinceMs, untilMs, sinceMs, untilMs, sinceMs, untilMs, queryFrom, bucketMs)
 	} else {
-		rows, err = s.history.QueryContext(ctx, tierUnion+`
+		rows, queryErr = s.history.QueryContext(ctx, rangeUnion+`
 			SELECT ts_ms,COALESCE(grid_w,0),COALESCE(pv_w,0),COALESCE(bat_w,0),COALESCE(load_w,0),COALESCE(bat_soc,0),
 			COALESCE((SELECT json FROM history_dashboard_partial WHERE last_ms=b.ts_ms),(SELECT json FROM history_dashboard WHERE last_ms=b.ts_ms),
  (SELECT json FROM history_hot WHERE ts_ms=b.ts_ms),
@@ -1548,8 +1575,8 @@ func (s *Store) loadArchiveHistory(ctx context.Context, sinceMs, untilMs int64, 
 			         (SELECT json FROM history_cold WHERE ts_ms=b.ts_ms),'{}'),n,resolution_ms,first_ms,missing
 			FROM deduped b ORDER BY ts_ms LIMIT ?`, sinceMs, untilMs, sinceMs, untilMs, sinceMs, untilMs, sinceMs, untilMs, sinceMs, untilMs, maxRawSeriesPoints+1)
 	}
-	if err != nil {
-		return nil, err
+	if queryErr != nil {
+		return nil, queryErr
 	}
 	defer rows.Close()
 
@@ -1559,6 +1586,9 @@ func (s *Store) loadArchiveHistory(ctx context.Context, sinceMs, untilMs int64, 
 		var p HistoryPoint
 		if err := rows.Scan(&p.TsMs, &p.GridW, &p.PVW, &p.BatW, &p.LoadW, &p.BatSoC, &p.JSON, &p.N, &p.ResolutionMS, &p.FirstMS, &p.Missing); err != nil {
 			return all, err
+		}
+		if sourceMode {
+			p.ResolutionMS = max(p.ResolutionMS, bucketMs)
 		}
 		if p.ResolutionMS > 1 {
 			var detail map[string]any
@@ -1576,7 +1606,16 @@ func (s *Store) loadArchiveHistory(ctx context.Context, sinceMs, untilMs int64, 
 		}
 		all = append(all, p)
 	}
-	return all, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	if sourceMode {
+		if err := s.applySourceLoadHistory(ctx, all, queryFrom, untilMs, bucketMs); err != nil {
+			return nil, err
+		}
+	}
+	return all, nil
 }
 
 // DayEnergy is the set of Wh totals over a time range, in site convention:

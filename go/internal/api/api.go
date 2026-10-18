@@ -2504,6 +2504,11 @@ func (s *Server) handleEnergyDaily(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	loc := now.Location()
 	todayMidnight := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
+	sourceThrough, sourceMode, err := s.deps.State.HistorySourceProgress(r.Context())
+	if err != nil {
+		http.Error(w, "history load failed", http.StatusInternalServerError)
+		return
+	}
 
 	// Walk day-by-day: past days hit the immutable-day cache, today always
 	// recomputes (in-progress). Each cache miss / today fire is one SQL
@@ -2513,9 +2518,13 @@ func (s *Server) handleEnergyDaily(w http.ResponseWriter, r *http.Request) {
 	for i := days - 1; i >= 0; i-- {
 		dayStart := todayMidnight.AddDate(0, 0, -i)
 		dayKey := dayStart.Format("2006-01-02")
+		cacheKey := dayKey
+		if sourceMode {
+			cacheKey += ":source_interval_balance_v1"
+		}
 		// A bounded balance episode can close just after midnight. Let its
 		// final intervals arrive before treating the previous day as immutable.
-		cacheReady := dailyEnergyCacheReady(dayStart, now)
+		cacheReady := dailyEnergyCacheReady(dayStart, now) && (!sourceMode || sourceThrough >= dayStart.AddDate(0, 0, 1).UnixMilli())
 
 		var de state.DayEnergy
 		if !cacheReady {
@@ -2534,14 +2543,14 @@ func (s *Server) handleEnergyDaily(w http.ResponseWriter, r *http.Request) {
 			// per-day DailyEnergy SQL pass; with the table populated
 			// the same query reduces to N PK lookups.
 			s.dailyCacheMu.Lock()
-			cached, ok := s.dailyCache[dayKey]
+			cached, ok := s.dailyCache[cacheKey]
 			s.dailyCacheMu.Unlock()
 			if ok {
 				de = cached
 			} else if persisted, present, err := s.deps.State.LoadDailyEnergy(dayKey); err == nil && present {
 				de = persisted
 				s.dailyCacheMu.Lock()
-				s.dailyCache[dayKey] = de
+				s.dailyCache[cacheKey] = de
 				s.dailyCacheMu.Unlock()
 			} else {
 				dayEnd := dayStart.AddDate(0, 0, 1)
@@ -2553,7 +2562,7 @@ func (s *Server) handleEnergyDaily(w http.ResponseWriter, r *http.Request) {
 				}
 				de = d
 				s.dailyCacheMu.Lock()
-				s.dailyCache[dayKey] = de
+				s.dailyCache[cacheKey] = de
 				s.dailyCacheMu.Unlock()
 				// Persist for next restart. Closed days only —
 				// today is excluded via the isToday branch above.

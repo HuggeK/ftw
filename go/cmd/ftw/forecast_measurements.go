@@ -31,6 +31,9 @@ func historyMeasurementOptions(cfg *config.Config, catalog []drivers.CatalogEntr
 		}
 	}
 	opts.ExpectedFlows = flows
+	if cfg != nil {
+		opts.HistoryRevision = cfg.Revision
+	}
 	return opts
 }
 

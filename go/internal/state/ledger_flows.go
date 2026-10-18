@@ -20,6 +20,16 @@ func (s *Store) LedgerFlowBuckets(ctx context.Context, since, until int64) ([]Le
 	if s == nil || s.history == nil || until <= since {
 		return nil, nil
 	}
+	cut, sourceMode, err := s.sourceEnergyFrom(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if sourceMode && until > cut {
+		// The savings endpoint then uses site-energy intervals. Mixing the
+		// counter ledger with receipt-integrated Load would hide different
+		// coverage and smear a signed balance across tariff boundaries.
+		return nil, nil
+	}
 	rows, err := s.history.QueryContext(ctx, `
 		SELECT bucket_start_ms, bucket_len_ms, flow, SUM(energy_wh)
 		FROM energy_ledger_entries

@@ -186,8 +186,14 @@ func TestPersistTelemetryTickUsesPersistenceFreshness(t *testing.T) {
 			if (len(history) == 1) != tc.wantSaved {
 				t.Fatalf("history = %+v, want saved=%v", history, tc.wantSaved)
 			}
-			if tc.wantSaved && (history[0].TsMs != tickMS || history[0].LoadW != 1200) {
-				t.Fatalf("tick timestamp or household power changed: %+v", history[0])
+			if tc.wantSaved && (history[0].TsMs != tickMS || history[0].GridW != 1200 || history[0].Missing&state.MissingLoad == 0) {
+				t.Fatal("fresh grid receipt lost or instantaneous Load entered history")
+			}
+			if tc.wantSaved {
+				p, _ := buildHistoryPoint(tel, ctrl, tickMS, time.Minute)
+				if p.Sources.AtMS < sampleAt.UnixMilli() || p.Sources.Missing != 0 {
+					t.Fatal("fresh source snapshot predates receipt or became unknown")
+				}
 			}
 			assets, err := st.EnergyAssets()
 			if err != nil {
@@ -199,8 +205,8 @@ func TestPersistTelemetryTickUsesPersistenceFreshness(t *testing.T) {
 					consumerSaved = asset.LastSeenMS == sampleAt.UnixMilli()
 				}
 			}
-			if consumerSaved != tc.wantSaved {
-				t.Fatalf("consumer ledger assets = %+v, want saved=%v", assets, tc.wantSaved)
+			if consumerSaved {
+				t.Fatal("instantaneous consumer observation entered interval history")
 			}
 		})
 	}
@@ -288,14 +294,14 @@ func TestStaleMeterTickKeepsSamplesAndIndependentLedgerWithoutDispatch(t *testin
 	tel.Update("solar", telemetry.DerPV, -400, nil, json.RawMessage(`{"generation_wh":110}`))
 	tel.Get("solar", telemetry.DerPV).UpdatedAt = now
 	tel.RecordDriverSuccess("solar")
-	if _, err := persistTelemetryTick(st, tel, ctrl, now.Add(time.Second).UnixMilli(), time.Minute, testEnergyIdentity(st)); err != nil {
+	if _, err := persistTelemetryTick(st, tel, ctrl, time.Now().UnixMilli(), time.Minute, testEnergyIdentity(st)); err != nil {
 		t.Fatal(err)
 	}
 
 	if err := st.FlushHistory(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	history, err := st.LoadHistory(base.UnixMilli(), now.Add(time.Second).UnixMilli(), 0)
+	history, err := st.LoadHistory(base.UnixMilli(), time.Now().Add(time.Second).UnixMilli(), 0)
 	if err != nil {
 		t.Fatal(err)
 	}

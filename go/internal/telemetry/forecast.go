@@ -27,6 +27,9 @@ type ForecastFlow struct {
 	FlowID  string
 }
 type ForecastOptions struct {
+	// HistoryRevision breaks receipt integration at a saved settings change.
+	// It does not alter forecast qualification or live power.
+	HistoryRevision int64 `json:",omitempty"`
 	// HouseholdInvalidReason qualifies unresolved site topology without invalidating independent PV observations.
 	HouseholdInvalidReason string
 	PVInvalidReason        string

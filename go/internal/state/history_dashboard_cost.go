@@ -35,10 +35,42 @@ func (s *Store) integrateHistoryRange(ctx context.Context, since, until int64, s
 		out = addDayCost(out, old)
 	}
 	idx := 0
+	sourcePrices := make(map[int]siteEnergyRow)
+	var sourceLoad float64
+	var sourceCovered int64
 	err = s.walkSiteEnergy(ctx, max(since, from), until, func(r siteEnergyRow) error {
 		out.ImportWh += r.imp
 		out.ExportWh += r.exp
 		out.LoadWh += r.load
+		if r.source {
+			if r.missing&MissingLoad == 0 {
+				sourceLoad += r.load
+				sourceCovered += r.covered
+			}
+			if r.missing&MissingGrid != 0 {
+				return nil
+			}
+			for idx < len(slots) && slots[idx].EndMs <= r.first {
+				idx++
+			}
+			if idx < len(slots) && slots[idx].StartMs <= r.first && slots[idx].EndMs >= r.last {
+				slot := slots[idx]
+				// Measured grid cost does not depend on a household residual.
+				out.ImportCostOre += r.imp * slot.TotalOre / 1000
+				out.ExportRevenueOre += r.exp * gridcost.ExportPriceOre(slot.SpotOreKwh, ep) / 1000
+				a := sourcePrices[idx]
+				if a.covered == 0 {
+					a.first = r.first
+				}
+				a.last = r.last
+				a.load += r.load
+				a.ev += r.ev
+				a.covered += r.covered
+				a.missing |= r.missing
+				sourcePrices[idx] = a
+			}
+			return nil
+		}
 		if r.missing&(MissingGrid|MissingLoad) != 0 {
 			return nil
 		}
@@ -58,6 +90,20 @@ func (s *Store) integrateHistoryRange(ctx context.Context, since, until int64, s
 		}
 		return nil
 	})
+	if sourceLoad >= 0 {
+		out.HistoryCoveredMs += sourceCovered
+	}
+	for idx, r := range sourcePrices {
+		if r.missing&MissingLoad != 0 || r.load < 0 || r.covered != r.last-r.first {
+			continue
+		}
+		out.PricedCoveredMs += r.covered
+		out.BaselineHouseOre += r.load * slots[idx].TotalOre / 1000
+		out.EVWh += r.ev
+	}
+	if out.LoadWh < 0 {
+		out.LoadWh = 0
+	}
 	return out, err
 }
 
