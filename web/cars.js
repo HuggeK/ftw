@@ -165,8 +165,17 @@ export function createWhichCar(doc, { onTap }) {
   const note = node(doc, 'p', 'car-which-note', el);
   note.setAttribute('aria-live', 'polite');
   let expanded = false, busy = false, last = null, shown = '';
+  let plugIn = '', generation = 0;
   open.addEventListener('click', () => { expanded = !expanded; if (last) update(...last); });
   function update(lp, cars, loadpoints, fresh) {
+    const nextPlugIn = JSON.stringify([lp.id, lp.session, !!lp.plugged_in]);
+    if (nextPlugIn !== plugIn) {
+      plugIn = nextPlugIn;
+      generation++;
+      expanded = false;
+      busy = false;
+      note.textContent = '';
+    }
     last = [lp, cars, loadpoints, fresh];
     const list = fresh ? choices(lp, cars, loadpoints) : [];
     const isAsking = asking(lp);
@@ -190,8 +199,10 @@ export function createWhichCar(doc, { onTap }) {
       b.disabled = busy || current;
       if (current) b.setAttribute('aria-pressed', 'true');
       b.addEventListener('click', async () => {
+        const requestGeneration = generation;
         busy = true; note.textContent = 'Saving…'; update(...last);
         const res = await onTap(lp, id).catch(() => ({ ok: false, text: 'The box did not answer. Try again.' }));
+        if (requestGeneration !== generation) return;
         busy = false; expanded = false;
         note.textContent = res.ok ? '' : res.text;
         update(...last);
