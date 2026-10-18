@@ -705,7 +705,21 @@ func waitForExchange(t *testing.T, relay *fakeRelay) {
 func TestTheBoxOpensAnExchangeBesideItsUplink(t *testing.T) {
 	charger := &fakeCharger{}
 	r := newExchangeRig(t, charger)
-	waitForExchange(t, r.relay)
+	// These sockets start beside one another. Exchange-ready alone does
+	// not mean the uplink's handler has recorded its join yet.
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	joined, exchangeReady := 0, false
+	for joined < 2 || !exchangeReady {
+		select {
+		case <-r.relay.joined:
+			joined++
+		case <-r.relay.exchangeJoined:
+			exchangeReady = true
+		case <-deadline.C:
+			t.Fatal("the box did not open both its uplink and exchange sockets")
+		}
+	}
 
 	handle, err := Handle(r.enroll.RendezvousSecret(), 481234)
 	if err != nil {
