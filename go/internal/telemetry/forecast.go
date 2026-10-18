@@ -34,6 +34,9 @@ type ForecastOptions struct {
 	MaxAge                 time.Duration
 	MaxSkew                time.Duration
 	UseWatchdogTimeout     bool `json:",omitempty"`
+	// Live display may use the driver's measured site-side control power
+	// (for example Pixii AC instead of battery DC). Raw history stays separate.
+	UseControlPower bool `json:",omitempty"`
 }
 
 // ForecastReading is one coherent snapshot, in site signs and raw watts.
@@ -172,13 +175,19 @@ func (s *Store) forecastMeasurementLocked(now time.Time, siteMeter string, opts 
 		powerQualified := true
 		if r != nil {
 			powerW, powerAt = r.RawW, r.UpdatedAt
-			var data struct {
-				Power json.RawMessage `json:"forecast_power"`
-			}
-			if json.Unmarshal(r.Data, &data) == nil && len(data.Power) > 0 {
-				var sample ForecastPowerSample
-				powerQualified = json.Unmarshal(data.Power, &sample) == nil && sample.Version == 1 && sample.Known && sample.MeasuredAtMS > 0 && sample.ReceivedAtMS >= sample.MeasuredAtMS && sample.ReceivedAtMS <= now.UnixMilli()
-				powerW, powerAt = sample.Watts, time.UnixMilli(sample.MeasuredAtMS)
+			if opts.UseControlPower {
+				p, known := ControlPowerObservation(r.RawW, r.Data, r.UpdatedAt)
+				powerQualified = known
+				powerW, powerAt = p.PowerW, p.Seen()
+			} else {
+				var data struct {
+					Power json.RawMessage `json:"forecast_power"`
+				}
+				if json.Unmarshal(r.Data, &data) == nil && len(data.Power) > 0 {
+					var sample ForecastPowerSample
+					powerQualified = json.Unmarshal(data.Power, &sample) == nil && sample.Version == 1 && sample.Known && sample.MeasuredAtMS > 0 && sample.ReceivedAtMS >= sample.MeasuredAtMS && sample.ReceivedAtMS <= now.UnixMilli()
+					powerW, powerAt = sample.Watts, time.UnixMilli(sample.MeasuredAtMS)
+				}
 			}
 		}
 		switch {

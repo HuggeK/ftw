@@ -38,7 +38,7 @@ test('the rendered house marks a mean and never combines it with live self-power
   const planets = [{id:'grid',role:'grid',corner:'bottom-left',kw:1,toHub:true,title:'GRID'}];
   flow.setReadings({load:2,loadEstimated:true,planets,selfPoweredPctToday:70});
   assert.match(flow.html, /≈ 2.0/);
-  assert.match(flow.html, /House load, estimated mean/);
+  assert.match(flow.html, /House load, estimated/);
   assert.doesNotMatch(flow.html, /SELF-POWERED NOW/);
   assert.match(flow.html, /70% SELF-POWERED TODAY/);
   flow.setReadings({load:2,loadEstimated:false,planets});

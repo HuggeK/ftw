@@ -42,6 +42,7 @@ func (s *Store) recordHomeObservation(driver string, kind DerType, w float64, da
 	if s.homeObservations == nil {
 		s.homeObservations = map[string][]ControlObservation{}
 		s.homeSourceTime = map[string]bool{}
+		s.homeIdleState = map[string]time.Time{}
 	}
 	p, ok := ControlPowerObservation(w, data, now)
 	var timing struct {
@@ -51,19 +52,32 @@ func (s *Store) recordHomeObservation(driver string, kind DerType, w float64, da
 	}
 	_ = json.Unmarshal(data, &timing)
 	sourceTime := timing.ControlPowerObservedAt != "" || timing.PowerObservedAt != "" || timing.ForecastPower != nil
-	if !ok || ((kind == DerEV || kind == DerV2X) && !sourceTime) {
+	idleState := time.Time{}
+	if ok && kind == DerEV && w == 0 && p.PowerW == 0 {
+		idleState = homeDisconnectedState(data, now)
+	}
+	if !ok || ((kind == DerEV || kind == DerV2X) && !sourceTime && idleState.IsZero()) {
 		delete(s.homeObservations, k)
 		delete(s.homeSourceTime, k)
+		delete(s.homeIdleState, k)
 		return
+	}
+	if !idleState.IsZero() {
+		// A confirmed disconnected poll supports a zero-EV-load estimate at
+		// receipt time. It does not refresh the old power/session observation.
+		// Bracket only these polls, and start over after any state transition.
+		p.At, sourceTime = now, false
+		delete(s.homeEnergy, k)
 	}
 	// A successful cloud request can return an old observation. The driver's
 	// control confirmation is not a new power timestamp and cannot extend it.
 	p.ConfirmedAt = time.Time{}
 	points := s.homeObservations[k]
-	if !s.health[driver].TelemetryLive() || s.homeSourceTime[k] != sourceTime {
+	if !s.health[driver].TelemetryLive() || s.homeSourceTime[k] != sourceTime || !s.homeIdleState[k].Equal(idleState) {
 		points = nil
 	}
 	s.homeSourceTime[k] = sourceTime
+	s.homeIdleState[k] = idleState
 	if len(points) > 0 {
 		last := &points[len(points)-1]
 		if p.At.Before(last.At) || p.At.Sub(last.At) > homeMaxGap {
@@ -88,6 +102,25 @@ func (s *Store) recordHomeObservation(driver string, kind DerType, w float64, da
 		points = points[len(points)-1024:]
 	}
 	s.homeObservations[k] = points
+}
+
+func homeDisconnectedState(data json.RawMessage, now time.Time) time.Time {
+	var d struct {
+		Connected             *bool  `json:"connected"`
+		Charging              *bool  `json:"charging"`
+		ControlPowerAvailable bool   `json:"control_power_available"`
+		ControlPowerConfirmed bool   `json:"control_power_confirmed"`
+		StateObservedAt       string `json:"state_observed_at"`
+		SessionID             string `json:"session_id"`
+	}
+	if json.Unmarshal(data, &d) != nil || d.Connected == nil || *d.Connected || d.Charging == nil || *d.Charging || !d.ControlPowerAvailable || !d.ControlPowerConfirmed || d.SessionID != "" {
+		return time.Time{}
+	}
+	at, err := time.Parse(time.RFC3339Nano, d.StateObservedAt)
+	if err != nil || at.After(now) {
+		return time.Time{}
+	}
+	return at
 }
 
 // HomeUseEstimate divides signed energy by a common reported interval. Prefer
@@ -118,7 +151,7 @@ func (s *Store) HomeUseEstimate(now time.Time, siteMeter string, opts ForecastOp
 	for k, source := range r.Sources {
 		points := s.homeObservations[k]
 		counter := s.homeEnergy[k]
-		if counter == nil && (source.Flow.DerType == DerEV || source.Flow.DerType == DerV2X) && !s.homeSourceTime[k] {
+		if counter == nil && (source.Flow.DerType == DerEV || source.Flow.DerType == DerV2X) && !s.homeSourceTime[k] && s.homeIdleState[k].IsZero() {
 			out.Reason = "charger_source_time_unavailable"
 			return out
 		}

@@ -298,6 +298,7 @@ type Store struct {
 	controlObservations map[string][]ControlObservation
 	homeObservations    map[string][]ControlObservation // display estimates only
 	homeSourceTime      map[string]bool                 // reported source time, otherwise receipt time
+	homeIdleState       map[string]time.Time            // disconnected state time; zero means unqualified
 	homeEnergy          map[string]*homeEnergySeries    // timestamped session counters, display only
 
 	processNoise     float64
@@ -791,6 +792,7 @@ func (s *Store) Remove(driver string) {
 		delete(s.controlObservations, key(driver, kind))
 		delete(s.homeObservations, key(driver, kind))
 		delete(s.homeSourceTime, key(driver, kind))
+		delete(s.homeIdleState, key(driver, kind))
 		delete(s.homeEnergy, key(driver, kind))
 	}
 	for k, c := range s.commands {
