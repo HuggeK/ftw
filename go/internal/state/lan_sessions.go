@@ -22,11 +22,22 @@ func lanPasswordBinding(encoded string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// Take the WAL writer before any read, including an existing-table schema
+// check. A deferred read transaction cannot wait when upgrading to a writer.
+// This leaves the stored password unchanged.
+func lockLANSessionWrite(tx *sql.Tx) error {
+	_, err := tx.Exec(`UPDATE config SET value=value WHERE key='lan_auth_password'`)
+	return err
+}
+
 func (s *Store) SaveLANSession(digest string, expiresMS, nowMS int64, verifiedPassword string) error {
 	if len(digest) != 64 || verifiedPassword == "" || expiresMS <= nowMS {
 		return errors.New("invalid LAN session")
 	}
 	return s.durableConfigWrite(func(tx *sql.Tx) error {
+		if err := lockLANSessionWrite(tx); err != nil {
+			return err
+		}
 		var current string
 		if err := tx.QueryRow(`SELECT value FROM config WHERE key='lan_auth_password'`).Scan(&current); err != nil {
 			return err
@@ -89,6 +100,9 @@ func (s *Store) DeleteAllLANSessions() error {
 
 func (s *Store) deleteLANSessions(digest *string) error {
 	return s.durableConfigWrite(func(tx *sql.Tx) error {
+		if err := lockLANSessionWrite(tx); err != nil {
+			return err
+		}
 		var exists int
 		if err := tx.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='lan_auth_sessions'`).Scan(&exists); err != nil || exists == 0 {
 			return err

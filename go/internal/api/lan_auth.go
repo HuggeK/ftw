@@ -7,6 +7,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -298,6 +299,23 @@ type lanAuthLoginRequest struct {
 	Password string `json:"password"`
 }
 
+// Keep storage diagnostics free of database paths and session credentials.
+func lanSessionStoreErrorCategory(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "deadline"
+	}
+	var coded interface{ Code() int }
+	if errors.As(err, &coded) {
+		switch coded.Code() & 0xff {
+		case 5:
+			return "sqlite_busy"
+		case 6:
+			return "sqlite_locked"
+		}
+	}
+	return "storage_error"
+}
+
 func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	var req lanAuthLoginRequest
 	if err := readJSON(r, &req); err != nil {
@@ -346,6 +364,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	lanSessionMu.Unlock()
 	if err := st.SaveLANSession(lanSessionDigest(token), now.Add(lanSessionTTL).UnixMilli(), now.UnixMilli(), encoded); err != nil {
 		dropLANSession(token)
+		slog.Warn("LAN session could not be saved", "category", lanSessionStoreErrorCategory(err))
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "could not save session"})
 		return
 	}
