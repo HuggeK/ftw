@@ -417,11 +417,13 @@ func classifyControlFeedback(f *ControlFeedback, cmd telemetry.CommandEvidence, 
 	}
 	// A positive clamp explains the lower offer, not prolonged zero delivery.
 	// Keep known safety pauses and unconfirmed/stale commands authoritative.
+	noPowerObserved := !cmd.NoPowerSince.IsZero() && cmd.NoPowerAt.Sub(cmd.NoPowerSince) >= 2*time.Minute
+	noPowerForCommand := !cmd.Since.IsZero() && now.Sub(cmd.Since) >= 2*time.Minute &&
+		!cmd.PowerMismatchSince.IsZero() && now.Sub(cmd.PowerMismatchSince) >= 2*time.Minute && f.ObservedAtMs >= cmd.Since.UnixMilli()
 	if f.Kind == "ev" && commanded && cmd.Result == "accepted" &&
 		coreReason != "site_meter_stale" && coreReason != "site_phase_currents_stale" && coreReason != "fuse_cooldown" &&
 		f.SentW != nil && *f.SentW > 100 && f.ActualW != nil && math.Abs(*f.ActualW) < 100 &&
-		f.OfferedA != nil && *f.OfferedA > 0 && !cmd.Since.IsZero() && now.Sub(cmd.Since) >= 2*time.Minute &&
-		!cmd.PowerMismatchSince.IsZero() && now.Sub(cmd.PowerMismatchSince) >= 2*time.Minute && f.ObservedAtMs >= cmd.Since.UnixMilli() {
+		f.OfferedA != nil && *f.OfferedA > 0 && (noPowerObserved || noPowerForCommand) {
 		set("warning", "no_power_response", "warning")
 		return
 	}

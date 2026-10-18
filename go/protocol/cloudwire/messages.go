@@ -62,7 +62,7 @@ var ClassScope = map[string]string{
 }
 
 // ServiceOnly are box messages the service acts on and never forwards.
-var ServiceOnly = []string{MsgHello, MsgRoster, MsgBye, MsgNotice}
+var ServiceOnly = []string{MsgHello, MsgRoster, MsgBye, MsgNotice, MsgStats}
 
 // Clock values for hello.clock and hb.clock.
 const (
@@ -106,7 +106,8 @@ type Challenge struct {
 // HelloOK answers hello. The service signs it, and the box sends nothing but
 // hello before it has checked it.
 type HelloOK struct {
-	BoxNonce []byte `cbor:"boxNonce"`
+	StatsPolicy string `cbor:"statsPolicy,omitempty"`
+	BoxNonce    []byte `cbor:"boxNonce"`
 	// EKM is the service's TLS exporter value for this session. A proxy that
 	// ends TLS holds two sessions with two values, so the check fails there.
 	EKM []byte `cbor:"ekm"`
@@ -393,10 +394,14 @@ type Pending struct {
 // id, scopes or purposes. While a revoke waits for its receipt it keeps the
 // id and has neither scopes nor purposes.
 type Grant struct {
-	ID         []byte   `cbor:"id"`
-	Scopes     []string `cbor:"scopes"`
-	Purposes   []string `cbor:"purposes"`
-	Controller string   `cbor:"controller"`
+	TermsPolicy  string   `cbor:"termsPolicy,omitempty"`
+	ID           []byte   `cbor:"id"`
+	Scopes       []string `cbor:"scopes"`
+	Purposes     []string `cbor:"purposes"`
+	Controller   string   `cbor:"controller"`
+	StatsID      []byte   `cbor:"statsId,omitempty"`
+	StatsPolicy  string   `cbor:"statsPolicy,omitempty"`
+	StatsSinceMs int64    `cbor:"statsSinceMs,omitempty"`
 }
 
 // Notice is a security notice for the owners: a push kind from the

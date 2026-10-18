@@ -319,10 +319,13 @@ type State struct {
 	// Peak limit — enforced only in PeakShaving mode
 	PeakLimitW float64
 
-	// PeakImportCeilingW is an import cap in every mode, at or below the
-	// fuse. Zero disables it. The battery covers the overrun while the EV
-	// ramps, then stops. Export and the per-phase clamp still use the fuse.
+	// PeakImportCeilingW caps the mean import over each local clock hour,
+	// in every mode. Zero disables it. The hour's budget sets the import
+	// limit (import_hour.go); the fuse stays an instant limit. Export and
+	// the per-phase clamp use the fuse only.
 	PeakImportCeilingW float64
+	importHour         hourImport
+	importHourZone     *time.Location // nil: the box's zone
 
 	// MaxExportW is an export cap in every mode, in watts of magnitude.
 	// Zero leaves only the fuse. Ferroamp EnergyHub 0x8030 trips after
@@ -367,10 +370,21 @@ type State struct {
 	// It reserves site capacity before optional battery charging, even before
 	// an EV ramps up and in modes without an accepted optimizer plan.
 	EVCommandedW float64
+	// evCommanded is the same offers per charger driver; SetEVCommanded
+	// keeps both.
+	evCommanded map[string]float64
 	// evFuseDemands keeps this tick's intent before the fuse clamp so optional
 	// battery charging yields even when the EV cannot start yet.
 	evFuseDemands    []evFuseDemand
 	evFuseDemandsSet bool
+	// evLimit is the EVs' meter-driven hard cap, kept between site readings.
+	evLimit evMeterLimit
+	// fuseHeat is the main fuse's heat per phase, from site readings only.
+	fuseHeat fuseHeat
+	// evOffers and batteryCommands are our own recent commands, the only
+	// device input the EV hard limit and the EV/battery split use.
+	evOffers        commandLog
+	batteryCommands map[string]commandLog
 
 	// PI controller (outer, site-level)
 	PI *PIController
@@ -532,8 +546,6 @@ type State struct {
 	// command so battery and EV cooperatively share the fuse budget.
 	// Recomputed every dispatch tick.
 	FuseEVMaxW float64
-	// Caller holds the control lock; diagnostic output is limited to once per minute.
-	evFuseEvidenceAt time.Time
 	// FuseSaturated signals that the joint allocator had to scale battery
 	// and/or EV demand to fit under the fuse this tick. Used to gate the
 	// loadpoint controller's read of FuseEVMaxW and as the trigger for
@@ -2030,10 +2042,11 @@ func ComputeDispatch(
 	state.FuseEVMaxW = 0
 	state.FuseSaturated = false
 	plannedEVW := scheduledEVPowerW(state)
-	if fuseMaxW > 0 && math.Max(state.EVChargingW, plannedEVW) > 0 {
+	evInMeterW := state.evInMeterW()
+	if fuseMaxW > 0 && math.Max(evInMeterW, plannedEVW) > 0 {
 		// Use the effective import ceiling (fuse minus safety margin,
-		// or tariff peak when tighter) so PeakImportCeilingW throttles
-		// the EV through the same surface as the fuse. Steady-state
+		// or the hour's import limit when tighter) so PeakImportCeilingW
+		// throttles the EV through the same surface as the fuse. Steady-state
 		// with peak active and BatteryCoversEV=false: the EV settles
 		// at this scaled rate; the battery's transient discharge to
 		// bridge the ramp-down is handled by forceFuseDischarge below.
@@ -2041,13 +2054,13 @@ func ComputeDispatch(
 		targetTotal := currentTotal + totalCorrection
 		B := math.Max(0, targetTotal)
 		Bn := math.Min(0, targetTotal)
-		E := math.Max(state.EVChargingW, plannedEVW)
-		H := rawGridW - currentTotal - state.EVChargingW
+		E := math.Max(evInMeterW, plannedEVW)
+		H := rawGridW - currentTotal - evInMeterW
 		projectedGrid := H + targetTotal + E
 		if projectedGrid > ceilingW && (B+E) > 0 {
 			if plannedEVW > 0 {
 				// A timed EV goal takes its share before optional battery charge.
-				available := evHeadroomW(ceilingW, rawGridW-currentTotal+Bn, state.EVChargingW)
+				available := evHeadroomW(ceilingW, rawGridW-currentTotal+Bn, evInMeterW)
 				state.FuseEVMaxW = math.Min(E, available)
 				newBattery := Bn + math.Min(B, math.Max(0, available-state.FuseEVMaxW))
 				totalCorrection = newBattery - currentTotal
@@ -2394,8 +2407,7 @@ func republishFuseEVCapAfterFuseDischarge(targets []DispatchTarget, store *telem
 		return
 	}
 	peakBindingW := fuseMaxW - state.fuseSafetyMarginW()
-	peakBinding := state.PeakImportCeilingW > 0 && state.PeakImportCeilingW < peakBindingW
-	if peakBinding {
+	if state.effectiveImportCeilingW(fuseMaxW) < peakBindingW {
 		return
 	}
 
@@ -2437,6 +2449,13 @@ func recordDispatchTargets(targets []DispatchTarget, state *State, updatePrevTar
 	if recordDispatch {
 		now := state.now()
 		state.LastDispatch = &now
+		if state.batteryCommands == nil {
+			state.batteryCommands = map[string]commandLog{}
+		}
+		for _, t := range targets {
+			state.batteryCommands[t.Driver] = state.batteryCommands[t.Driver].add(now, t.TargetW)
+		}
+		state.evOffers = state.evOffers.add(now, math.Max(0, state.EVCommandedW))
 	}
 	if updatePrevTargets {
 		for _, t := range targets {
@@ -3590,7 +3609,7 @@ func applyFuseGuard(targets []DispatchTarget, store *telemetry.Store, state *Sta
 	// own per-phase limiter doesn't fire first and cause a flap.
 	//
 	// Import ceiling is the tighter of (fuse − safety margin) and the
-	// operator's tariff peak; export ceiling is the tighter of (fuse −
+	// clock hour's import limit; export ceiling is the tighter of (fuse −
 	// safety margin) and the operator's max_export_w protection limit —
 	// set when an inverter trips on sustained export below the breaker
 	// (recurring Ferroamp 0x8030 fault). Both share one enforcement surface.
@@ -3754,22 +3773,21 @@ func (s *State) fuseSafetyMarginW() float64 {
 }
 
 // effectiveImportCeilingW returns the binding ceiling for grid import in
-// watts: the fuse limit minus its safety margin, further capped by
-// PeakImportCeilingW when the operator has opted into a tariff peak
-// (PeakImportCeilingW > 0). Used by every import-side clamp in the
-// dispatch path so peak and fuse share one enforcement surface.
+// watts: the fuse limit minus its safety margin, further capped by the
+// clock hour's import limit when the operator has opted into a tariff
+// ceiling (PeakImportCeilingW > 0). Used by every import-side clamp in the
+// dispatch path so the hour's budget and the fuse share one surface.
 //
-// Peak is taken at face value (no additional safety subtraction) — the
-// operator typed the contract limit, so the controller honours exactly
-// that. The fuse retains its independent safety margin because it
+// The hour's budget is the ceiling at face value — the operator typed the
+// contract limit. The fuse retains its independent safety margin because it
 // guards against a hardware breaker, not a billing line.
 func (s *State) effectiveImportCeilingW(fuseMaxW float64) float64 {
 	eff := fuseMaxW - s.fuseSafetyMarginW()
 	if eff < 0 {
 		eff = 0
 	}
-	if s != nil && s.PeakImportCeilingW > 0 && s.PeakImportCeilingW < eff {
-		eff = s.PeakImportCeilingW
+	if limitW, _, ok := s.importHourLimitsW(); ok && limitW < eff {
+		eff = limitW
 	}
 	return eff
 }
@@ -4435,10 +4453,17 @@ func fuseReliefFromSnapshot(
 		currentGrid = meter.SmoothedW
 	}
 
-	// The effective import ceiling includes both the fuse margin and an
-	// optional tariff peak. Per-phase relief remains fuse-only and may act only
-	// while the matching aggregate meter sample is on the import side.
-	overage := predicted - state.effectiveImportCeilingW(fuseMaxW)
+	// The fuse acts on every reading. The hour's import limit is a budget:
+	// the part of its overage that an EV cut we sent will remove waits for
+	// that cut while the meter may not show it yet. Relief for the same watts
+	// would discharge the battery into export once the cut lands (#1674).
+	// Per-phase relief remains fuse-only and may act only while the matching
+	// aggregate meter sample is on the import side.
+	fuseW := math.Max(0, fuseMaxW-state.fuseSafetyMarginW())
+	overage := predicted - fuseW
+	if ceilingW := state.effectiveImportCeilingW(fuseMaxW); ceilingW < fuseW {
+		overage = math.Max(overage, predicted-ceilingW-state.pendingEVCutW())
+	}
 	if currentGrid >= 0 {
 		relief := perPhaseOverageReadingW(meter, state) * float64(state.SiteFusePhases)
 		if relief > 0 && accountPhaseTargetDelta {
@@ -4583,4 +4608,15 @@ func forceFuseDischargeWithSnapshot(
 		out[s.idx].Clamped = true
 	}
 	return out
+}
+
+// evInMeterW is EV load the meter is sure to contain: the operator's declared
+// load plus the lowest managed offer of the last evSettle. This tick's new
+// offer is not in it yet. Charger readings take no part in the fuse share.
+func (s *State) evInMeterW() float64 {
+	low, _, _, ok := s.evOffers.span(s.now())
+	if !ok {
+		low = 0
+	}
+	return s.ManualEVChargingW + math.Max(0, low)
 }

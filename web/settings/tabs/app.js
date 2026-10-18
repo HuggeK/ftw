@@ -362,6 +362,12 @@
   // a pairing code still on screen, and the reverse. Every button here goes
   // through this, so the rule is not something a caller has to remember.
   function requestCode(opts, button, busyText, doneText) {
+    if(window.FTWStatistics && !window.FTWStatistics.cloudAccepted()) {
+      setStatus("Accept the Cloud terms above before pairing a phone. Statistics are included with Cloud.");
+      window.FTWStatistics.refresh();
+      return;
+    }
+
     var slot = document.getElementById("app-link-slot");
     if (!button || !slot) return;
 
@@ -439,9 +445,14 @@
         if (toggle) toggle.addEventListener("change", function () { refreshStatus(ctx); });
 
         refreshStatus(ctx);
+        if(window.FTWStatistics) {
+          var statistics=document.querySelector("[data-project-statistics-settings]");
+          if(statistics)window.FTWStatistics.mount(statistics);
+        }
       }, 0);
 
       return (
+        '<div data-project-statistics-settings></div>' +
         "<fieldset><legend>The FTW app</legend>" +
         '<p class="hint">This is not the Sourceful (Zap) app. The FTW app at ' +
         "app.ftw.energy talks to this box when you are away. On the same Wi-Fi you " +

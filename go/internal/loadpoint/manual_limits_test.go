@@ -40,8 +40,8 @@ func TestPauseHoldsThroughCarRefusalAndResumesOnlyOnRequest(t *testing.T) {
 	}
 	c.SetManualHold(cfg.ID, ManualHold{PowerW: 4140, PhaseMode: "3p", Persistent: true})
 	c.Tick(context.Background(), now.Add(time.Hour+time.Second))
-	if got := sender.calls[len(sender.calls)-1].power; got != 4140 {
-		t.Fatalf("explicit start failed without planner: %v", got)
+	if last, ok := lastSetCurrent(sender.calls); !ok || last.power != 4140 {
+		t.Fatalf("explicit start failed without planner: %+v", sender.calls)
 	}
 }
 

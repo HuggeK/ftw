@@ -215,7 +215,8 @@ type fakeService struct {
 	transports map[string]int
 	// kick drops this many connections right after hello_ok, so the box
 	// dials again.
-	kick int
+	kick        int
+	statsPolicy string
 	// usedEarly says, per QUIC connection, whether it took early data.
 	usedEarly []bool
 }
@@ -326,7 +327,7 @@ func (s *fakeService) serve(conn uplinkConn, ekm []byte) {
 		signer, _ = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	}
 	s.write(conn, signer, home, cloudwire.MsgHelloOK, cloudwire.HelloOK{
-		BoxNonce: hello.BoxNonce, EKM: okEKM, Have: map[string]string{}, RosterSeq: s.rosterSeqOK})
+		BoxNonce: hello.BoxNonce, EKM: okEKM, Have: map[string]string{}, RosterSeq: s.rosterSeqOK, StatsPolicy: s.statsPolicy})
 	if s.afterHello != nil {
 		go s.afterHello(conn, home)
 	}
@@ -1169,11 +1170,11 @@ func TestStatisticsAreASecondConsentUnderTheGrant(t *testing.T) {
 		t.Fatalf("grant record %+v", g)
 	}
 
-	// Asked again, the same id.
+	// A new policy needs a new id and consent start.
 	if err := h.link.Stats(StatsRequest{Policy: "stats-2026-11"}); err != nil {
 		t.Fatal(err)
 	}
-	if again := h.record(t); !bytes.Equal(again.StatsID, g.StatsID) || again.StatsPolicy != "stats-2026-11" {
+	if again := h.record(t); bytes.Equal(again.StatsID, g.StatsID) || again.StatsPolicy != "stats-2026-11" {
 		t.Fatalf("statsId %x became %x", g.StatsID, again.StatsID)
 	}
 

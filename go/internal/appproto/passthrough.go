@@ -31,6 +31,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/srcfl/ftw/go/internal/apiauth"
@@ -156,10 +157,19 @@ func (h *Handler) onAPIReq(env Envelope) error {
 		})
 	}
 
+	// The slot comes back just before the answer's last frame goes out, not
+	// after it. The app asks again the moment an answer ends; freed after the
+	// frame, the box could refuse that as busy, and the view that lost the
+	// race would wait out a backoff. Any other path (a revoke, a failed send,
+	// an answer refused while its handler still runs) frees the slot when
+	// this goroutine ends, and the Once stops that from freeing a later
+	// request's slot.
 	id := *env.ID
 	go func() {
-		defer h.apiBusy.Store(false)
-		if err := h.serveAPI(id, req); err != nil {
+		var once sync.Once
+		free := func() { once.Do(func() { h.apiBusy.Store(false) }) }
+		defer free()
+		if err := h.serveAPI(id, req, free); err != nil {
 			h.log.Warn("api passthrough failed", "err", err)
 		}
 	}()
@@ -200,7 +210,9 @@ func badAPIRequest(req APIReq) string {
 // Serving it
 // --------------------------------------------------------------------------
 
-func (h *Handler) serveAPI(id uint32, req APIReq) error {
+// free hands the one-at-a-time slot back. serveAPI calls it just before the
+// last frame of an answer, and only once the handler has returned.
+func (h *Handler) serveAPI(id uint32, req APIReq, free func()) error {
 	ctx, cancel := context.WithTimeout(h.ctx, apiHandlerTimeout)
 	defer cancel()
 
@@ -225,6 +237,7 @@ func (h *Handler) serveAPI(id uint32, req APIReq) error {
 		h.log.Info("api passthrough refused",
 			"subject", caller.Subject, "method", req.Method, "path", req.Path,
 			"tier", facts.Tier, "code", refusal.Code)
+		free()
 		return h.sendError(&id, *refusal)
 	}
 
@@ -241,7 +254,7 @@ func (h *Handler) serveAPI(id uint32, req APIReq) error {
 		max = req.MaxBytes
 	}
 	writer := &apiWriter{
-		h: h, id: id, ctx: ctx, max: max, header: http.Header{},
+		h: h, id: id, ctx: ctx, max: max, free: free, header: http.Header{},
 		buf: make([]byte, 0, APIChunkBytes),
 	}
 	h.serveHandler(writer, request)
@@ -457,10 +470,11 @@ func buildAPIRequest(ctx context.Context, caller apiauth.Caller, req APIReq) *ht
 
 // apiWriter turns an http.ResponseWriter into api.head, api.chunk and api.end.
 type apiWriter struct {
-	h   *Handler
-	id  uint32
-	ctx context.Context
-	max int64
+	h    *Handler
+	id   uint32
+	ctx  context.Context
+	max  int64
+	free func()
 
 	header    http.Header
 	buf       []byte
@@ -595,6 +609,7 @@ func (w *apiWriter) finish() error {
 			if w.panicked {
 				reason = "handler"
 			}
+			w.free()
 			return w.h.sendError(&w.id, ErrorBody{
 				Code:      ErrUnavailable,
 				Retryable: ErrorRetryable[ErrUnavailable],
@@ -618,6 +633,7 @@ func (w *apiWriter) finish() error {
 	// middle. The app is committed to the status by then, so the only honest
 	// thing left to say is that this is not the whole of it.
 	truncated := w.truncated || w.ctx.Err() != nil || w.panicked
+	w.free()
 	return w.h.sendBulk(MsgAPIEnd, &w.id, APIEnd{Bytes: w.written, Truncated: truncated})
 }
 

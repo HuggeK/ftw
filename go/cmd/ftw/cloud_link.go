@@ -63,6 +63,13 @@ type plugSession struct {
 	n       int
 }
 
+func (c *cloudSite) Statistics(ctx context.Context, now time.Time) (cloudwire.Stats, bool) {
+	if srv := c.api.srv.Load(); srv != nil {
+		return srv.CloudStatistics(ctx, now)
+	}
+	return cloudwire.Stats{}, false
+}
+
 func (c *cloudSite) Live() cloudlink.Live {
 	snap := c.site.Snapshot()
 	uptime := time.Since(c.site.started).Milliseconds()

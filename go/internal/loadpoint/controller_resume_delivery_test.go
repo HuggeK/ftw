@@ -28,8 +28,8 @@ func TestResumeRequiresSustainedMeaningfulDelivery(t *testing.T) {
 			resumes := 0
 			c := &Controller{send: func(context.Context, string, []byte) error { resumes++; return nil }}
 			sample := EVSample{DeviceID: "box", SessionID: "one", ConnectionGeneration: 1}
-			c.resumeAfterZeroOffer(context.Background(), cfg, sample, 0, now)
-			c.resumeAfterZeroOffer(context.Background(), cfg, sample, tc.offer, now.Add(time.Second))
+			c.recoverOfferedCharge(context.Background(), cfg, sample, 0, now)
+			c.recoverOfferedCharge(context.Background(), cfg, sample, tc.offer, now.Add(time.Second))
 			for _, seconds := range []int{5, 10, 15} {
 				sample.PowerW = tc.power
 				sample.PowerUnavailable = tc.unavailable
@@ -40,7 +40,7 @@ func TestResumeRequiresSustainedMeaningfulDelivery(t *testing.T) {
 				if tc.gap && seconds == 10 {
 					sample.PowerW = 0
 				}
-				c.resumeAfterZeroOffer(context.Background(), cfg, sample, tc.offer, now.Add(time.Duration(seconds)*time.Second))
+				c.recoverOfferedCharge(context.Background(), cfg, sample, tc.offer, now.Add(time.Duration(seconds)*time.Second))
 			}
 			_, exists := c.resumeOffers[cfg.ID]
 			if exists == tc.clear {
@@ -49,7 +49,7 @@ func TestResumeRequiresSustainedMeaningfulDelivery(t *testing.T) {
 			sample.PowerW = 0
 			sample.PowerUnavailable = false
 			sample.PowerAt = now.Add(35 * time.Second)
-			c.resumeAfterZeroOffer(context.Background(), cfg, sample, tc.offer, now.Add(35*time.Second))
+			c.recoverOfferedCharge(context.Background(), cfg, sample, tc.offer, now.Add(35*time.Second))
 			want := 2
 			if tc.clear {
 				want = 1
