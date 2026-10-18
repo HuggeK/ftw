@@ -83,6 +83,9 @@ type Snapshot struct {
 	PVW      float64
 	BatteryW float64
 	LoadW    float64
+	// LoadWKnown says Core has a valid live load estimate. Unknown load is
+	// omitted from field 6; a known zero remains a real reading.
+	LoadWKnown bool
 	// BatterySoC is a fraction in [0,1], per the SI rule. The wire carries
 	// permille, converted at the edge of this package.
 	BatterySoC float64

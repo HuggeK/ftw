@@ -143,19 +143,19 @@ func (s *Server) handleSupportReport(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(body))
 }
 
-// liveSnapshot is the aggregated site state the report needs. It mirrors
-// handleStatus's aggregation but deliberately skips Tel.UpdateLoad — that
-// call mutates the shared smoothing filter, and generating a report must
-// not perturb control inputs. The unsmoothed value is what we want anyway:
-// a report should show the instant, not a filtered version of it.
+// liveSnapshot adds forecast context to the same qualified live power that
+// the LAN dashboard and app receive. Reading a report changes no telemetry.
 type liveSnapshot struct {
 	GridW       float64
 	HaveGrid    bool
 	PVW         float64
+	HavePV      bool
 	BatW        float64
+	HaveBattery bool
 	EVW         float64
 	V2XW        float64
 	LoadW       float64
+	HaveLoad    bool
 	SoCPct      float64
 	HaveSoC     bool
 	PredictedPV float64
@@ -163,25 +163,22 @@ type liveSnapshot struct {
 }
 
 func (s *Server) liveNow(ctrl control.State, now time.Time) liveSnapshot {
-	var snap liveSnapshot
-	if statusDriverTelemetryUsable(s.deps.Tel, ctrl.SiteMeterDriver) {
-		if r := s.deps.Tel.Get(ctrl.SiteMeterDriver, telemetry.DerMeter); r != nil {
-			snap.GridW = r.SmoothedW
-			snap.HaveGrid = true
-		}
+	var opts telemetry.ForecastOptions
+	if s.deps.HistoryMeasurementSources != nil {
+		opts = s.deps.HistoryMeasurementSources()
 	}
-	for _, r := range s.deps.Tel.ReadingsByType(telemetry.DerPV) {
-		if h := s.deps.Tel.DriverHealth(r.Driver); h == nil || !h.IsOnline() {
-			continue
-		}
-		snap.PVW += r.SmoothedW
+	live := s.deps.Tel.LiveMeasurementNow(ctrl.SiteMeterDriver, opts)
+	snap := liveSnapshot{
+		GridW: live.GridW, HaveGrid: live.Known[telemetry.DerMeter],
+		PVW: live.PVW, HavePV: live.Known[telemetry.DerPV],
+		BatW: live.BatteryW, HaveBattery: live.Known[telemetry.DerBattery],
+		EVW: live.EVW, V2XW: live.V2XW, LoadW: live.HouseholdW, HaveLoad: live.Valid,
 	}
 	var socSum, socWeight float64
 	for _, r := range s.deps.Tel.ReadingsByType(telemetry.DerBattery) {
 		if h := s.deps.Tel.DriverHealth(r.Driver); h == nil || !h.IsOnline() {
 			continue
 		}
-		snap.BatW += r.SmoothedW
 		if r.SoC != nil {
 			socSum += *r.SoC
 			socWeight++
@@ -190,14 +187,6 @@ func (s *Server) liveNow(ctrl control.State, now time.Time) liveSnapshot {
 	if socWeight > 0 {
 		snap.SoCPct = socSum / socWeight * 100
 		snap.HaveSoC = true
-	}
-	snap.EVW = s.deps.Tel.SumOnlineEVW()
-	snap.V2XW = s.deps.Tel.SumOnlineV2XW()
-	if snap.HaveGrid {
-		snap.LoadW = snap.GridW - snap.BatW - snap.PVW - snap.EVW - snap.V2XW
-		if snap.LoadW < 0 {
-			snap.LoadW = 0
-		}
 	}
 	if s.deps.PVModel != nil {
 		snap.PredictedPV = -s.deps.PVModel.PredictNow()
@@ -326,9 +315,9 @@ func writeRightNow(
 	} else {
 		b.WriteString("| Grid | **no site meter reading** |\n")
 	}
-	fmt.Fprintf(b, "| Solar | %s |\n", fmtReportW(snap.PVW))
-	fmt.Fprintf(b, "| House load | %s |\n", fmtReportW(snap.LoadW))
-	fmt.Fprintf(b, "| Battery | %s |\n", fmtReportW(snap.BatW))
+	fmt.Fprintf(b, "| Solar | %s |\n", fmtReportLiveW(snap.PVW, snap.HavePV))
+	fmt.Fprintf(b, "| House load | %s |\n", fmtReportLiveW(snap.LoadW, snap.HaveLoad))
+	fmt.Fprintf(b, "| Battery | %s |\n", fmtReportLiveW(snap.BatW, snap.HaveBattery))
 	if snap.EVW != 0 {
 		fmt.Fprintf(b, "| EV | %s |\n", fmtReportW(snap.EVW))
 	}
@@ -354,13 +343,13 @@ func writeRightNow(
 			end.Format("15:04"),
 			fmtReportW(activeSlot.BatteryW),
 			activeSlot.Reason)
-		if delta := math.Abs(activeSlot.BatteryW - snap.BatW); delta > 500 {
+		if delta := math.Abs(activeSlot.BatteryW - snap.BatW); snap.HaveBattery && delta > 500 {
 			fmt.Fprintf(b, "The battery is **%s away from that intent** "+
 				"(planned %s, actual %s). A gap this size is either a "+
 				"safety clamp, a device that cannot follow the command, or "+
 				"a plan replaced since the slot began — check the replan "+
 				"reason in `Plan`.\n\n",
-				fmtReportW(delta), fmtReportW(activeSlot.BatteryW), fmtReportW(snap.BatW))
+				fmtReportW(delta), fmtReportW(activeSlot.BatteryW), fmtReportLiveW(snap.BatW, snap.HaveBattery))
 		}
 	} else {
 		b.WriteString("No plan slot covers this moment.\n\n")
@@ -497,14 +486,14 @@ func writeForecastSection(b *strings.Builder, s *Server, snap liveSnapshot, acti
 
 	b.WriteString("| Quantity | Forecast | Actual now |\n|---|---|---|\n")
 	fmt.Fprintf(b, "| House load | %s | %s |\n",
-		fmtReportW(snap.PredictedLd), fmtReportW(snap.LoadW))
+		fmtReportW(snap.PredictedLd), fmtReportLiveW(snap.LoadW, snap.HaveLoad))
 	fmt.Fprintf(b, "| Solar | %s | %s |\n",
-		fmtReportW(snap.PredictedPV), fmtReportW(snap.PVW))
+		fmtReportW(snap.PredictedPV), fmtReportLiveW(snap.PVW, snap.HavePV))
 	if activeSlot != nil {
 		fmt.Fprintf(b, "| Load the active slot assumed | %s | %s |\n",
-			fmtReportW(activeSlot.LoadW), fmtReportW(snap.LoadW))
+			fmtReportW(activeSlot.LoadW), fmtReportLiveW(snap.LoadW, snap.HaveLoad))
 		fmt.Fprintf(b, "| Solar the active slot assumed | %s | %s |\n",
-			fmtReportW(activeSlot.PVW), fmtReportW(snap.PVW))
+			fmtReportW(activeSlot.PVW), fmtReportLiveW(snap.PVW, snap.HavePV))
 	}
 	b.WriteString("\n")
 
@@ -722,6 +711,12 @@ func (s *Server) collectFindings(
 				"guesswork until the meter reports again."})
 	}
 
+	if !snap.HaveLoad {
+		out = append(out, finding{sevWarning, "Household load is unavailable",
+			"The required power measurements do not form a valid balance. " +
+				"Load forecast comparisons are skipped until that balance is available."})
+	}
+
 	if ctrl.PlanStale {
 		out = append(out, finding{sevProblem, "The plan is stale",
 			"The planner has not produced a usable plan, so control fell back " +
@@ -757,34 +752,34 @@ func (s *Server) collectFindings(
 			"so expect this to close on its own over the first weeks. A reset " +
 			"would only start that clock again."
 	}
-	if forecastMiss(snap.PredictedLd, snap.LoadW) {
+	if snap.HaveLoad && forecastMiss(snap.PredictedLd, snap.LoadW) {
 		out = append(out, finding{forecastSeverity, "The load forecast is far from reality",
 			fmt.Sprintf("The model predicts %s for right now; the house is "+
 				"drawing %s. The planner sized this slot against the forecast, "+
 				"so its charge and discharge decisions are built on the wrong "+
 				"house.%s",
-				fmtReportW(snap.PredictedLd), fmtReportW(snap.LoadW), learningNote)})
-	} else if activeSlot != nil && forecastMiss(activeSlot.LoadW, snap.LoadW) {
+				fmtReportW(snap.PredictedLd), fmtReportLiveW(snap.LoadW, snap.HaveLoad), learningNote)})
+	} else if snap.HaveLoad && activeSlot != nil && forecastMiss(activeSlot.LoadW, snap.LoadW) {
 		out = append(out, finding{forecastSeverity, "The active slot assumed a different house",
 			fmt.Sprintf("This slot was planned for a load of %s; actual load is "+
 				"%s. Expect the live setpoint to diverge from the plan, and "+
 				"expect frequent replans.%s",
-				fmtReportW(activeSlot.LoadW), fmtReportW(snap.LoadW), learningNote)})
+				fmtReportW(activeSlot.LoadW), fmtReportLiveW(snap.LoadW, snap.HaveLoad), learningNote)})
 	}
 
-	if activeSlot != nil && forecastMiss(math.Abs(activeSlot.PVW), math.Abs(snap.PVW)) {
+	if snap.HavePV && activeSlot != nil && forecastMiss(math.Abs(activeSlot.PVW), math.Abs(snap.PVW)) {
 		out = append(out, finding{sevWarning, "The solar forecast is far from reality",
 			fmt.Sprintf("This slot was planned for %s of solar; actual is %s.",
-				fmtReportW(activeSlot.PVW), fmtReportW(snap.PVW))})
+				fmtReportW(activeSlot.PVW), fmtReportLiveW(snap.PVW, snap.HavePV))})
 	}
 
-	if activeSlot != nil {
+	if snap.HaveBattery && activeSlot != nil {
 		if delta := math.Abs(activeSlot.BatteryW - snap.BatW); delta > 1000 {
 			out = append(out, finding{sevWarning, "The battery is not following the plan",
 				fmt.Sprintf("The slot intends %s, the battery is doing %s. "+
 					"Either safety clamped it, the device cannot deliver, or "+
 					"a replan changed the plan after this slot started.",
-					fmtReportW(activeSlot.BatteryW), fmtReportW(snap.BatW))})
+					fmtReportW(activeSlot.BatteryW), fmtReportLiveW(snap.BatW, snap.HaveBattery))})
 		}
 	}
 
@@ -984,6 +979,13 @@ func isActiveAction(a *mpc.Action, now time.Time) bool {
 	end := start + int64(a.SlotLenMin)*60_000
 	ms := now.UnixMilli()
 	return ms >= start && ms < end
+}
+
+func fmtReportLiveW(v float64, known bool) string {
+	if !known {
+		return "**unavailable**"
+	}
+	return fmtReportW(v)
 }
 
 func fmtReportW(v float64) string {

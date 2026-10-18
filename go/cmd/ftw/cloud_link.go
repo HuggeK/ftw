@@ -388,16 +388,14 @@ func (n *cloudNotices) notify(kind string) {
 func startCloudLink(
 	ctx context.Context, statePath, build string, st *state.Store, enroll *appenroll.Identity,
 	tel *telemetry.Store, ctrl *control.State, ctrlMu *sync.Mutex, revision *control.Revision,
-	siteMeterStale time.Duration, priceSvc *prices.Service, gateway *lateAPI, notices *cloudNotices,
+	siteMeterStale time.Duration, measurementOptions func() telemetry.ForecastOptions, priceSvc *prices.Service, gateway *lateAPI, notices *cloudNotices,
 	tunnel *appuplink.Tunnel, carsRT *cars.Runtime, webPush *notifications.WebPush,
 ) *cloudlink.Link {
 	if st == nil || enroll == nil {
 		return nil
 	}
-	site := &cloudSite{api: gateway, cars: carsRT, site: &appSite{
-		tel: tel, ctrl: ctrl, ctrlMu: ctrlMu, revision: revision,
-		started: processStarted, siteMeterStale: siteMeterStale,
-	}}
+	site := &cloudSite{api: gateway, cars: carsRT,
+		site: newAppSite(tel, ctrl, ctrlMu, revision, siteMeterStale, measurementOptions)}
 	if priceSvc != nil && priceSvc.Zone != "" && priceSvc.Store != nil {
 		site.prices = &appPrices{svc: priceSvc}
 	}

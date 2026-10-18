@@ -302,6 +302,7 @@ func newRigWith(t *testing.T, prefs PlannerPrefs) (*Handler, *fakeBox, *recorder
 			PVW:             -3400,
 			BatteryW:        900,
 			LoadW:           3700,
+			LoadWKnown:      true,
 			BatterySoC:      0.62,
 			BatterySoCKnown: true,
 			Sources: []Source{

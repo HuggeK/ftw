@@ -827,6 +827,9 @@ func main() {
 		return state.Device{}
 	}
 	forecastSettings := newForecastSiteConfig(st)
+	liveMeasurementOptions := func() telemetry.ForecastOptions {
+		return forecastSettings.Snapshot().HistoryOptions
+	}
 	forecastSettings.identity = func(name string) (string, bool) {
 		if id, ok := runningDeviceID(reg, name); ok {
 			return id, true
@@ -1037,7 +1040,7 @@ func main() {
 	// the broker did not accept. Its start closure reads the registry and
 	// control wiring only when it runs.
 	haOwner := newHABridgeOwner(func(c *config.HomeAssistant, names []string) (haBridgeHandle, error) {
-		b, err := ha.Start(c, tel, ctrl, ctrlMu, names, haCallbacks(ctrl, ctrlMu, st, mpcSvc, plannerPrefs), mpcPlanSource(mpcSvc), haEnergySource(st))
+		b, err := ha.Start(c, tel, ctrl, ctrlMu, names, haCallbacks(ctrl, ctrlMu, st, mpcSvc, plannerPrefs), mpcPlanSource(mpcSvc), haEnergySource(st), liveMeasurementOptions)
 		if err != nil {
 			return nil, err
 		}
@@ -2403,7 +2406,7 @@ func main() {
 	appEnroll, appUplink, appLinkEnabled, appLinkErr := startAppLink(
 		ctx, cfg, identityKeyPath, boxID, Version,
 		st, tel, mpcSvc, lpMgr, lpController, carsRT, priceSvc, ctrl, ctrlMu, plannerPrefs,
-		controlRev, appLinkWatchdog, appAPI, appCloud, agents,
+		controlRev, appLinkWatchdog, liveMeasurementOptions, appAPI, appCloud, agents,
 	)
 	switch {
 	case appLinkErr != nil:
@@ -2424,7 +2427,7 @@ func main() {
 		appTunnel = appUplink.Tunnel()
 	}
 	cloudLink := startCloudLink(ctx, statePath, Version, st, appEnroll,
-		tel, ctrl, ctrlMu, controlRev, appLinkWatchdog, priceSvc, appAPI, cloudNotify, appTunnel, carsRT, webPush)
+		tel, ctrl, ctrlMu, controlRev, appLinkWatchdog, liveMeasurementOptions, priceSvc, appAPI, cloudNotify, appTunnel, carsRT, webPush)
 	appCloud.bind(cloudLink)
 	if cloudLink != nil {
 		agents.home = cloudLink.Home
@@ -2501,7 +2504,7 @@ func main() {
 		SiteDispatchBlocked: func() string {
 			return siteDispatchNow(tel, cfg, cfgMu, ctrl, ctrlMu, time.Now()).Reason
 		},
-		HistoryMeasurementSources: func() telemetry.ForecastOptions { return forecastSettings.Snapshot().HistoryOptions },
+		HistoryMeasurementSources: liveMeasurementOptions,
 		SiteMeasurementSources: func() telemetry.ForecastOptions {
 			return forecastSettings.Snapshot().Options
 		},
@@ -3062,6 +3065,7 @@ func main() {
 				batW := troubleshootingSumOnlineW(tel, telemetry.DerBattery)
 				evW := tel.SumOnlineEVW()
 				v2xW := tel.SumOnlineV2XW()
+				live := tel.LiveMeasurementNow(siteMeterDriver, liveMeasurementOptions())
 				attrs := []any{
 					"mode", mode,
 					"plan_stale", planMissingNow,
@@ -3072,14 +3076,17 @@ func main() {
 					"bat_w", batW,
 					"ev_w", evW,
 					"v2x_w", v2xW,
+					"load_valid", live.Valid,
 					"self_tune_active", selfTuneActive,
 					"self_tune_driver", selfTuneName,
 					"self_tune_command_w", selfTuneCmd,
 					"targets", targets,
 					"final_targets", finalTargets,
 				}
-				if haveGrid {
-					attrs = append(attrs, "load_w", gridW-batW-pvW-evW-v2xW)
+				if live.Valid {
+					attrs = append(attrs, "load_w", live.HouseholdW)
+				} else {
+					attrs = append(attrs, "load_reason", live.Reason)
 				}
 				slog.Info("troubleshooting: dispatch decision", attrs...)
 			}

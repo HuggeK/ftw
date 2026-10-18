@@ -79,6 +79,15 @@ func (s *Store) ForecastMeasurementNow(siteMeter string, opts ForecastOptions) F
 	return s.forecastMeasurementLocked(time.Now(), siteMeter, opts)
 }
 
+// LiveMeasurementNow qualifies the current site balance for every live client.
+// Display power uses source-side AC/control observations and each driver's
+// watchdog cadence. Forecast training and stored history keep their own policy.
+func (s *Store) LiveMeasurementNow(siteMeter string, opts ForecastOptions) ForecastReading {
+	opts.UseWatchdogTimeout = true
+	opts.UseControlPower = true
+	return s.ForecastMeasurementNow(siteMeter, opts)
+}
+
 func (s *Store) forecastMeasurementLocked(now time.Time, siteMeter string, opts ForecastOptions) ForecastReading {
 	out := ForecastReading{At: now, Valid: true, PVValid: true, Known: map[DerType]bool{DerMeter: true, DerPV: true, DerBattery: true, DerEV: true, DerV2X: true}, Sources: map[string]ForecastSource{}}
 	if s == nil {

@@ -55,7 +55,15 @@ type appSite struct {
 	// siteMeterStale is how long a site-meter reading stays current. It is
 	// the watchdog timeout, so the app's freshness claim and the box's own
 	// dispatch gate are answering from the same number.
-	siteMeterStale time.Duration
+	siteMeterStale     time.Duration
+	measurementOptions func() telemetry.ForecastOptions
+}
+
+func newAppSite(tel *telemetry.Store, ctrl *control.State, ctrlMu *sync.Mutex,
+	revision *control.Revision, siteMeterStale time.Duration, options func() telemetry.ForecastOptions,
+) *appSite {
+	return &appSite{tel: tel, ctrl: ctrl, ctrlMu: ctrlMu, revision: revision,
+		started: processStarted, siteMeterStale: siteMeterStale, measurementOptions: options}
 }
 
 func (a *appSite) Snapshot() appproto.Snapshot {
@@ -66,7 +74,14 @@ func (a *appSite) Snapshot() appproto.Snapshot {
 	fuseA, fusePhases := a.ctrl.SiteFuseAmps, a.ctrl.SiteFusePhases
 	a.ctrlMu.Unlock()
 
-	snap := appproto.Snapshot{Mode: mode, ControlRev: rev, FuseA: fuseA}
+	var opts telemetry.ForecastOptions
+	if a.measurementOptions != nil {
+		opts = a.measurementOptions()
+	}
+	live := a.tel.LiveMeasurementNow(siteMeterDriver, opts)
+	snap := appproto.Snapshot{Mode: mode, ControlRev: rev, FuseA: fuseA,
+		GridW: live.GridW, PVW: live.PVW, BatteryW: live.BatteryW, EVW: live.EVW,
+		LoadW: live.HouseholdW, LoadWKnown: live.Valid}
 
 	uptimeMs := time.Since(a.started).Milliseconds()
 	seen := map[string]bool{}
@@ -101,7 +116,6 @@ func (a *appSite) Snapshot() appproto.Snapshot {
 		addSource(siteMeterDriver)
 		if health := a.tel.DriverHealth(siteMeterDriver); health != nil && health.IsOnline() {
 			if reading := a.tel.Get(siteMeterDriver, telemetry.DerMeter); reading != nil {
-				snap.GridW = reading.SmoothedW
 				snap.GridPhaseA = gridPhaseAmps(reading, fusePhases)
 			}
 		} else {
@@ -114,13 +128,6 @@ func (a *appSite) Snapshot() appproto.Snapshot {
 
 	for _, reading := range a.tel.ReadingsByType(telemetry.DerPV) {
 		addSource(reading.Driver)
-		if health := a.tel.DriverHealth(reading.Driver); health != nil && health.IsOnline() {
-			// Site convention: positive watts flow into the site, so PV is
-			// negative while generating. No sign conversion happens here —
-			// the driver boundary already did it, and doing it twice is how
-			// a solar panel starts consuming power.
-			snap.PVW += reading.SmoothedW
-		}
 	}
 
 	var socTotal float64
@@ -131,7 +138,6 @@ func (a *appSite) Snapshot() appproto.Snapshot {
 		if health == nil || !health.IsOnline() {
 			continue
 		}
-		snap.BatteryW += reading.SmoothedW
 		if reading.SoC != nil {
 			socTotal += *reading.SoC
 			socCount++
@@ -145,28 +151,15 @@ func (a *appSite) Snapshot() appproto.Snapshot {
 		snap.BatterySoC = socTotal / float64(socCount)
 	}
 
-	// EV chargers. Known means the site has one at all — an idle charger
-	// is a real 0 W reading, a site without one sends no field 10 and the
-	// app draws no EV node. Positive while charging: a charger consumes
-	// like any other load. The watts come from SumOnlineEVW so a charger
-	// that cannot take a command but is still drawing is counted here the
-	// same way the LAN dashboard counts it — IsOnline() would hide that
-	// draw in the house node.
+	// Keep charger presence and source metadata separate from qualified watts.
+	// An idle charger is a real zero; a missing configured flow still makes
+	// the household balance unavailable.
 	for _, reading := range a.tel.ReadingsByType(telemetry.DerEV) {
 		addSource(reading.Driver)
 		snap.EVWKnown = true
 	}
-	snap.EVW = a.tel.SumOnlineEVW()
-
-	// grid = load + battery + pv + ev + v2x, all site-signed. Rearranged,
-	// not re-derived: a second formula here would be a second thing to
-	// keep in step with docs/site-convention.md. House load is never
-	// negative; metering noise that would push it below zero is the car
-	// or the battery, not the house consuming in reverse.
-	snap.LoadW = snap.GridW - snap.BatteryW - snap.PVW -
-		snap.EVW - a.tel.SumOnlineV2XW()
-	if snap.LoadW < 0 {
-		snap.LoadW = 0
+	for _, source := range live.Sources {
+		addSource(source.Flow.Driver)
 	}
 
 	return snap
@@ -670,6 +663,7 @@ func startAppLink(
 	prefs *config.PlannerPrefs,
 	revision *control.Revision,
 	siteMeterStale time.Duration,
+	measurementOptions func() telemetry.ForecastOptions,
 	gateway *lateAPI,
 	cloud *cloudSession,
 	agents *agentPorts,
@@ -690,10 +684,7 @@ func startAppLink(
 		return enroll, nil, false, nil
 	}
 
-	site := &appSite{
-		tel: tel, ctrl: ctrl, ctrlMu: ctrlMu, revision: revision,
-		started: processStarted, siteMeterStale: siteMeterStale,
-	}
+	site := newAppSite(tel, ctrl, ctrlMu, revision, siteMeterStale, measurementOptions)
 	info := newAppBoxInfo(boxID, build)
 	modes := &appModes{ctrl: ctrl, ctrlMu: ctrlMu, state: st, mpc: planner, prefs: prefs}
 	plans := &appPlans{planner: planner, ctrl: ctrl, ctrlMu: ctrlMu}

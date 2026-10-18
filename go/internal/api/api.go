@@ -810,11 +810,6 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			haveGrid = true
 		}
 	}
-	if !haveGrid && ctrl.SiteMeterDriver == "" {
-		// Preserve the historical "no configured site meter" behaviour for
-		// development setups: report zero rather than treating it as stale data.
-		haveGrid = true
-	}
 	var pvW, batW float64
 	for _, r := range s.deps.Tel.ReadingsByType(telemetry.DerPV) {
 		if !statusDriverOnline(s.deps.Tel, r.Driver) {
@@ -829,21 +824,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		batW += r.SmoothedW
 	}
 
-	// Load = house-only consumption in site convention (+ into site):
-	//   meter = load + ev + v2x + battery + pv
-	//   so load = grid - bat - pv - ev - v2x
-	// Subtracting vehicle charging/storage keeps the load signal (and
-	// the loadmodel trained on it) reflecting the house, not "house + car".
 	evW := s.deps.Tel.SumOnlineEVW()
 	v2xW := s.deps.Tel.SumOnlineV2XW()
-	loadW := 0.0
-	if haveGrid {
-		rawLoad := gridW - batW - pvW - evW - v2xW
-		loadW = s.deps.Tel.UpdateLoad(rawLoad)
-		if loadW < 0 {
-			loadW = 0
-		}
-	}
 
 	// Weighted average SoC by capacity
 	var totalCap, weightedSoC float64
@@ -1273,18 +1255,6 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	resp["peak_import_hour_left_wh"], resp["peak_import_limit_w"] = nil, nil
 	if left, limit, ok := ctrl.ImportHourStatus(ctrl.SiteFuseAmps * ctrl.SiteFuseVoltage * float64(ctrl.SiteFusePhases)); ok {
 		resp["peak_import_hour_left_wh"], resp["peak_import_limit_w"] = left, limit
-	}
-	// A stale or missing site meter is not 0 W. Publishing zero made the
-	// dashboard and the FTW app draw "balanced" / "0 W" as if the house
-	// were idle. JSON null is what the flow mapping already treats as
-	// "no data". Development setups with no configured meter keep the
-	// historical zero (haveGrid is forced true above).
-	if haveGrid {
-		resp["grid_w"] = gridW
-		resp["load_w"] = loadW
-	} else {
-		resp["grid_w"] = nil
-		resp["load_w"] = nil
 	}
 	if energyToday != nil || energyCurrentSlot != nil {
 		energy := map[string]any{}

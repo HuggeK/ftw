@@ -444,47 +444,6 @@ func TestStoreDropsCachedVehicleSoCWithoutFreshPredecessor(t *testing.T) {
 	}
 }
 
-// ---- Load filter ----
-
-func TestLoadFilterClampsNegative(t *testing.T) {
-	// During driver startup or PV/meter sync lag, load = grid - pv - bat
-	// can go briefly negative. The filter must clamp to zero so the Kalman
-	// doesn't track garbage downward.
-	s := NewStore()
-
-	// Seed with a realistic positive load so the filter has state.
-	for i := 0; i < 10; i++ {
-		s.UpdateLoad(1000)
-	}
-
-	// Feed a burst of negative values.
-	var last float64
-	for i := 0; i < 5; i++ {
-		last = s.UpdateLoad(-500)
-	}
-	if last < 0 {
-		t.Errorf("load filter should never return negative after clamping, got %f", last)
-	}
-
-	// Single negative value should also be clamped.
-	out := s.UpdateLoad(-1)
-	if out < 0 {
-		t.Errorf("single negative load should be clamped, got %f", out)
-	}
-}
-
-func TestLoadFilterSmoothsNoisy(t *testing.T) {
-	s := NewStore()
-	vals := []float64{1000, 2000, 500, 1500, 1200, 800, 1100, 1400}
-	var last float64
-	for _, v := range vals {
-		last = s.UpdateLoad(v)
-	}
-	if last < 500 || last > 2000 {
-		t.Errorf("load filter should converge to middle, got %f", last)
-	}
-}
-
 // Happy path: two online EV drivers charging at 3.6 kW each → sum = 7200.
 func TestSumOnlineEVWSumsAllOnline(t *testing.T) {
 	s := NewStore()

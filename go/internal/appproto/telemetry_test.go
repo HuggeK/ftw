@@ -487,3 +487,84 @@ func TestEvFieldIsSentOnlyWhenAChargerExists(t *testing.T) {
 		t.Fatalf("field 10 = %+v, want name ev_w and no source", def)
 	}
 }
+
+func TestLoadFieldRequiresCoreQualification(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		snap  Snapshot
+		known bool
+		want  int64
+	}{
+		{name: "unknown zero"},
+		{name: "unknown previous value", snap: Snapshot{LoadW: 3700}},
+		{name: "known zero", snap: Snapshot{LoadWKnown: true}, known: true},
+		{name: "known positive", snap: Snapshot{LoadW: 3700.6, LoadWKnown: true}, known: true, want: 3701},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cloud, _ := LiveView(tc.snap, 60_000)
+			for name, fields := range map[string]map[string]int64{
+				"session": fieldValues(tc.snap, nil), "cloud": cloud,
+			} {
+				got, present := fields[fidKey(FidLoadW)]
+				if present != tc.known || present && got != tc.want {
+					t.Errorf("%s load = %d, present=%v; want %d, present=%v", name, got, present, tc.want, tc.known)
+				}
+			}
+		})
+	}
+}
+
+func TestLoadUnknownAtSubscription(t *testing.T) {
+	h, box, rec, _ := newRig(t)
+	box.snap.LoadWKnown = false
+	deliver(t, h, MsgHello, nil, Hello{Proto: ProtoRange{Min: 0, Max: ProtoMax}})
+	deliver(t, h, MsgSub, nil, Sub{Bucket: 512, Hz: 1})
+	snap := body[Snap](t, rec.only(t, MsgSnap))
+	if _, present := snap.Fields[fidKey(FidLoadW)]; present {
+		t.Fatal("initial snapshot turned unknown load into a reading")
+	}
+	if _, present := snap.Dict[fidKey(FidLoadW)]; !present {
+		t.Fatal("unknown load removed the existing field 6 dictionary entry")
+	}
+}
+
+func TestLoadLossAndReturnResyncTheStream(t *testing.T) {
+	h, box, rec, _ := newRig(t)
+	subscribe(t, h, rec)
+
+	box.snap.LoadWKnown = false
+	if err := h.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	snap := body[Snap](t, rec.only(t, MsgSnap))
+	if _, present := snap.Fields[fidKey(FidLoadW)]; present {
+		t.Fatal("replacement snapshot retained the previous load reading")
+	}
+	if got := snap.Fields[fidKey(FidGridW)]; got != 1200 {
+		t.Fatalf("load loss changed the grid reading: %d", got)
+	}
+	if got := rec.types(); got != "[snap tick]" {
+		t.Fatalf("load loss sent %s; want one replacement snapshot and the lane 0 beat", got)
+	}
+
+	rec.reset()
+	if err := h.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if got := rec.types(); got != "[tick]" {
+		t.Fatalf("unchanged unknown load sent %s; want only the lane 0 beat", got)
+	}
+
+	box.snap.LoadW, box.snap.LoadWKnown = 0, true
+	rec.reset()
+	if err := h.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	delta := body[Delta](t, rec.only(t, MsgDelta))
+	if got, present := delta.Fields[fidKey(FidLoadW)]; !present || got != 0 {
+		t.Fatalf("returning known zero load = %d, present=%v", got, present)
+	}
+	if len(delta.Fields) != 1 || rec.has(MsgSnap) {
+		t.Fatal("returning load changed unrelated fields or forced another snapshot")
+	}
+}

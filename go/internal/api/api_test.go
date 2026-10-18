@@ -170,7 +170,7 @@ func TestHandlePostConfigDoesNotPersistEVPasswordOnInvalidConfig(t *testing.T) {
 	}
 }
 
-func TestHandleStatusIgnoresOfflineDERInLiveBalance(t *testing.T) {
+func TestHandleStatusKeepsOfflineFlowsUnavailable(t *testing.T) {
 	tel := telemetry.NewStore()
 	ctrl := &control.State{SiteMeterDriver: "site"}
 
@@ -208,42 +208,25 @@ func TestHandleStatusIgnoresOfflineDERInLiveBalance(t *testing.T) {
 		t.Fatalf("status = %d, body: %s", rr.Code, rr.Body.String())
 	}
 
-	var resp struct {
-		GridW   float64                   `json:"grid_w"`
-		PVW     float64                   `json:"pv_w"`
-		BatW    float64                   `json:"bat_w"`
-		EVW     float64                   `json:"ev_w"`
-		LoadW   float64                   `json:"load_w"`
-		BatSoC  float64                   `json:"bat_soc"`
-		Drivers map[string]map[string]any `json:"drivers"`
-	}
+	var resp map[string]any
 	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-
-	want := map[string]float64{
-		"grid_w":  8000,
-		"pv_w":    -2000,
-		"bat_w":   -1000,
-		"ev_w":    1000,
-		"load_w":  10_000,
-		"bat_soc": 0.8,
-	}
-	got := map[string]float64{
-		"grid_w":  resp.GridW,
-		"pv_w":    resp.PVW,
-		"bat_w":   resp.BatW,
-		"ev_w":    resp.EVW,
-		"load_w":  resp.LoadW,
-		"bat_soc": resp.BatSoC,
-	}
-	for k, wantV := range want {
-		if got[k] != wantV {
-			t.Fatalf("%s = %v, want %v", k, got[k], wantV)
+	// Partial known flows do not prove the total PV, battery or household
+	// balance. This policy also applies when the config callback is absent.
+	for field, want := range map[string]any{
+		"grid_w": float64(8000), "ev_w": float64(1000),
+		"pv_w": nil, "bat_w": nil, "load_w": nil, "bat_soc": nil,
+		"history_quality": "incomplete",
+	} {
+		if resp[field] != want {
+			t.Fatalf("%s differs from the qualified live value", field)
 		}
 	}
-	if resp.Drivers["pv-offline"]["status"] != "offline" || resp.Drivers["pv-offline"]["pv_w"] != -9000.0 {
-		t.Fatalf("offline driver details not preserved: %#v", resp.Drivers["pv-offline"])
+	drivers := resp["drivers"].(map[string]any)
+	pv := drivers["pv-offline"].(map[string]any)
+	if pv["status"] != "offline" || pv["pv_w"] != nil {
+		t.Fatal("offline source lost its status or kept a live power value")
 	}
 }
 
@@ -285,11 +268,12 @@ func TestHandleStatusKeepsFaultedSiteMeterReading(t *testing.T) {
 	if resp.GridW != 2400 {
 		t.Fatalf("grid_w = %v, want fresh faulted-device meter reading 2400", resp.GridW)
 	}
-	if resp.BatW != 0 {
-		t.Fatalf("bat_w = %v, want faulted actuator excluded", resp.BatW)
+	// A command fault does not erase fresh meter or battery observations.
+	if resp.BatW != -500 {
+		t.Fatalf("bat_w = %v, want the measured -500 W", resp.BatW)
 	}
-	if resp.LoadW != 2400 {
-		t.Fatalf("load_w = %v, want 2400 from retained meter and excluded battery", resp.LoadW)
+	if resp.LoadW != 2900 {
+		t.Fatalf("load_w = %v, want 2900 from measured site and battery power", resp.LoadW)
 	}
 	if got := resp.Drivers["ferroamp"]["status"]; got != "fault" {
 		t.Fatalf("driver status = %v, want fault", got)
@@ -364,11 +348,8 @@ func TestHandleStatusOmitsWattsWhenSiteMeterIsOffline(t *testing.T) {
 	if ferroamp["status"] != "offline" {
 		t.Fatalf("driver status = %v, want offline", ferroamp["status"])
 	}
-	if ferroamp["pv_w"] != -1800.0 {
-		t.Fatalf("pv_w = %v, want last-known -1800 so the UI can keep a solar node", ferroamp["pv_w"])
-	}
-	if ferroamp["bat_w"] != -500.0 {
-		t.Fatalf("bat_w = %v, want last-known -500 so the UI can keep a battery node", ferroamp["bat_w"])
+	if ferroamp["pv_w"] != nil || ferroamp["bat_w"] != nil {
+		t.Fatal("offline driver's last values became live observations")
 	}
 }
 

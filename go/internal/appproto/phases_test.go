@@ -103,6 +103,7 @@ func TestTheExtraFieldsGiveWayFirst(t *testing.T) {
 	h, _, _, _ := newRig(t)
 	full := fieldValues(Snapshot{
 		GridW: 1200, PVW: -3400, BatteryW: 900, LoadW: 3700,
+		LoadWKnown: true,
 		BatterySoC: 0.62, BatterySoCKnown: true, EVWKnown: true, EVW: 7360,
 		GridPhaseA: amps(-21.3, 47.6, -16.1), FuseA: 20,
 	}, nil)

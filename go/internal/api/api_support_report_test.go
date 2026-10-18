@@ -117,7 +117,7 @@ func TestPlanControlDecisionMismatchBecomesFinding(t *testing.T) {
 	plan := &mpc.Plan{DecisionID: "00000000-0000-4000-8000-000000000202"}
 	slot := control.SlotEnergySnapshot{DecisionID: "00000000-0000-4000-8000-000000000201"}
 	findings := srv.collectFindings(*ctrl,
-		liveSnapshot{HaveGrid: true, LoadW: 1000, PredictedLd: 1000},
+		liveSnapshot{HaveGrid: true, HaveLoad: true, HavePV: true, HaveBattery: true, LoadW: 1000, PredictedLd: 1000},
 		plan, nil, nil, nil, slot, time.Now())
 
 	for _, got := range findings {
@@ -139,6 +139,9 @@ func TestSupportReportFlagsLoadForecastMiss(t *testing.T) {
 	now := time.Now()
 	snap := liveSnapshot{
 		HaveGrid:    true,
+		HaveLoad:    true,
+		HavePV:      true,
+		HaveBattery: true,
 		LoadW:       7900,
 		PredictedLd: 383,
 	}
@@ -244,7 +247,7 @@ func TestSupportReportMarksTheActiveSlot(t *testing.T) {
 
 	// And the live section should state the active slot's intent in prose.
 	var live strings.Builder
-	writeRightNow(&live, *ctrl, liveSnapshot{HaveGrid: true, BatW: -7500}, &plan.Actions[0], nil, control.SlotEnergySnapshot{}, now)
+	writeRightNow(&live, *ctrl, liveSnapshot{HaveGrid: true, HaveLoad: true, HavePV: true, HaveBattery: true, BatW: -7500}, &plan.Actions[0], nil, control.SlotEnergySnapshot{}, now)
 	if !strings.Contains(live.String(), "-8.40 kW") {
 		t.Errorf("active-slot intent missing from Right now:\n%s", live.String())
 	}
@@ -261,7 +264,7 @@ func TestSupportReportFlagsFallbackSolver(t *testing.T) {
 		},
 	}
 	findings := srv.collectFindings(*ctrl,
-		liveSnapshot{HaveGrid: true, LoadW: 1000, PredictedLd: 1000},
+		liveSnapshot{HaveGrid: true, HaveLoad: true, HavePV: true, HaveBattery: true, LoadW: 1000, PredictedLd: 1000},
 		plan, nil, nil, nil, control.SlotEnergySnapshot{}, time.Now())
 
 	found := false
@@ -286,7 +289,7 @@ func TestSupportReportFlagsOfflineAndFaultedDevices(t *testing.T) {
 		"faulting": {Name: "faulting", DeviceFault: true, DeviceFaultReason: "Fault mode"},
 	}
 	findings := srv.collectFindings(*ctrl,
-		liveSnapshot{HaveGrid: true, LoadW: 1000, PredictedLd: 1000},
+		liveSnapshot{HaveGrid: true, HaveLoad: true, HavePV: true, HaveBattery: true, LoadW: 1000, PredictedLd: 1000},
 		nil, nil, nil, health, control.SlotEnergySnapshot{}, time.Now())
 
 	var sawOffline, sawFault bool
@@ -403,7 +406,7 @@ func TestRepeatedWarningBecomesAFinding(t *testing.T) {
 	srv := New(&Deps{Ctrl: st, CtrlMu: &sync.Mutex{}, Tel: tel, LogRing: ring})
 
 	findings := srv.collectFindings(*st,
-		liveSnapshot{HaveGrid: true, LoadW: 1000, PredictedLd: 1000},
+		liveSnapshot{HaveGrid: true, HaveLoad: true, HavePV: true, HaveBattery: true, LoadW: 1000, PredictedLd: 1000},
 		nil, nil, nil, nil, control.SlotEnergySnapshot{}, time.Now())
 
 	var got *finding
@@ -429,7 +432,7 @@ func TestRepeatedWarningBecomesAFinding(t *testing.T) {
 func TestDispatchTableDisclaimsSiteLevelClamps(t *testing.T) {
 	st := control.NewState(0, 50, "meter")
 	var b strings.Builder
-	writeRightNow(&b, *st, liveSnapshot{HaveGrid: true},
+	writeRightNow(&b, *st, liveSnapshot{HaveGrid: true, HaveLoad: true, HavePV: true, HaveBattery: true},
 		nil,
 		[]control.DispatchTarget{{Driver: "ferroamp", TargetW: 6400, Clamped: false}}, control.SlotEnergySnapshot{}, time.Now())
 	out := b.String()
@@ -455,7 +458,7 @@ func TestForecastMissIsANoteWhileTheModelIsStillLearning(t *testing.T) {
 	srv := New(&Deps{Ctrl: st, CtrlMu: &sync.Mutex{}, Tel: tel, LoadModel: lm})
 
 	findings := srv.collectFindings(*st,
-		liveSnapshot{HaveGrid: true, LoadW: 3650, PredictedLd: 1470},
+		liveSnapshot{HaveGrid: true, HaveLoad: true, HavePV: true, HaveBattery: true, LoadW: 3650, PredictedLd: 1470},
 		nil, nil, nil, nil, control.SlotEnergySnapshot{}, time.Now())
 
 	var got *finding
@@ -495,7 +498,7 @@ func TestSlotEnergyShortfallIsAFinding(t *testing.T) {
 		SlotEnd:        now.Add(7 * time.Minute),
 	}
 	findings := srv.collectFindings(*ctrl,
-		liveSnapshot{HaveGrid: true, LoadW: 700, PredictedLd: 700},
+		liveSnapshot{HaveGrid: true, HaveLoad: true, HavePV: true, HaveBattery: true, LoadW: 700, PredictedLd: 700},
 		nil, nil, nil, nil, slot, now)
 
 	var got *finding
@@ -597,7 +600,7 @@ func TestSlotEnergyBooksAreInTheReport(t *testing.T) {
 	_, ctrl, _ := reportTestServer(t)
 	now := time.Now()
 	var b strings.Builder
-	writeRightNow(&b, *ctrl, liveSnapshot{HaveGrid: true}, nil, nil,
+	writeRightNow(&b, *ctrl, liveSnapshot{HaveGrid: true, HaveLoad: true, HavePV: true, HaveBattery: true}, nil, nil,
 		control.SlotEnergySnapshot{
 			HasSlot: true, PlannedWh: 1125, ActualWh: 560, EnergyPathWh: 545,
 			PlannedSoFarWh: 600,

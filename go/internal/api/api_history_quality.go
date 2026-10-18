@@ -13,13 +13,13 @@ func dailyEnergyCacheReady(dayStart, now time.Time) bool {
 }
 
 func (s *Server) qualifyStatusHistory(resp map[string]any, siteMeter string) {
-	if s.deps.HistoryMeasurementSources == nil {
-		return
+	var opts telemetry.ForecastOptions
+	if s.deps.HistoryMeasurementSources != nil {
+		opts = s.deps.HistoryMeasurementSources()
 	}
-	opts := s.deps.HistoryMeasurementSources()
-	opts.UseWatchdogTimeout = true
-	opts.UseControlPower = true
-	r := s.deps.Tel.ForecastMeasurementNow(siteMeter, opts)
+	r := s.deps.Tel.LiveMeasurementNow(siteMeter, opts)
+	// Interval metadata remains separate from the current live balance.
+	opts.UseWatchdogTimeout, opts.UseControlPower = true, true
 	resp["load_estimate"] = s.deps.Tel.HomeUseEstimate(time.Now(), siteMeter, opts)
 	var missing state.HistoryMissing
 	for kind, flag := range map[telemetry.DerType]state.HistoryMissing{telemetry.DerMeter: state.MissingGrid, telemetry.DerPV: state.MissingPV, telemetry.DerBattery: state.MissingBattery, telemetry.DerEV: state.MissingEV, telemetry.DerV2X: state.MissingV2X} {

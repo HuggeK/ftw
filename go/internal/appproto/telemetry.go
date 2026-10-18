@@ -103,7 +103,9 @@ func fieldValues(snap Snapshot, modes []ModeInfo) map[string]int64 {
 		fidKey(FidGridW):    roundW(snap.GridW),
 		fidKey(FidPvW):      roundW(snap.PVW),
 		fidKey(FidBatteryW): roundW(snap.BatteryW),
-		fidKey(FidLoadW):    roundW(snap.LoadW),
+	}
+	if snap.LoadWKnown {
+		f[fidKey(FidLoadW)] = roundW(snap.LoadW)
 	}
 	if snap.BatterySoCKnown {
 		f[fidKey(FidBatterySoc)] = units.PermilleFromFraction(snap.BatterySoC)

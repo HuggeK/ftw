@@ -63,8 +63,14 @@ it("distinguishes a real zero balance from missing, invalid or stale inputs", ()
     assert.equal(result.load,null);
     assert.match(result.homeEstimateNote,/unavailable/);
   }
-  for (const quality of ["incomplete", "balance_mismatch"]) {
-    assert.equal(flowReadingsFromStatus({...base,history_quality:quality,load_w:1234}).load,null);
+});
+
+it("renders Core load validity without another history-quality decision", () => {
+  for (const quality of ["complete", "incomplete", "balance_mismatch"]) {
+    const status = {history_quality: quality, load_estimate: {watts: null}};
+    assert.equal(flowReadingsFromStatus({...status, load_w: 1234}).load, 1.234);
+    assert.equal(flowReadingsFromStatus({...status, load_w: 0}).load, 0);
+    assert.equal(flowReadingsFromStatus({...status, load_w: null}).load, null);
   }
 });
 

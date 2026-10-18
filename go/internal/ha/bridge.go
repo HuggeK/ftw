@@ -97,6 +97,9 @@ type Bridge struct {
 	cb     CommandCallbacks
 	plan   PlanSource   // nil when MPC is not configured
 	energy EnergySource // nil when state.Store is not available
+	// Set before the publish loop starts; the callback reads the current
+	// source topology shared by all live views.
+	measurementOptions func() telemetry.ForecastOptions
 
 	topicPrefix string // stable wire ID, e.g. "forty-two-watts"
 	discoPrefix string // e.g. "homeassistant"
@@ -194,6 +197,7 @@ func Start(
 	cb CommandCallbacks,
 	plan PlanSource,
 	energy EnergySource,
+	measurementOptions func() telemetry.ForecastOptions,
 ) (*Bridge, error) {
 	b := &Bridge{
 		tel:                     tel,
@@ -202,6 +206,7 @@ func Start(
 		cb:                      cb,
 		plan:                    plan,
 		energy:                  energy,
+		measurementOptions:      measurementOptions,
 		topicPrefix:             "forty-two-watts",
 		discoPrefix:             "homeassistant",
 		deviceID:                "forty_two_watts",
@@ -933,17 +938,24 @@ func (b *Bridge) publishState() {
 	}
 	evW := b.tel.SumOnlineEVW()
 	v2xW := b.tel.SumOnlineV2XW()
-	loadW := gridW - batW - pvW - evW - v2xW
-	if loadW < 0 {
-		loadW = 0
+	options := telemetry.ForecastOptions{}
+	if b.measurementOptions != nil {
+		options = b.measurementOptions()
 	}
+	live := b.tel.LiveMeasurementNow(siteMeter, options)
 
 	b.publishValue("grid_w", gridW)
 	b.publishValue("pv_w", pvW)
 	b.publishValue("bat_w", batW)
 	b.publishValue("ev_w", evW)
 	b.publishValue("v2x_w", v2xW)
-	b.publishValue("load_w", loadW)
+	if live.Valid {
+		b.publishValue("load_w", live.HouseholdW)
+	} else {
+		// HA's numeric MQTT sensors ignore an empty payload. The literal
+		// None replaces the previous value with unknown.
+		b.publishString("load_w", "None")
+	}
 	b.publishValue("bat_soc_pct", units.PercentFromFraction(avgSoC))
 	b.publishValue("grid_target_w", gridTarget)
 	b.publishValue("peak_limit_w", peakLimit)
