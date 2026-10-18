@@ -18,6 +18,7 @@ func (s *Server) qualifyStatusHistory(resp map[string]any, siteMeter string) {
 	}
 	opts := s.deps.HistoryMeasurementSources()
 	opts.UseWatchdogTimeout = true
+	opts.UseControlPower = true
 	r := s.deps.Tel.ForecastMeasurementNow(siteMeter, opts)
 	resp["load_estimate"] = s.deps.Tel.HomeUseEstimate(time.Now(), siteMeter, opts)
 	var missing state.HistoryMissing

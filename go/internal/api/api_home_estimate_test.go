@@ -76,6 +76,36 @@ func TestStatusKeepsPowerBalanceWhenSessionEnergyCannotFormAnInterval(t *testing
 	}
 }
 
+func TestStatusHomePowerUsesPixiiACWithoutChangingRawHistoryInputs(t *testing.T) {
+	tel := telemetry.NewStore()
+	for _, name := range []string{"site", "battery", "charger"} {
+		tel.EnsureDriverHealth(name)
+	}
+	tel.Update("site", telemetry.DerMeter, 5000, nil, nil)
+	tel.Update("battery", telemetry.DerBattery, -2500, nil, json.RawMessage(`{"control_power_w":-2000,"control_power_available":true}`))
+	tel.Update("charger", telemetry.DerEV, 6000, nil, nil)
+	srv := New(&Deps{Tel: tel, HistoryMeasurementSources: func() telemetry.ForecastOptions { return telemetry.ForecastOptions{} }})
+	resp := map[string]any{}
+	srv.qualifyStatusHistory(resp, "site")
+	if resp["load_w"] != float64(1000) || resp["bat_w"] != float64(-2000) {
+		t.Fatal("household AC balance used battery DC power")
+	}
+	raw := tel.ForecastMeasurementNow("site", telemetry.ForecastOptions{})
+	if raw.BatteryW != -2500 || raw.HouseholdW != 1500 {
+		t.Fatal("display changed raw forecast/history input")
+	}
+	tel.Update("battery", telemetry.DerBattery, -2500, nil, json.RawMessage(`{"control_power_available":false}`))
+	srv.qualifyStatusHistory(resp, "site")
+	if resp["load_w"] != nil || resp["bat_w"] != nil {
+		t.Fatal("missing AC measurement became DC power or zero")
+	}
+	tel.Update("battery", telemetry.DerBattery, -2500, nil, json.RawMessage(`{"control_power_w":-500,"control_power_available":true}`))
+	srv.qualifyStatusHistory(resp, "site")
+	if resp["load_w"] != nil || resp["history_reason"] != "invalid_balance" {
+		t.Fatal("negative AC balance became zero or a DC estimate")
+	}
+}
+
 func TestEnergyTodayKeepsEstimatedLoadOutOfMeasuredFields(t *testing.T) {
 	got := energyTodayFields(state.DayEnergy{Intervals: 2, Missing: state.EstimatedLoad, LoadWh: 22, ImportWh: 10})
 	if got["history_quality"] != "estimated" || got["load_wh"] != float64(22) {
