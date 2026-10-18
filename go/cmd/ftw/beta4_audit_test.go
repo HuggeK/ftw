@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -57,6 +58,16 @@ func TestBeta4AuditPlannerAndControlKeepEachKnownBatteryLimit(t *testing.T) {
 // fixture with current Configure: that would stop testing an upgrade.
 func TestBeta4AuditUpgradePreservesForecastLearning(t *testing.T) {
 	t.Setenv("TZ", "UTC")
+	// localzone deliberately captures the process zone once. The historical
+	// fixture needs UTC even when another API test has already read that zone.
+	if os.Getenv("FTW_BETA3_FORECAST_FIXTURE") != "1" {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestBeta4AuditUpgradePreservesForecastLearning$", "-test.count=1")
+		cmd.Env = append(os.Environ(), "FTW_BETA3_FORECAST_FIXTURE=1")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("UTC fixture subprocess: %v\n%s", err, output)
+		}
+		return
+	}
 	raw, err := os.ReadFile("testdata/beta3-forecast-binding.json")
 	if err != nil {
 		t.Fatal(err)
