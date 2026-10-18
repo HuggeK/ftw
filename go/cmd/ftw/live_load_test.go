@@ -73,7 +73,7 @@ func TestLiveLoadAppAndLANShareSourcePowerAndValidity(t *testing.T) {
 				valid = false
 			case "skew":
 				tel.Update("solar", telemetry.DerPV, -500, nil, liveLoadData(t, map[string]any{"control_power_observed_at": time.Now().Add(-45 * time.Second).Format(time.RFC3339Nano)}))
-				valid = false
+				want = 1500
 			case "negative":
 				tel.Update("battery", telemetry.DerBattery, 2000, nil, nil)
 				valid = false

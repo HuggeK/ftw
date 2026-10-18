@@ -81,14 +81,23 @@ func (s *Store) ForecastMeasurementNow(siteMeter string, opts ForecastOptions) F
 
 // LiveMeasurementNow qualifies the current site balance for every live client.
 // Display power uses source-side AC/control observations and each driver's
-// watchdog cadence. Forecast training and stored history keep their own policy.
+// watchdog cadence. Current sources need not report at the same time. Forecast
+// training and stored history keep their source-alignment policy.
 func (s *Store) LiveMeasurementNow(siteMeter string, opts ForecastOptions) ForecastReading {
 	opts.UseWatchdogTimeout = true
 	opts.UseControlPower = true
-	return s.ForecastMeasurementNow(siteMeter, opts)
+	if s != nil {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+	}
+	return s.measurementLocked(time.Now(), siteMeter, opts, false)
 }
 
 func (s *Store) forecastMeasurementLocked(now time.Time, siteMeter string, opts ForecastOptions) ForecastReading {
+	return s.measurementLocked(now, siteMeter, opts, true)
+}
+
+func (s *Store) measurementLocked(now time.Time, siteMeter string, opts ForecastOptions, alignSources bool) ForecastReading {
 	out := ForecastReading{At: now, Valid: true, PVValid: true, Known: map[DerType]bool{DerMeter: true, DerPV: true, DerBattery: true, DerEV: true, DerV2X: true}, Sources: map[string]ForecastSource{}}
 	if s == nil {
 		for kind := range out.Known {
@@ -253,11 +262,11 @@ func (s *Store) forecastMeasurementLocked(now time.Time, siteMeter string, opts 
 			out.V2XW += powerW
 		}
 	}
-	if out.Latest.Sub(out.Earliest) > opts.MaxSkew {
+	if alignSources && out.Latest.Sub(out.Earliest) > opts.MaxSkew {
 		fail("time_skew", false)
 	}
 	out.PVEarliest, out.PVLatest = pvFirst, pvLast
-	if pvLast.Sub(pvFirst) > opts.MaxSkew {
+	if alignSources && pvLast.Sub(pvFirst) > opts.MaxSkew {
 		fail("pv_time_skew", true)
 	}
 	if pvCount == 0 {

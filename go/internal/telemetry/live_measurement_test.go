@@ -36,3 +36,37 @@ func TestLiveMeasurementUsesOneDisplayPolicyWithoutChangingHistory(t *testing.T)
 		t.Fatal("stale source clock ignored without its cadence override")
 	}
 }
+
+func TestLiveMeasurementAllowsIndependentCurrentSourceTimes(t *testing.T) {
+	for _, skew := range []time.Duration{time.Second, 30 * time.Second} {
+		t.Run(skew.String(), func(t *testing.T) {
+			s := NewStore()
+			for _, driver := range []string{"meter", "solar", "other-solar"} {
+				s.EnsureDriverHealth(driver)
+			}
+			s.Update("meter", DerMeter, 1000, nil, nil)
+			s.Update("solar", DerPV, -500, nil, nil)
+			data, err := json.Marshal(map[string]any{
+				"control_power_observed_at": time.Now().Add(-45 * time.Second).Format(time.RFC3339Nano),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.Update("other-solar", DerPV, -250, nil, data)
+			opts := ForecastOptions{MaxAge: 90 * time.Second, MaxSkew: skew, UseControlPower: true}
+			live := s.LiveMeasurementNow("meter", opts)
+			if !live.Valid || !live.PVValid || live.HouseholdW != 1750 {
+				t.Fatalf("current independent sources hid live load: valid=%t, pv_valid=%t, reason=%q", live.Valid, live.PVValid, live.Reason)
+			}
+			forecast := s.ForecastMeasurementNow("meter", opts)
+			if forecast.Valid || forecast.PVValid || forecast.Reason != "time_skew" || forecast.PVReason != "pv_time_skew" {
+				t.Fatal("live query relaxed the forecast's source alignment")
+			}
+			// Relaxing alignment does not turn an expired source into live data.
+			opts.MaxAge = 40 * time.Second
+			if s.LiveMeasurementNow("meter", opts).Valid {
+				t.Fatal("an expired source was accepted as live")
+			}
+		})
+	}
+}
