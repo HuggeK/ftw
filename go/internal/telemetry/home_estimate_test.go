@@ -178,7 +178,7 @@ func TestHomeEstimateDoesNotRepairRawNegativeBalance(t *testing.T) {
 			t.Fatal(raw)
 		}
 		got := s.HomeUseEstimate(now, "site", ForecastOptions{})
-		if got.Watts == nil || *got.Watts != 886 || got.AgeMS != 9000 {
+		if got.Watts == nil || math.Abs(*got.Watts-886) > 1e-8 || got.AgeMS != 9000 {
 			t.Fatal(fmt.Sprintf("%+v", got))
 		}
 	}

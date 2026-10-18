@@ -298,6 +298,7 @@ type Store struct {
 	controlObservations map[string][]ControlObservation
 	homeObservations    map[string][]ControlObservation // display estimates only
 	homeSourceTime      map[string]bool                 // reported source time, otherwise receipt time
+	homeEnergy          map[string]*homeEnergySeries    // timestamped session counters, display only
 
 	processNoise     float64
 	measurementNoise float64
@@ -788,6 +789,9 @@ func (s *Store) Remove(driver string) {
 	delete(s.health, driver)
 	for _, kind := range allDerTypes {
 		delete(s.controlObservations, key(driver, kind))
+		delete(s.homeObservations, key(driver, kind))
+		delete(s.homeSourceTime, key(driver, kind))
+		delete(s.homeEnergy, key(driver, kind))
 	}
 	for k, c := range s.commands {
 		c.Baseline, c.StepAfter = nil, nil

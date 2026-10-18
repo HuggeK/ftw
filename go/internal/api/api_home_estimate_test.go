@@ -23,7 +23,7 @@ func TestStatusHomeEstimateIsSeparateFromInstantaneousPower(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		srv.qualifyStatusHistory(resp, "site")
 		e, ok := resp["load_estimate"].(telemetry.HomeEstimate)
-		if !ok || e.Watts == nil || math.Abs(*e.Watts-1500) > 1e-6 || e.AgeMS < 15000 || e.AgeMS > 20000 || e.Method != "reported_time_balance_10s_v2" || e.TimingBasis != "source" {
+		if !ok || e.Watts == nil || math.Abs(*e.Watts-1500) > 1e-6 || e.AgeMS < 15000 || e.AgeMS > 20000 || e.Method != "reported_energy_balance_v3" || e.TimingBasis != "source" || e.EnergyBasis != "power_integral" || e.EnergyWh == nil || e.EndAgeMS < 10000 {
 			t.Fatal(e)
 		}
 		if resp["load_w"] != float64(2000) || resp["grid_w"] != float64(2000) || resp["history_quality"] != "complete" {

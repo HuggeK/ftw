@@ -3,23 +3,28 @@ package telemetry
 import (
 	"encoding/json"
 	"math"
+	"strings"
 	"time"
 )
 
 const homeWindow = 10 * time.Second
 const homeMaxGap = 30 * time.Second
 const homeLookback = 3 * time.Minute
+const homeMaxWindow = 5 * time.Minute
 
 // HomeEstimate describes a past interval, never a new instantaneous measurement.
 // MinW/MaxW describe variation in the reported window, not error bounds.
 // Reported source clocks and local receipt clocks are not verified as aligned.
 type HomeEstimate struct {
 	Watts       *float64 `json:"watts"`
+	EnergyWh    *float64 `json:"energy_wh"`
+	EnergyBasis string   `json:"energy_basis"`
 	MinW        *float64 `json:"window_min_w"`
 	MaxW        *float64 `json:"window_max_w"`
 	FromMS      int64    `json:"from_ms"`
 	ToMS        int64    `json:"to_ms"`
 	AgeMS       int64    `json:"age_ms"`
+	EndAgeMS    int64    `json:"end_age_ms"`
 	Method      string   `json:"method"`
 	TimingBasis string   `json:"timing_basis"`
 	SourceAgeMS int64    `json:"source_age_ms"`
@@ -32,6 +37,7 @@ func (s *Store) recordHomeObservation(driver string, kind DerType, w float64, da
 	if kind == DerVehicle {
 		return
 	}
+	s.recordHomeEnergy(driver, kind, data, now)
 	k := key(driver, kind)
 	if s.homeObservations == nil {
 		s.homeObservations = map[string][]ControlObservation{}
@@ -74,7 +80,7 @@ func (s *Store) recordHomeObservation(driver string, kind DerType, w float64, da
 		}
 	}
 	points = append(points, p)
-	cutoff := now.Add(-homeLookback - homeWindow)
+	cutoff := now.Add(-homeLookback - homeMaxWindow)
 	for len(points) > 1 && points[1].At.Before(cutoff) {
 		points = points[1:]
 	}
@@ -84,14 +90,13 @@ func (s *Store) recordHomeObservation(driver string, kind DerType, w float64, da
 	s.homeObservations[k] = points
 }
 
-// HomeUseEstimate integrates a common ten-second window in the reported clocks.
-// It uses reported source times, or receipt times for local non-charger flows.
-// Clock alignment and device sampling delay remain unverified. Chargers without
-// source time, sparse change-only reports and repeats cannot fill a window.
-// No extrapolation, guessed fixed delay, clipping, or offline gap repair occurs.
-// This path serves display only; ForecastMeasurement and dispatch stay raw.
+// HomeUseEstimate divides signed energy by a common reported interval. Prefer
+// timestamped session counters; otherwise integrate bracketed power. The period
+// is at least ten seconds and at least the largest of each source's last three
+// distinct reporting intervals. This is observed coverage, not a cadence promise.
+// Clocks and sampling delay remain unverified. This path serves display only.
 func (s *Store) HomeUseEstimate(now time.Time, siteMeter string, opts ForecastOptions) HomeEstimate {
-	out := HomeEstimate{Method: "reported_time_balance_10s_v2"}
+	out := HomeEstimate{Method: "reported_energy_balance_v3"}
 	if s == nil {
 		out.Reason = "no_telemetry"
 		return out
@@ -99,35 +104,70 @@ func (s *Store) HomeUseEstimate(now time.Time, siteMeter string, opts ForecastOp
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	r := s.forecastMeasurementLocked(now, siteMeter, opts)
-	if !r.Valid && r.Reason != "invalid_balance" && r.Reason != "time_skew" {
+	if !r.Valid && r.Reason != "invalid_balance" && r.Reason != "time_skew" && !strings.HasPrefix(r.Reason, "stale:") && !strings.HasPrefix(r.Reason, "unknown_power:") {
 		out.Reason = r.Reason
 		return out
 	}
 	to := now
+	window := homeWindow
+	counterCount := 0
+	var reference *homeEnergySeries
+	var referenceKey string
+	var referenceGap time.Duration
 	var sourceClocks, receiptClocks bool
 	for k, source := range r.Sources {
 		points := s.homeObservations[k]
-		if (source.Flow.DerType == DerEV || source.Flow.DerType == DerV2X) && !s.homeSourceTime[k] {
+		counter := s.homeEnergy[k]
+		if counter == nil && (source.Flow.DerType == DerEV || source.Flow.DerType == DerV2X) && !s.homeSourceTime[k] {
 			out.Reason = "charger_source_time_unavailable"
 			return out
 		}
-		if source.PowerW == nil || len(points) == 0 || !s.health[source.Flow.Driver].TelemetryLive() {
+		if !s.health[source.Flow.Driver].TelemetryLive() {
 			out.Reason = "missing_source_window"
 			return out
 		}
-		last := points[len(points)-1]
-		if s.homeSourceTime[k] && now.Sub(last.At).Milliseconds() > out.SourceAgeMS {
-			out.SourceAgeMS = now.Sub(last.At).Milliseconds()
+		var times []time.Time
+		usesSourceTime := s.homeSourceTime[k]
+		if counter != nil {
+			for _, p := range counter.Points {
+				times = append(times, p.At)
+			}
+			usesSourceTime = true
+			counterCount++
+		} else {
+			for _, p := range points {
+				times = append(times, p.At)
+			}
 		}
-		if last.At.After(now) || now.Sub(last.At) > homeLookback {
+		if len(times) < 2 {
+			out.Reason = "incomplete_source_window"
+			return out
+		}
+		last := times[len(times)-1]
+		if usesSourceTime && now.Sub(last).Milliseconds() > out.SourceAgeMS {
+			out.SourceAgeMS = now.Sub(last).Milliseconds()
+		}
+		if last.After(now) || now.Sub(last) > homeLookback {
 			out.Reason = "stale_source_window"
 			return out
 		}
-		if last.At.Before(to) {
-			to = last.At
+		if last.Before(to) {
+			to = last
 		}
-		sourceClocks = sourceClocks || s.homeSourceTime[k]
-		receiptClocks = receiptClocks || !s.homeSourceTime[k]
+		var reportGap time.Duration
+		for i := len(times) - 1; i > 0 && i >= len(times)-3; i-- {
+			if gap := times[i].Sub(times[i-1]); gap > reportGap {
+				reportGap = gap
+			}
+		}
+		if reportGap > window {
+			window = reportGap
+		}
+		if counter != nil && (reference == nil || reportGap > referenceGap || (reportGap == referenceGap && k < referenceKey)) {
+			reference, referenceKey, referenceGap = counter, k, reportGap
+		}
+		sourceClocks = sourceClocks || usesSourceTime
+		receiptClocks = receiptClocks || !usesSourceTime
 	}
 	out.TimingBasis = "source"
 	if receiptClocks {
@@ -136,31 +176,72 @@ func (s *Store) HomeUseEstimate(now time.Time, siteMeter string, opts ForecastOp
 			out.TimingBasis = "mixed"
 		}
 	}
-	from := to.Add(-homeWindow)
-	var mean, low, high float64
+	from := to.Add(-window)
+	if reference != nil {
+		// Keep the slowest counter's complete interval wherever possible.
+		// Other counter clocks may require cumulative-energy interpolation.
+		endFound, startFound := false, false
+		for i := len(reference.Points) - 1; i >= 0; i-- {
+			at := reference.Points[i].At
+			if !endFound && !at.After(to) {
+				to, endFound = at, true
+				from = to.Add(-window)
+			}
+			if endFound && !at.After(from) {
+				from, startFound = at, true
+				break
+			}
+		}
+		if !startFound || to.Sub(from) > homeMaxWindow || now.Sub(to) > homeLookback {
+			out.Reason = "incomplete_source_window"
+			return out
+		}
+		window = to.Sub(from)
+	}
+	out.FromMS, out.ToMS = from.UnixMilli(), to.UnixMilli()
+	out.AgeMS = now.Sub(from.Add(window / 2)).Milliseconds()
+	out.EndAgeMS = now.Sub(to).Milliseconds()
+	out.EnergyBasis = "power_integral"
+	if counterCount > 0 {
+		out.EnergyBasis = "counters"
+		if counterCount < len(r.Sources) {
+			out.EnergyBasis = "mixed"
+		}
+	}
+	var energy, low, high float64
 	for k, source := range r.Sources {
-		avg, minW, maxW, ok := homeWindowPower(s.homeObservations[k], from, to)
+		var wh, minW, maxW float64
+		var ok bool
+		if counter := s.homeEnergy[k]; counter != nil {
+			wh, ok = homeCounterEnergy(counter.Points, from, to)
+		} else {
+			var avg float64
+			avg, minW, maxW, ok = homeWindowPower(s.homeObservations[k], from, to)
+			wh = avg * window.Hours()
+		}
 		if !ok {
 			out.Reason = "incomplete_source_window"
 			return out
 		}
 		if source.Flow.DerType == DerMeter {
-			mean += avg
+			energy += wh
 			low += minW
 			high += maxW
 		} else {
-			mean -= avg
+			energy -= wh
 			low -= maxW
 			high -= minW
 		}
 	}
-	out.FromMS, out.ToMS = from.UnixMilli(), to.UnixMilli()
-	out.AgeMS = now.Sub(from.Add(homeWindow / 2)).Milliseconds()
+	mean := energy / window.Hours()
 	if !finite(mean) || !finite(low) || !finite(high) || mean < 0 {
 		out.Reason = "invalid_balance"
 		return out
 	}
-	out.Watts, out.MinW, out.MaxW = &mean, &low, &high
+	out.Watts, out.EnergyWh = &mean, &energy
+	if counterCount == 0 {
+		out.MinW, out.MaxW = &low, &high
+	}
 	return out
 }
 

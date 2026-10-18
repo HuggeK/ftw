@@ -39,6 +39,14 @@ export function fmtKwhShort(kwh) {
   return kwh.toFixed(2);
 }
 
+function usableHomeEstimate(estimate) {
+  const from = num(estimate?.from_ms), to = num(estimate?.to_ms);
+  const age = num(estimate?.end_age_ms);
+  return num(estimate?.watts) !== null && estimate.watts >= 0 &&
+    from !== null && to !== null && from > 0 && to > from && to - from <= 300000 &&
+    to < 8640000000000000 && age !== null && age >= 0 && age <= 180000;
+}
+
 export function homeEstimateNote(estimate, live = true) {
   if (!estimate) return "";
   if (!live) return "Home use estimate paused · no live data";
@@ -48,15 +56,17 @@ export function homeEstimateNote(estimate, live = true) {
     return "Home use estimate unavailable · waiting for source observations" +
       (sourceAge > 0 ? ` · last source report ${Math.ceil(sourceAge / 1000)} s old` : "");
   }
-  const age = num(estimate.age_ms);
-  const from = num(estimate.from_ms), to = num(estimate.to_ms);
-  if (age === null || age < 0 || age > 185000 || from === null || to === null || to <= from) {
+  if (!usableHomeEstimate(estimate)) {
     return "Home use estimate unavailable · readings are too old";
   }
-  const low = num(estimate.window_min_w), high = num(estimate.window_max_w);
-  const range = low === null || high === null ? "" : ` · window range ${(low / 1000).toFixed(1)}–${(high / 1000).toFixed(1)} kW`;
-  const basis = {source:"reported source times", receipt:"receipt times only", mixed:"source and receipt times"}[estimate.timing_basis] || "timing unknown";
-  return `Estimated home use ${(estimate.watts / 1000).toFixed(1)} kW · ${Math.round((to - from) / 1000)} s mean · reported age ${Math.ceil(age / 1000)} s · ${basis}${range}. Clock alignment and sensor delay are unverified; the range is not an error bound.`;
+  const from = new Date(estimate.from_ms), to = new Date(estimate.to_ms);
+  const options = {hour:"2-digit", minute:"2-digit", second:"2-digit", hourCycle:"h23", timeZoneName:"short"};
+  if (from.toDateString() !== to.toDateString()) Object.assign(options, {year:"numeric", month:"short", day:"numeric"});
+  const period = new Intl.DateTimeFormat("en-GB", options).formatRange(from, to);
+  const age = estimate.end_age_ms === 0 ? "ended now" : `ended ${Math.ceil(estimate.end_age_ms / 1000)} s ago`;
+  const basis = {counters:"energy counters", power_integral:"sampled power", mixed:"charger energy + sampled power"}[estimate.energy_basis] || "energy estimate";
+  const timing = estimate.timing_basis === "source" ? "Device clocks may differ." : "Includes arrival times; device delay is unknown.";
+  return `Estimated home use ${(estimate.watts / 1000).toFixed(1)} kW · ${Math.round((estimate.to_ms - estimate.from_ms) / 1000)} s mean · ${period} · ${age} · ${basis}. ${timing}`;
 }
 
 function planetColor(role, watts, thresholdW) {
@@ -227,7 +237,8 @@ export function flowReadingsFromStatus(status, opts) {
     if (!live[role]) planets.push(...offline[role]);
   }
 
-  const loadW = num(status && status.load_w);
+  const hasEstimate = status?.load_estimate != null;
+  const loadW = hasEstimate ? (usableHomeEstimate(status.load_estimate) ? status.load_estimate.watts : null) : num(status && status.load_w);
   // Today's share is kWh already in the box, not the live meter. A
   // quiet meter blanks % SELF-POWERED NOW (unknown instantaneous load)
   // but must not hide a day that already happened.
@@ -238,6 +249,7 @@ export function flowReadingsFromStatus(status, opts) {
 
   return {
     load: loadW === null ? null : loadW / 1000,
+    loadEstimated: hasEstimate,
     homeEstimateNote: homeEstimateNote(status?.load_estimate, opts?.live !== false),
     planets: withControlMarks(planets, status?.control_feedback, opts?.live !== false),
     selfPoweredPctToday,

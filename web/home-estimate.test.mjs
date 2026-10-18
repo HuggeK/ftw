@@ -16,3 +16,34 @@ test('display smooths the supplied household balance and resets across gaps', ()
   assert.equal(c.smoothStatusForDisplay({...status,load_w:null}).load_w,null);
   assert.equal(c.smoothStatusForDisplay({...status,load_w:500}).load_w,500);
 });
+
+test('the rendered house marks a mean and never combines it with live self-powered share', () => {
+  const module = readFileSync(new URL('./components/ftw-energy-flow.js', import.meta.url), 'utf8')
+    .replace(/^import .+;$/m, '').replace(/^export \{[^\n]+\};$/m, '');
+  let Flow;
+  const c = {
+    FtwElement: class {
+      constructor() { this.style = {setProperty(){}}; }
+      hasAttribute() { return false; }
+      toggleAttribute() {}
+      update() { this.html = this.render(); }
+    },
+    ftwDebugDelay: () => 0,
+    document: {addEventListener(){}},
+    performance: {now:()=>0},
+    customElements: {define:(_, type)=>{Flow=type;}},
+  };
+  vm.createContext(c); vm.runInContext(module, c);
+  const flow = new Flow();
+  const planets = [{id:'grid',role:'grid',corner:'bottom-left',kw:1,toHub:true,title:'GRID'}];
+  flow.setReadings({load:2,loadEstimated:true,planets,selfPoweredPctToday:70});
+  assert.match(flow.html, /≈ 2.0/);
+  assert.match(flow.html, /House load, estimated mean/);
+  assert.doesNotMatch(flow.html, /SELF-POWERED NOW/);
+  assert.match(flow.html, /70% SELF-POWERED TODAY/);
+  flow.setReadings({load:2,loadEstimated:false,planets});
+  assert.match(flow.html, /50% SELF-POWERED NOW/);
+  flow.setReadings({load:null,loadEstimated:true,planets});
+  assert.match(flow.html, /House load, no data/);
+  assert.doesNotMatch(flow.html, /SELF-POWERED NOW/);
+});
