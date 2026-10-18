@@ -60,10 +60,20 @@ func startServer(t *testing.T, tel *telemetry.Store, approved ...string) (int, *
 // the connection, then sends without its lock: a probe answered while the
 // charger closes can send on the closed queue and panic (#1712). Server.Stop
 // is idempotent.
-func stopAfterServer(t *testing.T, srv *Server, stop func()) {
+func stopAfterServer(t *testing.T, srv *Server, stop func(), connected func() bool) {
 	t.Helper()
 	t.Cleanup(func() {
 		srv.Stop()
+		// Server.Stop closes the peer, but the test charger's write pump
+		// may not have observed it yet. ocpp-go's Stop otherwise replaces
+		// its disconnect handler while that pump reads it.
+		deadline := time.Now().Add(3 * time.Second)
+		for connected() && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if connected() {
+			t.Error("test charger did not observe the server closing")
+		}
 		stop()
 	})
 }
@@ -93,7 +103,7 @@ func TestBootAndMeterValuesPushDerEV(t *testing.T) {
 	if err := cp.Start(url); err != nil {
 		t.Fatalf("client connect: %v", err)
 	}
-	stopAfterServer(t, srv, cp.Stop)
+	stopAfterServer(t, srv, cp.Stop, cp.IsConnected)
 
 	if _, err := cp.BootNotification("EaseeHome", "Easee"); err != nil {
 		t.Fatalf("boot: %v", err)
@@ -162,7 +172,7 @@ func TestStartStopTransactionTracksSession(t *testing.T) {
 	if err := cp.Start(fmt.Sprintf("ws://127.0.0.1:%d", port)); err != nil {
 		t.Fatalf("connect: %v", err)
 	}
-	stopAfterServer(t, srv, cp.Stop)
+	stopAfterServer(t, srv, cp.Stop, cp.IsConnected)
 
 	if _, err := cp.BootNotification("Home", "Easee"); err != nil {
 		t.Fatalf("boot: %v", err)
@@ -213,7 +223,7 @@ func TestPendingChargerIsQuarantinedFromTelemetry(t *testing.T) {
 	if err := cp.Start(fmt.Sprintf("ws://127.0.0.1:%d", port)); err != nil {
 		t.Fatalf("connect: %v", err)
 	}
-	stopAfterServer(t, srv, cp.Stop)
+	stopAfterServer(t, srv, cp.Stop, cp.IsConnected)
 
 	if _, err := cp.BootNotification("EvilCo", "FakeCharger"); err != nil {
 		t.Fatalf("boot: %v", err)

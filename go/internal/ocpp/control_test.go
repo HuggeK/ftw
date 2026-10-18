@@ -114,7 +114,7 @@ func connectCharger(t *testing.T, srv *Server, port int, id string) (ocpp16.Char
 	}
 	var once sync.Once
 	stop := func() { once.Do(cp.Stop) }
-	stopAfterServer(t, srv, stop)
+	stopAfterServer(t, srv, stop, cp.IsConnected)
 
 	if _, err := cp.BootNotification("Dawn", "Charge Amps"); err != nil {
 		t.Fatalf("boot: %v", err)

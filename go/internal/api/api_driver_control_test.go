@@ -706,15 +706,31 @@ func TestDriverControlReplacingHoldCancelsTheOldTimer(t *testing.T) {
 }
 
 func TestDriverControlAmbiguousCommandRestoresDefault(t *testing.T) {
-	srv, tel := controlServerWithLua(t, controlSafetyProbeLua)
+	// Enter the device hook before cancelling. A ten-millisecond deadline
+	// can expire in request admission under -race, which never touched the
+	// device and therefore must not send it a recovery default.
+	source := strings.Replace(controlSafetyProbeLua, "host.sleep(100)",
+		`host.emit_metric("fail_entered", 1, "n"); host.sleep(30000)`, 1)
+	srv, tel := controlServerWithLua(t, source)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	req := httptest.NewRequest(http.MethodPost, "/api/drivers/heat/control", strings.NewReader(
 		`{"control":"set_offset_fail","value":2,"duration_s":600}`)).WithContext(ctx)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rec, req)
+	done := make(chan struct{})
+	go func() {
+		srv.Handler().ServeHTTP(rec, req)
+		close(done)
+	}()
+	waitMetric(t, tel, "heat", "fail_entered", 1)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("cancelled command did not return")
+	}
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("ambiguous POST = %d, body %s", rec.Code, rec.Body.String())
 	}

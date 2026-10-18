@@ -121,7 +121,7 @@ func connectStationV201(t *testing.T, srv *Server, port int, id string) (*fakeSt
 	}
 	var once sync.Once
 	stop := func() { once.Do(cs.Stop) }
-	stopAfterServer(t, srv, stop)
+	stopAfterServer(t, srv, stop, cs.IsConnected)
 
 	station := provisioning.ChargingStationType{Model: "Dawn", VendorName: "Charge Amps"}
 	if _, err := cs.BootNotification(provisioning.BootReasonPowerUp, station.Model, station.VendorName); err != nil {
