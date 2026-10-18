@@ -452,6 +452,8 @@ func (h *Handler) dispatch(ctx context.Context, env Envelope) error {
 		return h.onCmd(ctx, env, "")
 	case protocol.MsgApprovalKeySet:
 		return h.onApprovalKeySet(env)
+	case protocol.MsgAgentInviteCreate, protocol.MsgAgentInviteList, protocol.MsgAgentInviteCancel:
+		return h.onAgentInvite(env)
 	case protocol.MsgAgentAdd:
 		return h.onAgentAdd(env)
 	case protocol.MsgAgentWiden:

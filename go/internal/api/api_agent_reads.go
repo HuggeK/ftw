@@ -103,6 +103,16 @@ func (s *Server) ServeAgentRead(w http.ResponseWriter, request *http.Request, re
 // remote caller is on the LAN or is an owner, and without admitting mutations.
 func (s *Server) serveAgentHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
+	case "/api/agent-invites":
+		if s.deps == nil || s.deps.Agents == nil {
+			writeJSON(w, 503, map[string]string{"error": "agents unavailable"})
+			return
+		}
+		if a, ok := s.deps.Agents.(AgentInviteAdmin); ok {
+			writeJSON(w, 200, map[string]any{"invitations": a.AgentInvites()})
+			return
+		}
+		writeJSON(w, 503, map[string]string{"error": "invitations unavailable"})
 	case "/api/agents", "/api/agents/audit":
 		if s.deps.Agents == nil {
 			writeJSON(w, 503, map[string]string{"error": "agents are not available on this box"})

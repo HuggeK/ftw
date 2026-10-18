@@ -105,6 +105,7 @@ const (
 )
 
 func (s *Server) agentRoutes() {
+	s.agentInviteRoutes()
 	s.handle("GET    /api/agents", Local, s.handleAgentsList)
 	s.handle("GET    /api/agents/audit", Local, s.handleAgentsAudit)
 	s.handle("POST   /api/agents/offer", Local, s.handleAgentsOffer)

@@ -328,9 +328,8 @@ type Roster struct {
 	TTLS      int64    `cbor:"ttlS"`
 	Devices   []Device `cbor:"devices"`
 	Grant     Grant    `cbor:"grant"`
-	// Pending lists the pairing codes the box shows now. Each admits one
-	// first session through the service, for a phone the roster does not
-	// list yet.
+	// Pending lists phone pairing and agent invitation hints. Each kind
+	// has its own admission path; agent hints never pair a phone.
 	Pending []Pending `cbor:"pending"`
 	// Noise is the box's X25519 Noise static key, the one in its pairing
 	// QR code. FTW Cloud's keys part opens an agent's session to it, and
@@ -382,8 +381,10 @@ type Agent struct {
 	Principal   protocol.Principal `cbor:"principal"`
 }
 
-// Pending is one pairing code on the box's screen, by its PairingHash.
+// Pending is a bootstrap hint. Kind keeps phone pairing and agent claims apart.
 type Pending struct {
+	// Kind is empty for phone pairing; agent invitations never pair a phone.
+	Kind string `cbor:"kind,omitempty"`
 	Hash []byte `cbor:"hash"`
 	// TTLS is how long the code has left, counted from when the service
 	// receives the roster.

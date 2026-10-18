@@ -761,7 +761,7 @@ func startAppLink(
 	if st != nil {
 		agents.audit = newStateAudit(ctx, st)
 	}
-	caps = append(caps, appproto.CapAccessAgents)
+	caps = append(caps, appproto.CapAccessAgents, appproto.CapAccessInvites)
 	// One view for every agent session, so a charger's plug-in count is
 	// the same whichever session reads it.
 	views := agentViews{site: &cloudSite{site: site, api: gateway, cars: carsRT}, cars: carsRT}

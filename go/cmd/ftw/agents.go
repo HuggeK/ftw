@@ -559,6 +559,9 @@ func (b boxPageAgents) ResetClock(by string) error {
 		b.record(by, "agents.clock.reset", "", err)
 		return err
 	}
+	if err := b.p.access.Enroll.CancelAllAgentInvites(); err != nil {
+		return err
+	}
 	for _, row := range b.p.access.Agents() {
 		if err := b.RevokeAgent(by, row.ID); err != nil {
 			return err
@@ -612,5 +615,11 @@ func agentsForAPI(p *agentPorts) api.AgentAdmin {
 	if p == nil || p.access == nil {
 		return nil
 	}
+	p.access.Enroll.SetAgentOfferKeys(cloudlink.ParseOfferKeys(cloudlink.OfferKeys))
+	p.access.Enroll.OnAgentInviteClaimed(func(v protocol.AgentInvite, row protocol.AgentRow) {
+		b := boxPageAgents{p: p}
+		b.record("invitation", protocol.MsgAgentAdd, row.ID, nil)
+		p.push(protocol.PushAgentAdded, row.Principal.Client)
+	})
 	return boxPageAgents{p: p}
 }

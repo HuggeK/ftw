@@ -24,8 +24,12 @@ type CloudRoster struct {
 
 // Devices lists the paired devices.
 func (r CloudRoster) Devices() []cloudlink.RosterDevice {
+	return r.devices(r.Enroll.Roster())
+}
+
+func (r CloudRoster) devices(entries []appenroll.RosterEntry) []cloudlink.RosterDevice {
 	var out []cloudlink.RosterDevice
-	for _, e := range r.Enroll.Roster() {
+	for _, e := range entries {
 		d := cloudlink.RosterDevice{ID: e.ID, Key: e.Key, Role: e.Role, Epoch: e.Epoch,
 			Scopes: appproto.GrantScopes(e.Role, e.ParentRole), Tun: r.Tunnel && e.Role != apiauth.RoleWatch}
 		if a := e.Agent; a != nil {
@@ -61,4 +65,20 @@ func (r CloudRoster) Pending() ([]byte, time.Time, bool) {
 		return nil, time.Time{}, false
 	}
 	return r.Enroll.PendingCode()
+}
+
+// Snapshot keeps invitation consumption and the newly listed key together.
+func (r CloudRoster) Snapshot(home string) cloudlink.RosterSnapshot {
+	s := r.Enroll.CloudSnapshot()
+	out := cloudlink.RosterSnapshot{Devices: r.devices(s.Devices), Noise: s.Noise}
+	if !r.Tunnel {
+		return out
+	}
+	if len(s.PairingCode) > 0 {
+		out.Pending = append(out.Pending, cloudlink.RosterPending{Hash: cloudwire.PairingHash(home, s.PairingCode), Expires: s.PairingExpires})
+	}
+	for _, v := range s.Invites {
+		out.Pending = append(out.Pending, cloudlink.RosterPending{Hash: v.Hash, Kind: protocol.RoleAgent, Expires: v.Expires})
+	}
+	return out
 }

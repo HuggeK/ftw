@@ -263,8 +263,11 @@ func (w *writer) tick(snap grantSnapshot, st *cadence, now time.Time) error {
 			return err
 		}
 		st.rosterAt = now
-		if _, expires, ok := l.opts.Roster.Pending(); ok {
-			st.pendingUntil = expires
+		for _, p := range roster.Pending {
+			expires := now.Add(time.Duration(p.TTLS) * time.Second)
+			if st.pendingUntil.IsZero() || expires.Before(st.pendingUntil) {
+				st.pendingUntil = expires
+			}
 		}
 	}
 
@@ -698,7 +701,8 @@ func (l *Link) rosterNumber(snap grantSnapshot) (uint64, cloudwire.Roster) {
 		r.Grant = cloudwire.Grant{ID: g.ID, Scopes: g.Scopes, Purposes: g.Purposes, Controller: g.Controller, TermsPolicy: g.Policy, StatsID: g.StatsID, StatsPolicy: g.StatsPolicy, StatsSinceMs: g.StatsAtMs}
 	}
 	if !snap.g.statisticsOnly() {
-		for _, d := range l.opts.Roster.Devices() {
+		roster := l.rosterSnapshot(snap.home)
+		for _, d := range roster.Devices {
 			var scopes []string
 			for _, s := range protocol.CloudScopes {
 				if slices.Contains(d.Scopes, s) {
@@ -709,7 +713,7 @@ func (l *Link) rosterNumber(snap grantSnapshot) (uint64, cloudwire.Roster) {
 				Epoch: d.Epoch, Tun: d.Tun, Agent: d.Agent})
 		}
 		sort.Slice(r.Devices, func(a, b int) bool { return r.Devices[a].ID < r.Devices[b].ID })
-		r.Noise = l.opts.Roster.Noise()
+		r.Noise = roster.Noise
 		if l.opts.WebPush != nil {
 			var err error
 			r.WebPush, err = l.opts.WebPush.WebPushRows()
@@ -718,20 +722,18 @@ func (l *Link) rosterNumber(snap grantSnapshot) (uint64, cloudwire.Roster) {
 			}
 			sort.Slice(r.WebPush, func(a, b int) bool { return r.WebPush[a].ID < r.WebPush[b].ID })
 		}
-		if code, expires, ok := l.opts.Roster.Pending(); ok && snap.home != "" {
-			if left := time.Until(expires); left > 0 {
-				r.Pending = append(r.Pending, cloudwire.Pending{
-					Hash: cloudwire.PairingHash(snap.home, code),
-					TTLS: int64((left + time.Second - 1) / time.Second),
-				})
+		for _, p := range roster.Pending {
+			if left := time.Until(p.Expires); left > 0 && snap.home != "" {
+				r.Pending = append(r.Pending, cloudwire.Pending{Hash: p.Hash, Kind: p.Kind, TTLS: int64((left + time.Second - 1) / time.Second)})
 			}
 		}
+		sort.Slice(r.Pending, func(a, b int) bool { return string(r.Pending[a].Hash) < string(r.Pending[b].Hash) })
 	}
 	// The number follows what the roster says, not how long a code has
 	// left, so it does not rise every second a code is shown.
-	var pending [][]byte
+	var pending []any
 	for _, p := range r.Pending {
-		pending = append(pending, p.Hash)
+		pending = append(pending, []any{p.Kind, p.Hash})
 	}
 	sum := digest([]any{r.Devices, r.Grant, pending, r.Noise, r.WebPush})
 

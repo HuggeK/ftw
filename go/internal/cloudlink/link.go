@@ -176,6 +176,29 @@ type Roster interface {
 	Noise() []byte
 }
 
+type RosterPending struct {
+	Hash    []byte
+	Kind    string
+	Expires time.Time
+}
+
+type RosterSnapshot struct {
+	Devices []RosterDevice
+	Noise   []byte
+	Pending []RosterPending
+}
+
+func (l *Link) rosterSnapshot(home string) RosterSnapshot {
+	if r, ok := l.opts.Roster.(interface{ Snapshot(string) RosterSnapshot }); ok {
+		return r.Snapshot(home)
+	}
+	s := RosterSnapshot{Devices: l.opts.Roster.Devices(), Noise: l.opts.Roster.Noise()}
+	if code, expires, ok := l.opts.Roster.Pending(); ok {
+		s.Pending = append(s.Pending, RosterPending{Hash: cloudwire.PairingHash(home, code), Expires: expires})
+	}
+	return s
+}
+
 // Tunnel serves the phones' sessions that FTW Cloud carries. The box's app
 // session table implements it; the link reaches it only through this port,
 // and hands it each tun from the service unread.
@@ -233,9 +256,11 @@ type Options struct {
 
 // Link is the box's one uplink to FTW Cloud.
 type Link struct {
-	opts Options
-	log  *slog.Logger
-	boot []byte
+	invitePreparingUntil time.Time
+	needsRevision        uint64
+	opts                 Options
+	log                  *slog.Logger
+	boot                 []byte
 
 	// wake is signalled when the grant or the roster changes, so the
 	// sender acts within one tick.
@@ -473,6 +498,9 @@ func (l *Link) signal() {
 // its screen, links at once, so the code's home id exists before the code
 // is drawn.
 func (l *Link) RosterChanged() {
+	l.mu.Lock()
+	l.needsRevision++
+	l.mu.Unlock()
 	if l.wantsLink() {
 		l.mu.Lock()
 		if err := l.linkLocked(); err != nil && !errors.Is(err, ErrNoService) {
@@ -495,14 +523,19 @@ func (l *Link) RosterChanged() {
 func (l *Link) wantsLink() bool {
 	l.mu.Lock()
 	blocked := l.disabled || (l.grant != nil && l.grant.statisticsOnly())
+	preparing := time.Now().Before(l.invitePreparingUntil)
 	l.mu.Unlock()
 	if blocked {
 		return false
 	}
-	if _, _, ok := l.opts.Roster.Pending(); ok {
+	if preparing {
 		return true
 	}
-	for _, d := range l.opts.Roster.Devices() {
+	snapshot := l.rosterSnapshot("")
+	if len(snapshot.Pending) > 0 {
+		return true
+	}
+	for _, d := range snapshot.Devices {
 		if d.Tun || (d.Agent != nil && l.opts.Tunnel != nil) {
 			return true
 		}
@@ -556,13 +589,14 @@ func (l *Link) linkLocked() error {
 func (l *Link) endIfIdle() {
 	l.mu.Lock()
 	idle := l.link != nil && !l.link.Ending && l.grant == nil
+	revision := l.needsRevision
 	l.mu.Unlock()
 	if !idle || l.wantsLink() {
 		return
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.link == nil || l.link.Ending || l.grant != nil {
+	if l.link == nil || l.link.Ending || l.grant != nil || l.needsRevision != revision || time.Now().Before(l.invitePreparingUntil) {
 		return
 	}
 	rec := *l.link
@@ -1189,3 +1223,22 @@ func (l *Link) quicTLSConfig() *tls.Config {
 
 // now is the wall clock, or a test's.
 func (l *Link) now() time.Time { return l.opts.Now() }
+
+// PrepareAgentInviteHome allocates the home for an owner who creates an
+// invitation before pairing a phone. No readable-copy consent changes.
+func (l *Link) PrepareAgentInviteHome() (string, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.Available() || l.opts.Tunnel == nil || l.disabled || l.grant.statisticsOnly() {
+		return "", protocol.Refuse(protocol.ErrUnavailable, map[string]any{"subsystem": "cloud"})
+	}
+	if err := l.linkLocked(); err != nil {
+		return "", err
+	}
+	if l.link.Ending {
+		return "", protocol.Refuse(protocol.ErrUnavailable, map[string]any{"subsystem": "cloud"})
+	}
+	l.invitePreparingUntil = time.Now().Add(30 * time.Second)
+	l.needsRevision++
+	return l.home, nil
+}

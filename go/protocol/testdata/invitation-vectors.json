@@ -1,0 +1,29 @@
+{
+  "boxHex": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+  "code": "pGF2AWNib3hYIFpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaZGhvbWV4GmFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eDIzZnNlY3JldFggkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZE",
+  "deviceId": "demoPh01",
+  "hashHex": "084bd13dd37899d0a7ca8f7b74050689d66a7969a97222d86e8c20f96534380e",
+  "home": "abcdefghijklmnopqrstuvwx23",
+  "request": {
+    "home": "abcdefghijklmnopqrstuvwx23",
+    "id": "VVVVVVVVVVVVVVVVVVVVVQ",
+    "hash": "CEvRPdN4mdCnyo97dAUGidZqeWmpciLYbowg+WU0OA4=",
+    "label": "Hannes",
+    "scopes": [
+      "ftw.diag.run",
+      "ftw.live.read"
+    ],
+    "ops": [],
+    "caps": {
+      "holdS": 0,
+      "maxW": 0,
+      "perMin": 0
+    },
+    "claimUntilMs": 1792000060000,
+    "expiresAtMs": 1792086400000,
+    "atMs": 1792000000000,
+    "sig": null
+  },
+  "secretHex": "9191919191919191919191919191919191919191919191919191919191919191",
+  "signedHex": "8e6f6674772e617070726f76616c2e7631736167656e742e696e766974652e63726561746558205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6864656d6f506830311b000001a13b860000781a6162636465666768696a6b6c6d6e6f707172737475767778323376565656565656565656565656565656565656565656515820084bd13dd37899d0a7ca8f7b74050689d66a7969a97222d86e8c20f96534380e6648616e6e6573826c6674772e646961672e72756e6d6674772e6c6976652e7265616480830000001b000001a13b86ea601b000001a140ac5c00"
+}
