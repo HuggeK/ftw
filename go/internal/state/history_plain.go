@@ -33,6 +33,7 @@ const (
 // readers still need these frozen tiers. Import cursors and Parquet receipts
 // travel with the hours they produced so restart cannot count samples twice.
 var plainHistoryTables = []string{
+	sourceEnergyTable, "history_source_cursor", "history_source_periods",
 	"history_hot", "history_warm", "history_cold",
 	"ts_drivers", "ts_metrics", "ts_latest",
 	"energy_daily", "energy_ledger_meta", "energy_assets", "energy_ledger_entries", "energy_ledger_cursors",

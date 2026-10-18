@@ -37,20 +37,22 @@ func TestHistoryDisabledBatteryKeepsP1Load(t *testing.T) {
 		tel.Update("solar", telemetry.DerPV, -2000, nil, nil)
 		tel.RecordDriverSuccess("solar")
 		opts := historyMeasurementOptions(cfg, catalog)
-		at := time.Now().Add(-2 * time.Second).UnixMilli()
-		for i := int64(0); i < 2; i++ {
+		at := time.Now().Add(-10 * time.Minute).Truncate(5 * time.Minute).UnixMilli()
+		for i := int64(0); i <= 30; i++ {
 			for _, kind := range []telemetry.DerType{telemetry.DerMeter, telemetry.DerPV} {
 				name := map[telemetry.DerType]string{telemetry.DerMeter: "p1", telemetry.DerPV: "solar"}[kind]
-				tel.Get(name, kind).UpdatedAt = time.UnixMilli(at + i*1000)
+				tel.Get(name, kind).UpdatedAt = time.Now()
 			}
-			if _, err := persistTelemetryTick(st, tel, tickPersistControl{SiteMeterDriver: "p1"}, at+i*1000, time.Minute, nil, opts); err != nil {
+			p, _ := buildHistoryPoint(tel, tickPersistControl{SiteMeterDriver: "p1"}, at+i*10000, time.Minute, opts)
+			p.Sources.AtMS = at + i*10000
+			if err := st.RecordTickWithEnergy(p, nil, nil); err != nil {
 				t.Fatal(err)
 			}
 		}
 		if err := st.FlushHistory(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		points, err := st.LoadHistory(at, at+1000, 0)
+		points, err := st.LoadHistory(at, at+300000, 5)
 		if err != nil {
 			t.Fatal(err)
 		}

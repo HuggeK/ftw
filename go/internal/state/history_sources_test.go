@@ -1,0 +1,376 @@
+package state
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+func sourceTick(t *testing.T, s *Store, at int64, v HistorySources) {
+	t.Helper()
+	v.AtMS = at
+	if v.Topology == "" {
+		v.Topology = "grid+charger"
+	}
+	// Deliberately contradictory instantaneous Load: readers must use sources.
+	p := HistoryPoint{TsMs: at, LoadW: 999999, Missing: MissingLoad | BalanceMismatch, JSON: `{"ev_w":0,"v2x_w":0}`, Sources: &v}
+	dashboardTick(t, s, fmt.Sprint(at), &p)
+}
+
+func sourceStore(t *testing.T) *Store {
+	t.Helper()
+	s := freshStore(t)
+	if err := s.EnableHistoryAggregation(); err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func sourceSeries(t *testing.T, s *Store, base int64, minutes []float64) {
+	t.Helper()
+	for i := int64(0); i <= int64(len(minutes))*6; i++ {
+		minute := min(int(i/6), len(minutes)-1)
+		sourceTick(t, s, base+i*10000, HistorySources{GridW: minutes[minute] + 2000, EVW: 2000})
+	}
+}
+
+func TestSourceLoadBalancesAfterAggregation(t *testing.T) {
+	s := sourceStore(t)
+	base := time.Now().UTC().Truncate(24 * time.Hour).UnixMilli()
+	sourceSeries(t, s, base, []float64{-1000, 3000, 1000, 1000, 1000})
+	ctx := context.Background()
+	minute, err := s.sourceLoadBuckets(ctx, base, base+300000, 60000)
+	if err != nil || len(minute) != 5 {
+		t.Fatal("minute evidence unavailable", err)
+	}
+	if minute[0].missing&MissingLoad == 0 {
+		t.Fatal("negative entire minute became valid Load")
+	}
+	check := func(s *Store) {
+		t.Helper()
+		b, err := s.sourceLoadBuckets(ctx, base, base+300000, 300000)
+		if err != nil || len(b) != 1 || b[0].missing&MissingLoad != 0 {
+			t.Fatal("signed interval balance missing", err)
+		}
+		near(t, "interval Wh", b[0].wh, 1000.0/12)
+		d, err := s.DailyEnergy(base, base+300000)
+		if err != nil || d.Missing&MissingLoad != 0 {
+			t.Fatal("daily balance missing", err)
+		}
+		near(t, "daily Wh", d.LoadWh, b[0].wh)
+		web, err := s.LoadHistory(base, base+300000, 1)
+		if err != nil || len(web) != 1 || web[0].Missing&MissingLoad != 0 {
+			t.Fatal("web balance missing", err)
+		}
+		near(t, "web W", web[0].LoadW, 1000)
+		native, _, err := s.LoadEnergyHistory(EnergyHistoryQuery{SinceMS: base, UntilMS: base + 300000, BucketMS: 300000, Limit: 10})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wh float64
+		var n int
+		for _, p := range native {
+			if p.Flow == FlowConsumerUse {
+				wh += p.EnergyWh
+				n++
+			}
+		}
+		if n != 1 {
+			t.Fatal("native household missing or duplicated")
+		}
+		near(t, "native Wh", wh, b[0].wh)
+	}
+	check(s)
+	path := s.mainDBPath
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	check(reopened)
+}
+
+func TestSourceLoadKeepsUnknownDistinctFromZero(t *testing.T) {
+	for _, kind := range []string{"zero", "missing EV", "write gap", "topology", "partial tail", "time reversal", "duplicate"} {
+		t.Run(kind, func(t *testing.T) {
+			s := sourceStore(t)
+			base := time.Now().UTC().Truncate(24 * time.Hour).UnixMilli()
+			for i := int64(0); i <= 6; i++ {
+				if kind == "write gap" && i == 3 {
+					continue
+				}
+				if kind == "partial tail" && i > 1 {
+					break
+				}
+				v := HistorySources{}
+				if kind == "missing EV" && i == 3 {
+					v.Missing = MissingEV
+				}
+				if kind == "topology" && i >= 3 {
+					v.Topology = "new meter+charger"
+				}
+				if kind == "time reversal" && i == 3 {
+					sourceTick(t, s, base+5000, v)
+				}
+				sourceTick(t, s, base+i*10000, v)
+				if kind == "duplicate" {
+					sourceTick(t, s, base+i*10000, v)
+				}
+			}
+			b, err := s.sourceLoadBuckets(context.Background(), base, base+60000, 60000)
+			if err != nil || len(b) != 1 {
+				t.Fatal(err)
+			}
+			known := b[0].missing&MissingLoad == 0
+			if known != (kind == "zero" || kind == "duplicate") {
+				t.Fatal("missing evidence classified as measured zero", kind)
+			}
+			if known {
+				near(t, "zero Wh", b[0].wh, 0)
+			}
+		})
+	}
+}
+
+func TestSourceLoadUsesSnapshotTimeAndDoesNotBridgeRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnableHistoryAggregation(); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().UTC().Truncate(24 * time.Hour).UnixMilli()
+	for i := int64(0); i < 3; i++ {
+		p := HistoryPoint{TsMs: base + i*10000, JSON: `{}`, Sources: &HistorySources{AtMS: base + 20000 + i*10000, Topology: "grid", GridW: 1000}}
+		dashboardTick(t, s, fmt.Sprint(i), &p)
+	}
+	var first, covered int64
+	if err := s.history.QueryRow(`SELECT MIN(first_ms),SUM(covered_ms) FROM history_source_energy`).Scan(&first, &covered); err != nil {
+		t.Fatal(err)
+	}
+	if first != base+20000 || covered != 20000 {
+		t.Fatal("source power assigned before observation")
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.EnableHistoryAggregation(); err != nil {
+		t.Fatal(err)
+	}
+	sourceTick(t, s, base+50000, HistorySources{Topology: "grid", GridW: 1000})
+	if err := s.history.QueryRow(`SELECT SUM(covered_ms) FROM history_source_energy`).Scan(&covered); err != nil {
+		t.Fatal(err)
+	}
+	if covered != 20000 {
+		t.Fatal("integrated across stopped process")
+	}
+}
+
+func TestSourceLoadKeepsOlderWriterPeriod(t *testing.T) {
+	s := sourceStore(t)
+	base := time.Now().UTC().Truncate(24 * time.Hour).UnixMilli()
+	sourceSeries(t, s, base, []float64{1000})
+	// Simulate rollback: its writer has no Sources field. A later new writer
+	// must keep this separately recorded minute without double-counting it.
+	for i := int64(0); i <= 6; i++ {
+		p := HistoryPoint{TsMs: base + 120000 + i*10000, GridW: 1000, LoadW: 1000, JSON: `{"ev_w":0,"v2x_w":0}`}
+		dashboardTick(t, s, "old-"+fmt.Sprint(i), &p)
+	}
+	sourceSeries(t, s, base+240000, []float64{1000})
+	d, err := s.DailyEnergy(base, base+300000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two source minutes and the older writer's minute (its opening interval
+	// follows the older integration policy and is deliberately queried alone).
+	old, err := s.DailyEnergy(base+120000, base+180000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	near(t, "older writer Wh", old.LoadWh, 1000.0/60)
+	if d.LoadWh < 3*1000.0/60-1e-8 {
+		t.Fatal("rollback history hidden by source method")
+	}
+}
+
+func TestSourceLoadTariffBalanceAndIndependentGridCost(t *testing.T) {
+	s := sourceStore(t)
+	base := time.Now().UTC().Truncate(24 * time.Hour).UnixMilli()
+	sourceSeries(t, s, base, []float64{-1000, 3000})
+	slots := []priceSlot{{StartMs: base, EndMs: base + 60000, TotalOre: 100}, {StartMs: base + 60000, EndMs: base + 120000, TotalOre: 200}}
+	c, err := s.integrateHistoryRange(context.Background(), base, base+120000, slots, ExportPricing{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	near(t, "valid tariff baseline", c.BaselineHouseOre, 50*200.0/1000)
+	near(t, "independent import cost", c.ImportCostOre, (1000.0/60)*.1+(5000.0/60)*.2)
+	if c.PricedCoveredMs != 60000 {
+		t.Fatal("negative tariff balance counted as priced household use")
+	}
+	whole := []priceSlot{{StartMs: base, EndMs: base + 120000, TotalOre: 100}}
+	c, err = s.integrateHistoryRange(context.Background(), base, base+120000, whole, ExportPricing{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	near(t, "common tariff balance", c.BaselineHouseOre, (2000.0/60)*.1)
+}
+
+func TestSourceLoadRetentionBackupAndDayBoundary(t *testing.T) {
+	s := sourceStore(t)
+	base := time.Now().UTC().Truncate(24 * time.Hour).Add(-15 * time.Minute).UnixMilli()
+	minutes := make([]float64, 30)
+	for i := range minutes {
+		minutes[i] = 1000
+	}
+	sourceSeries(t, s, base, minutes)
+	// A closed-day cache can exist while the last delayed receipt commits.
+	day := time.UnixMilli(base).UTC().Format("2006-01-02")
+	if err := s.SaveDailyEnergy(day, DayEnergy{LoadWh: 1, Intervals: 1}); err != nil {
+		t.Fatal(err)
+	}
+	sourceTick(t, s, base+1800000+10000, HistorySources{GridW: 3000, EVW: 2000})
+	if _, hit, err := s.LoadDailyEnergy(day); err != nil || hit {
+		t.Fatal("affected closed-day cache retained stale Load", err)
+	}
+	for _, bounds := range [][2]int64{{base, base + 900000}, {base + 900000, base + 1800000}} {
+		d, err := s.DailyEnergy(bounds[0], bounds[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		near(t, "day boundary Wh", d.LoadWh, 250)
+	}
+	if err := s.rollSiteEnergy(context.Background(), base+1800000); err != nil {
+		t.Fatal(err)
+	}
+	b, err := s.sourceLoadBuckets(context.Background(), base, base+1800000, 900000)
+	if err != nil || len(b) != 2 {
+		t.Fatal("retained source quarters missing", err)
+	}
+	for _, v := range b {
+		if v.missing&MissingLoad != 0 {
+			t.Fatal("retention lost coverage")
+		}
+		near(t, "retained Wh", v.wh, 250)
+	}
+	backup := filepath.Join(t.TempDir(), "restored.db")
+	if err := s.copyStateForBackup(context.Background(), backup); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.exportHistoryToSQLite(context.Background(), backup); err != nil {
+		t.Fatal(err)
+	}
+	db, err := openRaw(backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, table := range []string{sourceEnergyTable, "history_source_cursor", "history_source_periods"} {
+		a, na, err := sourceTableDigest(s.history, table)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, nb, err := sourceTableDigest(db, table)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if na != nb || a != b {
+			t.Fatal("backup changed source evidence")
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := Open(backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	d, err := restored.DailyEnergy(base, base+1800000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	near(t, "restored household Wh", d.LoadWh, 500)
+}
+
+func sourceTableDigest(db *sql.DB, table string) (string, int64, error) {
+	rows, err := db.Query(`SELECT * FROM ` + table + historyOrder(table))
+	if err != nil {
+		return "", 0, err
+	}
+	defer rows.Close()
+	return hashHistoryRows(rows)
+}
+
+func TestSourceLoadBackupRefusesIncompleteMethod(t *testing.T) {
+	s := sourceStore(t)
+	if _, err := s.history.Exec(`DROP TABLE history_source_periods`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.exportHistoryToSQLite(context.Background(), filepath.Join(t.TempDir(), "history.db")); err == nil {
+		t.Fatal("export accepted incomplete source method")
+	}
+}
+
+func TestSourceLoadTruncationWithoutLegacyLedger(t *testing.T) {
+	s := sourceStore(t)
+	base := time.Now().UTC().Truncate(24 * time.Hour).UnixMilli()
+	minutes := make([]float64, 15)
+	for i := range minutes {
+		minutes[i] = 1000
+	}
+	sourceSeries(t, s, base, minutes)
+	p, truncated, err := s.LoadEnergyHistory(EnergyHistoryQuery{SinceMS: base, UntilMS: base + 900000, BucketMS: 300000, Limit: 1})
+	if err != nil || !truncated || len(p) != 1 {
+		t.Fatal("source-only query lost truncation metadata", err)
+	}
+}
+
+func TestSourceLoadMidMinuteTransitionKeepsLegacyPrefix(t *testing.T) {
+	s := sourceStore(t)
+	base := time.Now().UTC().Truncate(24 * time.Hour).UnixMilli()
+	for i := int64(0); i <= 3; i++ {
+		p := HistoryPoint{TsMs: base + i*10000, GridW: 1000, LoadW: 1000, Missing: MissingSoC, JSON: `{}`}
+		dashboardTick(t, s, "legacy-prefix-"+fmt.Sprint(i), &p)
+	}
+	for i := int64(3); i <= 12; i++ {
+		sourceTick(t, s, base+i*10000, HistorySources{GridW: 1000})
+	}
+	d, err := s.DailyEnergy(base, base+120000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	near(t, "source and legacy Wh", d.LoadWh, 1000.0/30)
+	near(t, "source and legacy import", d.ImportWh, 1000.0/30)
+	var legacyLoad float64
+	if err := s.history.QueryRow(`SELECT SUM(load_wh) FROM (SELECT load_wh FROM history_site_energy UNION ALL SELECT load_wh FROM history_site_energy_partial)`).Scan(&legacyLoad); err != nil {
+		t.Fatal(err)
+	}
+	near(t, "unchanged prefix", legacyLoad, 1000.0/120)
+}
+
+func TestSourceLoadV2XDischargeIsNotNegativeEVCharge(t *testing.T) {
+	s := sourceStore(t)
+	base := time.Now().UTC().Truncate(24 * time.Hour).UnixMilli()
+	for i := int64(0); i <= 6; i++ {
+		sourceTick(t, s, base+i*10000, HistorySources{GridW: -1000, V2XW: -2000})
+	}
+	c, err := s.integrateHistoryRange(context.Background(), base, base+60000, []priceSlot{{StartMs: base, EndMs: base + 60000, TotalOre: 100}}, ExportPricing{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	near(t, "V2X house Wh", c.LoadWh, 1000.0/60)
+	near(t, "EV charging Wh", c.EVWh, 0)
+}

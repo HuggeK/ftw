@@ -182,6 +182,11 @@ func (s *Server) handleSavingsDaily(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.ensureSavingsCache()
+	sourceThrough, sourceMode, err := s.deps.State.HistorySourceProgress(r.Context())
+	if err != nil {
+		http.Error(w, "savings load failed", http.StatusInternalServerError)
+		return
+	}
 
 	out := make([]map[string]any, 0, days)
 	var tImpWh, tExpWh, tLoadWh, tActual, tBaseline, tSaved float64
@@ -190,11 +195,16 @@ func (s *Server) handleSavingsDaily(w http.ResponseWriter, r *http.Request) {
 	for i := days - 1; i >= 0; i-- {
 		dayStart := todayMidnight.AddDate(0, 0, -i)
 		dayKey := dayStart.Format("2006-01-02")
+		cacheKey := dayKey
+		if sourceMode {
+			cacheKey += ":source_interval_balance_v1"
+		}
 		isToday := i == 0
+		dayEnd := dayStart.AddDate(0, 0, 1)
 
 		var ds daySavings
-		if isToday {
-			b, err := s.deps.State.DailyCostBreakdownContext(r.Context(), dayStart.UnixMilli(), now.UnixMilli(), zone, ep)
+		if isToday || (sourceMode && sourceThrough < dayEnd.UnixMilli()) {
+			b, err := s.deps.State.DailyCostBreakdownContext(r.Context(), dayStart.UnixMilli(), min(now.UnixMilli(), dayEnd.UnixMilli()), zone, ep)
 			if err != nil {
 				slog.Error("handleSavingsDaily: DailyCostBreakdown failed", "err", err, "day", dayKey)
 				http.Error(w, "savings load failed", http.StatusInternalServerError)
@@ -203,7 +213,7 @@ func (s *Server) handleSavingsDaily(w http.ResponseWriter, r *http.Request) {
 			ds = fromBreakdown(b, resolutionFor(b))
 		} else {
 			s.savingsCacheMu.Lock()
-			cached, ok := s.savingsCache[dayKey]
+			cached, ok := s.savingsCache[cacheKey]
 			s.savingsCacheMu.Unlock()
 			if ok {
 				ds = cached
@@ -217,7 +227,7 @@ func (s *Server) handleSavingsDaily(w http.ResponseWriter, r *http.Request) {
 				}
 				ds = fromBreakdown(b, resolutionFor(b))
 				s.savingsCacheMu.Lock()
-				s.savingsCache[dayKey] = ds
+				s.savingsCache[cacheKey] = ds
 				s.savingsCacheMu.Unlock()
 			}
 		}

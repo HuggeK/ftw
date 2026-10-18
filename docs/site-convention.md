@@ -46,8 +46,18 @@ this one thing were the only thing running.
 Balance equation (all signed):
 
 ```
-grid_w = load_w + bat_w + pv_w
+grid_w = load_w + bat_w + pv_w + ev_w + v2x_w
 ```
+
+Live household Load uses the current fresh site-side powers. Historical Load
+uses source energy over a common interval, with EV charging excluded. Core
+holds each qualified snapshot forward until the next safe snapshot, at most
+15 seconds later, and stores signed source energy by UTC minute. It balances
+the sums when reading a chart interval, day or tariff period. A negative
+minute may contribute to a valid longer interval; it is never clipped first.
+Chart means need complete interval coverage. Missing sources, writer gaps,
+process stops and topology changes cannot become measured zero. This is an
+estimate from received measurements, not a correction of device clocks.
 
 In self-consumption mode, the controller drives the site meter toward the
 grid target (normally 0 W): it charges from live surplus and may discharge

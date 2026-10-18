@@ -131,9 +131,6 @@ func writeLoadEstimateTx(ctx context.Context, tx *sql.Tx, previous, until int64,
 // and offline gaps. It does not extrapolate energy into unrecorded periods.
 func (s *Store) HistoryEnergyCoverage(ctx context.Context, from, to int64) (int64, error) {
 	var covered int64
-	err := s.history.QueryRowContext(ctx, `SELECT COALESCE(SUM(covered_ms),0) FROM (
- SELECT start_ms,first_ms,last_ms,covered_ms FROM history_site_energy
- UNION ALL SELECT start_ms,first_ms,last_ms,covered_ms FROM history_site_energy_partial
- ) WHERE start_ms>=? AND start_ms<? AND first_ms>=? AND last_ms<=?`, from, to, from, to).Scan(&covered)
+	err := s.walkSiteEnergy(ctx, from, to, func(r siteEnergyRow) error { covered += r.covered; return nil })
 	return covered, err
 }

@@ -183,10 +183,13 @@ func (s *Store) rollSiteEnergy(ctx context.Context, cutoff int64) error {
 			return err
 		}
 	}
-	return nil
+	return s.rollSiteEnergyStorage(ctx, cutoff, sourceEnergyTable, "source_energy")
 }
 func (s *Store) rollSiteEnergyTable(ctx context.Context, cutoff int64, partial bool) error {
 	table, kind := energyStorage(partial)
+	return s.rollSiteEnergyStorage(ctx, cutoff, table, kind)
+}
+func (s *Store) rollSiteEnergyStorage(ctx context.Context, cutoff int64, table, kind string) error {
 	width := int64((15 * time.Minute).Milliseconds())
 	cutoff = bucketStart(cutoff, width)
 	for {
@@ -206,9 +209,21 @@ func (s *Store) rollSiteEnergyTable(ctx context.Context, cutoff int64, partial b
 			if err := tx.QueryRowContext(ctx, `SELECT COALESCE(`+historyMissingAggregate+`,0) FROM history_quality WHERE kind='`+kind+`' AND resolution_ms=? AND start_ms>=? AND start_ms<?`, ArchiveResolutionMS, from, to).Scan(&r.missing); err != nil {
 				return err
 			}
-			return tx.QueryRowContext(ctx, `SELECT MIN(first_ms),MAX(last_ms),SUM(covered_ms),SUM(n),SUM(import_wh),SUM(export_wh),SUM(pv_wh),SUM(bat_charge_wh),SUM(bat_discharge_wh),SUM(load_wh),SUM(ev_wh) FROM `+table+` WHERE resolution_ms=? AND start_ms>=? AND start_ms<?`, ArchiveResolutionMS, from, to).Scan(&r.first, &r.last, &r.covered, &r.n, &r.imp, &r.exp, &r.pv, &r.charge, &r.discharge, &r.load, &r.ev)
+			columns := ""
+			dest := []any{&r.first, &r.last, &r.covered, &r.n, &r.imp, &r.exp, &r.pv, &r.charge, &r.discharge, &r.load, &r.ev}
+			if table == sourceEnergyTable {
+				columns = ",SUM(ev_charge_wh),SUM(ev_discharge_wh)"
+				dest = append(dest, &r.evCharge, &r.evDischarge)
+			}
+			return tx.QueryRowContext(ctx, `SELECT MIN(first_ms),MAX(last_ms),SUM(covered_ms),SUM(n),SUM(import_wh),SUM(export_wh),SUM(pv_wh),SUM(bat_charge_wh),SUM(bat_discharge_wh),SUM(load_wh),SUM(ev_wh)`+columns+` FROM `+table+` WHERE resolution_ms=? AND start_ms>=? AND start_ms<?`, ArchiveResolutionMS, from, to).Scan(dest...)
 		}, func(ctx context.Context, tx *sql.Tx) error {
-			_, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO `+table+` VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, from, width, r.first, r.last, r.covered, r.n, r.imp, r.exp, r.pv, r.charge, r.discharge, r.load, r.ev)
+			args := []any{from, width, r.first, r.last, r.covered, r.n, r.imp, r.exp, r.pv, r.charge, r.discharge, r.load, r.ev}
+			marks := "?,?,?,?,?,?,?,?,?,?,?,?,?"
+			if table == sourceEnergyTable {
+				args = append(args, r.evCharge, r.evDischarge)
+				marks += ",?,?"
+			}
+			_, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO `+table+` VALUES(`+marks+`)`, args...)
 			if err != nil {
 				return err
 			}
