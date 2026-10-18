@@ -7,17 +7,10 @@ package appenroll
 // box, reading eight characters down the phone. Everything here exists to make
 // those eight characters safe to say out loud.
 //
-// It is redeemed exactly where the QR code's payload is redeemed — inside
-// Noise handshake message 1 — so there is no new endpoint, no new carrier and
-// no HTTP path. The app decodes the characters back to five bytes and sends
-// those. The wire does not change at all.
-//
-// What it is not, and the box's own page says so on the screen: it is not a
-// way in for a phone that has never seen this box. These characters are the
-// pairing code and nothing else. The box's static key and its rendezvous
-// secret travel only in the QR payload, so a phone with no record of this box
-// can neither find it nor be sure the box answering is the right one. This
-// re-admits a phone that already holds those.
+// A phone that knows the box may send its five decoded bytes in Noise
+// handshake message 1. A new phone uses RedeemSpokenCode through the box's
+// protected local HTTP API to obtain the same payload a QR carries. The
+// trust anchor passes directly from the box to the phone on the home network.
 //
 // What it proves is not that the phone is trusted. It is that somebody was
 // standing at the box: the code is minted only through the LAN-only pairing

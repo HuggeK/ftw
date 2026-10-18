@@ -15,7 +15,8 @@ import (
 // Pairing a phone with this box.
 //
 // The box mints a single-use code and shows the payload as a QR. The app scans
-// it, and the box's static key travels optically — never through Sourceful.
+// it, or receives it directly from the box by link, paste or local code
+// exchange. The box's static key never passes through Sourceful.
 // That is what lets a hostile or compelled relay deny service without being
 // able to impersonate a box.
 //
@@ -138,8 +139,9 @@ type appLinkPairingRequest struct {
 	// Role is "owner" or "viewer". Validated by the enroller against the
 	// registry, never against a list written here.
 	Role string `json:"role"`
-	// Kind is "qr" or "spoken".
+	// Kind is "qr", "spoken", or "claim" for a code entered on the LAN.
 	Kind string `json:"kind"`
+	Code string `json:"code,omitempty"`
 }
 
 // appLinkRoleRequest changes what one paired phone may do.
@@ -177,6 +179,10 @@ func (s *Server) handleAppLinkPairing(w http.ResponseWriter, r *http.Request) {
 	// below rather than being filled in for.
 	var req appLinkPairingRequest
 	_ = readJSON(r, &req)
+	if req.Kind == "claim" {
+		s.handlePairingClaim(w, r, req.Code)
+		return
+	}
 	if req.Role == apiauth.RoleWatch {
 		s.handleWatchPairing(w, r, req)
 		return
@@ -196,10 +202,8 @@ func (s *Server) handleAppLinkPairing(w http.ResponseWriter, r *http.Request) {
 	// needs a person in the room. A code mintable from a phone anywhere in the
 	// world takes that argument away.
 	//
-	// It would also buy nothing. A typed code carries the pairing code alone —
-	// not the box's static key, not the rendezvous secret — so it re-admits a
-	// phone that already holds those and cannot let in a guest's phone, which
-	// has never seen this box. There is no second, weaker way to mint one.
+	// A new phone exchanges this code locally for the full enrollment payload.
+	// A phone that already knows the box can also use it in a Noise handshake.
 	if req.Kind == appPairingKindSpoken {
 		if appLinkOverSession(r) {
 			writeAppLinkError(w, http.StatusForbidden,

@@ -1,0 +1,22 @@
+.app-pairing button,
+.app-pairing a.btn-send {
+  min-height: 44px;
+}
+
+.app-pairing a.btn-send {
+  display: inline-flex;
+  align-items: center;
+  text-decoration: none;
+}
+
+#app-link-slot > button,
+#app-link-slot > a {
+  margin-right: 8px;
+}
+
+#app-link-slot input[readonly] {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin: 8px 0;
+}

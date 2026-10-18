@@ -750,6 +750,14 @@ each time it receives such a roster. With no id, there is no copy.
 Only a QR code is listed. A spoken code has 40 bits, and its hash would let
 the service find it offline; it pairs over the relay or the home network.
 
+A new iPhone may exchange a short code directly with the box on the home
+network through `POST /api/app-link/pairing` with `kind: "claim"`. The box
+replaces that code with a full 128-bit enrollment token, keeping its role and
+expiry, and returns the same v3 link as the QR. Only the full token's hash
+enters the roster above. The exchange keeps the pairing route's local-address,
+house-password and browser-origin checks and refuses app sessions. See
+[Pair with one iPhone](pairing.md) for the steps.
+
 **`stats`**
 
 Signed box to service only. Never forwarded to phones or agents. The box
