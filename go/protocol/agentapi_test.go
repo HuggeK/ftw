@@ -33,12 +33,12 @@ func TestDiagnosticPageVector(t *testing.T) {
 	}
 }
 func TestDiagnosticPathSyntaxDoesNotKeepAnAPIList(t *testing.T) {
-	for _, value := range []string{"/api/future/read", "/api/drivers/charger-192.168.1.9/source"} {
+	for _, value := range []string{"/api/future/read", "/api/drivers/charger-192.168.1.9/source", "/api/drivers/EV%20charger%2Fgarage/logs", "/api/drivers/battery%25name"} {
 		if !ValidAgentAPIPath(value) {
 			t.Errorf("valid path refused: %s", value)
 		}
 	}
-	for _, value := range []string{"/status", "/api/../config", "/api/status?x=1", "/api/status#x", "/api/a%2fb", "/api/a\\b", "/api/a\n"} {
+	for _, value := range []string{"/status", "/api/../config", "/api/status?x=1", "/api/status#x", "/api/%2e%2e/config", "/api/a%0Ab", "/api/a%ZZ", "/api/a\\b", "/api/a\n"} {
 		if ValidAgentAPIPath(value) {
 			t.Errorf("invalid path accepted: %q", value)
 		}

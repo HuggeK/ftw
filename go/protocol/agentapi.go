@@ -1,8 +1,10 @@
 package protocol
 
 import (
+	"net/url"
 	"path"
 	"strings"
+	"time"
 	"unicode"
 )
 
@@ -25,8 +27,9 @@ func DecodeAPIRead(body []byte) (APIRead, error) {
 }
 
 const (
-	AgentAPIMaxBytes    = 1 << 20   // Complete JSON wire answer, including escaped text.
-	AgentAPIPageBytes   = 128 << 10 // Source bytes per page; not a total data limit.
+	AgentAPIReadTimeout = 5 * time.Minute // Large exports may need more time than a status read.
+	AgentAPIMaxBytes    = 1 << 20         // Complete JSON wire answer, including escaped text.
+	AgentAPIPageBytes   = 128 << 10       // Source bytes per page; not a total data limit.
 	AgentAPICatalogPath = "/api/diagnostics/catalog"
 )
 
@@ -42,6 +45,17 @@ type AgentAPIRoute struct {
 // ValidAgentAPIPath validates syntax only. Core's router decides whether the
 // path is a read; Cloud does not keep a second list of the box's API.
 func ValidAgentAPIPath(value string) bool {
-	return strings.HasPrefix(value, "/api/") && path.Clean(value) == value &&
-		!strings.ContainsAny(value, "?%#\\") && strings.IndexFunc(value, unicode.IsControl) < 0
+	target, err := url.ParseRequestURI(value)
+	if err != nil || !strings.HasPrefix(value, "/api/") || path.Clean(value) != value ||
+		target.RawQuery != "" || target.ForceQuery || strings.ContainsAny(value, "?#\\") ||
+		strings.IndexFunc(target.Path, unicode.IsControl) >= 0 {
+		return false
+	}
+	for _, part := range strings.Split(value, "/") {
+		decoded, _ := url.PathUnescape(part)
+		if decoded == "." || decoded == ".." {
+			return false
+		}
+	}
+	return true
 }

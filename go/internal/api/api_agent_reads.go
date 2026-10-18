@@ -29,6 +29,7 @@ func (s *Server) ServeAgentRead(w http.ResponseWriter, request *http.Request, re
 	if request.URL.Path == protocol.AgentAPICatalogPath {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"routes": s.agentReadCatalog(), "requiredScope": protocol.ScopeDiagRun,
+			"timeoutMs":       protocol.AgentAPIReadTimeout.Milliseconds(),
 			"maxPageBytes":    protocol.AgentAPIPageBytes,
 			"troubleshooting": s.agentDebugContext(),
 			"queryPolicy":     "Use the existing API's parameters. Query hints are not a restriction.",
