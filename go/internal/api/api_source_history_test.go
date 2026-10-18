@@ -88,6 +88,14 @@ func testSourceHistoryDayCaches(t *testing.T, firstBatch bool) {
 	if err := st.FlushHistory(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	if firstBatch {
+		// An older request finishes saving after the first source commit.
+		// Its stale total must not refill the persistent cache under a new RAM key.
+		day := time.UnixMilli(base).In(now.Location()).Format("2006-01-02")
+		if err := st.SaveDailyEnergyForSourceMode(day, state.DayEnergy{LoadWh: 1, Intervals: 1}, false); err != nil {
+			t.Fatal(err)
+		}
+	}
 	for _, path := range []string{"/api/energy/daily?days=2", "/api/savings/daily?days=2"} {
 		if got := read(path); math.Abs(got-1000.0/60) > 1e-8 {
 			t.Fatal("same API server retained Load from before final commit")

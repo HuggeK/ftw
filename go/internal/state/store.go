@@ -1821,6 +1821,17 @@ func (s *Store) LoadDailyEnergy(day string) (DayEnergy, bool, error) {
 // persisted via this method (the day is still accumulating); callers
 // should gate on "is closed day" before saving.
 func (s *Store) SaveDailyEnergy(day string, de DayEnergy) error {
+	return s.saveDailyEnergy(day, de, nil)
+}
+
+// SaveDailyEnergyForSourceMode cannot repopulate a legacy cache after the
+// first source batch invalidated it. The check and write share the writer
+// lock and transaction; an in-flight older API request may simply skip saving.
+func (s *Store) SaveDailyEnergyForSourceMode(day string, de DayEnergy, expectedSourceMode bool) error {
+	return s.saveDailyEnergy(day, de, &expectedSourceMode)
+}
+
+func (s *Store) saveDailyEnergy(day string, de DayEnergy, expectedSourceMode *bool) error {
 	s.historyWriteMu.Lock()
 	defer s.historyWriteMu.Unlock()
 	const q = `
@@ -1841,6 +1852,20 @@ func (s *Store) SaveDailyEnergy(day string, de DayEnergy) error {
 		return err
 	}
 	defer tx.Rollback()
+	if expectedSourceMode != nil {
+		// Acquire SQLite's writer before checking the method, including when
+		// no cursor exists. Never upgrade a deferred read transaction to write.
+		if _, err := tx.Exec(`UPDATE history_source_cursor SET value=value WHERE key='through'`); err != nil {
+			return err
+		}
+		var current bool
+		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM history_source_cursor WHERE key='through')`).Scan(&current); err != nil {
+			return err
+		}
+		if current != *expectedSourceMode {
+			return nil
+		}
+	}
 	_, err = tx.Exec(q, day,
 		de.ImportWh, de.ExportWh, de.PVWh,
 		de.BatChargedWh, de.BatDischargedWh, de.LoadWh,

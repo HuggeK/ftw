@@ -2569,7 +2569,7 @@ func (s *Server) handleEnergyDaily(w http.ResponseWriter, r *http.Request) {
 				// Best-effort: a write failure is logged but not
 				// surfaced to the operator since the in-memory
 				// cache still serves this request.
-				if err := s.deps.State.SaveDailyEnergy(dayKey, de); err != nil {
+				if err := s.deps.State.SaveDailyEnergyForSourceMode(dayKey, de, sourceMode); err != nil {
 					slog.Warn("handleEnergyDaily: persist daily aggregate failed", "err", err, "day", dayKey)
 				}
 			}
