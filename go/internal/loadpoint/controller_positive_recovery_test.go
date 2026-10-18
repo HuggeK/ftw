@@ -2,6 +2,7 @@ package loadpoint
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"math"
 	"testing"
@@ -79,6 +80,51 @@ func TestPositiveOfferRecoveryWithoutPriorZero(t *testing.T) {
 			}
 			if countAction(sender.calls, "ev_pause") != 0 {
 				t.Fatal("recovery must not pause the charger")
+			}
+		})
+	}
+}
+
+func TestRecoveryRechecksStopAndSessionAfterCurrentWrite(t *testing.T) {
+	for _, boundary := range []string{"stop", "unplug", "session", "unknown", "started drawing"} {
+		t.Run(boundary, func(t *testing.T) {
+			now := time.Now()
+			cfg := Config{ID: "garage", DriverName: "easee", MinChargeW: 4140, MaxChargeW: 10350}
+			dir := &Directive{SlotStart: now, SlotEnd: now.Add(time.Hour), LoadpointEnergyWh: map[string]float64{cfg.ID: 0}}
+			sample := EVSample{Connected: true, RequestActive: true, DeviceID: "charger", SessionID: "one", ConnectionGeneration: 1}
+			samples := map[string]EVSample{cfg.DriverName: sample}
+			sender := &fakeSender{}
+			c := newTestController(t, []Config{cfg}, dir, samples, sender)
+			c.Tick(context.Background(), now)
+			dir.LoadpointEnergyWh[cfg.ID] = 10350
+			c.send = func(ctx context.Context, driver string, payload []byte) error {
+				var command struct {
+					Action string  `json:"action"`
+					PowerW float64 `json:"power_w"`
+				}
+				if err := json.Unmarshal(payload, &command); err != nil {
+					return err
+				}
+				if command.Action == "ev_set_current" && command.PowerW > 0 {
+					switch boundary {
+					case "stop":
+						c.SetManualHold(cfg.ID, ManualHold{PowerW: 0, Persistent: true})
+					case "unplug":
+						sample.Connected = false
+					case "session":
+						sample.SessionID = "two"
+					case "unknown":
+						sample.ConnectionUnknown = true
+					case "started drawing":
+						sample.PowerW = 4712
+					}
+					samples[cfg.DriverName] = sample
+				}
+				return sender.Send(ctx, driver, payload)
+			}
+			c.Tick(context.Background(), now.Add(5*time.Second))
+			if countAction(sender.calls, "ev_resume") != 0 {
+				t.Fatalf("resume crossed %s during current write", boundary)
 			}
 		})
 	}

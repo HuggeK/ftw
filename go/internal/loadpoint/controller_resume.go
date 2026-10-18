@@ -41,6 +41,26 @@ func (c *Controller) recoverOfferedCharge(ctx context.Context, cfg Config, sampl
 		c.resumeOffers[cfg.ID] = proof
 		return
 	}
+	// The current write can block while a Stop or socket change arrives.
+	// Recheck before reopening the contactor, using the newest observation.
+	if hold, held := c.GetManualHold(cfg.ID, now); held && hold.PowerW == 0 {
+		delete(c.resumeOffers, cfg.ID)
+		return
+	}
+	if c.tel != nil {
+		latest, live := c.tel(cfg.DriverName)
+		if !live || !latest.Connected || latest.ConnectionUnknown || latest.DeviceID != sample.DeviceID ||
+			latest.SessionID != sample.SessionID || latest.ConnectionGeneration != sample.ConnectionGeneration {
+			delete(c.resumeOffers, cfg.ID)
+			return
+		}
+		sample = latest
+		// A poll may have arrived during the current write. Judge it against
+		// the time after that call, while still rejecting future source times.
+		if checkedAt := time.Now(); sample.PowerAt.After(now) && !sample.PowerAt.After(checkedAt) {
+			now = checkedAt
+		}
+	}
 	if !exists {
 		if proof.device == "" || proof.session == "" || !sample.RequestActive {
 			return
