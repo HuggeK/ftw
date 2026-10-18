@@ -1,10 +1,16 @@
 package api
 
 import (
+	"strings"
+	"time"
+
 	"github.com/srcfl/ftw/go/internal/state"
 	"github.com/srcfl/ftw/go/internal/telemetry"
-	"strings"
 )
+
+func dailyEnergyCacheReady(dayStart, now time.Time) bool {
+	return !now.Before(dayStart.AddDate(0, 0, 1).Add(time.Minute))
+}
 
 func (s *Server) qualifyStatusHistory(resp map[string]any, siteMeter string) {
 	if s.deps.HistoryMeasurementSources == nil {
@@ -13,6 +19,7 @@ func (s *Server) qualifyStatusHistory(resp map[string]any, siteMeter string) {
 	opts := s.deps.HistoryMeasurementSources()
 	opts.UseWatchdogTimeout = true
 	r := s.deps.Tel.ForecastMeasurementNow(siteMeter, opts)
+	resp["load_estimate"] = s.deps.Tel.HomeUseEstimate(time.Now(), siteMeter, opts)
 	var missing state.HistoryMissing
 	for kind, flag := range map[telemetry.DerType]state.HistoryMissing{telemetry.DerMeter: state.MissingGrid, telemetry.DerPV: state.MissingPV, telemetry.DerBattery: state.MissingBattery, telemetry.DerEV: state.MissingEV, telemetry.DerV2X: state.MissingV2X} {
 		if !r.Known[kind] {

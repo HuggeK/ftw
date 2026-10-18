@@ -475,10 +475,11 @@
       out.ev_charging_w = sums.ev_w;
     }
     if (out.grid_w != null && data.load_w != null) {
-      out.load_w = Math.max(0, (out.grid_w || 0) - (out.bat_w || 0) - (out.pv_w || 0) - (out.ev_w || 0));
+      out.load_w = smoothDisplayNumber("load_w", data.load_w, now);
     } else {
       // No live meter: do not keep a previous load or treat JSON null as 0 W.
       out.load_w = null;
+      delete statusDisplayState.load_w;
     }
     return out;
   }
@@ -563,6 +564,15 @@
     }
     var opts = energyFlowOpts(data); opts.live = lastFlowLive;
     lastFlowReadings = window.ftwFlowReadingsFromStatus(data, opts);
+    var homeNote = document.getElementById("home-use-estimate");
+    if (!homeNote) {
+      homeNote = document.createElement("p");
+      homeNote.id = "home-use-estimate";
+      homeNote.className = "muted";
+      flowEl.insertAdjacentElement("afterend", homeNote);
+    }
+    homeNote.textContent = lastFlowReadings.homeEstimateNote || "";
+    homeNote.hidden = !homeNote.textContent;
     (lastFlowReadings.planets || []).forEach(function (p) {
       if (p.role !== "ev" || p.placeholder || !p.name) return;
       var lpEv = loadpointsByDriver && loadpointsByDriver[p.name];

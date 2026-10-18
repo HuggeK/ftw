@@ -26,7 +26,7 @@ var historyTables = []string{
 }
 var sqliteHistoryBaseTables = append(append([]string{}, historyTables...), "ts_series_hour", "ts_archive_days", "ts_buckets", "ts_bucket_days", "ts_legacy_bucket_days", "ts_aggregate_hours", "ts_latest", "history_dashboard", "history_site_energy", "history_site_cursor")
 var historyQualityTables = []string{"history_quality", "history_daily_quality", "history_dashboard_partial", "history_site_energy_partial", "history_partial_cursor", "energy_daily_partial"}
-var sqliteHistoryTables = append(append(append([]string{}, sqliteHistoryBaseTables...), historyQualityTables...), "history_load_estimates")
+var sqliteHistoryTables = append(append(append([]string{}, sqliteHistoryBaseTables...), historyQualityTables...), "history_load_estimates", "history_load_estimate_pending")
 
 func ensureHistorySchema(exec func(string) error) error {
 	for _, stmt := range historySchema {
@@ -145,6 +145,13 @@ func (s *Store) openHistory() error {
 		if err := s.RetireRawHistory(context.Background()); err != nil {
 			return err
 		}
+	}
+	// A process stop has no continuous sampling proof, even when it was brief.
+	// Keep completed energy and quality, but never bridge the stopped process.
+	if _, err := s.history.Exec(`DELETE FROM history_load_estimate_pending;
+ UPDATE history_partial_cursor SET value=0 WHERE key IN ('last','residual_eligible');
+ UPDATE history_site_cursor SET value=0 WHERE key='last'`); err != nil {
+		return err
 	}
 	ok = true
 	return nil
@@ -368,6 +375,8 @@ func historyOrder(table string) string {
 		return " ORDER BY driver_id, metric_id"
 	case "history_load_estimates", "history_dashboard", "history_site_energy", "history_dashboard_partial", "history_site_energy_partial":
 		return " ORDER BY start_ms, resolution_ms"
+	case "history_load_estimate_pending":
+		return " ORDER BY from_ms"
 	case "ts_buckets":
 		return " ORDER BY driver_id, metric_id, start_ms, resolution_ms"
 	case "ts_bucket_days", "ts_legacy_bucket_days":
@@ -494,12 +503,14 @@ func (s *Store) exportHistoryToSQLite(ctx context.Context, path string) error {
 		return errors.New("incomplete history quality tables; keep the source and restore a verified full backup")
 	}
 	// Estimates are additive and optional in published older backups.
-	var estimatesExist int
-	if err := src.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='history_load_estimates'`).Scan(&estimatesExist); err != nil {
-		return err
-	}
-	if estimatesExist != 0 {
-		tables = append(append([]string{}, tables...), "history_load_estimates")
+	for _, table := range []string{"history_load_estimates", "history_load_estimate_pending"} {
+		var exists int
+		if err := src.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&exists); err != nil {
+			return err
+		}
+		if exists != 0 {
+			tables = append(append([]string{}, tables...), table)
+		}
 	}
 	// This is an unpublished scratch file. Flush each small commit, then
 	// pause, so the next goal/session sync does not inherit a dirty backlog.

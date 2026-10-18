@@ -296,6 +296,7 @@ type Store struct {
 	health              map[string]*DriverHealth
 	commands            map[string]CommandEvidence
 	controlObservations map[string][]ControlObservation
+	homeObservations    map[string][]ControlObservation // display estimates only
 
 	processNoise     float64
 	measurementNoise float64
@@ -479,6 +480,7 @@ func (s *Store) Update(driver string, t DerType, rawW float64, soc *float64, dat
 
 	s.observeCommand(driver, t, rawW, data, now)
 	s.recordControlObservation(driver, t, rawW, data, now)
+	s.recordHomeObservation(driver, t, rawW, data, now)
 	s.freezeStepWindows(now)
 
 	// Auto-buffer the standard fields (raw, not smoothed — we store ground

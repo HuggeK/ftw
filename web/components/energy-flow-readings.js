@@ -39,6 +39,20 @@ export function fmtKwhShort(kwh) {
   return kwh.toFixed(2);
 }
 
+export function homeEstimateNote(estimate, live = true) {
+  if (!estimate) return "";
+  if (!live) return "Home use estimate paused · no live data";
+  if (num(estimate.watts) === null) return "Home use estimate unavailable · waiting for matching readings";
+  const age = num(estimate.age_ms);
+  const from = num(estimate.from_ms), to = num(estimate.to_ms);
+  if (age === null || age < 0 || age > 35000 || from === null || to === null || to <= from) {
+    return "Home use estimate unavailable · readings are too old";
+  }
+  const low = num(estimate.timing_min_w), high = num(estimate.timing_max_w);
+  const range = low === null || high === null ? "" : ` · timing range ${(low / 1000).toFixed(1)}–${(high / 1000).toFixed(1)} kW`;
+  return `Estimated home use ${(estimate.watts / 1000).toFixed(1)} kW · ${Math.round((to - from) / 1000)} s mean · ${Math.ceil(age / 1000)} s old${range}. Sensor accuracy and unknown delays are not included.`;
+}
+
 function planetColor(role, watts, thresholdW) {
   if (watts === undefined || watts === null) {
     if (role === "grid" || role === "pv") return "var(--fg-muted)";
@@ -218,6 +232,7 @@ export function flowReadingsFromStatus(status, opts) {
 
   return {
     load: loadW === null ? null : loadW / 1000,
+    homeEstimateNote: homeEstimateNote(status?.load_estimate, opts?.live !== false),
     planets: withControlMarks(planets, status?.control_feedback, opts?.live !== false),
     selfPoweredPctToday,
   };

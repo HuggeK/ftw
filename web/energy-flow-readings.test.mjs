@@ -1,7 +1,20 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { flowReadingsFromStatus, fmtKwhShort } from "./components/energy-flow-readings.js";
+import { flowReadingsFromStatus, fmtKwhShort, homeEstimateNote } from "./components/energy-flow-readings.js";
+
+it("keeps a smoothed estimate separate from raw Home use and shows age and uncertainty", () => {
+  const estimate = {watts: 886, timing_min_w: -3946, timing_max_w: 5768, from_ms: 1000, to_ms: 11000, age_ms: 9000};
+  const result = flowReadingsFromStatus({load_w: null, load_estimate: estimate});
+  assert.equal(result.load, null);
+  assert.match(result.homeEstimateNote, /Estimated home use 0.9 kW/);
+  assert.match(result.homeEstimateNote, /10 s mean · 9 s old/);
+  assert.match(result.homeEstimateNote, /timing range -3.9–5.8 kW/);
+  assert.match(result.homeEstimateNote, /unknown delays are not included/);
+  assert.match(homeEstimateNote(estimate, false), /paused/);
+  assert.match(homeEstimateNote({...estimate, age_ms: 36000}), /too old/);
+  assert.match(homeEstimateNote({watts: null}), /unavailable/);
+});
 
 const LIVE = {
   grid_w: 500,
