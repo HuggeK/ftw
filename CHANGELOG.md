@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.151.0
+
+### Minor Changes
+
+- 16fbd58: Let the direct private LAN page accept Cloud terms or statistics without requiring a house password to be set first. When password protection is on, saving the choice still requires login. Show a shorter consent card, full sharing details, a clear saved message and errors that allow a retry.
+
+### Patch Changes
+
+- 8f937e7: The box now takes the app's next API request as soon as the previous answer has ended. Before, it freed its one request slot only after it had sent the answer's last frame. An app that asked again at once could be told the box was busy and then wait out a backoff before the view filled in.
+- 6308d04: With two or more managed chargers, unplugging one car during an overage of the import ceiling no longer holds back battery relief. Its offer left the pool, but Core did not cut it, so the battery no longer waits for it. A cut Core has sent to a car that stays plugged still counts, so its landing does not swing the site into export.
+- Resume a known charging session after sustained non-delivery and keep checking until measured power returns. Set the safe current before resuming. Do not interrupt charging from a delayed vehicle status, cycle a charger after an accepted vehicle start, or wake a read-only vehicle. Show sustained zero draw even while FTW adjusts the current, and record command evidence when charging stops. Keep missing power unknown and recheck Stop and the plug session after slow commands.
+- a111fdb: Calculate Home use from timestamped charger session energy where available and integrate other sources over the same period. Adapt the period to source reporting and show the estimated mean, period and age. Cloud polls do not refresh source time. Retain signed daily energy only for bounded balance failures that recover, while preserving raw quality, offline gaps and control inputs.
+- 7622380: Pair an iPhone from the same phone's browser or with a local pairing code. Show a restart action beside the app connection setting and keep restart progress in view.
+- a94e256: Keep signed source-balance estimates for short measurement imbalances, preserving original history quality and separating estimated household energy from missing data.
+
 ## 0.150.0
 
 ### Minor Changes
