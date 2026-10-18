@@ -5,8 +5,9 @@ import { flowReadingsFromStatus, fmtKwhShort, homeEstimateNote } from "./compone
 
 it("keeps a smoothed estimate separate from raw Home use and shows age and uncertainty", () => {
   const estimate = {watts: 886, timing_min_w: -3946, timing_max_w: 5768, from_ms: 1000, to_ms: 11000, age_ms: 9000};
-  const result = flowReadingsFromStatus({load_w: null, load_estimate: estimate});
+  const result = flowReadingsFromStatus({load_w: null, load_estimate: estimate, energy:{today:{load_wh:2000,import_wh:500,history_quality:'estimated'}}});
   assert.equal(result.load, null);
+  assert.equal(result.selfPoweredPctToday, null);
   assert.match(result.homeEstimateNote, /Estimated home use 0.9 kW/);
   assert.match(result.homeEstimateNote, /10 s mean · 9 s old/);
   assert.match(result.homeEstimateNote, /timing range -3.9–5.8 kW/);

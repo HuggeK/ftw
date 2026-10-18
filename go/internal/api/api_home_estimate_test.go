@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/srcfl/ftw/go/internal/state"
 	"github.com/srcfl/ftw/go/internal/telemetry"
 )
 
@@ -33,6 +34,17 @@ func TestStatusHomeEstimateIsSeparateFromInstantaneousPower(t *testing.T) {
 	srv.qualifyStatusHistory(resp, "site")
 	if resp["load_w"] != nil || resp["load_estimate"].(telemetry.HomeEstimate).Watts != nil {
 		t.Fatal(resp)
+	}
+}
+
+func TestEnergyTodayKeepsEstimatedLoadOutOfMeasuredFields(t *testing.T) {
+	got := energyTodayFields(state.DayEnergy{Intervals: 2, Missing: state.EstimatedLoad, LoadWh: 22, ImportWh: 10})
+	if got["history_quality"] != "estimated" || got["load_wh"] != float64(22) {
+		t.Fatal(got)
+	}
+	measured := got["measured"].(map[string]any)
+	if measured["load_wh"] != nil || measured["import_wh"] != float64(10) {
+		t.Fatal(measured)
 	}
 }
 
