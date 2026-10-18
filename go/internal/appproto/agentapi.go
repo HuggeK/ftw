@@ -3,6 +3,7 @@ package appproto
 import (
 	"context"
 	"net/http"
+	"net/url"
 	"sync"
 
 	"github.com/srcfl/ftw/go/protocol"
@@ -37,7 +38,7 @@ func (h *Handler) onAPIRead(env Envelope) error {
 		var once sync.Once
 		free := func() { once.Do(func() { h.apiBusy.Store(false) }) }
 		defer free()
-		ctx, cancel := context.WithTimeout(h.ctx, apiHandlerTimeout)
+		ctx, cancel := context.WithTimeout(h.ctx, protocol.AgentAPIReadTimeout)
 		defer cancel()
 		if h.isAgent() {
 			_, refusal, end := h.agentGate()
@@ -55,6 +56,11 @@ func (h *Handler) onAPIRead(env Envelope) error {
 			return
 		}
 		req := buildAPIRequest(ctx, caller, request)
+		// API paths use ordinary URL encoding. Keep RawPath so an escaped
+		// slash remains inside one driver-name segment in Go's ServeMux.
+		target, _ := url.ParseRequestURI(read.Path)
+		req.URL.Path, req.URL.RawPath = target.Path, target.RawPath
+		req.RequestURI = req.URL.RequestURI()
 		writer := &apiWriter{h: h, id: id, ctx: ctx, max: protocol.AgentAPIMaxBytes, free: free, header: http.Header{}, buf: make([]byte, 0, APIChunkBytes)}
 		writer.recheck = func() *ErrorBody {
 			if h.isAgent() {

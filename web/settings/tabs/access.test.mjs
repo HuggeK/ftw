@@ -61,6 +61,13 @@ describe("the page's words follow the registry", () => {
     for (const scope of Object.keys(P.SCOPE_WORDS)) assert.ok(agentScopes.includes(scope), scope);
   });
 
+  it("warns that diagnostic access reads full backups that can contain saved credentials", () => {
+    const words = P.SCOPE_WORDS["ftw.diag.run"];
+    assert.match(words, /full technical diagnostics, source, logs and backups/);
+    assert.match(words, /backups can contain saved credentials/);
+    assert.doesNotMatch(words, /checks that change nothing/);
+  });
+
   it("has words for every op an assistant may name", () => {
     assert.ok(agentOps.length >= 5);
     for (const op of agentOps) assert.ok(P.OP_WORDS[op], op);
@@ -297,6 +304,23 @@ describe("a request waiting for the owner", () => {
     const rlo = String.fromCharCode(0x202e);
     const rows = P.requestArgs({ op: "x", args: { ["evil" + rlo + "gnp"]: 1 } }, registry);
     assert.equal(rows[0].label, "evilgnp");
+  });
+
+  it("names a charger or car by what the box calls it, and by its id when the box has no name", () => {
+    const car = P.requestArgs({
+      op: "car.goal.set",
+      args: { id: "0123456789abcdef0123456789abcdef", target: 0.8 },
+      names: { id: "Volvo" + String.fromCharCode(0x200b) + " XC40" },
+    }, registry);
+    assert.deepEqual(car.map((r) => r.value), ["Volvo XC40", "80 %"]);
+    const charger = P.requestArgs({
+      op: "loadpoint.hold",
+      args: { id: "garage", power_w: 7400 },
+      names: { id: "Carport Easee", power_w: "not a name" },
+    }, registry);
+    assert.deepEqual(charger.map((r) => r.value), ["Carport Easee", "7.4 kW"]);
+    const gone = P.requestArgs({ op: "car.goal.set", args: { id: "0123456789abcdef0123456789abcdef" }, names: { id: "" } }, registry);
+    assert.equal(gone[0].value, "0123456789abcdef0123456789abcdef");
   });
 
   it("shows power, length and odd numbers plainly", () => {
