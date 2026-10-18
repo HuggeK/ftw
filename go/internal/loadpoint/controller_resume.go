@@ -66,8 +66,15 @@ func (c *Controller) recoverOfferedCharge(ctx context.Context, cfg Config, sampl
 		c.resumeOffers[cfg.ID] = &proof
 		return
 	}
+	// Ten seconds near the supported minimum prove recovery. A normal
+	// charge with no recovery in progress needs no retry record at all.
+	minimum := cfg.MinChargeW
+	if minimum <= 0 {
+		minimum = offerW
+	}
+	floor := math.Max(DeliveringW, 0.9*math.Min(minimum, offerW))
 	if previous == nil {
-		if proof.device == "" || proof.session == "" || !sample.RequestActive {
+		if proof.device == "" || proof.session == "" || !sample.RequestActive || sample.PowerW >= floor {
 			return
 		}
 		previous = &proof
@@ -78,16 +85,6 @@ func (c *Controller) recoverOfferedCharge(ctx context.Context, cfg Config, sampl
 		delete(c.resumeOffers, cfg.ID)
 		return
 	}
-	// A small startup pulse is not successful recovery. Require fresh,
-	// advancing observations near a supported charging step for ten seconds.
-	// The current offer can be lower than the configured 3p minimum after a
-	// phase change. Leave the shared DeliveringW semantics unchanged.
-	minimum := cfg.MinChargeW
-	if minimum <= 0 {
-		minimum = offerW
-	}
-	// Allow ten percent variation around the nominal-voltage minimum.
-	floor := math.Max(DeliveringW, 0.9*math.Min(minimum, offerW))
 	observedAt := sample.PowerAt
 	if observedAt.IsZero() {
 		observedAt = now // Legacy telemetry uses the fresh-read contract.
