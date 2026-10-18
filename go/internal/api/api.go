@@ -2463,11 +2463,13 @@ func (s *Server) handleEnergyDaily(w http.ResponseWriter, r *http.Request) {
 	for i := days - 1; i >= 0; i-- {
 		dayStart := todayMidnight.AddDate(0, 0, -i)
 		dayKey := dayStart.Format("2006-01-02")
-		isToday := i == 0
+		// A bounded balance episode can close just after midnight. Let its
+		// final intervals arrive before treating the previous day as immutable.
+		cacheReady := dailyEnergyCacheReady(dayStart, now)
 
 		var de state.DayEnergy
-		if isToday {
-			d, err := s.deps.State.DailyEnergy(dayStart.UnixMilli(), now.UnixMilli())
+		if !cacheReady {
+			d, err := s.deps.State.DailyEnergy(dayStart.UnixMilli(), min(now.UnixMilli(), dayStart.AddDate(0, 0, 1).UnixMilli()))
 			if err != nil {
 				slog.Error("handleEnergyDaily: DailyEnergy failed", "err", err, "day", dayKey)
 				http.Error(w, "history load failed", http.StatusInternalServerError)
