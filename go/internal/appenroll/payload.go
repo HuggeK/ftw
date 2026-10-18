@@ -18,7 +18,8 @@ import (
 //
 // Everything after the '#' is a URL fragment, and a fragment is never sent in
 // an HTTP request. That is the whole design: the app's trust anchor reaches it
-// optically and reaches no server on the way, so a hostile or compelled cloud
+// from the box by QR, link, paste or local code exchange, without a cloud
+// server on the way, so a hostile or compelled cloud
 // can deny service but cannot present itself as this box. Nothing here may
 // ever move into the path or the query.
 //

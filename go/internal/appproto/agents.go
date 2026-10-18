@@ -643,6 +643,7 @@ func (h *Handler) onAgentList(env Envelope) error {
 	out.Agents = append(out.Agents, h.cfg.Access.Agents()...)
 	out.Requests = h.cfg.Agents.list("", now, h.liveAgents())
 	out.Keys = append(out.Keys, h.cfg.Access.ApprovalKeys()...)
+	out.LongestMs = protocol.LongestMs()
 	return h.agentOK(env.ID, out)
 }
 
@@ -785,6 +786,8 @@ func (h *Handler) onRead(env Envelope) error {
 		}
 	}
 	switch env.T {
+	case protocol.MsgAPIRead:
+		return h.onAPIRead(env)
 	case protocol.MsgHealthGet:
 		return h.onHealthGet(env)
 	case protocol.MsgDriversGet:

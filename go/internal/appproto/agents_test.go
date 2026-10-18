@@ -575,8 +575,26 @@ func TestADurableChangeWaitsForTheOwner(t *testing.T) {
 	if len(mine.Agents) != 1 || mine.Agents[0].ID != row.ID || len(mine.Requests) != 1 || mine.Requests[0].State != protocol.RequestApproved {
 		t.Errorf("the agent's own list: %+v", mine)
 	}
+	if mine.LongestMs != nil {
+		t.Errorf("an agent was told the box's limits: %v", mine.LongestMs)
+	}
 	if rows := r.audit.find("agent.request.run"); len(rows) != 1 || rows[0].Result != CmdApplied {
 		t.Errorf("audit of the run: %+v", rows)
+	}
+}
+
+// An owner's agent.list says, under longestMs, how long the box lets each
+// role have, so the app offers no length the box would refuse.
+func TestAgentListTellsAnOwnerTheLongestGrant(t *testing.T) {
+	r := newAgentRig(t)
+	owner, orec := r.ownerSession()
+	deliver(t, owner, protocol.MsgAgentList, ptrU32(1), struct{}{})
+	got := body[struct {
+		LongestMs map[string]int64 `cbor:"longestMs"`
+	}](t, orec.last(t, protocol.MsgAgentOK)).LongestMs
+	if got[protocol.RoleAgent] != protocol.AgentMaxMs || got[protocol.RoleSupport] != protocol.SupportMaxMs ||
+		got[protocol.RoleRelease] != protocol.ReleaseMaxMs {
+		t.Errorf("longestMs = %v", got)
 	}
 }
 

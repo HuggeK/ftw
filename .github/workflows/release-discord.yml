@@ -1,0 +1,73 @@
+name: announce Core release on Discord
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+      dry_run:
+        type: boolean
+        default: false
+    secrets:
+      DISCORD_WEBHOOK:
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Published native Core tag to announce"
+        required: true
+        type: string
+      dry_run:
+        description: "Preview the message without posting to Discord"
+        type: boolean
+        default: true
+  pull_request:
+    paths:
+      - .github/workflows/release-discord.yml
+      - .github/workflows/native-release.yml
+      - .github/scripts/discord_release.py
+      - .github/scripts/test_discord_release.py
+  push:
+    branches: [master]
+    paths:
+      - .github/workflows/release-discord.yml
+      - .github/workflows/native-release.yml
+      - .github/scripts/discord_release.py
+      - .github/scripts/test_discord_release.py
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: python3 -m unittest discover -s .github/scripts -p test_discord_release.py
+
+  announce:
+    if: ${{ github.repository == 'srcfl/ftw' && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') }}
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Read the published release
+        env:
+          TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "${TAG}" =~ ^v0\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?$ ]]
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" > "${RUNNER_TEMP}/discord-release.json"
+      - name: Send the release notes
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ "${DRY_RUN}" = true ]; then args+=(--dry-run); fi
+          python3 .github/scripts/discord_release.py \
+            "${RUNNER_TEMP}/discord-release.json" "${args[@]}"

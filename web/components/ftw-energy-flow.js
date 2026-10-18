@@ -574,6 +574,7 @@ class FtwEnergyFlow extends FtwElement {
     // a previous number. `!= null` would keep drawing the last 0 W as if
     // the house were idle.
     if ("load" in r)              this._readings.load    = r.load;
+    if ("loadEstimated" in r)     this._readings.loadEstimated = r.loadEstimated;
     if (Array.isArray(r.planets)) this._readings.planets = r.planets;
     // Optional today's-totals payload pushed through to the central
     // hub render. selfPoweredPctToday is the share of consumption
@@ -876,7 +877,7 @@ class FtwEnergyFlow extends FtwElement {
   }
 
   render() {
-    const { load } = this._readings;
+    const { load, loadEstimated } = this._readings;
     const loadKnown = load != null && Number.isFinite(Number(load));
 
     // Self-powered % for the visible site demand — house load plus any
@@ -887,7 +888,7 @@ class FtwEnergyFlow extends FtwElement {
     // Unknown load (stale meter) is not 0 % — that would claim the house
     // is fully self-powered while we cannot see it.
     let selfPoweredPct = null;
-    if (loadKnown) {
+    if (loadKnown && !loadEstimated) {
       let gridImport = 0;
       for (const p of (this._readings.planets || [])) {
         if (p.role === "grid" && !p.placeholder && p.toHub) gridImport += Math.max(0, p.kw || 0);
@@ -1189,14 +1190,11 @@ class FtwEnergyFlow extends FtwElement {
         ${aggLayerSvg}
         ${indLayerSvg}
 
-        <!-- HOUSE / hub: load reading lives here. Kept outside both
-             aggregation layers because the hub value (instantaneous
-             house load) is identical in both views, so there's no
-             reason to duplicate it. Clickable like a planet, so the host
-             can open the house's own live reading — the click handler
-             reads data-role and fires ftw-planet-click with role "load". -->
+        <!-- House load uses the same value in both views. An estimated
+             interval mean carries an approximation mark. Clicking opens
+             the house reading through ftw-planet-click with role load. -->
         <g class="ef-hub ef-clickable" data-role="load" data-name="" data-id=""
-           tabindex="0" role="button" aria-label="${loadKnown ? "House load, live" : "House load, no data"}">
+           tabindex="0" role="button" aria-label="${loadKnown ? (loadEstimated ? "House load, estimated mean" : "House load, live") : "House load, no data"}">
           <circle cx="${CX}" cy="${P.cy}" r="${P.hubR}"
                   fill="var(--hero-house-fill)"
                   stroke="var(--hero-house-stroke)" stroke-width="1.5"/>
@@ -1212,7 +1210,7 @@ class FtwEnergyFlow extends FtwElement {
           </g>
           <text x="${CX}" y="${P.hubValueY}" text-anchor="middle"
                 fill="var(--hero-load-text)" class="sv-hub-value">
-            ${loadKnown ? fmtKw(load) : "—"}
+            ${loadKnown ? (loadEstimated ? "≈ " : "") + fmtKw(load) : "—"}
           </text>
           ${selfPoweredPct !== null ? `
           <text x="${CX}" y="${P.hubSelfNowY}" text-anchor="middle"

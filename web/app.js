@@ -291,19 +291,10 @@
   // visual cue that there's work to commit. Cleared on successful POST.
   let peakLimitDirty = false;
   let gridTargetDirty = false;
-  // Last non-zero peak ceiling, remembered so unchecking + rechecking
-  // the enable toggle restores the previous value instead of resetting
-  // to the default. Keyed by localStorage so it survives reloads.
-  function readLastPeakLimitW() {
-    try {
-      const v = localStorage.getItem("ftw-peak-import-ceiling-w");
-      const n = v == null ? null : Number(v);
-      return Number.isFinite(n) && n > 0 ? n : 5000;
-    } catch (e) { return 5000; }
-  }
-  function writeLastPeakLimitW(w) {
-    try { localStorage.setItem("ftw-peak-import-ceiling-w", String(w)); } catch (e) {}
-  }
+  // The last peak ceiling that was on, as the box serves it: what switching
+  // the toggle back on applies. A copy kept in the browser once applied an
+  // old test value (#1674), so only the box keeps it.
+  let peakLimitLastW = null;
   const fuseUse = $("fuse-use");
   const fuseFill = $("fuse-fill");
   const fusePhases = $("fuse-phases");
@@ -485,10 +476,11 @@
       out.ev_charging_w = sums.ev_w;
     }
     if (out.grid_w != null && data.load_w != null) {
-      out.load_w = Math.max(0, (out.grid_w || 0) - (out.bat_w || 0) - (out.pv_w || 0) - (out.ev_w || 0));
+      out.load_w = smoothDisplayNumber("load_w", data.load_w, now);
     } else {
       // No live meter: do not keep a previous load or treat JSON null as 0 W.
       out.load_w = null;
+      delete statusDisplayState.load_w;
     }
     return out;
   }
@@ -573,6 +565,15 @@
     }
     var opts = energyFlowOpts(data); opts.live = lastFlowLive;
     lastFlowReadings = window.ftwFlowReadingsFromStatus(data, opts);
+    var homeNote = document.getElementById("home-use-estimate");
+    if (!homeNote) {
+      homeNote = document.createElement("p");
+      homeNote.id = "home-use-estimate";
+      homeNote.className = "muted";
+      flowEl.insertAdjacentElement("afterend", homeNote);
+    }
+    homeNote.textContent = lastFlowReadings.homeEstimateNote || "";
+    homeNote.hidden = !homeNote.textContent;
     (lastFlowReadings.planets || []).forEach(function (p) {
       if (p.role !== "ev" || p.placeholder || !p.name) return;
       var lpEv = loadpointsByDriver && loadpointsByDriver[p.name];
@@ -872,6 +873,7 @@
     const peakSrcW = data.peak_import_ceiling_w != null
       ? data.peak_import_ceiling_w
       : data.peak_limit_w;
+    peakLimitLastW = data.peak_import_ceiling_last_w > 0 ? data.peak_import_ceiling_last_w : null;
     if (peakLimitSlider && !peakLimitDirty && peakSrcW != null) {
       const enabled = peakSrcW > 0;
       if (peakLimitEnableToggle) {
@@ -879,13 +881,13 @@
         if (peakLimitEnableLabel) peakLimitEnableLabel.textContent = enabled ? "On" : "Off";
       }
       peakLimitSlider.disabled = !enabled;
-      const display = enabled ? peakSrcW : readLastPeakLimitW();
+      // Off, the slider shows what switching on applies.
+      const display = enabled ? peakSrcW : peakLimitLastW || Number(peakLimitSlider.defaultValue);
       peakLimitSlider.value = display;
       // Don't decorate the value with " (off)" — the toggle is the
       // single source of truth for enabled/disabled, doubling that
       // signal is the kind of redundancy the shared design system warns about.
       peakLimitValue.textContent = formatW(display);
-      if (enabled) writeLastPeakLimitW(peakSrcW);
       if (peakLimitSend) peakLimitSend.disabled = true; // pristine
     }
     // Energy today
@@ -2716,9 +2718,9 @@
   }
 
   // Peak slider: same dirty pattern, plus an enable/disable checkbox.
-  // Off → POST 0 (backend reads 0 = disabled). On → POST slider value.
-  // The slider is disabled when the toggle is off so the operator can't
-  // accidentally drag a dead control.
+  // Off → POST 0 (backend reads 0 = disabled). On → POST the box's last
+  // ceiling. The slider is disabled when the toggle is off so the operator
+  // can't accidentally drag a dead control.
   if (peakLimitSlider) {
     peakLimitSlider.addEventListener("input", function () {
       const w = Number(peakLimitSlider.value);
@@ -2732,15 +2734,20 @@
       const enabled = peakLimitEnableToggle.checked;
       if (peakLimitEnableLabel) peakLimitEnableLabel.textContent = enabled ? "On" : "Off";
       if (peakLimitSlider) peakLimitSlider.disabled = !enabled;
-      // Show the value the toggle is about to enable (last known)
-      // without committing — the operator still has to press Save
-      // unless the toggle is being switched OFF, which is a destructive
-      // change worth one extra click confirmation. Wait — the spec
-      // calls for the toggle itself to be the on/off control, so flip
-      // straight through: post immediately on toggle change.
-      const w = enabled ? Number(peakLimitSlider.value) || readLastPeakLimitW() : 0;
-      if (enabled && peakLimitSlider) peakLimitSlider.value = w;
-      if (peakLimitValue) peakLimitValue.textContent = formatW(w);
+      if (enabled && !peakLimitLastW) {
+        // The box has never had a ceiling on, so there is none to restore:
+        // the owner picks one and Save applies it.
+        peakLimitDirty = true;
+        if (peakLimitSend) peakLimitSend.disabled = false;
+        return;
+      }
+      // On applies the ceiling the box last had on, shown as it applies;
+      // off applies 0. The toggle is the switch, so neither waits for Save.
+      const w = enabled ? peakLimitLastW : 0;
+      if (enabled) {
+        if (peakLimitSlider) peakLimitSlider.value = w;
+        if (peakLimitValue) peakLimitValue.textContent = formatW(w);
+      }
       peakLimitEnableToggle.disabled = true;
       setPeakImportCeiling(w)
         .then(function () { peakLimitDirty = false; if (peakLimitSend) peakLimitSend.disabled = true; })
@@ -2751,7 +2758,6 @@
   if (peakLimitSend) {
     peakLimitSend.addEventListener("click", function () {
       const w = Number(peakLimitSlider.value);
-      writeLastPeakLimitW(w);
       peakLimitSend.disabled = true;
       setPeakImportCeiling(w)
         .then(function () { peakLimitDirty = false; })
@@ -2917,12 +2923,12 @@
       case "limited":
         if (m.limit_reason === "charger_limit") return "The charger limits this request to " + cmdA + " (" + reqA + " requested).";
         if (m.limit_reason === "fuse_cooldown") {
-          return "Paused: main-fuse protection — " + reqA + " requested; charging resumes on its own." + sinceP;
+          return "Paused by site power limits — " + reqA + " requested; charging resumes on its own." + sinceP;
         }
         if (m.limit_reason === "site_meter_stale") {
           return "Paused for safety: site-meter data is stale — " + reqA + " requested; charging resumes when telemetry recovers.";
         }
-        return "Main fuse limits this charge to " + cmdA + " right now (" + reqA + " requested)." + sinceP;
+        return "Site power limits cap this charge at " + cmdA + " right now (" + reqA + " requested)." + sinceP;
     }
     return "FTW received " + reqA + ". Waiting for charger status." + end;
   }
@@ -2970,7 +2976,7 @@
         ? "Charging on plan until " + evFmtClock(lp.plan_next_end_ms) + "." + kwPlanned
         : "Charging.";
       if (lp.commanded_reason === "fuse_limit") {
-        text += " Rate is limited by the main fuse right now.";
+        text += " Rate is limited by site power limits right now.";
       }
     } else if (lp.goal_complete === true) {
       text = "The car confirmed this charging goal is complete.";
@@ -2995,7 +3001,7 @@
       // The specific pauses beat the generic branches — this is the
       // line that stops an operator debugging cable and charger while
       // the box is protecting the main fuse (#1009).
-      text = "Paused: main-fuse protection — the house is using the headroom; charging resumes on its own." + kwPlanned;
+      text = "Paused by site power limits — the house is using the headroom; charging resumes on its own." + kwPlanned;
       tone = "var(--text)";
     } else if (lp.commanded_known && !lp.commanded_w && lp.commanded_reason === "site_meter_stale") {
       text = "Paused for safety: site-meter data is stale — charging resumes when telemetry recovers.";

@@ -343,6 +343,14 @@ func newRigWith(t *testing.T, prefs PlannerPrefs) (*Handler, *fakeBox, *recorder
 // deliver hands one client message to the handler as bytes.
 func deliver(t *testing.T, h *Handler, msgType string, id *uint32, b any) {
 	t.Helper()
+	if err := h.Handle(context.Background(), clientFrame(t, msgType, id, b)); err != nil {
+		t.Fatalf("handle %s: %v", msgType, err)
+	}
+}
+
+// clientFrame is one client message as the bytes deliver hands over.
+func clientFrame(t *testing.T, msgType string, id *uint32, b any) []byte {
+	t.Helper()
 	env, err := newEnvelope(msgType, id, b)
 	if err != nil {
 		t.Fatalf("build %s: %v", msgType, err)
@@ -359,9 +367,7 @@ func deliver(t *testing.T, h *Handler, msgType string, id *uint32, b any) {
 	if err != nil {
 		t.Fatalf("frame %s: %v", msgType, err)
 	}
-	if err := h.Handle(context.Background(), frame); err != nil {
-		t.Fatalf("handle %s: %v", msgType, err)
-	}
+	return frame
 }
 
 func subscribe(t *testing.T, h *Handler, rec *recorder) {

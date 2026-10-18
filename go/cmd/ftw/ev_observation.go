@@ -46,13 +46,15 @@ func currentEVSample(r *telemetry.DerReading, health *telemetry.DriverHealth, wa
 	sample := loadpoint.EVSample{ConnectionGeneration: d.ConnectionGeneration, PowerW: r.RawW,
 		PowerAt: r.UpdatedAt, PowerMaxAge: time.Duration(min(max(d.PowerMaxAgeS, 0), 180)) * time.Second, Connected: *d.Connected, RequestActive: active, DeviceID: deviceID, SessionID: d.SessionID,
 		SessionWhUnavailable: d.SessionWh == nil}
+	_, powerKnown := telemetry.ControlPowerObservation(sample.PowerW, r.Data, r.UpdatedAt)
+	sample.PowerUnavailable = !powerKnown
 	if d.SessionWh != nil {
 		sample.SessionWh = *d.SessionWh
 	}
 	if d.PowerAt != "" {
 		at, err := time.Parse(time.RFC3339Nano, d.PowerAt)
 		sample.PowerAt = at
-		sample.PowerUnavailable = err != nil || at.After(now.Add(time.Second)) || (now.Sub(at) > sample.PowerWindow() && r.RawW > 0)
+		sample.PowerUnavailable = sample.PowerUnavailable || err != nil || at.After(now.Add(time.Second)) || (now.Sub(at) > sample.PowerWindow() && r.RawW > 0)
 	}
 	if d.EnergyAt != "" {
 		at, err := time.Parse(time.RFC3339Nano, d.EnergyAt)

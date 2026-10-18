@@ -727,3 +727,22 @@ func TestWatchdogGivesANewDriverItsTimeoutBeforeTheFirstReading(t *testing.T) {
 		t.Fatalf("a restarted driver went stale at once: %+v", tr)
 	}
 }
+
+// The import ceiling's hour counts only readings from a meter that is still
+// reporting. A watchdog-offline meter's last value is not a new reading.
+func TestOnlineMeterWSkipsOfflineMeter(t *testing.T) {
+	s := NewStore()
+	if _, _, ok := s.OnlineMeterW("meter"); ok {
+		t.Fatal("a meter with no reading reported one")
+	}
+	s.Update("meter", DerMeter, 7110, nil, nil)
+	s.DriverHealthMut("meter").RecordSuccess()
+	w, at, ok := s.OnlineMeterW("meter")
+	if !ok || w != 7110 || at.IsZero() {
+		t.Fatalf("online meter: %v %v %v, want 7110 W", w, at, ok)
+	}
+	s.DriverHealthMut("meter").SetOffline()
+	if _, _, ok := s.OnlineMeterW("meter"); ok {
+		t.Fatal("an offline meter's last reading was returned")
+	}
+}

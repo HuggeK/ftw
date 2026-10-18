@@ -96,7 +96,7 @@ describe("the app tab", () => {
     const config = { app_link: { enabled: false } };
     const html = appWithFleet.render({ config });
 
-    assert.match(html, /<legend>Fleet statistics<\/legend>/);
+    assert.match(html, /<legend>Anonymous daily report<\/legend>/);
     assert.match(html, /data-checkbox-path="fleet_ping\.enabled"/);
     assert.equal(config.fleet_ping.enabled, true, "fleet sharing should still default on");
     assert.doesNotMatch(html, /id="app-link-enabled"[^>]*checked/);
@@ -119,7 +119,7 @@ describe("the app tab", () => {
     vm.runInContext(fleetSource, sandbox);
 
     win.FTWSettings.tabs.app.afterSave();
-    assert.deepEqual(asked, ["/api/fleet-ping"]);
+    assert.deepEqual(asked, ["/api/fleet-ping", "/api/app-link/status"]);
   });
 
   it("does not leave a standalone Fleet ping destination behind", () => {

@@ -1260,10 +1260,19 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"control_feedback":    s.controlFeedback(time.Now()),
 		"slot_delivery_stats": ctrl.SlotDeliveryStats,
 	}
+	// The ceiling that switching on applies, so a client shows the box's
+	// value instead of keeping its own (#1674). Null until one was on.
+	resp["peak_import_ceiling_last_w"] = s.peakImportCeilingLastW(ctrl.PeakImportCeilingW)
 	// The operator's cap for storing live PV surplus, 0 when unset. Dispatch
 	// prefers it to the plan's per-slot cap, so the Plan card needs it to say
 	// where extra sun goes.
 	resp["pv_surplus_absorb_soc_cap"] = ctrl.PVSurplusAbsorbSoCCap
+	// The import ceiling caps each clock hour's mean import: what is left of
+	// this hour's budget and the import limit it sets now. Null while off.
+	resp["peak_import_hour_left_wh"], resp["peak_import_limit_w"] = nil, nil
+	if left, limit, ok := ctrl.ImportHourStatus(ctrl.SiteFuseAmps * ctrl.SiteFuseVoltage * float64(ctrl.SiteFusePhases)); ok {
+		resp["peak_import_hour_left_wh"], resp["peak_import_limit_w"] = left, limit
+	}
 	// A stale or missing site meter is not 0 W. Publishing zero made the
 	// dashboard and the FTW app draw "balanced" / "0 W" as if the house
 	// were idle. JSON null is what the flow mapping already treats as
@@ -1820,12 +1829,12 @@ func (s *Server) handleSetPeakLimit(w http.ResponseWriter, r *http.Request) {
 
 // ---- /api/peak_import_ceiling ----
 //
-// Hard import ceiling enforced in every mode. Default 0 = disabled. When
-// > 0, dispatch's import-side clamps (joint EV/battery allocator,
-// applyFuseGuard import branch, forceFuseDischarge) use min(fuse, peak)
-// as the binding threshold. Persisted in state.db so the operator's
-// tariff stays armed across restarts. See control.State.PeakImportCeilingW
-// for the full rationale.
+// Import ceiling on each clock hour's mean import, in every mode. Default
+// 0 = disabled. When > 0, dispatch's import-side clamps (joint EV/battery
+// allocator, applyFuseGuard import branch, forceFuseDischarge, the EV hard
+// limit) use the tighter of the fuse and the hour's import limit.
+// Persisted in state.db so the operator's tariff stays armed across
+// restarts. See control.State.PeakImportCeilingW.
 func (s *Server) handleSetPeakImportCeiling(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		PeakImportCeilingW float64 `json:"peak_import_ceiling_w"`
@@ -1839,12 +1848,54 @@ func (s *Server) handleSetPeakImportCeiling(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	s.deps.CtrlMu.Lock()
-	s.deps.Ctrl.PeakImportCeilingW = req.PeakImportCeilingW
+	prevW := s.deps.Ctrl.PeakImportCeilingW
 	s.deps.CtrlMu.Unlock()
 	if s.deps.State != nil {
-		_ = s.deps.State.SaveConfig("peak_import_ceiling_w", strconv.FormatFloat(req.PeakImportCeilingW, 'f', 1, 64))
+		values := map[string]string{"peak_import_ceiling_w": strconv.FormatFloat(req.PeakImportCeilingW, 'f', 1, 64)}
+		// Switching off keeps the ceiling that was on, so switching back on
+		// restores the box's tariff, not a value a browser kept (#1674).
+		lastW := req.PeakImportCeilingW
+		if lastW == 0 {
+			lastW = prevW
+		}
+		if lastW > 0 {
+			values[peakImportCeilingLastKey] = strconv.FormatFloat(lastW, 'f', 1, 64)
+		}
+		// Save before applying, so the box never runs a ceiling that a
+		// restart would undo.
+		if err := s.deps.State.SaveConfigValues(values); err != nil {
+			slog.Warn("failed to persist peak_import_ceiling_w", "err", err)
+			writeJSON(w, 500, map[string]string{"error": "save failed: " + err.Error()})
+			return
+		}
 	}
+	s.deps.CtrlMu.Lock()
+	s.deps.Ctrl.PeakImportCeilingW = req.PeakImportCeilingW
+	s.deps.CtrlMu.Unlock()
 	writeJSON(w, 200, map[string]any{"status": "ok", "peak_import_ceiling_w": req.PeakImportCeilingW})
+}
+
+// peakImportCeilingLastKey holds the last import ceiling that was on.
+const peakImportCeilingLastKey = "peak_import_ceiling_last_w"
+
+// peakImportCeilingLastW is the ceiling switching on applies: the current one
+// while on, else the last one that was on. Nil when none ever was.
+func (s *Server) peakImportCeilingLastW(currentW float64) *float64 {
+	if currentW > 0 {
+		return &currentW
+	}
+	if s.deps.State == nil {
+		return nil
+	}
+	v, ok := s.deps.State.LoadConfig(peakImportCeilingLastKey)
+	if !ok {
+		return nil
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f <= 0 {
+		return nil
+	}
+	return &f
 }
 
 // ---- /api/ev_charging ----
@@ -2421,11 +2472,13 @@ func (s *Server) handleEnergyDaily(w http.ResponseWriter, r *http.Request) {
 	for i := days - 1; i >= 0; i-- {
 		dayStart := todayMidnight.AddDate(0, 0, -i)
 		dayKey := dayStart.Format("2006-01-02")
-		isToday := i == 0
+		// A bounded balance episode can close just after midnight. Let its
+		// final intervals arrive before treating the previous day as immutable.
+		cacheReady := dailyEnergyCacheReady(dayStart, now)
 
 		var de state.DayEnergy
-		if isToday {
-			d, err := s.deps.State.DailyEnergy(dayStart.UnixMilli(), now.UnixMilli())
+		if !cacheReady {
+			d, err := s.deps.State.DailyEnergy(dayStart.UnixMilli(), min(now.UnixMilli(), dayStart.AddDate(0, 0, 1).UnixMilli()))
 			if err != nil {
 				slog.Error("handleEnergyDaily: DailyEnergy failed", "err", err, "day", dayKey)
 				http.Error(w, "history load failed", http.StatusInternalServerError)
@@ -2475,7 +2528,15 @@ func (s *Server) handleEnergyDaily(w http.ResponseWriter, r *http.Request) {
 		if de.Intervals == 0 {
 			de.Missing |= state.MissingPower
 		}
+		periodEnd := min(now.UnixMilli(), dayStart.AddDate(0, 0, 1).UnixMilli())
+		coverage, err := s.deps.State.HistoryEnergyCoverage(r.Context(), dayStart.UnixMilli(), periodEnd)
+		if err != nil {
+			http.Error(w, "history coverage unavailable", http.StatusInternalServerError)
+			return
+		}
 		out = append(out, map[string]any{
+			"coverage_ms":       coverage,
+			"period_ms":         periodEnd - dayStart.UnixMilli(),
 			"history_quality":   de.Missing.Quality(),
 			"day":               dayKey,
 			"import_wh":         de.Missing.Value(state.MissingGrid, de.ImportWh),

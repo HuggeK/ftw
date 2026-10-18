@@ -639,6 +639,7 @@ func main() {
 			ctrl.PeakImportCeilingW = f
 		}
 	}
+	seedImportHour(st, ctrl, time.Now())
 
 	// ---- Driver catalog (pure text scan, no Lua VM) ----
 	// Loaded once here so the pre-flight capacity + warning logic can
@@ -1918,6 +1919,7 @@ func main() {
 		// for the sends that are deliberately not.
 		lpController.SetOutcomeSender(evRouter.SendWithOutcome)
 		lpController.SetCycleSender(evRouter.SendCycle)
+		lpController.SetVehicleControlAllowed(reg.CanControl)
 		lpController.SetDispatchOutcome(actuation.recordCommandOutcome)
 		lpController.SetDriverOnline(func(name string) bool {
 			if ocppSrv != nil && ocppSrv.Handler().IsOnline(name) && ocppSrv.Handler().IsApproved(name) {
@@ -2069,14 +2071,11 @@ func main() {
 			go mpcSvc.ReplanWithReason(context.Background(), "loadpoint_battery_boost_stopped")
 			slog.Info("battery boost stopped — replan requested", "lp", id, "reason", reason)
 		})
-		// Wire the live per-phase site-meter current reader. The control
-		// package's fuse guard is site-TOTAL only (sum across phases);
-		// a single phase can still trip from house-load imbalance (e.g.
-		// a vacuum or oven on L1) stacked on top of the EV's per-phase
-		// draw. This reader feeds the loadpoint's reactive per-phase EV
-		// clamp (applyPerPhaseFuseClamp), which lowers max_amps_per_phase
-		// the instant the worst phase approaches the breaker. Reads the
-		// same meter_lN_a metrics the fuse_over_limit notifier uses.
+		// Wire the live per-phase site-meter current reader. The EV hard
+		// limit (control.EVFuseBudget) cuts a worst-phase overage; this
+		// reader lets the loadpoint gate an increase on the phase a
+		// runtime 1p or auto charger may land on. Reads the same
+		// meter_lN_a metrics the fuse_over_limit notifier uses.
 		lpController.SetPerPhaseMeterAmps(func() (float64, float64, float64, bool) {
 			cfgMu.RLock()
 			siteMeter := cfg.SiteMeterDriver()
@@ -2904,6 +2903,7 @@ func main() {
 			// telemetry exists, closes every physical dispatch path. Safe
 			// standdown/default commands remain permitted.
 			ctrlMu.Lock()
+			ctrl.ObserveSiteImport(tel)
 			siteMeterDriver := ctrl.SiteMeterDriver
 			siteFuseAmps := ctrl.SiteFuseAmps
 			siteFusePhases := ctrl.SiteFusePhases
@@ -3038,7 +3038,7 @@ func main() {
 			ctrl.EVCurtailHeadroomW = evCurtailHeadroomW
 			ctrl.BatteryBoostEVChargingW = boostEVW
 			ctrl.BatteryBoostReserveSoC = boostReserveSoC
-			ctrl.EVCommandedW = loadpoint.CommandedEVPowerW(lpStatesSnapshot)
+			ctrl.SetEVCommanded(lpStatesSnapshot)
 			ctrl.SetEVFuseDemands(evFuseDemands)
 			fuseMaxW := ctrl.SiteFuseAmps * ctrl.SiteFuseVoltage * float64(ctrl.SiteFusePhases)
 			targets := control.ComputeDispatch(tel, ctrl, capsSnap, fuseMaxW)
@@ -3185,8 +3185,13 @@ func main() {
 						lastEVStopReplan = time.Now()
 						fired = true
 						go mpcSvc.ReplanWithReason(ctx, "loadpoint_ev_stopped")
+						command, _ := tel.CommandEvidence(lp.DriverName, "ev")
 						slog.Info("loadpoint EV stopped → MPC replan triggered",
-							"lp", lp.ID, "prev_w", prev, "curr_w", curr)
+							"lp", lp.ID, "prev_w", prev, "curr_w", curr,
+							"commanded_known", lp.CommandedKnown, "commanded_w", lp.CommandedW,
+							"commanded_reason", lp.CommandedReason, "command_result", command.Result,
+							"command_at", command.At, "power_at_ms", lp.PowerUpdatedAtMs,
+							"power_unavailable", lp.PowerUnavailable)
 					}
 					evDrawPrev[lp.ID] = curr
 				}
@@ -3322,6 +3327,18 @@ func rolloffLoop(ctx context.Context, st *state.Store, coldDir string, dataMaint
 			run()
 		}
 	}
+}
+
+// seedImportHour gives the import ceiling the clock hour's import that
+// state.db recorded before this start, so a restart keeps it.
+func seedImportHour(st *state.Store, ctrl *control.State, now time.Time) {
+	start := control.ImportHourStart(now)
+	wh, covered, err := st.ImportWhIntervals(context.Background(), [][2]int64{{start.UnixMilli(), now.UnixMilli()}})
+	if err != nil || len(wh) != 1 || len(covered) != 1 {
+		slog.Warn("import ceiling: the hour's recorded import is unavailable; it counts at the ceiling", "err", err)
+		return
+	}
+	ctrl.SeedHourImport(now, wh[0], time.Duration(covered[0])*time.Millisecond)
 }
 
 func flushHistoryOnStop(st *state.Store) {

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -516,6 +517,82 @@ func TestASecondRequestWhileOneIsInFlightIsRefused(t *testing.T) {
 	}
 }
 
+// askAgainAtEnd is a phone with no delay at all. It hands the box its next
+// request from inside the Send that carries the last frame of the answer
+// before.
+type askAgainAtEnd struct {
+	*recorder
+	h      *Handler
+	last   string
+	next   []byte
+	asked  atomic.Bool
+	handed chan error
+}
+
+func (s *askAgainAtEnd) Send(frame []byte) error {
+	if err := s.recorder.Send(frame); err != nil {
+		return err
+	}
+	f, err := testCodec{}.DecodeFrame(frame)
+	if err == nil && f.Envelope.T == s.last && s.asked.CompareAndSwap(false, true) {
+		s.handed <- s.h.Handle(context.Background(), s.next)
+	}
+	return nil
+}
+
+// The app waits for the end of one answer and then asks again. The box used
+// to free its one slot only after that last frame had gone, so a phone quick
+// enough was told busy about a call that had already ended.
+func TestTheNextRequestIsServedOnceAnAnswerEnds(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		tier apiauth.Tier
+		last string
+	}{
+		{"after an answer", apiauth.TierRead, MsgAPIEnd},
+		{"after a refusal", apiauth.TierLocal, MsgError},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h, _, rec, _ := newAPIRig(t, &stubAPI{
+				facts: apiauth.RouteFacts{Tier: c.tier},
+				serve: text(`{}`),
+			})
+			sender := &askAgainAtEnd{
+				recorder: rec, h: h, last: c.last, handed: make(chan error, 1),
+				next: clientFrame(t, MsgAPIReq, ptrU32(41), APIReq{Method: APIGet, Path: "/api/status"}),
+			}
+			h.cfg.Sender = sender
+
+			deliver(t, h, MsgAPIReq, ptrU32(40), APIReq{Method: APIGet, Path: "/api/status"})
+			select {
+			case err := <-sender.handed:
+				if err != nil {
+					t.Fatalf("the next request: %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatalf("the first answer never ended; got %s", rec.types())
+			}
+
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) {
+				for _, f := range rec.snapshot() {
+					if f.env.ID == nil || *f.env.ID != 41 {
+						continue
+					}
+					if f.env.T == MsgError {
+						if err := body[ErrorBody](t, f); err.Code == ErrUnavailable {
+							t.Fatalf("the next request met %+v the moment the answer before it ended", err)
+						}
+					}
+					return
+				}
+				time.Sleep(time.Millisecond)
+			}
+			t.Fatalf("no answer to the next request; got %s", rec.types())
+		})
+	}
+}
+
 // --------------------------------------------------------------------------
 // Revocation
 // --------------------------------------------------------------------------
@@ -732,22 +809,6 @@ func stepUpClock(t *testing.T, h *Handler) *fakeClock {
 	return c
 }
 
-// waitIdle blocks until the passthrough queue is free, so the next request is
-// served rather than refused as busy. The frame lands just before the serving
-// goroutine clears the flag, so a test that only waited on the frame could race
-// the very next deliver.
-func waitIdle(t *testing.T, h *Handler) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if !h.apiBusy.Load() {
-			return
-		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatal("passthrough stayed busy")
-}
-
 // The security property the window must not weaken: a configure with no
 // ceremony behind it, and no recent one either, is still refused. This is the
 // first write of any session — the app was never meant to skip it.
@@ -819,7 +880,6 @@ func TestANoStepUpWriteDoesNotOpenTheWindow(t *testing.T) {
 		Method: APIPut, Path: "/api/loadpoints/1/schedule",
 	})
 	waitFor(t, rec, MsgAPIEnd)
-	waitIdle(t, h)
 
 	api.facts = apiauth.RouteFacts{Tier: apiauth.TierConfigure}
 	rec.reset()
@@ -853,7 +913,6 @@ func TestASecondConfigureWithinTheWindowSkipsTheCeremony(t *testing.T) {
 		t.Fatalf("the ceremony write answered %d, want 200", head.Status)
 	}
 	waitFor(t, rec, MsgAPIEnd)
-	waitIdle(t, h)
 	rec.reset()
 
 	// A later write in the same screen, four minutes on, carrying no ceremony.
@@ -883,7 +942,6 @@ func TestAConfigureAfterTheWindowNeedsAFreshCeremony(t *testing.T) {
 		Method: APIPost, Path: "/api/battery_covers_ev", StepUp: true,
 	})
 	waitFor(t, rec, MsgAPIEnd)
-	waitIdle(t, h)
 	rec.reset()
 
 	clock.uptimeMs += StepUpWindowMs

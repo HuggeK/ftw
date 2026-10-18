@@ -22,10 +22,12 @@ import (
 // document, so a whole-document config write cannot reset them. A missing
 // record reads as off.
 const (
-	linkKey   = "cloud/link_v1"
-	grantKey  = "cloud/grant_v1"
-	rosterKey = "cloud/roster_v1"
-	purgedKey = "cloud/purged_v1"
+	linkKey          = "cloud/link_v1"
+	grantKey         = "cloud/grant_v1"
+	rosterKey        = "cloud/roster_v1"
+	purgedKey        = "cloud/purged_v1"
+	disabledKey      = "cloud/disabled_v1"
+	statsDecisionKey = "cloud/statistics_decision_v1"
 )
 
 // linkRecord is the box's link to FTW Cloud: which cloud.key it holds. The
@@ -71,6 +73,7 @@ type grantRecord struct {
 	StatsID []byte `json:"statsId,omitempty"`
 	// StatsPolicy names the consent text the owner read for statistics.
 	StatsPolicy string `json:"statsPolicy,omitempty"`
+	StatsAtMs   int64  `json:"statsAtMs,omitempty"`
 	// Revoked means the owner turned the readable copy off and the service
 	// has not yet confirmed that the copy is gone. The record stays until it
 	// has; the link and its key stay after.

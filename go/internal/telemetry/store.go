@@ -296,6 +296,9 @@ type Store struct {
 	health              map[string]*DriverHealth
 	commands            map[string]CommandEvidence
 	controlObservations map[string][]ControlObservation
+	homeObservations    map[string][]ControlObservation // display estimates only
+	homeSourceTime      map[string]bool                 // reported source time, otherwise receipt time
+	homeEnergy          map[string]*homeEnergySeries    // timestamped session counters, display only
 
 	processNoise     float64
 	measurementNoise float64
@@ -479,6 +482,7 @@ func (s *Store) Update(driver string, t DerType, rawW float64, soc *float64, dat
 
 	s.observeCommand(driver, t, rawW, data, now)
 	s.recordControlObservation(driver, t, rawW, data, now)
+	s.recordHomeObservation(driver, t, rawW, data, now)
 	s.freezeStepWindows(now)
 
 	// Auto-buffer the standard fields (raw, not smoothed — we store ground
@@ -672,6 +676,22 @@ func (s *Store) SumOnlineV2XW() float64 {
 	return sum
 }
 
+// OnlineMeterW returns a site meter's latest power and when it arrived,
+// while its driver is still reporting. A watchdog-offline meter returns
+// false, so its last value never counts as a new reading.
+func (s *Store) OnlineMeterW(driver string) (w float64, at time.Time, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	r, found := s.readings[key(driver, DerMeter)]
+	if !found || math.IsNaN(r.RawW) || math.IsInf(r.RawW, 0) {
+		return 0, time.Time{}, false
+	}
+	if h, known := s.health[driver]; !known || !h.TelemetryLive() {
+		return 0, time.Time{}, false
+	}
+	return r.RawW, r.UpdatedAt, true
+}
+
 // ReadingsByDriver returns all readings from one driver.
 func (s *Store) ReadingsByDriver(driver string) []*DerReading {
 	s.mu.RLock()
@@ -769,6 +789,9 @@ func (s *Store) Remove(driver string) {
 	delete(s.health, driver)
 	for _, kind := range allDerTypes {
 		delete(s.controlObservations, key(driver, kind))
+		delete(s.homeObservations, key(driver, kind))
+		delete(s.homeSourceTime, key(driver, kind))
+		delete(s.homeEnergy, key(driver, kind))
 	}
 	for k, c := range s.commands {
 		c.Baseline, c.StepAfter = nil, nil

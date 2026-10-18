@@ -9,8 +9,8 @@ import (
 )
 
 // A 0 W offer (no plan, surplus pause, safety standdown) maps on Easee to a
-// sticky user-pause at 0 A. The next non-zero offer must send ev_resume
-// before ev_set_current, otherwise the contactor stays open until unplug.
+// sticky user-pause at 0 A. The next non-zero offer must set the safe positive current
+// before ev_resume, otherwise the contactor stays open until unplug.
 func TestTickResumesChargerWhenOfferReturns(t *testing.T) {
 	sender := &fakeSender{}
 	cfgs := []Config{{
@@ -54,13 +54,13 @@ func TestTickResumesChargerWhenOfferReturns(t *testing.T) {
 	}
 	c.Tick(context.Background(), now.Add(5*time.Second))
 	if len(sender.calls) != 3 {
-		t.Fatalf("reoffer command count = %d, want 3 (0 W, resume, set); got %+v", len(sender.calls), sender.calls)
+		t.Fatalf("reoffer command count = %d, want 3 (0 W, set, resume); got %+v", len(sender.calls), sender.calls)
 	}
-	if sender.calls[1].action != "ev_resume" {
-		t.Fatalf("expected ev_resume after 0 W standdown, got %+v", sender.calls[1])
+	if sender.calls[2].action != "ev_resume" {
+		t.Fatalf("expected ev_resume after the safe positive current, got %+v", sender.calls[2])
 	}
-	if sender.calls[2].action != "ev_set_current" || sender.calls[2].power != 11000 {
-		t.Fatalf("expected 11000 W ev_set_current after resume, got %+v", sender.calls[2])
+	if sender.calls[1].action != "ev_set_current" || sender.calls[1].power != 11000 {
+		t.Fatalf("expected 11000 W ev_set_current before resume, got %+v", sender.calls[1])
 	}
 
 	sender.calls = nil
@@ -194,9 +194,16 @@ func TestTickCancelsResumeRetryWhenSessionProofChanges(t *testing.T) {
 			}
 			samples["easee"] = sample
 			c.Tick(context.Background(), now.Add(10*time.Second))
+			zeroAt := now.Add(15 * time.Second)
+			if change == "delivering" {
+				// Recovery needs sustained delivery, not one startup pulse.
+				c.Tick(context.Background(), now.Add(15*time.Second))
+				c.Tick(context.Background(), now.Add(20*time.Second))
+				zeroAt = now.Add(25 * time.Second)
+			}
 			sample.Connected, sample.ConnectionUnknown, sample.PowerW = true, false, 0
 			samples["easee"] = sample
-			c.Tick(context.Background(), now.Add(15*time.Second))
+			c.Tick(context.Background(), zeroAt)
 			if attempts != 1 {
 				t.Fatalf("stale retry crossed %s boundary: %d attempts", change, attempts)
 			}

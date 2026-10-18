@@ -1,7 +1,30 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { flowReadingsFromStatus, fmtKwhShort } from "./components/energy-flow-readings.js";
+import { flowReadingsFromStatus, fmtKwhShort, homeEstimateNote } from "./components/energy-flow-readings.js";
+
+it("shows the energy mean, period and end age while keeping raw power unchanged", () => {
+  const estimate = {watts: 886, from_ms: Date.UTC(2026,9,18,10), to_ms: Date.UTC(2026,9,18,10,1), age_ms: 90000, end_age_ms:60000, energy_basis:'mixed', timing_basis: 'mixed'};
+  const status = {load_w: 1800, load_estimate: estimate, energy:{today:{load_wh:2000,import_wh:500,history_quality:'estimated'}}};
+  const result = flowReadingsFromStatus(status);
+  assert.equal(result.load, 0.886);
+  assert.equal(result.loadEstimated, true);
+  assert.equal(status.load_w, 1800);
+  assert.equal(result.selfPoweredPctToday, null);
+  assert.match(result.homeEstimateNote, /Estimated home use 0.9 kW/);
+  assert.match(result.homeEstimateNote, /60 s mean/);
+  assert.match(result.homeEstimateNote, /\d{2}:00:00.+\d{2}:01:00/);
+  assert.match(result.homeEstimateNote, /ended 60 s ago/);
+  assert.match(result.homeEstimateNote, /charger energy \+ sampled power/);
+  assert.match(result.homeEstimateNote, /Includes arrival times/);
+  assert.match(homeEstimateNote(estimate, false), /paused/);
+  assert.match(homeEstimateNote({...estimate, end_age_ms: 181000}), /too old/);
+  assert.match(homeEstimateNote({...estimate, from_ms:estimate.to_ms-300000,age_ms:210000}), /300 s mean/);
+  assert.match(homeEstimateNote({watts:null,reason:'charger_source_time_unavailable'}), /source time unknown/);
+  assert.match(homeEstimateNote({watts: null}), /unavailable/);
+  assert.equal(flowReadingsFromStatus({...status,load_estimate:{watts:null}}).load, null);
+  assert.equal(flowReadingsFromStatus({...status,load_estimate:{...estimate,end_age_ms:181000}}).load, null);
+});
 
 const LIVE = {
   grid_w: 500,

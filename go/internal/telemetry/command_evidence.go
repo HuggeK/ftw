@@ -30,6 +30,10 @@ type CommandEvidence struct {
 	PowerObservedSince    time.Time
 	LastObservation       time.Time
 	LastMeasuredAt        time.Time
+	// NoPower is an observed EV stop during uninterrupted positive orders.
+	// Retuning the current cannot restart this clock; a pause, failed command,
+	// missing measurement or observed power ends it.
+	NoPowerSince, NoPowerAt time.Time
 	// LastGapW is the latest fresh reading's distance from the commands in
 	// force during the response delay. Nil until such a reading arrives.
 	LastGapW *float64
@@ -101,6 +105,11 @@ func (s *Store) BeginCommand(driver string, payload []byte, now time.Time) Comma
 	if json.Unmarshal(payload, &request) != nil {
 		return CommandEvidence{}
 	}
+	// Resume changes permission to draw, not the current limit. Keep the
+	// accepted limit and its measured response while this optional call runs.
+	if request.Action == "ev_resume" && request.PowerW == nil {
+		return CommandEvidence{}
+	}
 	if request.Action == "ev_pause" {
 		zero := 0.0
 		request.PowerW = &zero
@@ -136,6 +145,9 @@ func (s *Store) BeginCommand(driver string, payload []byte, now time.Time) Comma
 	// step, a failed or unknown call, or a return to device control needs new
 	// proof against the new target.
 	if ok && old.Action == c.Action && (old.Result == "accepted" || old.Result == "pending") {
+		if kind == "ev" && old.PowerW != nil && c.PowerW != nil && *old.PowerW > 100 && *c.PowerW > 100 {
+			c.NoPowerSince, c.NoPowerAt = old.NoPowerSince, old.NoPowerAt
+		}
 		c.Recent, c.MaxAge = append([]CommandPoint(nil), old.Recent...), old.MaxAge
 		if !materialStep(old.PowerW, c.PowerW) {
 			c.Since, c.Baseline, c.StepAfter, c.StepAfterAt = old.Since, old.Baseline, old.StepAfter, old.StepAfterAt
@@ -361,6 +373,7 @@ func (s *Store) observeCommand(driver string, kind DerType, power float64, data 
 		SetpointW *float64 `json:"setpoint_w"`
 	}
 	if json.Unmarshal(data, &d) != nil {
+		c.NoPowerSince, c.NoPowerAt = time.Time{}, time.Time{}
 		c.ReadbackMismatchSince, c.PowerMismatchSince, c.PowerMatchSince = time.Time{}, time.Time{}, time.Time{}
 		c.PowerObservedSince, c.LastObservation = time.Time{}, time.Time{}
 		s.commands[k] = c
@@ -395,6 +408,17 @@ func (s *Store) observeCommand(driver string, kind DerType, power float64, data 
 	// A change-only source that confirms an unchanged sample states the power
 	// at the confirmation time; an unconfirmed repeat adds nothing new.
 	power, observedAt := observation.PowerW, observation.Seen()
+	if kind == DerEV {
+		switch {
+		case !fresh || !finite(power) || *c.PowerW <= 100 || math.Abs(power) >= 100:
+			c.NoPowerSince, c.NoPowerAt = time.Time{}, time.Time{}
+		case observedAt.After(c.NoPowerAt) && (!c.NoPowerSince.IsZero() || !observedAt.Before(c.Since)):
+			if c.NoPowerSince.IsZero() || observedAt.Sub(c.NoPowerAt) > max(time.Minute, c.MaxAge) {
+				c.NoPowerSince = observedAt
+			}
+			c.NoPowerAt = observedAt
+		}
+	}
 	// A cached sample from before the run cannot show its response. Repeated
 	// delivery of one source sample also cannot extend a measured time window.
 	if !fresh || !finite(power) || observedAt.Before(c.Since) {

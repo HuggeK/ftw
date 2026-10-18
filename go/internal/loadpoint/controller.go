@@ -41,24 +41,25 @@ type Controller struct {
 	// registry owns cross-command serialization and lifecycle cancellation.
 	commandTimeout  time.Duration
 	wallboxCycleSeq atomic.Uint64
-	resumeOffers    map[string]resumeOffer // owned by the dispatch tick
+	resumeOffers    map[string]*resumeOffer // owned by the dispatch tick
 	energySamples   map[string]*meteredEnergy
 
 	// fuseEVMax is this tick's EV share of the site fuse. nil means no cap.
 	fuseEVMax func() (float64, bool)
 
 	// perPhaseMeterAmps returns the live site-meter per-phase currents (L1,
-	// L2, L3). Wired from telemetry; nil disables the per-phase fuse clamp.
+	// L2, L3). Wired from telemetry; nil disables the phase increase gate.
 	perPhaseMeterAmps func() (l1, l2, l3 float64, ok bool)
-	// fusePhaseCapA holds the per-loadpoint per-phase EV current cap carried
-	// between ticks by the reactive per-phase fuse clamp (tickOne goroutine).
-	fusePhaseCapA map[string]float64
 	// tickFuseCaps belongs to the serial tick, after one shared budget read.
 	tickFuseCaps        map[string]float64
 	tickFusePhases      int
 	tickDirectiveActive bool
 	tickDirectiveOK     bool
 	tickDirective       Directive
+	// offerPeaks is each loadpoint's highest recent offer (serial tick).
+	offerPeaks map[string]offerPeak
+	// savedOffers mirrors each loadpoint's last order kept across restarts.
+	savedOffers map[string]savedOffer
 	// fuseResumeTicks is owned by the serial tick. A paused charger needs
 	// two consecutive dispatch ticks with room for a legal step.
 	fuseResumeTicks map[string]int
@@ -119,9 +120,10 @@ type Controller struct {
 
 	// vehicleStatus is the bound vehicle driver and its charging state.
 	// nil disables auto-wake.
-	vehicleStatus        func(loadpointID string) (driver, chargingState string, ok bool)
-	vehicleRefreshTarget func(loadpointID string) (string, error)
-	vehicleChargeState   func(loadpointID string) (VehicleChargeState, bool)
+	vehicleStatus         func(loadpointID string) (driver, chargingState string, ok bool)
+	vehicleRefreshTarget  func(loadpointID string) (string, error)
+	vehicleChargeState    func(loadpointID string) (VehicleChargeState, bool)
+	vehicleControlAllowed func(driver string) bool
 
 	// peakRemainingSurplusW is the best PV-minus-load surplus left today.
 	// Below the 3Φ minimum, surplus_only locks 1Φ for the day. nil keeps 3Φ.
@@ -206,6 +208,11 @@ const nearTermLogCooldown = 10 * time.Minute
 const phaseSwitchMinHold = 30 * time.Minute
 
 const fuseResumeSafeTicks = 2
+
+// CommandSettle is how long a new current may take to reach the site meter.
+// Easee Cloud needs about 5-15 s (#1674). Until then the meter may still show
+// an earlier, higher offer.
+const CommandSettle = 20 * time.Second
 
 // defaultPhaseSplitW mirrors loadpoint.Config.PhaseSplitW's default —
 // 3680 W is a 16 A 1Φ ceiling at 230 V. Kept in sync with the comment
@@ -554,6 +561,18 @@ func (c *Controller) SetVehicleStatus(f func(loadpointID string) (driver, chargi
 	c.vehicleStatus = f
 }
 
+// SetVehicleControlAllowed checks the loaded driver's write authority. A
+// telemetry-only car can inform the plan without receiving wake commands.
+func (c *Controller) SetVehicleControlAllowed(f func(string) bool) {
+	if c != nil {
+		c.vehicleControlAllowed = f
+	}
+}
+
+func (c *Controller) canControlVehicle(driver string) bool {
+	return c.vehicleControlAllowed == nil || c.vehicleControlAllowed(driver)
+}
+
 // SetVehicleRefreshTarget selects an authorized telemetry recipient from
 // configuration. It must not require a fresh SoC or permit charging.
 func (c *Controller) SetVehicleRefreshTarget(f func(string) (string, error)) {
@@ -578,75 +597,6 @@ func (c *Controller) SetPeakRemainingSurplusW(f func() (float64, bool)) {
 
 // fusePhaseMarginA is the per-phase amp headroom held below the breaker.
 const fusePhaseMarginA = 1.0
-
-// fusePhaseStepUpA is how fast the per-phase EV cap recovers per tick once a
-// phase has headroom — gentle enough not to re-trip, quick enough to ramp back.
-const fusePhaseStepUpA = 1.0
-
-// nextFusePhaseCapA reactively caps the EV's per-phase offer so the worst
-// measured site-meter phase stays at or below (fuseA - marginA). Reductions are
-// immediate (the full overage) to protect the breaker; ramp-up is gradual
-// (stepA/tick). prevCapA <= 0 means "uninitialised" -> start from the full fuse.
-// Pure for testability.
-func nextFusePhaseCapA(prevCapA, worstMeterA, fuseA, marginA, stepA float64) float64 {
-	if fuseA <= 0 {
-		return prevCapA
-	}
-	limit := fuseA - marginA
-	capA := prevCapA
-	if capA <= 0 {
-		capA = fuseA
-	}
-	switch {
-	case worstMeterA > limit:
-		capA -= worstMeterA - limit
-	case worstMeterA+stepA <= limit:
-		capA += stepA
-	}
-	if capA < 0 {
-		capA = 0
-	}
-	if capA > fuseA {
-		capA = fuseA
-	}
-	return capA
-}
-
-// applyPerPhaseFuseClamp caps one phase. The site-total fuse guard
-// misses a phase that is already near the breaker (L1 at 18 A on a 16 A fuse).
-func (c *Controller) applyPerPhaseFuseClamp(lpCfg Config, cmd map[string]any) {
-	if c == nil || c.perPhaseMeterAmps == nil {
-		return
-	}
-	if c.tickFuseCaps != nil {
-		// The shared budget already accounts for the worst measured phase.
-		// Re-integrating its overage here would trim the same reading again
-		// on each tick, eventually turning a safe positive offer into 0 W.
-		return
-	}
-	fuseA := c.siteFuse().MaxAmps
-	if fuseA <= 0 {
-		return
-	}
-	l1, l2, l3, ok := c.perPhaseMeterAmps()
-	if !ok {
-		return
-	}
-	worst := math.Max(l1, math.Max(l2, l3))
-	if c.fusePhaseCapA == nil {
-		c.fusePhaseCapA = map[string]float64{}
-	}
-	capA := nextFusePhaseCapA(c.fusePhaseCapA[lpCfg.ID], worst, fuseA, fusePhaseMarginA, fusePhaseStepUpA)
-	c.fusePhaseCapA[lpCfg.ID] = capA
-	if capA >= fuseA {
-		return
-	}
-	if existing, has := cmd["max_amps_per_phase"].(float64); !has || capA < existing {
-		cmd["max_amps_per_phase"] = capA
-		slog.Info("loadpoint per-phase fuse clamp",
-			"lp", lpCfg.ID, "worst_phase_a", worst, "ev_cap_a", capA, "fuse_a", fuseA)
-	}
-}
 
 // applyFuseClampAndCooldown applies the frozen hard cap. A short recovery
 // wait is part of that cap; an unknown startup budget never starts a timer.
@@ -864,7 +814,7 @@ func (c *Controller) RefreshVehicle(ctx context.Context, lpID string) error {
 var (
 	ErrForceStartNotReady       = errors.New("loadpoint controller not ready (missing vehicleStatus/send wiring)")
 	ErrForceStartLoadpointGone  = errors.New("loadpoint not found")
-	ErrForceStartNoVehicleBound = errors.New("no vehicle driver bound to loadpoint")
+	ErrForceStartNoVehicleBound = errors.New("no vehicle driver with charge control bound to loadpoint")
 )
 
 // ForceStartVehicle sends charge_start now, past the auto-wake backoff.
@@ -880,7 +830,7 @@ func (c *Controller) ForceStartVehicle(ctx context.Context, lpID string) (string
 		}
 	}
 	driver, _, ok := c.vehicleStatus(lpID)
-	if !ok || driver == "" {
+	if !ok || driver == "" || !c.canControlVehicle(driver) {
 		return "", ErrForceStartNoVehicleBound
 	}
 	now := time.Now()
@@ -928,7 +878,7 @@ func (c *Controller) wakeVehicleAuto(ctx context.Context, lpID string, reason st
 		return
 	}
 	driver, _, ok := c.vehicleStatus(lpID)
-	if !ok || driver == "" {
+	if !ok || driver == "" || !c.canControlVehicle(driver) {
 		return
 	}
 	now := time.Now()
@@ -1270,6 +1220,7 @@ func (c *Controller) TickWithDispatch(ctx context.Context, now time.Time, dispat
 	if dispatchAllowed {
 		c.tickDirective, c.tickDirectiveOK = c.currentDirective(now)
 		c.tickDirectiveActive = true
+		c.restoreOffers(now, samples)
 		c.freezeFuseBudget(now, samples)
 		defer func() { c.tickFuseCaps = nil; c.tickFusePhases = 0; c.tickDirectiveActive = false }()
 	}
@@ -1350,7 +1301,7 @@ func (c *Controller) standDownBeforeStorage(ctx context.Context, now time.Time, 
 	if err := c.sendDispatchWithDeadline(ctx, cfg.DriverName, []byte(`{"action":"ev_set_current","power_w":0}`)); err != nil {
 		slog.Warn("loadpoint safety standdown", "lp", cfg.ID, "driver", cfg.DriverName, "err", err)
 	} else {
-		c.resumeAfterZeroOffer(ctx, cfg, sample, 0, now)
+		c.recoverOfferedCharge(ctx, cfg, sample, 0, now)
 	}
 }
 
@@ -1620,7 +1571,6 @@ func (c *Controller) tickOne(ctx context.Context, now time.Time, lpCfg Config, s
 			cmd["power_w"], cmdReason = float64(0), "fuse_limit"
 		}
 	}
-	c.applyPerPhaseFuseClamp(lpCfg, cmd)
 	if applyCurrentCeiling(cmd) {
 		cmdReason = "fuse_limit"
 	}
@@ -1633,6 +1583,8 @@ func (c *Controller) tickOne(ctx context.Context, now time.Time, lpCfg Config, s
 	if w, ok := cmd["power_w"].(float64); ok {
 		offerW, haveOffer = w, true
 		c.manager.setCommandedForManual(lpCfg.ID, w, cmdReason, manualCommandUpdatedAt)
+		phase := c.recordOfferPeak(now, lpCfg.ID, w, cmd)
+		c.saveOffer(now, lpCfg, sample, w, phase, cmdReason)
 	}
 	payload, err := json.Marshal(cmd)
 	if err != nil {
@@ -1640,11 +1592,6 @@ func (c *Controller) tickOne(ctx context.Context, now time.Time, lpCfg Config, s
 	}
 	if c.send == nil {
 		return
-	}
-	// Resume only a zero offer from this transport and plug session. A failed
-	// optional resume keeps its retry state even after recording positive W.
-	if haveOffer && offerW > 0 {
-		c.resumeAfterZeroOffer(ctx, lpCfg, sample, offerW, now)
 	}
 	// The one command whose outcome decides whether core can actuate this
 	// charger. A charger that answers every poll and refuses this holds
@@ -1658,15 +1605,13 @@ func (c *Controller) tickOne(ctx context.Context, now time.Time, lpCfg Config, s
 	if sendErr != nil {
 		slog.Warn("loadpoint dispatch", "lp", lpCfg.ID,
 			"driver", lpCfg.DriverName, "err", sendErr)
-	}
-	if sendErr != nil {
 		// Never start wake work from a command that did not complete. In
 		// particular, a timeout may still be unwinding inside the registry;
 		// its per-driver owner restores default before another command runs.
 		return
 	}
 	if haveOffer && offerW <= 0 {
-		c.resumeAfterZeroOffer(ctx, lpCfg, sample, 0, now)
+		c.recoverOfferedCharge(ctx, lpCfg, sample, 0, now)
 	}
 	if !c.driverCanDispatch(lpCfg.DriverName) {
 		// The outcome callback can close Core's health gate synchronously.
@@ -1674,17 +1619,39 @@ func (c *Controller) tickOne(ctx context.Context, now time.Time, lpCfg Config, s
 		// wake side effects of a dispatch that Core has just rejected.
 		return
 	}
+	// The current write can block while Stop or new charger data arrives.
+	// Reuse the same session check for recovery and vehicle wake work.
+	latest, checkedAt, live := c.currentChargeSample(now, lpCfg, sample)
+	if !live {
+		if offerW > 0 {
+			delete(c.resumeOffers, lpCfg.ID)
+		}
+		return
+	}
+	sample, now = latest, checkedAt
+	// Establish the safe current before reopening a paused session. The
+	// charger may still retain a higher limit from before our standdown.
+	if haveOffer && offerW > 0 {
+		c.recoverOfferedCharge(ctx, lpCfg, sample, offerW, now)
+	}
 
 	// Wake on Stopped or Disconnected, including a surplus pause at 0 W.
 	// Otherwise the car never draws, so surplus never appears. The
 	// bat-SoC unlock must not poke a sleeping car, so this is the
 	// configured SurplusOnly flag, not the armed tick.
-	c.maybeWakeVehicle(ctx, now, lpCfg, lpCfg.SurplusOnly, sample.RequestActive, selfWithheld, cmd)
+	c.maybeWakeVehicle(ctx, now, lpCfg, lpCfg.SurplusOnly, sample, selfWithheld, cmd)
 }
 
-func (c *Controller) maybeWakeVehicle(ctx context.Context, now time.Time, lpCfg Config, surplusOn, chargerRequesting, selfPaused bool, cmd map[string]any) {
+func (c *Controller) maybeWakeVehicle(ctx context.Context, now time.Time, lpCfg Config, surplusOn bool, sample EVSample, selfPaused bool, cmd map[string]any) {
 	lpID := lpCfg.ID
 	if c == nil || c.send == nil {
+		return
+	}
+	var live bool
+	sample, now, live = c.currentChargeSample(now, lpCfg, sample)
+	// Vehicle APIs can lag the charger by minutes. Do not interrupt measured
+	// delivery, or turn missing charger power into evidence of a sleeping car.
+	if !live || !chargerIdleForWake(sample, now) {
 		return
 	}
 	pw, _ := cmd["power_w"].(float64)
@@ -1709,11 +1676,14 @@ func (c *Controller) maybeWakeVehicle(ctx context.Context, now time.Time, lpCfg 
 		// pause, cycle the contactor so the vehicle renegotiates — there's
 		// no vehicle driver for charge_start to land on, so the wallbox
 		// cycle is the only lever. Throttled to once per cooldown.
-		if c.shouldKickWallboxForResume(now, lpID, surplusOn, chargerRequesting, selfPaused, pw) {
+		if c.shouldKickWallboxForResume(now, lpID, surplusOn, sample.RequestActive, selfPaused, pw) {
 			slog.Info("loadpoint wallbox-cycle: charger not requesting while surplus offered — renegotiating",
 				"lp", lpID, "driver", lpCfg.DriverName)
 			c.cycleWallbox(lpID, lpCfg.DriverName)
 		}
+		return
+	}
+	if !c.canControlVehicle(driver) {
 		return
 	}
 	// "Complete" is intentionally NOT in the wake set: the car says
@@ -1776,6 +1746,10 @@ func (c *Controller) maybeWakeVehicle(ctx context.Context, now time.Time, lpCfg 
 	if err := c.sendVehicle(ctx, driver, payload); err != nil {
 		slog.Warn("loadpoint auto-wake failed", "lp", lpID,
 			"vehicle_driver", driver, "err", err)
+	} else {
+		// Let an accepted start take effect. Cycling now would immediately
+		// pause the charger we just asked the car to use.
+		return
 	}
 
 	// Wallbox session-cycle: when Tesla is in a "Stopped" state that
@@ -1788,6 +1762,10 @@ func (c *Controller) maybeWakeVehicle(ctx context.Context, now time.Time, lpCfg 
 	// driver implementing the standard ev_pause / ev_resume actions
 	// gets this for free.
 	//
+	latest, checkedAt, live := c.currentChargeSample(now, lpCfg, sample)
+	if !live || !chargerIdleForWake(latest, checkedAt) {
+		return
+	}
 	c.cycleWallbox(lpID, lpCfg.DriverName)
 }
 

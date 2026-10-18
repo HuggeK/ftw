@@ -415,6 +415,17 @@ func classifyControlFeedback(f *ControlFeedback, cmd telemetry.CommandEvidence, 
 		set("waiting", "not_connected", "info")
 		return
 	}
+	// A positive clamp explains the lower offer, not prolonged zero delivery.
+	// Keep known safety pauses and unconfirmed/stale commands authoritative.
+	evMismatchObserved := !cmd.PowerMismatchSince.IsZero() && cmd.LastObservation.Sub(cmd.PowerMismatchSince) >= 2*time.Minute
+	noPowerObserved := evMismatchObserved || !cmd.NoPowerSince.IsZero() && cmd.NoPowerAt.Sub(cmd.NoPowerSince) >= 2*time.Minute
+	if f.Kind == "ev" && commanded && cmd.Result == "accepted" &&
+		coreReason != "site_meter_stale" && coreReason != "site_phase_currents_stale" && coreReason != "fuse_cooldown" &&
+		f.SentW != nil && *f.SentW > 100 && f.ActualW != nil && math.Abs(*f.ActualW) < 100 &&
+		f.OfferedA != nil && *f.OfferedA > 0 && noPowerObserved {
+		set("warning", "no_power_response", "warning")
+		return
+	}
 	if f.RequestedA != nil && f.DeviceLimitA != nil && *f.RequestedA > *f.DeviceLimitA+0.5 {
 		set("limited", "device_limit", "warning")
 		return
@@ -467,7 +478,11 @@ func classifyControlFeedback(f *ControlFeedback, cmd telemetry.CommandEvidence, 
 	if cmd.LastGapW != nil {
 		gap = *cmd.LastGapW
 	}
-	if !cmd.PowerMismatchSince.IsZero() && now.Sub(cmd.PowerMismatchSince) >= grace && gap > telemetry.ControlToleranceW(*f.SentW) {
+	mismatchSettled := !cmd.PowerMismatchSince.IsZero() && now.Sub(cmd.PowerMismatchSince) >= grace
+	if f.Kind == "ev" {
+		mismatchSettled = evMismatchObserved
+	}
+	if mismatchSettled && gap > telemetry.ControlToleranceW(*f.SentW) {
 		if reason := batteryChargeLevelLimit(f); reason != "" {
 			set("limited", reason, "info")
 			return

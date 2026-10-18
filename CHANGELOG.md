@@ -1,5 +1,74 @@
 # Changelog
 
+## 0.151.0
+
+### Minor Changes
+
+- 16fbd58: Let the direct private LAN page accept Cloud terms or statistics without requiring a house password to be set first. When password protection is on, saving the choice still requires login. Show a shorter consent card, full sharing details, a clear saved message and errors that allow a retry.
+
+### Patch Changes
+
+- 8f937e7: The box now takes the app's next API request as soon as the previous answer has ended. Before, it freed its one request slot only after it had sent the answer's last frame. An app that asked again at once could be told the box was busy and then wait out a backoff before the view filled in.
+- 6308d04: With two or more managed chargers, unplugging one car during an overage of the import ceiling no longer holds back battery relief. Its offer left the pool, but Core did not cut it, so the battery no longer waits for it. A cut Core has sent to a car that stays plugged still counts, so its landing does not swing the site into export.
+- Resume a known charging session after sustained non-delivery and keep checking until measured power returns. Set the safe current before resuming. Do not interrupt charging from a delayed vehicle status, cycle a charger after an accepted vehicle start, or wake a read-only vehicle. Show sustained zero draw even while FTW adjusts the current, and record command evidence when charging stops. Keep missing power unknown and recheck Stop and the plug session after slow commands.
+- a111fdb: Calculate Home use from timestamped charger session energy where available and integrate other sources over the same period. Adapt the period to source reporting and show the estimated mean, period and age. Cloud polls do not refresh source time. Retain signed daily energy only for bounded balance failures that recover, while preserving raw quality, offline gaps and control inputs.
+- 7622380: Pair an iPhone from the same phone's browser or with a local pairing code. Show a restart action beside the app connection setting and keep restart progress in view.
+- a94e256: Keep signed source-balance estimates for short measurement imbalances, preserving original history quality and separating estimated household energy from missing data.
+
+## 0.150.0
+
+### Minor Changes
+
+- 75a8b2c: Limit project statistics to 48 hours under new Cloud and local policies. Earlier choices do not accept the new policy. Collection still waits for the signed privacy review.
+
+## 0.149.2
+
+### Patch Changes
+
+- 61e2563: When an overage of the import ceiling makes Core cut or stop the car, the battery no longer discharges for the same watts. Before, both answered the overage, and when the car's cut reached the meter 5–15 seconds later the battery was still discharging, so the site exported for several seconds. The hour's budget now waits for a cut Core sends during that overage, for at most 20 seconds. The battery covers any part the cut does not remove, a new overage after the cut has shown, and all of it if the car has not followed in time. The fuse still gets battery relief on every reading.
+- f8f5e43: The EV's hard limit now treats the main fuse as heat, as a fuse or breaker does. A short house spike, such as a heat pump or an oven starting, no longer cuts the charge. A phase above the fuse less 1 A cuts it only once that phase's current, weighted over about the last minute, passes the same limit, and at once above 1.2 times the fuse. The charge rises again only once that weighted current has room too, so repeated peaks cut it once instead of every minute. Where the meter reports phase currents, they replace total import as the fuse check, so a short spike on all three phases no longer cuts either. A tariff import ceiling still applies.
+- e40ff96: Switching the peak import limit on now applies the last limit the box had on, not a value one browser kept from earlier. The Grid dialog shows that value while the limit is off, and `/api/status` serves it as `peak_import_ceiling_last_w`. If the box has never had a limit on, switching on applies nothing until you pick a value and press Save, and Save now looks off while there is nothing to apply.
+- 78a67b4: Keep the statistics and Cloud terms prompt readable by making it span the full Overview width.
+
+## 0.149.1
+
+### Patch Changes
+
+- 6989fa8: Stop the active Cloud session as soon as its off flag is saved, even if a
+  later storage write fails. Live data, hourly statistics and remote access
+  stop; the saved flag also keeps them off after a restart.
+- 404a754: The import ceiling now caps the mean grid import over each local clock hour, as a power tariff bills it, instead of every second. Only the site meter counts toward the hour's budget, and a restart keeps what the hour has already imported. The EV and battery are cut only when the hour's budget needs it, so a short house peak no longer throttles the car, and a quiet start to the hour lets it charge above the ceiling later in that hour. Increases wait for a step of room, at most once a minute, five minutes after a cut and not in the hour's last quarter, so the charger does not hunt. One reading over the ceiling no longer stops a car: an overage smaller than one charging step must last 20 seconds before the hour's budget cuts. A stopped car restarts when the house's mean load over the restart wait leaves room for its minimum under the ceiling itself, so it never starts on one hour's slack only to stop when the next hour begins. A ceiling set during an hour counts from then. A meter gap never makes room. The physical fuse stays an instant limit. `/api/status` shows the hour's budget left (`peak_import_hour_left_wh`) and the import limit in force (`peak_import_limit_w`).
+
+## 0.149.0
+
+### Minor Changes
+
+- 2b1cc25: Include project statistics in the updated FTW Cloud terms. Local-only users
+  get a separate question with Yes suggested; nothing starts before an answer.
+  Statistics-only sharing grants no app or assistant remote access. Turning
+  Cloud off ends remote access and remembers that choice across restarts.
+  Hourly collection still waits for the signed C8 review and service approval.
+
+## 0.148.0
+
+### Minor Changes
+
+- 6335dbc: Add a separate, versioned Cloud statistics path for reporting installations,
+  configured capacity and recorded hourly energy. Older consents stay inactive
+  for these fields; the owner must accept the new policy.
+
+## 0.147.2
+
+### Patch Changes
+
+- 47799bd: The EV's hard limit now reads only the site meter and FTW's own commands, never the charger's power readings. A charge is cut by the overage the meter measures on the worst phase or in total import, holds while the site is inside its limits, and rises one step at a time once the meter shows the last one. After a stop it restarts only when the meter has shown room for 35 seconds, and a Core restart keeps FTW's last offer while the same charging session is still plugged in. A late, missing or lone 0 W reading from the charger can no longer stop a charge, and an import ceiling no longer makes the charger start and stop every half minute.
+
+## 0.147.1
+
+### Patch Changes
+
+- 8a7bd9c: An owner can let an assistant in for up to a year, up from 30 days. The box tells the app how long it lets each kind of access last, so a newer app offers an older box no more than 30 days.
+
 ## 0.147.0
 
 ### Minor Changes

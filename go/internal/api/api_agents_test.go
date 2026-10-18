@@ -459,3 +459,89 @@ func TestTheAgentRoutesNeedSignInWithLANAuthOn(t *testing.T) {
 		t.Errorf("signed in: %d", rr.Code)
 	}
 }
+
+// yearOfferBody is an offer that asks for a year, as FTW Cloud's does.
+func yearOfferBody(t *testing.T, extra string) string {
+	t.Helper()
+	o, err := protocol.Marshal(protocol.GrantOffer{
+		V: protocol.GrantOfferVersion, Key: make([]byte, 32), Role: apiauth.RoleAgent, Client: "Claude",
+		Scopes: []string{protocol.ScopeLiveRead}, Ops: []string{}, TTLS: 365 * 24 * 3600, Code: "ABCD",
+		ExpMs: 1_000_000 + 60_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := protocol.OfferBytes(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := protocol.Marshal(protocol.SignedOffer{O: o, Kid: "k1", Sig: offerSigner.Sign(msg)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return `{"offer":"` + base64.RawURLEncoding.EncodeToString(raw) + `"` + extra + `}`
+}
+
+// A grant with no length named gets 30 days of an offer's year; one past a
+// year, or so long it would wrap, is refused as the box would refuse it,
+// with the latest end it takes.
+func TestTheBoxPageBoundsALength(t *testing.T) {
+	const day = int64(24 * 3600 * 1000)
+	agents := newStubAgents("")
+	s := New(&Deps{Agents: agents})
+	post := func(path, body string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		r := signedIn(localRequest(http.MethodPost, path, body))
+		if strings.HasSuffix(path, "/widen") {
+			r.SetPathValue("id", "agent001")
+			s.handleAgentsWiden(w, r)
+		} else {
+			s.handleAgentsAdd(w, r)
+		}
+		return w
+	}
+	capped := func(w *httptest.ResponseRecorder) bool {
+		var got struct {
+			Error string         `json:"error"`
+			Args  map[string]any `json:"args"`
+		}
+		_ = json.Unmarshal(w.Body.Bytes(), &got)
+		return got.Error == protocol.ErrCapExceeded && got.Args["cap"] == "expiresAtMs" &&
+			got.Args["max"] == float64(1_000_000+365*day)
+	}
+
+	if w := post("/api/agents", yearOfferBody(t, "")); w.Code != http.StatusCreated ||
+		agents.added[0].ExpiresAtMs != 1_000_000+30*day {
+		t.Fatalf("no length named: %d, ends %d", w.Code, agents.added[len(agents.added)-1].ExpiresAtMs)
+	}
+	if w := post("/api/agents", yearOfferBody(t, `,"ttlS":31536000`)); w.Code != http.StatusCreated ||
+		agents.added[1].ExpiresAtMs != 1_000_000+365*day {
+		t.Fatalf("a year: %d", w.Code)
+	}
+	for _, ttl := range []string{"31536001", "18446744073709552"} {
+		if w := post("/api/agents/agent001/widen", `{"epoch":1,"scopes":["ftw.live.read"],"ops":[],"caps":{},"ttlS":`+ttl+`}`); !capped(w) {
+			t.Errorf("renewed for %s s: %d %s", ttl, w.Code, w.Body.String())
+		}
+	}
+	if w := post("/api/agents/agent001/widen", `{"epoch":1,"scopes":["ftw.live.read"],"ops":[],"caps":{},"ttlS":31536000}`); w.Code != http.StatusOK {
+		t.Errorf("renewed for a year: %d %s", w.Code, w.Body.String())
+	}
+	if len(agents.added) != 2 {
+		t.Errorf("a refused length reached the box: %d grants", len(agents.added))
+	}
+}
+
+// The box page reads the longest grant from box.longestMs, and no stray
+// top-level copy of it.
+func TestTheBoxPageListCarriesNoStrayLongest(t *testing.T) {
+	s := New(&Deps{Agents: newStubAgents("")})
+	w := httptest.NewRecorder()
+	s.handleAgentsList(w, localRequest(http.MethodGet, "/api/agents", ""))
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if _, stray := got["longestMs"]; stray {
+		t.Errorf("GET /api/agents carries a top-level longestMs: %s", w.Body.String())
+	}
+}

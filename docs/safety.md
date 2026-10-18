@@ -49,6 +49,14 @@ The reactive fuse saver may bypass normal slew limiting because preventing a
 fuse trip is the higher-priority quantified risk. It must still respect
 available battery energy and hardware power capability.
 
+The EV hard limit treats the main fuse as heat, not as one reading. It
+low-passes each phase's I² from the site meter with a 60 s time constant.
+A phase over the fuse less 1 A cuts the EVs once that filtered current
+passes the same limit, and at once above 1.2 × the fuse. A rise or start
+reads the higher of the reading and that filtered current. Where the meter
+reports phase currents, they replace total import as the EVs' fuse check; a
+tariff import ceiling still applies.
+
 The implementation and tests in [`go/internal/control`](../go/internal/control)
 are authoritative. Planner-side limits in [`go/internal/mpc`](../go/internal/mpc)
 reduce infeasible plans but do not

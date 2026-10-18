@@ -24,7 +24,6 @@ import (
 	"net/http"
 	"slices"
 	"strconv"
-	"time"
 
 	"github.com/srcfl/ftw/go/protocol"
 )
@@ -78,6 +77,9 @@ type AgentFacts struct {
 	// The list sets it per request, so the page stops before a code is
 	// spent on a grant the box would refuse.
 	Widen bool `json:"widen"`
+	// LongestMs is the longest grant the box takes for each role, so the
+	// page offers no length the box would refuse.
+	LongestMs map[string]int64 `json:"longestMs"`
 }
 
 // The agent clock as the box page reports it.
@@ -249,7 +251,7 @@ func (s *Server) handleAgentsAudit(w http.ResponseWriter, r *http.Request) {
 
 // agentAddBody is a grant offer, as FTW Cloud's consent page shows it, and
 // what the owner chose to grant of it. A field left out grants what the
-// offer asks.
+// offer asks, except ttlS, which grants at most 30 days.
 type agentAddBody struct {
 	Offer  string         `json:"offer"`
 	Scopes []string       `json:"scopes,omitempty"`
@@ -289,11 +291,16 @@ func (s *Server) handleAgentsAdd(w http.ResponseWriter, r *http.Request) {
 	if body.Caps != nil {
 		m.Caps = *body.Caps
 	}
-	ttl := offer.TTLS
+	ttl := min(offer.TTLS, defaultTTLS)
 	if body.TTLS != 0 {
 		ttl = body.TTLS
 	}
-	m.ExpiresAtMs = now + int64(ttl)*int64(time.Second/time.Millisecond)
+	end, err := grantEnd(now, ttl, m.Role)
+	if err != nil {
+		agentError(w, err)
+		return
+	}
+	m.ExpiresAtMs = end
 	row, err := s.deps.Agents.AddAgent(by, m)
 	if err != nil {
 		agentError(w, err)
@@ -384,6 +391,24 @@ func (s *Server) handleAgentsOffer(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// defaultTTLS is the length a grant gets when the request names none and the
+// offer asks for more: 30 days, where the app starts.
+const defaultTTLS = 30 * 24 * 60 * 60
+
+// grantEnd is the end of a grant of ttlS seconds from now. A length past the
+// role's longest grant is refused here, as the box would refuse it, before
+// it can overflow.
+func grantEnd(now int64, ttlS uint64, role string) (int64, error) {
+	most, ok := protocol.LongestMs()[role]
+	if !ok {
+		most = protocol.AgentMaxMs
+	}
+	if ttlS > uint64(most/1000) {
+		return 0, protocol.Refuse(protocol.ErrCapExceeded, map[string]any{"cap": "expiresAtMs", "max": now + most})
+	}
+	return now + int64(ttlS)*1000, nil
+}
+
 // withinOffer reports whether what the owner chose on the page gives no more
 // than the offer the agent's client signed for.
 func withinOffer(offer protocol.GrantOffer, body agentAddBody) bool {
@@ -435,9 +460,20 @@ func (s *Server) handleAgentsWiden(w http.ResponseWriter, r *http.Request) {
 		agentError(w, protocol.Refuse(protocol.ErrUnavailable, map[string]any{"subsystem": "clock"}))
 		return
 	}
+	id := r.PathValue("id")
+	role := protocol.RoleAgent
+	for _, row := range s.deps.Agents.Agents() {
+		if row.ID == id {
+			role = row.Role
+		}
+	}
+	end, err := grantEnd(now, body.TTLS, role)
+	if err != nil {
+		agentError(w, err)
+		return
+	}
 	row, err := s.deps.Agents.WidenAgent(by, protocol.AgentWiden{
-		ID: r.PathValue("id"), Epoch: body.Epoch, Scopes: body.Scopes, Ops: body.Ops, Caps: body.Caps,
-		ExpiresAtMs: now + int64(body.TTLS)*int64(time.Second/time.Millisecond),
+		ID: id, Epoch: body.Epoch, Scopes: body.Scopes, Ops: body.Ops, Caps: body.Caps, ExpiresAtMs: end,
 	})
 	if err != nil {
 		agentError(w, err)

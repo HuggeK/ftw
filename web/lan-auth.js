@@ -123,6 +123,7 @@
           return r.json().then(function (body) {
             if (!r.ok) throw new Error((body && body.error) || "login failed");
             finish(true);
+            if (typeof window.dispatchEvent === "function" && typeof window.Event === "function") window.dispatchEvent(new window.Event("ftw-owner-ready"));
           });
         }).catch(function (err) {
           if (errEl) errEl.textContent = err.message || "login failed";

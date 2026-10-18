@@ -288,7 +288,7 @@ func TestPerChargerCredentialOverTheWire(t *testing.T) {
 		cp := ocpp16.NewChargePoint(id, nil, client)
 		err := cp.Start(fmt.Sprintf("ws://127.0.0.1:%d", port))
 		if err == nil {
-			t.Cleanup(cp.Stop)
+			stopAfterServer(t, srv, cp.Stop)
 		}
 		return err
 	}

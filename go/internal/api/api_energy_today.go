@@ -23,6 +23,11 @@ func energyTodayFields(d state.DayEnergy) map[string]any {
 		out[key] = d.Missing.Value(field.flag, field.wh)
 		measured[key] = d.MeasuredValue(field.flag, field.wh)
 	}
+	if d.Missing&state.EstimatedLoad != 0 {
+		// The load total includes inferred intervals. It cannot also appear
+		// in the measured-only fallback used by clients after a data gap.
+		measured["load_wh"] = nil
+	}
 	out["measured"] = measured
 	return out
 }

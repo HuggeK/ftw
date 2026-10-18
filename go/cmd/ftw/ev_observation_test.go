@@ -68,3 +68,20 @@ func TestEVSourceCadenceDoesNotExtendTransportWatchdog(t *testing.T) {
 		t.Fatal("source cadence bypassed transport watchdog")
 	}
 }
+
+func TestEVObservationKeepsUnknownPowerSeparateFromZero(t *testing.T) {
+	now := time.Now()
+	health := &telemetry.DriverHealth{Status: telemetry.StatusOk}
+	for _, available := range []bool{false, true} {
+		data, _ := json.Marshal(map[string]any{
+			"connected": true, "session_id": "same", "control_power_available": available,
+			"control_power_observed_at": now.Add(-5 * time.Minute).Format(time.RFC3339Nano),
+			"control_power_confirmed":   true,
+		})
+		r := &telemetry.DerReading{UpdatedAt: now, Data: data}
+		sample, ok := currentEVSample(r, health, time.Minute, now, false, "charger")
+		if !ok || !sample.Connected || sample.PowerUnavailable == available {
+			t.Fatalf("available=%t: unknown power became a measured zero or an unplug: %+v", available, sample)
+		}
+	}
+}

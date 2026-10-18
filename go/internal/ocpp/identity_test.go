@@ -121,7 +121,7 @@ func TestBootNotificationTakesEitherSerialField(t *testing.T) {
 			if err := cp.Start(fmt.Sprintf("ws://127.0.0.1:%d", port)); err != nil {
 				t.Fatalf("connect: %v", err)
 			}
-			t.Cleanup(cp.Stop)
+			stopAfterServer(t, srv, cp.Stop)
 
 			if _, err := cp.BootNotification("Halo", "Charge Amps", tc.props...); err != nil {
 				t.Fatalf("boot: %v", err)

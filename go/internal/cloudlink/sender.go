@@ -73,19 +73,21 @@ func (b *budget) total(uptimeMs int64) int64 {
 
 // cadence is one connection's view of what it last sent.
 type cadence struct {
-	full       bool
-	lastFull   time.Time
-	liveKey    string
-	liveAt     time.Time
-	lpLast     *cloudwire.LP
-	lpAt       time.Time
-	carLast    *cloudwire.Cars
-	carAt      time.Time
-	pricesKey  string
-	pricesAt   time.Time
-	anyAt      time.Time // last live or hb
-	rosterAt   time.Time
-	watchUntil time.Time
+	statsHour      int64
+	statsCheckedAt time.Time
+	full           bool
+	lastFull       time.Time
+	liveKey        string
+	liveAt         time.Time
+	lpLast         *cloudwire.LP
+	lpAt           time.Time
+	carLast        *cloudwire.Cars
+	carAt          time.Time
+	pricesKey      string
+	pricesAt       time.Time
+	anyAt          time.Time // last live or hb
+	rosterAt       time.Time
+	watchUntil     time.Time
 	// pendingUntil is when the pairing code the last roster listed runs
 	// out, zero when it listed none.
 	pendingUntil time.Time
@@ -119,6 +121,9 @@ func (w *writer) run(ctx context.Context, events <-chan cloudwire.Envelope) erro
 	var slot <-chan time.Time
 
 	for {
+		if err := l.startStatisticsClock(); err != nil {
+			return err
+		}
 		snap := l.current()
 		if snap.link == nil || snap.home != connHome {
 			return errors.New("cloudlink: the link changed under the connection")
@@ -263,6 +268,9 @@ func (w *writer) tick(snap grantSnapshot, st *cadence, now time.Time) error {
 		}
 	}
 
+	if err := w.statistics(snap, st, now); err != nil {
+		return err
+	}
 	period := periodIdle
 	if now.Before(st.watchUntil) {
 		period = periodWatched
@@ -687,34 +695,36 @@ func (l *Link) rosterNumber(snap grantSnapshot) (uint64, cloudwire.Roster) {
 	case g.Revoked:
 		r.Grant.ID = g.ID
 	default:
-		r.Grant = cloudwire.Grant{ID: g.ID, Scopes: g.Scopes, Purposes: g.Purposes, Controller: g.Controller}
+		r.Grant = cloudwire.Grant{ID: g.ID, Scopes: g.Scopes, Purposes: g.Purposes, Controller: g.Controller, TermsPolicy: g.Policy, StatsID: g.StatsID, StatsPolicy: g.StatsPolicy, StatsSinceMs: g.StatsAtMs}
 	}
-	for _, d := range l.opts.Roster.Devices() {
-		var scopes []string
-		for _, s := range protocol.CloudScopes {
-			if slices.Contains(d.Scopes, s) {
-				scopes = append(scopes, s)
+	if !snap.g.statisticsOnly() {
+		for _, d := range l.opts.Roster.Devices() {
+			var scopes []string
+			for _, s := range protocol.CloudScopes {
+				if slices.Contains(d.Scopes, s) {
+					scopes = append(scopes, s)
+				}
 			}
+			r.Devices = append(r.Devices, cloudwire.Device{ID: d.ID, Key: d.Key, Role: d.Role, Scopes: scopes,
+				Epoch: d.Epoch, Tun: d.Tun, Agent: d.Agent})
 		}
-		r.Devices = append(r.Devices, cloudwire.Device{ID: d.ID, Key: d.Key, Role: d.Role, Scopes: scopes,
-			Epoch: d.Epoch, Tun: d.Tun, Agent: d.Agent})
-	}
-	sort.Slice(r.Devices, func(a, b int) bool { return r.Devices[a].ID < r.Devices[b].ID })
-	r.Noise = l.opts.Roster.Noise()
-	if l.opts.WebPush != nil {
-		var err error
-		r.WebPush, err = l.opts.WebPush.WebPushRows()
-		if err != nil {
-			l.log.Warn("could not prepare browser offline notices")
+		sort.Slice(r.Devices, func(a, b int) bool { return r.Devices[a].ID < r.Devices[b].ID })
+		r.Noise = l.opts.Roster.Noise()
+		if l.opts.WebPush != nil {
+			var err error
+			r.WebPush, err = l.opts.WebPush.WebPushRows()
+			if err != nil {
+				l.log.Warn("could not prepare browser offline notices")
+			}
+			sort.Slice(r.WebPush, func(a, b int) bool { return r.WebPush[a].ID < r.WebPush[b].ID })
 		}
-		sort.Slice(r.WebPush, func(a, b int) bool { return r.WebPush[a].ID < r.WebPush[b].ID })
-	}
-	if code, expires, ok := l.opts.Roster.Pending(); ok && snap.home != "" {
-		if left := time.Until(expires); left > 0 {
-			r.Pending = append(r.Pending, cloudwire.Pending{
-				Hash: cloudwire.PairingHash(snap.home, code),
-				TTLS: int64((left + time.Second - 1) / time.Second),
-			})
+		if code, expires, ok := l.opts.Roster.Pending(); ok && snap.home != "" {
+			if left := time.Until(expires); left > 0 {
+				r.Pending = append(r.Pending, cloudwire.Pending{
+					Hash: cloudwire.PairingHash(snap.home, code),
+					TTLS: int64((left + time.Second - 1) / time.Second),
+				})
+			}
 		}
 	}
 	// The number follows what the roster says, not how long a code has
@@ -823,7 +833,7 @@ func (l *Link) Preview() Preview {
 func (l *Link) sample() []sentFrame {
 	snap := l.current()
 	if snap.g == nil {
-		snap.g = &grantRecord{GrantKey: make([]byte, cloudwire.GrantKeyBytes), Scopes: protocol.CloudScopes}
+		snap.g = &grantRecord{GrantKey: make([]byte, cloudwire.GrantKeyBytes), Scopes: protocol.CloudScopes, Purposes: []string{protocol.CloudPurposeServe}}
 	}
 	up := l.uptimeMs()
 	var out []sentFrame
