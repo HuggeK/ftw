@@ -140,6 +140,9 @@ func (s *Service) Edit(live *config.Config, expected int64, patch json.RawMessag
 	if err != nil {
 		return Draft{}, err
 	}
+	if cfg.API.LANAuth != previous.API.LANAuth {
+		return Draft{}, errors.New("api.lan_auth changes through the house-password action on the box, not a setup draft")
+	}
 	if s.preserveSecrets != nil {
 		s.preserveSecrets(cfg, previous)
 	} else {

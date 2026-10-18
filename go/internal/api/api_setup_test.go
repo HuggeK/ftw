@@ -113,6 +113,16 @@ func TestSetupDraftDoesNotClaimCommissioningFromAValidConfig(t *testing.T) {
 	}
 }
 
+func TestSetupDoesNotPretendToChangeHousePasswordProtection(t *testing.T) {
+	s, cfg := setupTestServer(t)
+	w, _ := setupCall(t, s, http.MethodPost, "/api/setup/draft", map[string]any{
+		"revision": 0, "patch": map[string]any{"api": map[string]any{"lan_auth": !cfg.API.LANAuth}},
+	})
+	if w.Code != http.StatusUnprocessableEntity || !strings.Contains(w.Body.String(), "house-password") {
+		t.Fatal("draft accepted a password flag Settings would ignore", w.Body.String())
+	}
+}
+
 func TestSetupFailedSaveLeavesLiveAndStoredConfigUntouched(t *testing.T) {
 	s, cfg := setupTestServer(t)
 	w, draft := setupCall(t, s, http.MethodPost, "/api/setup/draft", map[string]any{"revision": 0, "patch": map[string]any{"site": map[string]any{"name": "Unsaved"}}})

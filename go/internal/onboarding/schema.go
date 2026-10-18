@@ -36,7 +36,12 @@ func schemaFor(t reflect.Type) map[string]any {
 			if name == "" {
 				name = f.Name
 			}
-			properties[name] = schemaFor(f.Type)
+			field := schemaFor(f.Type)
+			if t == reflect.TypeFor[config.API]() && name == "lan_auth" {
+				field["readOnly"] = true
+				field["description"] = "Read current house-password protection. Change it through /api/auth/password on the box, not a setup draft."
+			}
+			properties[name] = field
 		}
 		return map[string]any{"type": "object", "properties": properties, "additionalProperties": false}
 	case reflect.Map:
