@@ -269,11 +269,15 @@ func (h *Handler) dispatchAgent(ctx context.Context, env Envelope) error {
 		return h.sendError(env.ID, *refusal)
 	}
 	need, read := agentReads[env.T]
-	if !read && !agentOther[env.T] {
+	callScope, setup := protocol.RegistryAgentCalls[env.T]
+	if setup {
+		need = callScope
+	}
+	if !read && !setup && !agentOther[env.T] {
 		h.audit(env.By, env.T, "", ErrScopeDenied)
 		return h.refuse(env.ID, ErrScopeDenied, map[string]any{"t": env.T})
 	}
-	if read {
+	if read || setup {
 		if !ScopesForEnrolment(grant).Has(need) {
 			h.audit(env.By, env.T, "", ErrScopeDenied)
 			return h.refuse(env.ID, ErrScopeDenied, map[string]any{"t": env.T, "needScope": need, "role": grant.Role})
@@ -283,7 +287,12 @@ func (h *Handler) dispatchAgent(ctx context.Context, env Envelope) error {
 			return h.sendError(env.ID, ErrorBody{Code: protocol.ErrRateLimited,
 				Retryable: ErrorRetryable[protocol.ErrRateLimited], RetryAfterMs: &wait})
 		}
-		h.auditRead(env.By, env.T)
+		if read {
+			h.auditRead(env.By, env.T)
+		}
+	}
+	if setup {
+		return h.onSetupCall(env)
 	}
 
 	switch env.T {

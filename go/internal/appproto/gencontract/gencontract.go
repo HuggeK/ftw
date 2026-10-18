@@ -80,6 +80,12 @@ type Registry struct {
 		Scope string `yaml:"scope"`
 		Desc  string `yaml:"desc"`
 	} `yaml:"reads"`
+	AgentCalls []struct {
+		Msg   string `yaml:"msg"`
+		Const string `yaml:"const"`
+		Scope string `yaml:"scope"`
+		Desc  string `yaml:"desc"`
+	} `yaml:"agent_calls"`
 	Resolutions map[string]struct {
 		TileSpanMs    int64  `yaml:"tile_span_ms"`
 		RetentionDays int    `yaml:"retention_days"`
@@ -134,6 +140,7 @@ func Generate(raw []byte) ([]byte, error) {
 	writeOps(&b, reg)
 	writeAgentArgs(&b, reg)
 	writeReads(&b, reg)
+	writeAgentCalls(&b, reg)
 	writeErrors(&b, reg)
 	writeSourceStates(&b, reg)
 	writeResolutions(&b, reg)
@@ -141,6 +148,17 @@ func Generate(raw []byte) ([]byte, error) {
 	writeCars(&b, reg)
 
 	return format.Source(b.Bytes())
+}
+
+func writeAgentCalls(b *bytes.Buffer, reg Registry) {
+	for _, call := range reg.AgentCalls {
+		fmt.Fprintf(b, "const %s = %q\n\n", call.Const, call.Msg)
+	}
+	b.WriteString("// RegistryAgentCalls maps typed setup calls to their required grants.\nvar RegistryAgentCalls = map[string]string{\n")
+	for _, call := range reg.AgentCalls {
+		fmt.Fprintf(b, "\t// %s.\n\t%q: %q,\n", call.Desc, call.Msg, call.Scope)
+	}
+	b.WriteString("}\n\n")
 }
 
 // GenerateRoles renders the role table into package apiauth.

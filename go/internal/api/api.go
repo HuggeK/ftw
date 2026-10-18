@@ -1984,6 +1984,10 @@ func (s *Server) handleDrivers(w http.ResponseWriter, r *http.Request) {
 // drivers/ directory, parsed from each .lua file's DRIVER metadata.
 // Used by the Settings UI to offer an "Add from catalog" dropdown.
 func (s *Server) handleDriversCatalog(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.driverCatalogReply())
+}
+
+func (s *Server) driverCatalogReply() map[string]any {
 	// Default is next to the config file; overridable via -drivers for
 	// deployments (Docker) where drivers live in the image, not the data volume.
 	dir := s.deps.DriverDir
@@ -2001,8 +2005,7 @@ func (s *Server) handleDriversCatalog(w http.ResponseWriter, r *http.Request) {
 		drivers.CatalogSource{Dir: dir, Source: "bundled"},
 	)
 	if err != nil {
-		writeJSON(w, 200, map[string]any{"path": dir, "entries": []any{}, "error": err.Error()})
-		return
+		return map[string]any{"path": dir, "entries": []any{}, "error": err.Error()}
 	}
 	if s.deps.DriverRepository != nil {
 		entries = s.deps.DriverRepository.EnrichCatalog(entries)
@@ -2041,7 +2044,7 @@ func (s *Server) handleDriversCatalog(w http.ResponseWriter, r *http.Request) {
 			entries[i].Chosen = s.deps.DriverRepository.Chosen(entries[i].Path, entries[i].Version)
 		}
 	}
-	writeJSON(w, 200, map[string]any{"path": dir, "entries": entries})
+	return map[string]any{"path": dir, "entries": entries}
 }
 
 // POST /api/drivers/{name}/restart — stop + re-add the driver so it
@@ -2636,6 +2639,10 @@ func (s *Server) handlePrices(w http.ResponseWriter, r *http.Request) {
 //
 // Response: {"zones": [{code, country, currency, name}]}
 func (s *Server) handlePriceZones(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, 200, map[string]any{"zones": priceZoneItems()})
+}
+
+func priceZoneItems() []map[string]string {
 	all := prices.Zones()
 	items := make([]map[string]string, 0, len(all))
 	for _, z := range all {
@@ -2646,7 +2653,7 @@ func (s *Server) handlePriceZones(w http.ResponseWriter, _ *http.Request) {
 			"name":     z.Name(),
 		})
 	}
-	writeJSON(w, 200, map[string]any{"zones": items})
+	return items
 }
 
 // ---- /api/forecast ----

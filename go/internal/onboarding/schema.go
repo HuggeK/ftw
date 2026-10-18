@@ -45,8 +45,10 @@ func schemaFor(t reflect.Type) map[string]any {
 		}
 		return map[string]any{"type": "object", "properties": properties, "additionalProperties": false}
 	case reflect.Map:
-		return map[string]any{"type": "object", "additionalProperties": schemaFor(t.Elem())}
-	case reflect.Slice, reflect.Array:
+		return map[string]any{"type": []string{"object", "null"}, "additionalProperties": schemaFor(t.Elem())}
+	case reflect.Slice:
+		return map[string]any{"type": []string{"array", "null"}, "items": schemaFor(t.Elem())}
+	case reflect.Array:
 		return map[string]any{"type": "array", "items": schemaFor(t.Elem())}
 	case reflect.String:
 		return map[string]any{"type": "string"}
