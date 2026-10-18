@@ -130,7 +130,7 @@ type Deps struct {
 	SelfTune             *selftune.Coordinator
 	DtS                  float64                                   // control interval seconds (for model τ / age displays)
 	SaveConfig           func(path string, c *config.Config) error // injection for testability
-	SaveConfigWithValues func(path string, c *config.Config, values map[string]string, reviewedJSON []byte) error
+	SaveConfigWithValues func(path string, c *config.Config, values map[string]string, reviewedJSON []byte, beforeSave func() error) error
 	// ConfigApplier is main.go's config-applied callback — the same
 	// closure the configreload watcher runs (registry reload with SoC
 	// bounds, capacities, inverter groups, fuse and mpc/loadmodel
@@ -333,8 +333,8 @@ func New(deps *Deps) *Server {
 	}
 	s.setup = onboarding.NewWithSecrets(deps.State, s.preserveSetupSecrets, filepath.Dir(deps.ConfigPath))
 	if deps.SaveConfigWithValues == nil && deps.State != nil {
-		deps.SaveConfigWithValues = func(path string, cfg *config.Config, values map[string]string, reviewedJSON []byte) error {
-			return config.SaveStoredReviewedWithValues(deps.State, path, cfg, values, reviewedJSON)
+		deps.SaveConfigWithValues = func(path string, cfg *config.Config, values map[string]string, reviewedJSON []byte, beforeSave func() error) error {
+			return config.SaveStoredReviewedWithCheck(deps.State, path, cfg, values, reviewedJSON, beforeSave)
 		}
 	}
 	if deps.Registry != nil {
@@ -1727,6 +1727,11 @@ func (s *Server) handlePostConfigWith(w http.ResponseWriter, r *http.Request, re
 
 	// Persist atomically (Password has yaml:"-" so it won't appear in YAML)
 	if err := save(s.deps.ConfigPath, &newCfg); err != nil {
+		var denied *setupAccessError
+		if errors.As(err, &denied) {
+			writeJSON(w, denied.status, map[string]string{"error": denied.Error()})
+			return
+		}
 		status := http.StatusInternalServerError
 		if errors.Is(err, config.ErrReviewedConfigChanged) {
 			status = http.StatusConflict

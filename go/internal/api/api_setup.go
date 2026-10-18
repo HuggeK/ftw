@@ -105,6 +105,10 @@ func (s *Server) setupLive() (*config.Config, error) {
 
 func (s *Server) setupError(w http.ResponseWriter, err error) {
 	status := http.StatusUnprocessableEntity
+	var denied *setupAccessError
+	if errors.As(err, &denied) {
+		status = denied.status
+	}
 	if errors.Is(err, onboarding.ErrConflict) {
 		status = http.StatusConflict
 	}
@@ -223,9 +227,9 @@ func (s *Server) handleSetupEdit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(q.Operations) > 0 {
-		d, err = s.setup.EditOperations(live, q.Revision, q.Operations)
+		d, err = s.setup.EditOperationsWithCheck(live, q.Revision, q.Operations, setupWriteCheck(r))
 	} else {
-		d, err = s.setup.Edit(live, q.Revision, q.Patch)
+		d, err = s.setup.EditWithCheck(live, q.Revision, q.Patch, setupWriteCheck(r))
 	}
 	if err != nil {
 		s.setupError(w, err)
@@ -249,7 +253,7 @@ func (s *Server) handleSetupReset(w http.ResponseWriter, r *http.Request) {
 	if !setupAuthority(w, r) {
 		return
 	}
-	d, err := s.setup.Restart(live, q.Revision)
+	d, err := s.setup.RestartWithCheck(live, q.Revision, setupWriteCheck(r))
 	if err != nil {
 		s.setupError(w, err)
 		return
@@ -278,7 +282,10 @@ func (s *Server) handleSetupValidate(w http.ResponseWriter, r *http.Request) {
 		s.setupError(w, onboarding.ErrConflict)
 		return
 	}
-	d, err := s.setup.Validate(live, q.Revision, q.SHA256)
+	if !setupAuthority(w, r) {
+		return
+	}
+	d, err := s.setup.ValidateWithCheck(live, q.Revision, q.SHA256, setupWriteCheck(r))
 	if err != nil {
 		s.setupError(w, err)
 		return
@@ -346,12 +353,10 @@ func (s *Server) handleSetupCommit(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		s.handlePostConfigWith(w, request, true, func(path string, cfg *config.Config) error {
-			if check, ok := request.Context().Value(setupAuthorityKey{}).(func() error); ok {
-				if err := check(); err != nil {
-					return err
-				}
+			if err := setupWriteCheck(request)(); err != nil {
+				return err
 			}
-			return s.deps.SaveConfigWithValues(path, cfg, map[string]string{onboarding.CommitKey: string(record)}, raw)
+			return s.deps.SaveConfigWithValues(path, cfg, map[string]string{onboarding.CommitKey: string(record)}, raw, setupWriteCheck(request))
 		}, func(cfg *config.Config, _ []string) {
 			s.writeSetupCommit(w, cfg.Revision, &receipt)
 		})

@@ -14,6 +14,10 @@ import (
 // EditOperations applies JSON Patch add/replace/remove operations to a
 // named draft revision. Editing a list entry does not resend its siblings.
 func (s *Service) EditOperations(live *config.Config, expected int64, raw json.RawMessage) (Draft, error) {
+	return s.EditOperationsWithCheck(live, expected, raw, nil)
+}
+
+func (s *Service) EditOperationsWithCheck(live *config.Config, expected int64, raw json.RawMessage, beforeSave func() error) (Draft, error) {
 	d, err := s.Read(live)
 	if err != nil {
 		return Draft{}, err
@@ -87,7 +91,7 @@ func (s *Service) EditOperations(live *config.Config, expected int64, raw json.R
 	}
 	// Edit performs the final revision check, type validation, secret
 	// preservation and one durable write. Any concurrent edit conflicts.
-	return s.Edit(live, expected, patch)
+	return s.EditWithCheck(live, expected, patch, beforeSave)
 }
 
 func editPointer(node any, parts []string, op string, value any) (any, error) {
