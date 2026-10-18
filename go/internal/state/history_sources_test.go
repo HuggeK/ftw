@@ -265,6 +265,18 @@ func TestSourceLoadRetentionBackupAndDayBoundary(t *testing.T) {
 		}
 		near(t, "retained Wh", v.wh, 250)
 	}
+	for _, asset := range []string{"", ObservedConsumerAssetID} {
+		p, truncated, err := s.LoadEnergyHistory(EnergyHistoryQuery{AssetID: asset, SinceMS: base + 17123, UntilMS: base + 1800000, BucketMS: 300000, Limit: 10})
+		if err != nil || truncated || len(p) != 2 {
+			t.Fatal("retained source history lost whole intervals", err)
+		}
+		for _, v := range p {
+			if v.BucketLenMS != 900000 || v.BucketStartMS%900000 != 0 {
+				t.Fatal("retained source interval was split")
+			}
+			near(t, "retained native Wh", v.EnergyWh, 250)
+		}
+	}
 	backup := filepath.Join(t.TempDir(), "restored.db")
 	if err := s.copyStateForBackup(context.Background(), backup); err != nil {
 		t.Fatal(err)
@@ -457,5 +469,38 @@ func TestSourceLoadLimitFiltersAggregatedLegacyOverlap(t *testing.T) {
 	p, truncated, err := s.LoadEnergyHistory(EnergyHistoryQuery{AssetID: ObservedConsumerAssetID, SinceMS: base, UntilMS: base + 1800000, BucketMS: 900000, Limit: 1})
 	if err != nil || truncated || len(p) != 1 || p[0].BucketStartMS != base+900000 {
 		t.Fatal("aggregated overlap consumed the result limit", err)
+	}
+}
+
+func TestSourceLoadAlignsArbitraryRequestTimes(t *testing.T) {
+	s := sourceStore(t)
+	base := time.Now().UTC().Truncate(24 * time.Hour).UnixMilli()
+	minutes := make([]float64, 30)
+	for i := range minutes {
+		minutes[i] = 1000
+	}
+	sourceSeries(t, s, base, minutes)
+	insertLedgerEntryTest(t, s, "meter", FlowGridImport, base, 300000, 100, "hardware_counter", "measured", "counter", 1)
+	for _, asset := range []string{"", ObservedConsumerAssetID} {
+		for _, width := range []int64{300000, 420000, 900000} {
+			p, truncated, err := s.LoadEnergyHistory(EnergyHistoryQuery{AssetID: asset, SinceMS: base + 137123, UntilMS: base + 1800000, BucketMS: width, Limit: 10})
+			if err != nil || truncated {
+				t.Fatal("unaligned history request failed", err)
+			}
+			consumer := 0
+			for _, v := range p {
+				actualWidth := ((width + 300000 - 1) / 300000) * 300000
+				if v.BucketStartMS%300000 != 0 || v.BucketLenMS != actualWidth {
+					t.Fatal("history flows use different, split-minute intervals")
+				}
+				if v.Flow == FlowConsumerUse {
+					consumer++
+				}
+			}
+			actualWidth := ((width + 300000 - 1) / 300000) * 300000
+			if consumer != int(1800000/actualWidth) {
+				t.Fatal("arbitrary request timestamp hid complete source intervals")
+			}
+		}
 	}
 }

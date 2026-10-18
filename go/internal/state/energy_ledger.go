@@ -408,6 +408,24 @@ func (s *Store) LoadEnergyHistoryContext(ctx context.Context, q EnergyHistoryQue
 	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+	cut, sourceMode, err := s.sourceEnergyFrom(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	if sourceMode && q.UntilMS > cut {
+		var sourceWidth int64
+		if err := s.history.QueryRowContext(ctx, `SELECT COALESCE(MAX(resolution_ms),?) FROM history_source_energy WHERE start_ms>=? AND start_ms<? AND start_ms+resolution_ms>?`, ArchiveResolutionMS, q.SinceMS-maxSourceEnergyWidth, q.UntilMS, q.SinceMS).Scan(&sourceWidth); err != nil {
+			return nil, false, err
+		}
+		// All flows use the stored energy grid. Arbitrary request times and
+		// widths cannot split stored intervals or invalidate every Load bucket.
+		unit := max(EnergyLedgerBucketMS, sourceWidth)
+		if q.BucketMS > math.MaxInt64-unit+1 {
+			return nil, false, ErrHistoryQueryLimit
+		}
+		q.BucketMS = ((q.BucketMS + unit - 1) / unit) * unit
+		q.SinceMS = bucketStart(q.SinceMS, unit)
+	}
 	assetID := q.AssetID
 	rows, err := s.history.QueryContext(ctx, `WITH aggregated AS (
 		SELECT
