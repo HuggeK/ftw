@@ -129,11 +129,17 @@ func (s *Server) writeSetupDraft(w http.ResponseWriter, live *config.Config, d o
 		return
 	}
 	saved := receipt != nil && receipt.DraftRevision == d.Revision && receipt.SHA256 == d.SHA256
-	restartPending := saved && setupRestartPending(receipt)
+	restartPending := setupRestartPending(receipt)
 	applied := saved && receipt.SavedRevision == live.Revision && !restartPending
 	restartReasons := config.RestartRequiredFor(live, &candidate)
 	if saved {
 		restartReasons = receipt.RestartReasons
+	} else if restartPending {
+		for _, reason := range receipt.RestartReasons {
+			if !slices.Contains(restartReasons, reason) {
+				restartReasons = append(restartReasons, reason)
+			}
+		}
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, map[string]any{

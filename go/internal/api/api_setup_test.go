@@ -242,6 +242,30 @@ func TestSetupResumeKeepsPendingRestartVisible(t *testing.T) {
 	}
 }
 
+func TestSetupNewDraftKeepsTheProcessRestartPending(t *testing.T) {
+	s, _ := setupTestServer(t)
+	w, draft := setupCall(t, s, http.MethodPost, "/api/setup/draft", map[string]any{"revision": 0, "patch": map[string]any{"api": map[string]any{"port": 8899}}})
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	w, _ = setupCall(t, s, http.MethodPost, "/api/setup/commit", map[string]any{"revision": draft["revision"], "base_revision": draft["base_revision"], "sha256": draft["sha256"], "confirmed": true})
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	w, draft = setupCall(t, s, http.MethodPost, "/api/setup/reset", map[string]any{"revision": draft["revision"]})
+	if w.Code != http.StatusOK || draft["saved"] != false || draft["restart_pending"] != true || len(draft["restart_reasons"].([]any)) == 0 {
+		t.Fatal("new draft hid the pending restart", w.Body.String())
+	}
+	w, draft = setupCall(t, s, http.MethodPost, "/api/setup/draft", map[string]any{"revision": draft["revision"], "patch": map[string]any{"site": map[string]any{"name": "Next change"}}})
+	if w.Code != http.StatusOK || draft["restart_pending"] != true {
+		t.Fatal(w.Body.String())
+	}
+	w, resumed := setupCall(t, New(s.deps), http.MethodGet, "/api/setup/draft", nil)
+	if w.Code != http.StatusOK || resumed["restart_pending"] != true || len(resumed["restart_reasons"].([]any)) == 0 {
+		t.Fatal("resume hid process state", w.Body.String())
+	}
+}
+
 func TestSetupSwappedDriverNamesKeepOwnPasswords(t *testing.T) {
 	s, _ := setupTestServer(t)
 	a := map[string]any{"name": "meter A", "lua": "drivers/test.lua", "is_site_meter": true,
