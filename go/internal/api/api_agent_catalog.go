@@ -47,6 +47,7 @@ var agentAPIHints = []protocol.AgentAPIRoute{
 // are not reads. Configure and Actuate handlers keep their command path.
 var agentLocalReads = map[string]bool{
 	"/api/config":              true,
+	"/api/setup/draft":         true,
 	"/api/drivers/{id}/source": true,
 	"/api/drivers/{name}/logs": true,
 	"/api/logs":                true,

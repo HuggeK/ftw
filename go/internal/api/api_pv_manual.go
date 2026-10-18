@@ -236,6 +236,8 @@ func readNominalW(d config.Driver) float64 {
 		return float64(n)
 	case int64:
 		return float64(n)
+	case uint64:
+		return float64(n)
 	}
 	return 0
 }

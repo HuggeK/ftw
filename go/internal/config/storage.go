@@ -22,6 +22,26 @@ type storedSettings struct {
 	YAMLSourceHash  string  `json:"yaml_source_hash,omitempty"`
 }
 
+func (s *storedSettings) UnmarshalJSON(raw []byte) error {
+	var doc struct {
+		Config          json.RawMessage `json:"config"`
+		LANPasswordHash string          `json:"lan_password_hash"`
+		YAMLSourceHash  string          `json:"yaml_source_hash"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return err
+	}
+	if len(doc.Config) == 0 || bytes.Equal(bytes.TrimSpace(doc.Config), []byte("null")) {
+		return errors.New("stored settings have no config")
+	}
+	cfg := new(Config)
+	if err := DecodeJSON(doc.Config, cfg); err != nil {
+		return err
+	}
+	*s = storedSettings{Config: cfg, LANPasswordHash: doc.LANPasswordHash, YAMLSourceHash: doc.YAMLSourceHash}
+	return nil
+}
+
 func decodeStored(c state.Configuration, database, baseDir string) (*Config, error) {
 	var doc storedSettings
 	if err := json.Unmarshal(c.Document, &doc); err != nil {
@@ -215,6 +235,12 @@ func SaveStored(st *state.Store, path string, cfg *Config) error {
 	return saveStored(st, path, cfg, "")
 }
 
+// SaveStoredWithValues commits a settings change and its companion records
+// in the same SQLite transaction, for example a setup commit receipt.
+func SaveStoredWithValues(st *state.Store, path string, cfg *Config, values map[string]string) error {
+	return saveStoredValues(st, path, cfg, "", values, nil)
+}
+
 // DropRetiredSettings rewrites stored settings that still carry settings of a
 // removed feature. Ask why kept an OpenRouter key there; nothing reads it, so
 // it must not stay in state.db and every backup. Device Support repositories,
@@ -241,6 +267,22 @@ func DropRetiredSettings(st *state.Store, path string, cfg *Config) ([]string, e
 }
 
 func saveStored(st *state.Store, path string, cfg *Config, sourceHash string) error {
+	return saveStoredValues(st, path, cfg, sourceHash, nil, nil)
+}
+
+// ErrReviewedConfigChanged means a save would differ from the reviewed document.
+var ErrReviewedConfigChanged = errors.New("configuration changed after review; validate and review the returned draft again")
+
+// SaveStoredReviewedWithValues checks the portable document after all save-time
+// normalization, before committing either settings or companion records.
+func SaveStoredReviewedWithValues(st *state.Store, path string, cfg *Config, values map[string]string, reviewedJSON []byte) error {
+	if len(reviewedJSON) == 0 {
+		return errors.New("reviewed configuration is required")
+	}
+	return saveStoredValues(st, path, cfg, "", values, reviewedJSON)
+}
+
+func saveStoredValues(st *state.Store, path string, cfg *Config, sourceHash string, values map[string]string, reviewedJSON []byte) error {
 	if cfg.ConfigDatabase == "" {
 		return errors.New("settings database is not initialized")
 	}
@@ -285,6 +327,15 @@ func saveStored(st *state.Store, path string, cfg *Config, sourceHash string) er
 	portable := *cfg
 	portable.Drivers = append([]Driver(nil), cfg.Drivers...)
 	portable.UnresolveDriverPaths(filepath.Dir(path))
+	if reviewedJSON != nil {
+		actual, err := json.Marshal(&portable)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(actual, reviewedJSON) {
+			return ErrReviewedConfigChanged
+		}
+	}
 	raw, err := json.Marshal(storedSettings{Config: &portable, LANPasswordHash: cfg.LANPasswordHash, YAMLSourceHash: sourceHash})
 	if err != nil {
 		return err
@@ -303,6 +354,12 @@ func saveStored(st *state.Store, path string, cfg *Config, sourceHash string) er
 	}
 	credentials["ev_charger_password"] = password
 	credentials["lan_auth_password"] = cfg.LANPasswordHash
+	for key, value := range values {
+		if _, credential := credentials[key]; credential || key == "settings/config_v1" {
+			return errors.New("companion settings record conflicts with configuration or credentials")
+		}
+		credentials[key] = value
+	}
 	revision, err := st.SaveConfiguration(raw, cfg.Revision, credentials)
 	if err != nil {
 		return err

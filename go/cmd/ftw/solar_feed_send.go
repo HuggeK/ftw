@@ -57,6 +57,8 @@ func configNumber(v any) float64 {
 		return float64(n)
 	case int64:
 		return float64(n)
+	case uint64:
+		return float64(n)
 	case float64:
 		return n
 	}

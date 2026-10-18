@@ -261,6 +261,7 @@ func requiresMutationProtection(r *http.Request) bool {
 func protectedReadPath(path string) bool {
 	switch path {
 	case "/api/config",
+		"/api/setup/draft",
 		"/api/support/dump",
 		"/api/support/report",
 		"/api/logs",

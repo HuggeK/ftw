@@ -1532,6 +1532,8 @@ func tcpAllowedHostsFor(cfg config.Driver) []string {
 			port = p
 		case int64:
 			port = int(p)
+		case uint64:
+			port = int(p)
 		case float64:
 			port = int(p)
 		}
