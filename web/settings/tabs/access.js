@@ -33,7 +33,7 @@
     "ftw.events.read": "See alerts and events",
     "ftw.logs.read": "Read the box's logs, with names and secrets taken out",
     "ftw.config.read": "Read the settings, with names and secrets taken out",
-    "ftw.diag.run": "Run checks that change nothing",
+    "ftw.diag.run": "Read full technical diagnostics, source, logs and backups; backups can contain saved credentials",
     "ftw.dispatch.hold": "Act at once, for a few minutes at a time, within these limits",
     "ftw.goals.request": "Ask for lasting changes, each waiting for your yes here",
   };

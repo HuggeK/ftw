@@ -61,6 +61,13 @@ describe("the page's words follow the registry", () => {
     for (const scope of Object.keys(P.SCOPE_WORDS)) assert.ok(agentScopes.includes(scope), scope);
   });
 
+  it("warns that diagnostic access reads full backups that can contain saved credentials", () => {
+    const words = P.SCOPE_WORDS["ftw.diag.run"];
+    assert.match(words, /full technical diagnostics, source, logs and backups/);
+    assert.match(words, /backups can contain saved credentials/);
+    assert.doesNotMatch(words, /checks that change nothing/);
+  });
+
   it("has words for every op an assistant may name", () => {
     assert.ok(agentOps.length >= 5);
     for (const op of agentOps) assert.ok(P.OP_WORDS[op], op);
