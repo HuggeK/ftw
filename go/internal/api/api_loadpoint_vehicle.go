@@ -58,7 +58,7 @@ func (s *Server) handleLoadpointForceStart(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, 404, map[string]string{"error": "loadpoint not found", "loadpoint_id": id})
 		return
 	case errors.Is(err, loadpoint.ErrForceStartNoVehicleBound):
-		writeJSON(w, 422, map[string]string{"error": "no vehicle driver bound to loadpoint", "loadpoint_id": id})
+		writeJSON(w, 422, map[string]string{"error": "no vehicle driver with charge control bound to loadpoint", "loadpoint_id": id})
 		return
 	case err != nil:
 		// Generic 502 — do NOT surface the underlying driver error

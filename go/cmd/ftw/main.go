@@ -1919,6 +1919,7 @@ func main() {
 		// for the sends that are deliberately not.
 		lpController.SetOutcomeSender(evRouter.SendWithOutcome)
 		lpController.SetCycleSender(evRouter.SendCycle)
+		lpController.SetVehicleControlAllowed(reg.CanControl)
 		lpController.SetDispatchOutcome(actuation.recordCommandOutcome)
 		lpController.SetDriverOnline(func(name string) bool {
 			if ocppSrv != nil && ocppSrv.Handler().IsOnline(name) && ocppSrv.Handler().IsApproved(name) {
@@ -3184,8 +3185,13 @@ func main() {
 						lastEVStopReplan = time.Now()
 						fired = true
 						go mpcSvc.ReplanWithReason(ctx, "loadpoint_ev_stopped")
+						command, _ := tel.CommandEvidence(lp.DriverName, "ev")
 						slog.Info("loadpoint EV stopped → MPC replan triggered",
-							"lp", lp.ID, "prev_w", prev, "curr_w", curr)
+							"lp", lp.ID, "prev_w", prev, "curr_w", curr,
+							"commanded_known", lp.CommandedKnown, "commanded_w", lp.CommandedW,
+							"commanded_reason", lp.CommandedReason, "command_result", command.Result,
+							"command_at", command.At, "power_at_ms", lp.PowerUpdatedAtMs,
+							"power_unavailable", lp.PowerUnavailable)
 					}
 					evDrawPrev[lp.ID] = curr
 				}

@@ -1313,6 +1313,15 @@ func (r *Registry) SendDefault(ctx context.Context, name string) error {
 	}
 }
 
+// CanControl checks the loaded driver's write authority without sending a
+// command. Registry.Send still checks it again for the selected generation.
+func (r *Registry) CanControl(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rd, ok := r.rec[name]
+	return ok && !rd.readOnly && !rd.cfg.ObserveOnly
+}
+
 // ControlStatus returns the command safety state for the current driver
 // generation without creating or changing any state.
 func (r *Registry) ControlStatus(name string) (DriverControlStatus, bool) {
