@@ -814,7 +814,7 @@ func (c *Controller) RefreshVehicle(ctx context.Context, lpID string) error {
 var (
 	ErrForceStartNotReady       = errors.New("loadpoint controller not ready (missing vehicleStatus/send wiring)")
 	ErrForceStartLoadpointGone  = errors.New("loadpoint not found")
-	ErrForceStartNoVehicleBound = errors.New("no vehicle driver bound to loadpoint")
+	ErrForceStartNoVehicleBound = errors.New("no vehicle driver with charge control bound to loadpoint")
 )
 
 // ForceStartVehicle sends charge_start now, past the auto-wake backoff.
