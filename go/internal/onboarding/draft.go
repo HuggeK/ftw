@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"sync"
 
@@ -258,12 +259,20 @@ func (s *Service) ValidateWithCheck(live *config.Config, revision int64, sha str
 	if err != nil {
 		return Draft{}, err
 	}
-	if bytes.Equal(normalized, d.Config) {
+	warnings := slices.Clone(d.ValidationWarnings)
+	for _, warning := range cfg.LoadpointWarnings {
+		if !slices.Contains(warnings, warning) {
+			warnings = append(warnings, warning)
+		}
+	}
+	if bytes.Equal(normalized, d.Config) && slices.Equal(warnings, d.ValidationWarnings) {
 		return d, nil
 	}
+	if !bytes.Equal(normalized, d.Config) {
+		d.NormalizedFromRevision = d.Revision
+	}
 	d.Config = normalized
-	d.NormalizedFromRevision = d.Revision
-	d.ValidationWarnings = append([]string(nil), cfg.LoadpointWarnings...)
+	d.ValidationWarnings = warnings
 	d.Revision++
 	d.SHA256 = digest(d.Config, d.BaseRevision)
 	raw, err := json.Marshal(d)
@@ -317,6 +326,11 @@ func (s *Service) checkedLocked(liveRevision, revision int64, sha string) (*conf
 	}
 	if !bytes.Equal(normalized, d.Config) {
 		return nil, fmt.Errorf("%w: run setup_validate and review its returned draft before saving", ErrConflict)
+	}
+	for _, warning := range cfg.LoadpointWarnings {
+		if !slices.Contains(d.ValidationWarnings, warning) {
+			return nil, fmt.Errorf("%w: run setup_validate and review its returned warnings before saving", ErrConflict)
+		}
 	}
 	return cfg, nil
 }

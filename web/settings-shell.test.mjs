@@ -61,6 +61,7 @@ function loadShell(saveResponse, ok = true) {
   const requests = [];
   const responses = {};
   const alerts = [];
+  const timers = [];
   const sandbox = {
     window: { FTWSettings: { tabs: {} } },
     document,
@@ -73,13 +74,13 @@ function loadShell(saveResponse, ok = true) {
     },
     // The shell only uses timers to clear the "Saved" status and to poll after
     // a restart; neither is what these tests are about.
-    setTimeout: () => 0,
+    setTimeout: fn => { timers.push(fn); return timers.length; },
     Date, JSON, Array, Object, String, console,
   };
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
   vm.runInContext(source, sandbox);
-  return { elements, document, requests, responses, alerts, tabs: sandbox.window.FTWSettings.tabs,
+  return { elements, document, requests, responses, alerts, timers, tabs: sandbox.window.FTWSettings.tabs,
     loadTab: file => vm.runInContext(readFileSync(new URL(file, import.meta.url), "utf8"), sandbox) };
 }
 
@@ -440,6 +441,26 @@ describe("late driver profile fields", () => {
 });
 
 describe("the settings shell after a save", () => {
+  it("keeps charger warnings visible after a successful save", async () => {
+    const rig = loadShell({warnings: ["Missing charger connection: select a configured charger."]});
+    rig.elements["settings-save"].handlers.click();
+    await settled();
+    const status = rig.elements["settings-status"];
+    assert.match(status.textContent, /Saved.*Missing charger connection/);
+    assert.equal(status.className, "settings-status warning");
+    assert.equal(status.attributes.role, "alert");
+    assert.equal(rig.timers.length, 0, "a warning must not disappear on a timer");
+  });
+  it("does not let an earlier success timer clear a later warning", async () => {
+    const rig = loadShell({});
+    rig.elements["settings-save"].handlers.click();
+    await settled();
+    rig.responses["/api/config"] = {warnings: ["Missing charger connection."]};
+    rig.elements["settings-save"].handlers.click();
+    await settled();
+    rig.timers.forEach(fn => fn());
+    assert.match(rig.elements["settings-status"].textContent, /Missing charger connection/);
+  });
   it("calls the tab back so it can ask the box again", async () => {
     const { elements, tabs } = loadShell({ restart_required: false, restart_reasons: [] });
     let called = 0;

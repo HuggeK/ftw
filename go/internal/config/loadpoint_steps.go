@@ -34,5 +34,6 @@ func (c *Config) normalizeLoadpointSteps() error {
 		}
 	}
 	c.Loadpoints = loadpoints
+	c.warnMissingLoadpointConnections()
 	return nil
 }

@@ -27,7 +27,8 @@ loadpoints:
 	if !reflect.DeepEqual(cfg.Loadpoints[0].AllowedStepsW, want) {
 		t.Fatal(cfg.Loadpoints[0].AllowedStepsW)
 	}
-	if len(cfg.LoadpointWarnings) != 1 || !strings.Contains(cfg.LoadpointWarnings[0], `"Easee"`) {
+	// This fixture also has no configured charger for its saved connection.
+	if len(cfg.LoadpointWarnings) != 2 || !strings.Contains(cfg.LoadpointWarnings[0], `"Easee"`) {
 		t.Fatal(cfg.LoadpointWarnings)
 	}
 	old := cfg.Loadpoints[0].AllowedStepsW
@@ -48,8 +49,8 @@ loadpoints:
 			t.Fatalf("persisted step %v exceeds max", step)
 		}
 	}
-	if len(reloaded.LoadpointWarnings) != 0 {
-		t.Fatal("corrected persisted config still warns", reloaded.LoadpointWarnings)
+	if len(reloaded.LoadpointWarnings) != 1 || !strings.HasPrefix(reloaded.LoadpointWarnings[0], missingChargerConnection) {
+		t.Fatal("step correction should leave only the unresolved connection warning")
 	}
 }
 
@@ -79,7 +80,7 @@ func TestLoadpointStepsAreLimitedInStoredSettings(t *testing.T) {
 	if err := json.Unmarshal(doc.Document, &saved); err != nil {
 		t.Fatal(err)
 	}
-	if saved.Config.Loadpoints[0].AllowedStepsW[1] != 11000 || len(cfg.LoadpointWarnings) != 1 {
+	if saved.Config.Loadpoints[0].AllowedStepsW[1] != 11000 || len(cfg.LoadpointWarnings) != 2 {
 		t.Fatalf("stored steps=%v warnings=%v", saved.Config.Loadpoints[0].AllowedStepsW, cfg.LoadpointWarnings)
 	}
 }

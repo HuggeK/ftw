@@ -53,6 +53,19 @@
     return out;
   }
 
+  function chargerConnection(config, lp, ocppStatus) {
+    var name = lp.driver_name || "";
+    if (name && (config.drivers || []).some(function (driver) { return driver.name === name; })) return null;
+    if (name && ocppChargerIds(ocppStatus).indexOf(name) >= 0) return null;
+    if (name && config.ocpp && config.ocpp.enabled) {
+      return { kind: "unverified_ocpp", label: "OCPP not seen",
+        message: 'Connection "' + name + '" is not a configured driver and has not been seen by OCPP. Check its OCPP identity or select a configured charger.' };
+    }
+    return { kind: "missing", label: "missing connection",
+      message: (name ? 'Saved connection "' + name + '" is missing. ' : 'No charger is selected. ') +
+        'Select a configured charger or remove this charger.' };
+  }
+
   // One human-readable state per charger. Online is the WebSocket session;
   // connected is a vehicle on the connector — a charger is usually online
   // long before anything is plugged into it.
@@ -473,6 +486,7 @@
       html += '<div class="devices-list">';
       config.loadpoints.forEach(function (lp, idx) {
         var prefix = "loadpoints." + idx;
+        var connection = chargerConnection(config, lp, S.ocppStatus);
         var stepsStr = fmtStepsW(lp.allowed_steps_w);
         var driverOpts = drivers.map(function (n) {
           var label = n + (ocppIds.indexOf(n) >= 0 ? " (OCPP)" : "");
@@ -480,17 +494,18 @@
             (n === lp.driver_name ? " selected" : "") + ">" + escHtml(label) + "</option>";
         }).join("");
         if (lp.driver_name && drivers.indexOf(lp.driver_name) < 0) {
-          // Show the bound driver even if it's not currently EV-tagged
-          // (driver was renamed / catalog reload pending / an OCPP charger
-          // that is not connected right now). Operator can re-pick from
-          // the list to fix it.
+          // Preserve the saved choice; a missing catalogue or offline OCPP
+          // identity must never select a different physical charger.
           driverOpts = '<option value="' + escHtml(lp.driver_name) + '" selected>' +
-            escHtml(lp.driver_name) + ' (saved connection)</option>' + driverOpts;
+            escHtml(lp.driver_name) + ' (' + (connection ? connection.label : 'saved connection') + ')</option>' + driverOpts;
         }
 
         html +=
           '<fieldset class="device-card" data-lp-idx="' + idx + '">' +
           '<legend>Charger ' + (idx + 1) + ' <span class="dim">·</span> ' + escHtml(lp.id || "(unnamed)") + '</legend>' +
+          (connection ? '<p data-charger-connection-status="' + idx + '" role="' +
+            (connection.kind === 'missing' ? 'alert' : 'status') + '" style="color:var(--' +
+            (connection.kind === 'missing' ? 'amber' : 'text-dim') + ')">' + escHtml(connection.message) + '</p>' : '') +
 
           '<div class="field-row">' +
           '<div>' +
@@ -778,7 +793,10 @@
         });
       });
       bodyEl.querySelectorAll('[data-path^="loadpoints."]').forEach(function (input) {
-        input.addEventListener('change', applyChargers);
+        input.addEventListener('change', function () {
+          applyChargers();
+          if (/\.driver_name$/.test(input.dataset.path)) ctx.renderTab('loadpoints');
+        });
       });
     },
 

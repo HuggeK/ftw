@@ -134,7 +134,7 @@ func (s *Server) agentDebugContext() map[string]any {
 		ref, kind = "v"+strings.TrimPrefix(s.deps.Version, "v"), "declared release tag"
 	}
 	tree := "https://github.com/srcfl/ftw/tree/" + url.PathEscape(ref)
-	return map[string]any{
+	out := map[string]any{
 		"core": map[string]any{"version": s.deps.Version, "revision": revision, "modified": modified, "source_ref_kind": kind,
 			"repository": "https://github.com/srcfl/ftw", "source": tree,
 			"api": tree + "/go/internal/api", "energy_history": tree + "/go/internal/state", "planner": tree + "/go/internal/mpc",
@@ -151,8 +151,18 @@ func (s *Server) agentDebugContext() map[string]any {
 			"Read /api/health, /api/support/report and /api/components for versions, clock, freshness and failures.",
 			"Use /api/energy/history for Wh and provenance, /api/series for original measurements, and /api/mpc/diagnose/history then /api/mpc/diagnose/at for the plan active at the incident.",
 			"Inspect configuration, driver details, driver source and logs as needed. Compare with source for the running version; default-branch code may differ.",
+			"For charger faults, read charger_connections below and use /api/config, /api/drivers and /api/loadpoints to compare loadpoints[].driver_name with drivers[].name. If OCPP is enabled, also check /api/ocpp/chargers. A configured name does not prove online equipment or successful control.",
+			"Basic config_get and drivers_status hide technical names and cannot prove these bindings. Use these full diagnostic API reads. If a read is refused, record the path, refusal and missing grant or version; do not infer a driver fault from unavailable or redacted evidence.",
 			"For a bug report, include the Core version and source reference, equipment and driver versions, reproduction steps, expected and observed results, incident time, exact API queries and relevant logs or snapshots. Mark data gaps and whether evidence came from real equipment, a simulator or a test.",
 			"Use the existing control and goal tools when an action is needed. Reading a diagnostic view does not issue a command. Prepare a bug report for the user; do not publish it without their request.",
 		},
 	}
+	if s.deps.Cfg != nil {
+		if s.deps.CfgMu != nil {
+			s.deps.CfgMu.RLock()
+			defer s.deps.CfgMu.RUnlock()
+		}
+		out["charger_connections"] = s.deps.Cfg.LoadpointConnections()
+	}
+	return out
 }

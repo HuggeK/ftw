@@ -31,7 +31,9 @@ func TestPostConfigSavesLimitedStepsAndReturnsWarning(t *testing.T) {
 	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	if len(response.Warnings) != 1 || len(response.Loadpoints) != 1 {
+	// The missing connection is separate from the corrected power steps.
+	if len(response.Warnings) != 2 || len(response.Loadpoints) != 1 ||
+		!strings.Contains(strings.Join(response.Warnings, " "), "Missing charger connection") {
 		t.Fatalf("missing save feedback: %s", rr.Body.String())
 	}
 	if response.Loadpoints[0].AllowedStepsW[3] != 11000 {

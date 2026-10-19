@@ -2190,6 +2190,7 @@ body.ftw-app .settings-status {
   font-family: var(--mono);
 }
 body.ftw-app .settings-status.success { color: var(--green-e); }
+body.ftw-app .settings-status.warning { color: var(--amber); }
 body.ftw-app .settings-status.error { color: var(--red-e); }
 body.ftw-app .creds-badge {
   border-radius: 999px;

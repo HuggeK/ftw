@@ -158,8 +158,12 @@
         return r.json();
       })
       .then(function (res) {
-        setStatus("Saved ✓", "success");
-        setTimeout(function () { setStatus(""); }, 2000);
+        var warnings = res && Array.isArray(res.warnings) ? res.warnings : [];
+        var savedText = "Saved ✓" + (warnings.length ? " " + warnings.join(" ") : "");
+        setStatus(savedText, warnings.length ? "warning" : "success");
+        if (!warnings.length) setTimeout(function () {
+          if (statusEl.textContent === savedText) setStatus("");
+        }, 2000);
         // A tab that shows what the box says about itself, rather than what
         // the form holds, is stale from here until it asks again.
         var saved = S.tabs[currentTab];
@@ -315,6 +319,7 @@
   function setStatus(msg, kind) {
     statusEl.textContent = msg || "";
     statusEl.className = "settings-status" + (kind ? " " + kind : "");
+    statusEl.setAttribute("role", kind === "warning" || kind === "error" ? "alert" : "status");
   }
 
   // Async tabs register a field when they insert it, before the user can edit it.
