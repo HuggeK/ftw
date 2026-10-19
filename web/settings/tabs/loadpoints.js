@@ -55,7 +55,12 @@
 
   function chargerConnection(config, lp, ocppStatus) {
     var name = lp.driver_name || "";
-    if (name && (config.drivers || []).some(function (driver) { return driver.name === name; })) return null;
+    var driver = name && (config.drivers || []).find(function (driver) { return driver.name === name; });
+    if (driver) {
+      if (!driver.disabled) return null;
+      return { kind: "disabled", label: "disabled connection",
+        message: 'Saved connection "' + name + '" uses a disabled driver. Enable it in Settings > Devices, select an enabled charger, or remove this charger.' };
+    }
     if (name && ocppChargerIds(ocppStatus).indexOf(name) >= 0) return null;
     if (name && config.ocpp && config.ocpp.enabled) {
       return { kind: "unverified_ocpp", label: "OCPP not seen",
@@ -504,8 +509,8 @@
           '<fieldset class="device-card" data-lp-idx="' + idx + '">' +
           '<legend>Charger ' + (idx + 1) + ' <span class="dim">·</span> ' + escHtml(lp.id || "(unnamed)") + '</legend>' +
           (connection ? '<p data-charger-connection-status="' + idx + '" role="' +
-            (connection.kind === 'missing' ? 'alert' : 'status') + '" style="color:var(--' +
-            (connection.kind === 'missing' ? 'amber' : 'text-dim') + ')">' + escHtml(connection.message) + '</p>' : '') +
+            (connection.kind !== 'unverified_ocpp' ? 'alert' : 'status') + '" style="color:var(--' +
+            (connection.kind !== 'unverified_ocpp' ? 'amber' : 'text-dim') + ')">' + escHtml(connection.message) + '</p>' : '') +
 
           '<div class="field-row">' +
           '<div>' +

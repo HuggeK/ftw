@@ -11,6 +11,22 @@ const config = () => ({
 });
 
 describe('saved charger connections', () => {
+ it('warns for a disabled driver, even with OCPP enabled, until an explicit repair', () => {
+  S.catalogByLua = {'drivers/charger.lua': {capabilities: ['ev']}};
+  S.ocppStatus = {enabled: true, chargers: []};
+  const cfg = config();
+  cfg.ocpp = {enabled: true};
+  cfg.drivers[0].disabled = true;
+  cfg.loadpoints[0].driver_name = 'charger-current';
+  const html = render(cfg);
+  assert.match(html, /data-charger-connection-status="0" role="alert"/);
+  assert.match(html, /disabled/);
+  assert.match(html, /Settings &gt; Devices/);
+  assert.equal(cfg.drivers[0].disabled, true);
+  assert.equal(cfg.loadpoints[0].driver_name, 'charger-current');
+  cfg.drivers[0].disabled = false;
+  assert.doesNotMatch(render(cfg), /data-charger-connection-status/);
+ });
  it('shows the missing saved connection without selecting a replacement', () => {
   S.catalogByLua = {'drivers/charger.lua': {capabilities: ['ev']}};
   S.ocppStatus = {enabled: false, chargers: []};
