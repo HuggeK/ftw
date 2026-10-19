@@ -1495,6 +1495,11 @@ func registerHost(L *lua.LState, env *HostEnv) {
 	}))
 
 	host.RawSetString("ws_send", L.NewFunction(func(L *lua.LState) int {
+		if err := env.allowWrite("websocket.send"); err != nil {
+			L.Push(lua.LNil)
+			L.Push(lua.LString(err.Error()))
+			return 2
+		}
 		if env.WS == nil {
 			L.Push(lua.LNil)
 			L.Push(lua.LString("ws: capability not granted"))

@@ -1,6 +1,6 @@
 # ADR 0011: Set up a home through an authorized agent
 
-- Status: proposed; implementation and field tests remain work to do.
+- Status: implemented for beta review; novice and hardware trials remain.
 - Date: 2026-10-18
 - Owner: Fredrik. Requested complete setup through MCP on 18 October 2026.
 
@@ -88,10 +88,39 @@ preserve exact numbers, and audit the caller and changed field paths without
 logging credentials. A reply must distinguish saved, applied, restart needed
 and verified on hardware.
 
-Current first-run bootstrap serves only the web wizard. It must gain a
-passive owner-claim path before claiming that a fresh installation can use
-Cloud MCP. Existing agents can read and propose goals; that is not authority
-to replace configuration. Both gaps need code and tests.
+First-run bootstrap now offers assistant setup alongside the wizard. It stores
+an empty measurement-only configuration and a private house-password hash in
+one published SQLite settings file, then restarts. The owner signs in from
+another device on the LAN, reviews Cloud terms and approves the setup grant
+in Access. Statistics-only sharing cannot carry an assistant session.
+
+`setup_begin` requests diagnostic and setup access together. The box supplies
+the complete typed configuration schema, supported modes, runtime time zone,
+driver catalogue, outstanding questions, version and commissioning status.
+`setup_discover` scans only after confirmation. `setup_test` uses private draft
+credentials and blocks equipment writes. It reads an existing driver's health
+instead of forking a running OAuth token family. `setup_connect` binds MyUplink
+browser consent to the exact draft and grant. Other vendors use their driver
+catalogue fields. A driver that needs an undeclared authentication or read
+subscription write may require a driver update before it works in measurement
+mode; do not present that as a verified connection.
+
+Save equipment in measurement mode first. Read fresh measurements and the
+running meter's identity. While control remains blocked, use the ordinary
+`goal_request` and `car_goal_request` tools to choose mode, planning style and
+car departure goals. The owner approves these in local Access or the FTW app;
+Check requests and access refreshes the local list. Read both request receipts
+and active values. These goals use their existing state and never replay old
+setup answers over later choices. Confirm the host time zone before local
+HH:MM targets; a wrong host zone needs a host change and Core restart.
+
+The final draft records the reviewed connection digest, equipment and live
+meter identity. Enabling control requires a fresh grid-boundary meter with
+usable phase currents for the configured fuse, and unchanged meter connection
+settings. Changing measurement mode requires a restart. Saved mode and active
+mode appear separately. Measurement mode blocks driver writes even in init,
+poll and cleanup; a changed meter identity blocks new dispatch while allowing
+Core's safe stop/default paths. Hardware response still needs a measured test.
 
 ## Useful forecasts before learning
 
@@ -111,6 +140,10 @@ estimate. Do not add synthetic samples to measured history or increase a
 model's sample count. Measured days progressively replace the prior through
 the model's existing learning weights. Changing a prior must preserve learned
 history and must not change an equipment safety limit.
+
+If no separate heating estimate exists, an annual whole-house estimate stays
+a coarse prior. Its unlearned share already includes average heating; only
+the measured share adds the learned weather-sensitive heat term.
 
 Missing solar capacity stays unknown until the owner supplies an estimate or
 measurement supports one. An observed production peak is not a verified

@@ -128,6 +128,10 @@ type HostEnv struct {
 	// DeviceReadOnly blocks device writes in every Lua phase when an
 	// external Modbus controller owns the endpoint.
 	DeviceReadOnly bool
+	// ControlBlocked is a live installation gate, including init and poll.
+	// Authentication paths come from this driver's catalog metadata.
+	ControlBlocked func() bool
+	SetupAuthPaths []string
 
 	// BatteryCapacityWh mirrors the operator's `battery_capacity_wh`
 	// declaration for this driver. Zero means "no physical battery
@@ -254,6 +258,18 @@ func (h *HostEnv) permissionAllowed(permission string) bool {
 // device, so it is admitted here instead, confined to the single path the
 // signed manifest names and only for a driver published read-only.
 func (h *HostEnv) allowAuthPost(rawURL string) bool {
+	if h.ControlBlocked != nil && h.ControlBlocked() && h.RuntimePolicy == nil {
+		parsed, err := net_url.Parse(rawURL)
+		if err != nil {
+			return false
+		}
+		for _, path := range h.SetupAuthPaths {
+			if path != "" && parsed.Path == path {
+				return true
+			}
+		}
+		return false
+	}
 	if h.RuntimePolicy == nil || !h.RuntimePolicy.ReadOnly {
 		return false
 	}
@@ -274,6 +290,9 @@ func (h *HostEnv) allowAuthPost(rawURL string) bool {
 }
 
 func (h *HostEnv) allowWrite(permission string) error {
+	if h.ControlBlocked != nil && h.ControlBlocked() {
+		return fmt.Errorf("%s: setup measurement mode blocks device writes", permission)
+	}
 	if h.DeviceReadOnly {
 		return fmt.Errorf("%s: external Modbus client owns control; FTW only reads", permission)
 	}

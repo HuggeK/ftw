@@ -2,12 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/srcfl/ftw/go/internal/api"
 	"github.com/srcfl/ftw/go/internal/config"
@@ -22,6 +24,15 @@ func runBootstrap(configPath, webDir, driverDir string) {
 	slog.Info("no config found — starting setup wizard", "url", "http://localhost:8080/setup")
 
 	mux := http.NewServeMux()
+	var initialWriteMu sync.Mutex
+	// Both first-run choices share one write lock. A late wizard request must
+	// not replace an assistant installation which has already started.
+	saveInitial := func(cfg *config.Config) error {
+		initialWriteMu.Lock()
+		defer initialWriteMu.Unlock()
+		return saveInitialConfig(configPath, cfg)
+	}
+	mux.HandleFunc("POST /api/setup/assistant", bootstrapAssistant(saveInitial, func() error { return execCurrentProcess(nil) }))
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
 			http.Redirect(w, r, "/setup", http.StatusFound)
@@ -103,7 +114,7 @@ func runBootstrap(configPath, webDir, driverDir string) {
 			writeBootstrapJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
 			return
 		}
-		if err := config.SaveAtomic(configPath, &cfg); err != nil {
+		if err := saveInitial(&cfg); err != nil {
 			writeBootstrapJSON(w, http.StatusInternalServerError, map[string]string{"error": "write config: " + err.Error()})
 			return
 		}
@@ -120,6 +131,63 @@ func runBootstrap(configPath, webDir, driverDir string) {
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		slog.Error("bootstrap server", "err", err)
 		os.Exit(1)
+	}
+}
+
+func saveInitialConfig(path string, cfg *config.Config) error {
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		return fmt.Errorf("settings already exist or cannot be checked; reload the box instead of starting again")
+	}
+	// A lost locator is a recovery case, never a new household. Check both
+	// the default working directory and the seed's directory without opening
+	// or creating a database.
+	for _, db := range []string{"state.db", filepath.Join(filepath.Dir(path), "state.db")} {
+		if _, err := os.Lstat(db); !os.IsNotExist(err) {
+			return fmt.Errorf("existing data found at %s; restore its settings locator before setup", db)
+		}
+	}
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	if cfg.API.LANAuth {
+		return saveInitialAssistantStorage(path, cfg)
+	}
+	return config.SaveAtomic(path, cfg)
+}
+
+func bootstrapAssistant(save func(*config.Config) error, restart func() error) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var q struct {
+			Confirmed bool   `json:"confirmed"`
+			Password  string `json:"password"`
+		}
+		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&q); err != nil || !q.Confirmed {
+			writeBootstrapJSON(w, http.StatusBadRequest, map[string]string{"error": "confirm starting an empty measurement installation"})
+			return
+		}
+		if err := dec.Decode(new(any)); err != io.EOF {
+			writeBootstrapJSON(w, http.StatusBadRequest, map[string]string{"error": "send one setup request"})
+			return
+		}
+		hash, err := api.HashInitialLANPassword(q.Password)
+		if err != nil {
+			writeBootstrapJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		cfg := config.NewSetup()
+		cfg.API.LANAuth, cfg.LANPasswordHash = true, hash
+		if err := save(cfg); err != nil {
+			writeBootstrapJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+			return
+		}
+		writeBootstrapJSON(w, http.StatusOK, map[string]any{"saved": true, "restart_pending": true, "next": "/?setup=assistant"})
+		go func() {
+			if err := restart(); err != nil {
+				slog.Error("assistant setup restart failed", "err", err)
+			}
+		}()
 	}
 }
 

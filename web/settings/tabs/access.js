@@ -57,6 +57,8 @@
     invites: null, inviteDraft: null,
     list: null,      // GET /api/agents
     unavailable: "", // why the box has no agents, when it has none
+    cloudChecked: false,
+    cloud: null,     // GET /api/cloud
     auth: null,      // GET /api/auth/status
     held: null,      // {raw, view, lookup, fetchedAt}
     note: null,      // {text, kind} under the code field
@@ -249,6 +251,7 @@
   // What stops a grant before the owner types a code, or null. The order is
   // the order to fix them in.
   function readiness(list, unavailable, auth) {
+    if (state.cloudChecked && (!state.cloud || state.cloud.link !== "on" || state.cloud.statisticsOnly || !state.cloud.cloudTermsAccepted)) return {kind:"cloud"};
     if (unavailable) return { kind: "unavailable" };
     if (!list) return { kind: "loading" };
     if (!auth || !auth.lan_auth || !auth.configured) return { kind: "password" };
@@ -375,13 +378,18 @@
     if (typeof v === "boolean") return v ? "yes" : "no";
     if (typeof v !== "number") return cleanText(v, 80);
     if (!Number.isFinite(v)) return "?";
+    if(arg.name === "days" && Number.isInteger(v) && v>=0 && v<=127) {
+      if(v===0) return "Once at the next ready time";
+      if(v===127) return "Every day";
+      return ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"].filter(function(_,i){return !!(v & (1<<i));}).join(", ");
+    }
     if (arg.kind === "ratio") return Math.round(v * 100) + " %";
     if (arg.unit === "W") return kw(v) + " kW";
     if (arg.unit === "s") return Math.round(v / 60) + " min";
     // The box's convention: a time of day is minutes after midnight, in an
     // argument named _min.
     if (/_min$/.test(arg.name || "") && v >= 0 && v < 1440) {
-      return String(Math.floor(v / 60)).padStart(2, "0") + ":" + String(v % 60).padStart(2, "0");
+      return String(Math.floor(v / 60)).padStart(2, "0") + ":" + String(v % 60).padStart(2, "0") + (state.list && state.list.box && state.list.box.timezone ? " ("+cleanText(state.list.box.timezone,80)+")" : " (box local time)");
     }
     return String(v);
   }
@@ -416,10 +424,11 @@
       }),
       fetch("/api/auth/status").then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; }),
       fetch("/api/agent-invites").then(function(r){ return r.ok ? r.json() : null; }).catch(function(){ return null; }),
+      fetch("/api/cloud").then(function(r){return r.ok?r.json():null;}).catch(function(){return null;}),
     ]).then(function (got) {
       state.unavailable = got[0].unavailable ? "off" : "";
       state.list = got[0].unavailable ? null : got[0];
-      state.auth = got[1]; state.invites = got[2];
+      state.auth = got[1]; state.invites = got[2]; state.cloud = got[3]; state.cloudChecked=true;
       if(state.inviteDraft && state.inviteDraft.request && state.invites) {
         var latest=(state.invites.invitations || []).find(function(v){return v.id===state.inviteDraft.request.id;});
         if(latest) {
@@ -478,6 +487,9 @@
     var box = el("div", { className: "access-blocked", role: "status" });
     slot.appendChild(box);
     switch (problem.kind) {
+      case "cloud":
+        box.appendChild(el("p", {text:"Accept FTW Cloud terms above before entering the assistant code. Statistics-only sharing gives no assistant remote access. If Cloud is stopping, wait for its deletion receipt first."}));
+        return;
       case "loading":
         box.className = "access-quiet";
         box.textContent = "Checking the box…";
@@ -542,6 +554,7 @@
     var input = document.getElementById("access-code");
     var button = document.getElementById("access-lookup");
     if (!input || !button || !state.list) return;
+    if(readiness(state.list,state.unavailable,state.auth)) {drawReady(ctx);return;}
     var code = normalizeCode(input.value);
     state.done = null;
     if (!code) {
@@ -1096,6 +1109,10 @@
   }
 
   var lastCtx = null;
+  if(window.addEventListener) window.addEventListener("ftw-cloud-choice-changed",function(event){
+    state.cloud=event.detail;state.cloudChecked=true;
+    if(document.getElementById("access-ready")) drawReady(lastCtx);
+  });
 
   function refresh(ctx) {
     if (ctx) lastCtx = ctx;
@@ -1116,6 +1133,8 @@
         '<p class="access-lede">Let an AI assistant, such as Claude or ChatGPT, read this home and, ' +
         "if you allow it, control it within limits. It connects through FTW Cloud. This box " +
         "decides what it may do and checks every call. No phone app is needed.</p>" +
+        '<p class="access-quiet">For a new box: sign in with the house password you chose, review Cloud terms, then ask your assistant to begin FTW setup. Approve its setup connection below. If its connection page offers a choice, choose “Set up and configure”. The assistant can resume the draft stored on this box.</p>' +
+        '<div id="access-cloud-settings" data-project-statistics-settings></div>' +
         '<div id="access-ready"></div>' +
         '<form id="access-code-form" class="access-code-form" autocomplete="off">' +
         '<label for="access-code">Code from the assistant\'s page</label>' +
@@ -1130,6 +1149,7 @@
         "</form>" +
         '<div id="access-offer"></div>' +
         "</fieldset>" +
+        '<p><button type="button" class="btn-ghost" id="access-refresh">Check requests and access</button></p>' +
         '<fieldset id="access-requests-section" hidden>' +
         "<legend>Waiting for your yes</legend>" +
         '<div id="access-requests"></div>' +
@@ -1143,6 +1163,10 @@
     },
 
     after: function (ctx) {
+      var cloud = document.getElementById("access-cloud-settings");
+      if (cloud && window.FTWStatistics) window.FTWStatistics.mount(cloud);
+      var refreshButton=document.getElementById("access-refresh");
+      if(refreshButton) refreshButton.addEventListener("click",function(){refresh(ctx);});
       var form = document.getElementById("access-code-form");
       if (form) {
         form.addEventListener("submit", function (e) {

@@ -80,6 +80,10 @@ type DriverControlStatus struct {
 type Registry struct {
 	tel                 *telemetry.Store
 	troubleshootingMode bool
+	// Set before Add. The callback reads the live installation mode.
+	ControlBlocked func() bool
+	// CommandBlocked stops new dispatch while safe defaults remain possible.
+	CommandBlocked func() bool
 
 	// MQTTFactory creates an MQTT capability for a driver given its config.
 	// Called on Add; the returned MQTTCap belongs to that driver alone.
@@ -136,6 +140,32 @@ func NewRegistry(tel *telemetry.Store) *Registry {
 		recoveryRequired: map[string]bool{},
 		lifecycleGates:   map[string]*lifecycleGate{},
 	}
+}
+
+func (r *Registry) controlBlocked() bool {
+	return r.ControlBlocked != nil && r.ControlBlocked()
+}
+
+func (r *Registry) commandBlocked(payload []byte) bool {
+	return r.CommandBlocked != nil && r.CommandBlocked() && !IsEVStanddown(payload)
+}
+
+// IsEVStanddown admits only the explicit stop forms used by Core. Extra
+// fields cannot turn the zero-power exception into a different command.
+func IsEVStanddown(payload []byte) bool {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(payload, &fields) != nil {
+		return false
+	}
+	var action string
+	if json.Unmarshal(fields["action"], &action) != nil {
+		return false
+	}
+	if action == "ev_pause" && len(fields) == 1 {
+		return true
+	}
+	var power *float64
+	return action == "ev_set_current" && len(fields) == 2 && json.Unmarshal(fields["power_w"], &power) == nil && power != nil && *power == 0
 }
 
 func (r *Registry) acquireLifecycle(name string) func() {
@@ -530,6 +560,10 @@ func (r *Registry) add(ctx context.Context, cfg config.Driver, startupDefault bo
 	}
 
 	env := NewHostEnv(cfg.Name, r.tel)
+	env.ControlBlocked = r.ControlBlocked
+	if entry, err := ParseCatalogFile(cfg.Lua); err == nil {
+		env.SetupAuthPaths = append([]string{entry.AuthPostPath}, entry.AuthPostPaths...)
+	}
 	// runLoop owns the capabilities once the driver is registered. Until then
 	// every failed return closes what it opened: a leaked MQTT client keeps
 	// reconnecting under the same client ID and fights the next Add.
@@ -717,7 +751,7 @@ func (r *Registry) add(ctx context.Context, cfg config.Driver, startupDefault bo
 		return fmt.Errorf("driver_init: %w", err)
 	}
 	var startupDefaultErr error
-	if startupDefault && !cfg.ObserveOnly {
+	if startupDefault && !cfg.ObserveOnly && !r.controlBlocked() {
 		defaultCtx, cancel := context.WithTimeout(ctx, defaultRecoveryTimeout)
 		startupDefaultErr = drv.DefaultMode(defaultCtx)
 		cancel()
@@ -739,11 +773,12 @@ func (r *Registry) add(ctx context.Context, cfg config.Driver, startupDefault bo
 		stop:            make(chan bool, 1),
 		done:            make(chan struct{}),
 	}
+	controlBlockedAtStart := r.controlBlocked()
 	r.mu.Lock()
 	r.nextGeneration++
 	rd.generation = r.nextGeneration
 	inheritsRecovery := r.recoveryRequired[cfg.Name]
-	if startupDefault && !cfg.ObserveOnly {
+	if startupDefault && !cfg.ObserveOnly && !controlBlockedAtStart {
 		if startupDefaultErr == nil {
 			rd.defaultConfirmed = true
 			if inheritsRecovery {
@@ -841,6 +876,9 @@ func (r *Registry) runLoop(rd *runningDriver) {
 		scheduleRecovery()
 	}
 	attemptDefault := func() error {
+		if r.controlBlocked() {
+			return fmt.Errorf("setup measurement mode blocks device defaults")
+		}
 		// The actor owns this transition. Invalidate any pause→resume
 		// continuation before the default call starts, regardless of whether
 		// the device later confirms it.
@@ -869,6 +907,12 @@ func (r *Registry) runLoop(rd *runningDriver) {
 		return commandOutcome
 	}
 	handleDefault := func(cmd driverCmd) {
+		if r.controlBlocked() {
+			if cmd.result != nil {
+				cmd.result <- fmt.Errorf("setup measurement mode blocks device defaults")
+			}
+			return
+		}
 		invalidateCommandSequence()
 		cmdCtx := cmd.ctx
 		if cmdCtx == nil {
@@ -911,6 +955,7 @@ func (r *Registry) runLoop(rd *runningDriver) {
 		}
 		select {
 		case skipDefault := <-rd.stop:
+			skipDefault = skipDefault || r.controlBlocked()
 			if skipDefault {
 				rd.driver.Discard()
 			} else {
@@ -956,6 +1001,10 @@ func (r *Registry) runLoop(rd *runningDriver) {
 			}
 			switch cmd.kind {
 			case "command":
+				if r.controlBlocked() || r.commandBlocked(cmd.payload) {
+					err = fmt.Errorf("setup measurement mode blocks device commands")
+					break
+				}
 				metadata := commandMetadata(cmd.payload)
 				action := metadata.Action
 				cyclePause := action == "ev_pause" && cmd.cycleID != 0
@@ -1131,6 +1180,7 @@ func (r *Registry) remove(name string, skipDefault bool) {
 // lets Restart and Reload keep the old generation and its replacement in one
 // serialized transition instead of opening an Add/Remove gap.
 func (r *Registry) removeLocked(name string, skipDefault bool) {
+	skipDefault = skipDefault || r.controlBlocked()
 	r.mu.Lock()
 	rd, ok := r.rec[name]
 	if !ok {
@@ -1218,6 +1268,9 @@ func (r *Registry) SendWithGeneration(ctx context.Context, name string, payload 
 }
 
 func (r *Registry) sendWithGeneration(ctx context.Context, name string, payload []byte, cycleID uint64, checkEVHealth bool, outcome func(error)) (uint64, error) {
+	if r.controlBlocked() || r.commandBlocked(payload) {
+		return 0, fmt.Errorf("setup measurement mode blocks device commands")
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1272,6 +1325,9 @@ func (r *Registry) sendWithGeneration(ctx context.Context, name string, payload 
 // blocked until the default succeeds or the recovery timer retries it. An
 // observe_only driver is refused with ErrObserveOnly, as main's watchdog does.
 func (r *Registry) SendDefault(ctx context.Context, name string) error {
+	if r.controlBlocked() {
+		return fmt.Errorf("setup measurement mode blocks device defaults")
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}

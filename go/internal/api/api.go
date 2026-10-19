@@ -198,6 +198,11 @@ type Deps struct {
 	// "" when it is allowed. Operator setpoints that bypass the tick (the
 	// manual V2X command) check it. Nil refuses those setpoints.
 	SiteDispatchBlocked func() string
+	// SetupControlReady checks live measurement and identity against the
+	// exact draft before its first transition from measurement to control.
+	SetupControlReady           func(*config.Config) error
+	SetupMeterIdentity          func(string) (string, bool)
+	SetupRuntimeMeasurementOnly func() bool
 
 	// Optional: returns the running HA MQTT bridge, or nil when HA is
 	// disabled or not connected yet. Nil func means HA is not wired.
@@ -1720,6 +1725,20 @@ func (s *Server) handlePostConfigWith(w http.ResponseWriter, r *http.Request, re
 	s.deps.CfgMu.RLock()
 	oldCfg := *s.deps.Cfg
 	s.deps.CfgMu.RUnlock()
+	if s.deps.SetupRuntimeMeasurementOnly != nil && !s.deps.SetupRuntimeMeasurementOnly() && !(newCfg.Fuse.MaxAmps > 0) {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "Keep a positive main fuse while control is active. Save measurement mode, restart, then change unknown connection values."})
+		return
+	}
+	if oldCfg.MeasurementOnly() && !newCfg.MeasurementOnly() {
+		if s.deps.SetupControlReady == nil {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "Live commissioning check is unavailable; keep measurement mode on."})
+			return
+		}
+		if err := s.deps.SetupControlReady(&newCfg); err != nil {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
+			return
+		}
+	}
 	// The house-password flag only moves through POST /api/auth/password.
 	// A whole-document save must not turn the lock on (or off) by itself.
 	newCfg.API.LANAuth = oldCfg.API.LANAuth

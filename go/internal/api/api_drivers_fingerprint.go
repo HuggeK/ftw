@@ -9,6 +9,7 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
@@ -121,6 +122,10 @@ func (s *Server) handleDriverFingerprint(w http.ResponseWriter, r *http.Request)
 // unreachable host can stall the caller; candidates that don't fit are
 // simply not probed.
 func (s *Server) sweepFingerprint(protocol, host string, port, unit int) []drivers.Fingerprint {
+	return s.sweepFingerprintContext(context.Background(), protocol, host, port, unit)
+}
+
+func (s *Server) sweepFingerprintContext(ctx context.Context, protocol, host string, port, unit int) []drivers.Fingerprint {
 	dir := s.deps.DriverDir
 	if dir == "" {
 		dir = filepath.Join(filepath.Dir(s.deps.ConfigPath), "drivers")
@@ -132,6 +137,9 @@ func (s *Server) sweepFingerprint(protocol, host string, port, unit int) []drive
 	deadline := time.Now().Add(fingerprintBudget)
 	var tried []drivers.Fingerprint
 	for _, e := range entries {
+		if ctx.Err() != nil {
+			break
+		}
 		if !hasProtocol(e.Protocols, protocol) {
 			continue
 		}
@@ -257,14 +265,21 @@ type scannedDevice struct {
 // when no Modbus factory is wired — pass through untouched. This is what
 // turns "port 502 is open on 10.0.0.7" into "that's a SolarEdge".
 func (s *Server) enrichScanWithFingerprints(devices []scanner.FoundDevice) []scannedDevice {
+	return s.enrichScanWithFingerprintsContext(context.Background(), devices)
+}
+
+func (s *Server) enrichScanWithFingerprintsContext(ctx context.Context, devices []scanner.FoundDevice) []scannedDevice {
 	out := make([]scannedDevice, len(devices))
 	for i, d := range devices {
+		if ctx.Err() != nil {
+			return out[:i]
+		}
 		sd := scannedDevice{FoundDevice: d}
 		switch {
 		case d.Protocol == "modbus" && s.deps.DriverModbusFactory != nil:
-			sd.Matches = matchesOf(s.sweepFingerprint("modbus", d.IP, d.Port, 1))
+			sd.Matches = matchesOf(s.sweepFingerprintContext(ctx, "modbus", d.IP, d.Port, 1))
 		case d.Protocol == "http":
-			sd.Matches = matchesOf(s.sweepFingerprint("http", d.IP, d.Port, 1))
+			sd.Matches = matchesOf(s.sweepFingerprintContext(ctx, "http", d.IP, d.Port, 1))
 		}
 		out[i] = sd
 	}

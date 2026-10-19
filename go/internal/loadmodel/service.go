@@ -300,6 +300,36 @@ func (s *Service) Predict(t time.Time) float64 {
 	return s.activeModelLocked().Predict(t, temp)
 }
 
+// SetAnnualBase changes only the unlearned part of the household estimate.
+// It neither trains buckets nor changes their sample counts or learning ID.
+// Zero restores the generic prior. EV must already be removed. A baseline
+// excludes separately modelled heat; a whole-house prior includes average
+// heat and blends it only with the learned share of the temperature model.
+func (s *Service) SetAnnualBase(kWh float64, includesHeating bool) {
+	if s == nil || math.IsNaN(kWh) || math.IsInf(kWh, 0) || kWh < 0 {
+		return
+	}
+	mean := 0.0
+	for i := 0; i < Buckets; i++ {
+		mean += typicalPrior(i) / Buckets
+	}
+	scale := 1.0
+	if kWh > 0 {
+		scale = kWh * 1000 / (365 * 24 * mean)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, p := range Profiles() {
+		if m := s.models[p]; m != nil {
+			m.PriorScale = scale
+			m.PriorIncludesHeating = kWh > 0 && includesHeating
+			if p == ProfileAway {
+				m.PriorScale *= awayPriorScale
+			}
+		}
+	}
+}
+
 // PredictWith is like Predict but forces a specific profile's model,
 // regardless of which profile is currently active. The calendar service
 // (issue #498) uses it to predict reduced "away"-profile load for the slots
@@ -588,6 +618,8 @@ func (s *Service) Reset() {
 	heating := old.HeatingW_per_degC
 	s.models[profile] = newProfileModel(peak, profile)
 	s.models[profile].HeatingW_per_degC = heating
+	s.models[profile].PriorScale = old.PriorScale
+	s.models[profile].PriorIncludesHeating = old.PriorIncludesHeating
 	s.models[profile].Timezone = s.timezone
 	s.models[profile].ConfigRevision = old.ConfigRevision
 	s.models[profile].LearningStartedMS = old.LearningStartedMS
@@ -655,6 +687,9 @@ func freshProfile(old *Model, profile Profile, zone string, startedMS int64, hea
 		maxPlausibleW = old.MaxPlausibleW
 	}
 	m := newProfileModel(peak, profile)
+	if old != nil {
+		m.PriorScale, m.PriorIncludesHeating = old.PriorScale, old.PriorIncludesHeating
+	}
 	m.Timezone = zone
 	m.ConfigRevision = revision
 	m.MaxPlausibleW = maxPlausibleW

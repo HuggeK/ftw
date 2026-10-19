@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Finish equipment sign-in · FTW</title>
+  <link rel="stylesheet" href="/components/theme.css"><link rel="stylesheet" href="/style.css">
+  <style>body{font:1rem/1.6 system-ui;background:var(--bg);color:var(--text);margin:0;padding:2rem}main{max-width:34rem;margin:3rem auto}label,input,button{display:block}input{box-sizing:border-box;width:100%;padding:.8rem;margin:.5rem 0 1rem;background:var(--bg);color:var(--text);border:1px solid currentColor;border-radius:.5rem}button{padding:.8rem 1rem;cursor:pointer}a{color:var(--accent)}#result{overflow-wrap:anywhere}</style>
+</head>
+<body>
+  <main>
+    <h1>Finish equipment sign-in</h1>
+    <p>If the vendor sent you to an address that could not open the box, copy that full address here. FTW will finish the sign-in that you started in the setup draft.</p>
+    <p>Paste the redirected address here on your box. Keep access tokens and refresh tokens out of chat.</p>
+    <form id="finish">
+      <label for="redirect">Address after vendor sign-in</label>
+      <input id="redirect" type="url" required autocomplete="off" spellcheck="false">
+      <button class="btn-send">Save sign-in to draft</button>
+    </form>
+    <p id="result" role="status" aria-live="polite"></p>
+    <p><a href="/">Return to FTW</a></p>
+  </main>
+  <script src="/lan-auth.js"></script>
+  <script src="/setup-vendor.js"></script>
+</body>
+</html>

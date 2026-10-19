@@ -707,6 +707,34 @@ func main() {
 	// cfgMu guards cfg, which a config apply replaces in place.
 	cfgMu := &sync.RWMutex{}
 	reg := newDriverRegistry(tel, st)
+	setupMeasurementAtBoot := cfg.MeasurementOnly()
+	reg.ControlBlocked = func() bool { return setupMeasurementAtBoot }
+	setupRuntimeBlockReason := func() string {
+		cfgMu.RLock()
+		configuredMeasurementOnly := cfg.MeasurementOnly()
+		meter, expected := cfg.SiteMeterDriver(), ""
+		if cfg.Setup != nil {
+			expected = cfg.Setup.MeterIdentity
+		}
+		cfgMu.RUnlock()
+		if setupMeasurementAtBoot {
+			if !configuredMeasurementOnly {
+				return "setup_restart_required"
+			}
+			return "setup_measurement_only"
+		}
+		if expected != "" {
+			id, ok := runningDeviceID(reg, meter)
+			if !ok {
+				return "setup_meter_identity_unconfirmed"
+			}
+			if id != expected {
+				return "setup_meter_identity_changed"
+			}
+		}
+		return ""
+	}
+	reg.CommandBlocked = func() bool { return setupRuntimeBlockReason() != "" }
 	reg.SiteLocation = func() (float64, float64, bool) {
 		cfgMu.RLock()
 		defer cfgMu.RUnlock()
@@ -1014,6 +1042,8 @@ func main() {
 					slog.Warn("loadmodel configuration not saved", "err", err)
 				}
 				loadSvc.SeedHeatingCoef(heating)
+				annual, includesHeating := forecastSettings.AnnualPrior()
+				loadSvc.SetAnnualBase(annual, includesHeating)
 			}
 		}
 		if pvSvc != nil {
@@ -1369,6 +1399,8 @@ func main() {
 			slog.Warn("loadmodel configuration not saved", "err", err)
 		}
 	}
+	annualBase, _ := cfg.AnnualBaseKWh()
+	loadSvc.SetAnnualBase(annualBase, cfg.AnnualPriorIncludesHeating())
 	// SeedHeatingCoef — operator config is a cold-start prior. Once the
 	// load model has accumulated samples in production, its
 	// telemetry-fit HeatingW_per_degC survives restart and the config
@@ -1878,7 +1910,12 @@ func main() {
 	// SendCycle and must take this same path; wiring those straight to the
 	// registry is how planner ticks never reached an OCPP wallbox.
 	evRouter := newEVCommandRouter(ocppSrv, reg.Send, reg.SendWithOutcome, reg.SendEVContinuation)
-	evSend := evRouter.Send
+	evSend := func(ctx context.Context, name string, payload []byte) error {
+		if reg.ControlBlocked() || reg.CommandBlocked() && !drivers.IsEVStanddown(payload) {
+			return fmt.Errorf("setup measurement mode or meter identity blocks charger commands")
+		}
+		return evRouter.Send(ctx, name, payload)
+	}
 
 	// ---- EV loadpoint controller ----
 	// loadpoint.Controller owns per-tick EV dispatch, including the
@@ -1922,8 +1959,18 @@ func main() {
 		// current and the plan keeps counting the load. Only the periodic
 		// ev_set_current is reported — see loadpoint.DispatchOutcomeFunc
 		// for the sends that are deliberately not.
-		lpController.SetOutcomeSender(evRouter.SendWithOutcome)
-		lpController.SetCycleSender(evRouter.SendCycle)
+		lpController.SetOutcomeSender(func(ctx context.Context, name string, payload []byte, outcome func(error)) error {
+			if reg.ControlBlocked() || reg.CommandBlocked() && !drivers.IsEVStanddown(payload) {
+				return fmt.Errorf("setup measurement mode or meter identity blocks charger commands")
+			}
+			return evRouter.SendWithOutcome(ctx, name, payload, outcome)
+		})
+		lpController.SetCycleSender(func(ctx context.Context, name string, payload []byte, cycleID uint64) error {
+			if reg.ControlBlocked() || reg.CommandBlocked() && !drivers.IsEVStanddown(payload) {
+				return fmt.Errorf("setup measurement mode or meter identity blocks charger commands")
+			}
+			return evRouter.SendCycle(ctx, name, payload, cycleID)
+		})
 		lpController.SetVehicleControlAllowed(reg.CanControl)
 		lpController.SetDispatchOutcome(actuation.recordCommandOutcome)
 		lpController.SetDriverOnline(func(name string) bool {
@@ -2504,7 +2551,36 @@ func main() {
 		OCPPChargers:     ocppChargersFn,
 		EVSend:           evSend,
 		SiteDispatchBlocked: func() string {
+			if reason := setupRuntimeBlockReason(); reason != "" {
+				return reason
+			}
 			return siteDispatchNow(tel, cfg, cfgMu, ctrl, ctrlMu, time.Now()).Reason
+		},
+		SetupRuntimeMeasurementOnly: func() bool { return setupMeasurementAtBoot },
+		SetupMeterIdentity:          func(name string) (string, bool) { return runningDeviceID(reg, name) },
+		SetupControlReady: func(candidate *config.Config) error {
+			if err := candidate.Validate(); err != nil {
+				return err
+			}
+			meter := candidate.SiteMeterDriver()
+			cfgMu.RLock()
+			same := sameSetupMeterConfiguration(cfg, candidate)
+			cfgMu.RUnlock()
+			if !same {
+				return fmt.Errorf("save and measure the selected site meter before enabling control")
+			}
+			id, ok := runningDeviceID(reg, meter)
+			if !ok || candidate.Setup == nil || id != candidate.Setup.MeterIdentity {
+				return fmt.Errorf("the selected site meter has not confirmed this device identity")
+			}
+			timeout := time.Duration(candidate.Site.WatchdogTimeoutS) * time.Second
+			if timeout <= 0 {
+				timeout = 60 * time.Second
+			}
+			if gate := evaluateSiteDispatchFreshnessAt(tel, meter, candidate.Fuse.MaxAmps, candidate.Fuse.Phases, timeout, time.Now()); !gate.Allowed() {
+				return fmt.Errorf("measure before enabling control: %s", gate.Reason)
+			}
+			return nil
 		},
 		HistoryMeasurementSources: liveMeasurementOptions,
 		SiteMeasurementSources: func() telemetry.ForecastOptions {
@@ -2868,7 +2944,18 @@ func main() {
 			cfgMu.RLock()
 			watchdogTimeout := time.Duration(cfg.Site.WatchdogTimeoutS) * time.Second
 			troubleshootingMode := cfg.Site.TroubleshootingMode
+			measurementOnly := setupMeasurementAtBoot
 			cfgMu.RUnlock()
+			if measurementOnly {
+				// Keep the record and telemetry alive without watchdog defaults,
+				// charger standdowns, self-tuning or normal physical dispatch.
+				lpMgr.RollSchedules(tickNow.UTC())
+				carsRT.Tick()
+				if _, err := persistTelemetryTick(st, tel, snapshotTickPersistControl(ctrl, ctrlMu), nowMs, watchdogTimeout, energyIdentity, forecastSettings.Snapshot().HistoryOptions); err != nil {
+					slog.Warn("setup measurement persistence failed", "err", err)
+				}
+				continue
+			}
 			if watchdogTimeout <= 0 {
 				watchdogTimeout = 60 * time.Second
 			}
@@ -2918,6 +3005,9 @@ func main() {
 			freshness := evaluateSiteDispatchFreshnessAt(
 				tel, siteMeterDriver, siteFuseAmps, siteFusePhases, watchdogTimeout, tickNow,
 			)
+			if reason := setupRuntimeBlockReason(); reason != "" {
+				freshness.Reason = reason
+			}
 			pendingDefaults, enteredStale, recovered := staleDefaults.update(
 				!freshness.Allowed(), siteMeterDriver, reg.Names(),
 			)

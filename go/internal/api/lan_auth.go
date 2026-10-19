@@ -226,6 +226,15 @@ func hashLANPassword(password string) (string, error) {
 	), nil
 }
 
+// HashInitialLANPassword lets the first-run server establish the owner's
+// lock before the normal API starts. It grants no password-change authority.
+func HashInitialLANPassword(password string) (string, error) {
+	if len(password) < minLANPasswordLen || len(password) > 512 {
+		return "", fmt.Errorf("house password must be between %d and 512 characters", minLANPasswordLen)
+	}
+	return hashLANPassword(password)
+}
+
 func verifyLANPassword(encoded, password string) bool {
 	salt, want, timeCost, memory, threads, keyLen, ok := parseLANPasswordHash(encoded)
 	if !ok {

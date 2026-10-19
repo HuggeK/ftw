@@ -6,7 +6,7 @@ import vm from 'node:vm';
 const source = readFileSync(new URL('./access.js', import.meta.url), 'utf8');
 const setup = 'ftw.setup.write';
 
-function rig(renew = false) {
+function rig(renew = false, cloud = {link:'on',cloudTermsAccepted:true,statisticsOnly:false}) {
   function element(tag) {
     const e = { tag, children: [], listeners: {}, checked: false, value: '',
       setAttribute(k, v) { this[k] = v; },
@@ -36,7 +36,8 @@ function rig(renew = false) {
     createElement: element, getElementById: id => all().find(e => e.id === id) || null,
   }, fetch: (path, opts) => {
     if (opts?.method === 'POST') posts.push({ path, body: JSON.parse(opts.body) });
-    if (path === '/api/auth/status') return answer({ lan_auth: true, configured: true });
+    if (path === '/api/cloud') return answer(cloud);
+      if (path === '/api/auth/status') return answer({ lan_auth: true, configured: true });
     if (path === '/api/agents' && !opts) return answer({ agents: renew ? [row] : [], requests: [], registry, box: { widen: true, offers: true, clock: 'ok', nowMs: Date.now(), lookup: '/lookup', longestMs: { agent: 31536000000 } } });
     if (path.startsWith('/lookup?')) return answer({ offer: 'closed-fixture', status: 'pending' });
     if (path === '/api/agents/offer') return answer({ ...row, code: 'TESTCODE', client: 'ChatGPT', ttlS: 2592000, expMs: Date.now() + 600000 });
@@ -73,4 +74,11 @@ for (const keep of [false, true]) test(`renewal preserves the setup choice (${ke
   const sent = r.posts.find(p => p.path === '/api/agents/agent1/widen');
   assert.ok(sent);
   assert.equal(sent.body.scopes.includes(setup), keep);
+});
+
+for (const cloud of [{link:'off'}, {link:'on',statisticsOnly:true}, {link:'ending'}, {link:'on',cloudTermsAccepted:false}]) test(`Cloud readiness blocks code consumption: ${JSON.stringify(cloud)}`,async()=>{
+ const r=rig(false,cloud);await settle();
+ r.roots['access-code'].value='TESTCODE';r.roots['access-code-form'].submit();await settle();
+ assert.equal(r.posts.some(p=>p.path==='/api/agents/offer'),false);
+ assert.equal(r.roots['access-lookup'].disabled,true);
 });

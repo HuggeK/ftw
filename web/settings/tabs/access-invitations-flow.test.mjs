@@ -35,6 +35,7 @@ function rig({ loseReply = false } = {}) {
   const context = vm.createContext({ window: {}, document: { createElement: element, getElementById: id => all().find(e => e.id === id) || null },
     Uint8Array, crypto: webcrypto, atob, btoa, navigator: {}, setTimeout() {}, clearTimeout() {}, console,
     fetch: (path, opts) => {
+      if (path === '/api/cloud') return answer({link:'on',cloudTermsAccepted:true,statisticsOnly:false});
       if (path === '/api/auth/status') return answer({ lan_auth: true, configured: true });
       if (path === '/api/agents') return answer({ agents: [], requests: [], registry: { agentOps: {}, writeScopes: ['ftw.setup.write'], callScopes: ['ftw.setup.write'] }, box: { widen: true, offers: true, clock: 'ok', nowMs: Date.now() } });
       if (path === 'https://cloud.ftw.energy/oauth/invitations') {

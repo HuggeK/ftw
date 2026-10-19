@@ -83,6 +83,17 @@
     openBtn.click();
   };
 
+  // A first-run restart returns to the existing local owner controls. No
+  // URL parameter can approve a grant, accept terms or save a password.
+  if (window.location && new URLSearchParams(window.location.search).get("setup") === "assistant") {
+    window.addEventListener("load", function () {
+      var url = new URL(window.location.href);
+      url.searchParams.delete("setup");
+      window.history.replaceState(null, "", url.pathname + url.search + url.hash);
+      S.open("access");
+    }, {once: true});
+  }
+
   function closeSettings() {
     modal.classList.add("hidden");
     if (returnFocus && returnFocus.isConnected && returnFocus.getClientRects().length) {
@@ -147,11 +158,11 @@
     setStatus("Saving...");
     var headers = { "Content-Type": "application/json" };
     if (configETag) headers["If-Match"] = configETag;
-    return apiFetch("/api/config", {
+    return prepareSetupConnection().then(function () { return apiFetch("/api/config", {
       method: "POST",
       headers: headers,
       body: JSON.stringify(currentConfig),
-    })
+    }); })
       .then(function (r) {
         if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || ("HTTP " + r.status)); });
         configETag = r.headers && r.headers.get ? r.headers.get("ETag") : configETag;
@@ -184,6 +195,18 @@
       .catch(function (e) {
         setStatus("Save failed: " + e.message, "error");
         throw e;
+      });
+  }
+
+  function prepareSetupConnection() {
+    if (!currentConfig || !currentConfig.setup || currentConfig.setup.measurement_only) return Promise.resolve();
+    return apiFetch("/api/setup/connection", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({fuse: currentConfig.fuse})})
+      .then(function (r) { return r.json().then(function (body) { if (!r.ok) throw new Error(body.error || "Could not check the electricity connection."); return body; }); })
+      .then(function (review) {
+        if (!currentConfig.setup.connection_confirmed || currentConfig.setup.connection_digest !== review.connection_digest) {
+          navigateTab("control");
+          throw new Error("Review the electricity connection and confirm the shown values under Equipment control, then save again.");
+        }
       });
   }
 

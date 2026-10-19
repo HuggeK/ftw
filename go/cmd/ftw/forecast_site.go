@@ -36,6 +36,9 @@ type forecastSiteConfig struct {
 	bindingDirty          bool
 	configuredAt          time.Time
 	heatingPrior, ratedPV float64
+	annualBase            float64
+	annualIncludesHeating bool
+	priorRevision         string
 }
 
 type forecastIdentityReceipt struct {
@@ -50,7 +53,7 @@ const forecastIdentityReceiptKey = "forecast/live_identity_v1"
 // The evaluation cohort keys on it rather than on the Core version, so error
 // bands and baselines survive updates that leave forecasting alone. Bump it
 // whenever Core changes what reaches the planner.
-const forecastPipelinePolicy = "energyplan-primary-v4"
+const forecastPipelinePolicy = "energyplan-primary-v5"
 
 func newForecastSiteConfig(st *state.Store) *forecastSiteConfig {
 	id, _ := st.LoadConfig("forecast/site_id")
@@ -109,12 +112,18 @@ func (s *forecastSiteConfig) Configure(cfg *config.Config, catalog []drivers.Cat
 	driverInputs := append([]config.Driver(nil), cfg.Drivers...)
 	sort.Slice(driverInputs, func(i, j int) bool { return driverInputs[i].Name < driverInputs[j].Name })
 	learningDrivers := forecastLearningDrivers(v.Meter, v.Options.ExpectedFlows, driverInputs)
-	baseRevision, err := forecastStaticRevision(v, weather, learningDrivers)
+	// Nameplate and heating estimates change predictions, not the meaning of
+	// a measured sample. Keep their revision out of the learning identity.
+	learningWeather := forecastLearningWeather(weather)
+	baseRevision, err := forecastStaticRevision(v, learningWeather, learningDrivers)
 	// Earlier policies hashed the resolved script path: beta.4 the measurement
 	// drivers, beta.3 every driver. Verify that exact old contract before
 	// retaining its learning ID. A release that also moved the path cannot
 	// match, so such a site starts over once, as every update did before.
 	earlier := make([]string, 0, 2)
+	if old, oldErr := forecastStaticRevision(v, weather, learningDrivers); oldErr == nil {
+		earlier = append(earlier, old)
+	}
 	for _, inputs := range [][]config.Driver{learningDrivers, driverInputs} {
 		if old, oldErr := forecastResolvedPathRevision(v, weather, inputs); oldErr == nil {
 			earlier = append(earlier, old)
@@ -172,6 +181,14 @@ func (s *forecastSiteConfig) Configure(cfg *config.Config, catalog []drivers.Cat
 		s.heatingPrior = cfg.Weather.HeatingWPerDegC
 	}
 	s.ratedPV = forecastRatedPVW(cfg.Weather)
+	s.annualBase, _ = cfg.AnnualBaseKWh()
+	s.annualIncludesHeating = s.annualBase > 0 && cfg.AnnualPriorIncludesHeating()
+	priorData, _ := json.Marshal(struct {
+		Weather         *config.Weather
+		AnnualBase      float64
+		IncludesHeating bool
+	}{weather, s.annualBase, s.annualIncludesHeating})
+	s.priorRevision = fmt.Sprintf("%x", sha256.Sum256(priorData))
 	s.mu.Unlock()
 	s.RefreshIdentity(time.Now())
 	return previous != s.Snapshot().Revision
@@ -216,7 +233,7 @@ func (s *forecastSiteConfig) RefreshIdentity(now time.Time) bool {
 		learningBase = s.accepted.LearningBaseRevision
 	}
 	learning := fmt.Sprintf("site-v2:%x", sha256.Sum256([]byte(learningBase+"/"+string(data))))
-	cohort := learning + "/" + s.engineVersion + "/" + forecastPipelinePolicy
+	cohort := learning + "/" + s.engineVersion + "/" + forecastPipelinePolicy + "/" + s.priorRevision
 	revision := fmt.Sprintf("forecast-v1:%x", sha256.Sum256([]byte(cohort)))
 	opts := s.baseOptions
 	if pending && opts.HouseholdInvalidReason == "" {
@@ -364,6 +381,29 @@ func (s *forecastSiteConfig) ModelPriors() (heating, rated float64) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.heatingPrior, s.ratedPV
+}
+
+func (s *forecastSiteConfig) AnnualBase() float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.annualBase
+}
+
+func (s *forecastSiteConfig) AnnualPrior() (float64, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.annualBase, s.annualIncludesHeating
+}
+
+func forecastLearningWeather(w *config.Weather) *config.Weather {
+	if w == nil {
+		return nil
+	}
+	cp := *w
+	cp.PVRatedW, cp.HeatingWPerDegC = 0, 0
+	cp.PVArrays = nil
+	cp.PVTiltDeg, cp.PVAzimuthDeg = 0, 0
+	return &cp
 }
 
 func forecastRatedPVW(w *config.Weather) float64 {

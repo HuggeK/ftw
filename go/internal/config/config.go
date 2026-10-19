@@ -43,6 +43,8 @@ type Config struct {
 	Nova             *Nova              `yaml:"nova,omitempty" json:"nova,omitempty"`
 	DeviceRepository *DeviceRepository  `yaml:"device_repository,omitempty" json:"device_repository,omitempty"`
 	OCPP             *OCPP              `yaml:"ocpp,omitempty" json:"ocpp,omitempty"`
+	Setup            *Setup             `yaml:"setup,omitempty" json:"setup,omitempty"`
+	ForecastPriors   *ForecastPriors    `yaml:"forecast_priors,omitempty" json:"forecast_priors,omitempty"`
 
 	// LoadWarnings collects recoverable problems Parse repaired instead of
 	// refusing the file: an on-disk config an older version accepted must
@@ -1916,6 +1918,9 @@ func isLegacyDefaultDriverRepository(repo DriverRepositorySource) bool {
 // Validate ensures the config is internally consistent and safe to run with.
 func (c *Config) Validate() error {
 	c.NormalizeUnits()
+	if err := c.validateSetup(); err != nil {
+		return err
+	}
 	if err := c.normalizeLoadpointSteps(); err != nil {
 		return err
 	}
@@ -2034,7 +2039,7 @@ func (c *Config) Validate() error {
 	if c.Site.MinDispatchIntervalS < 0 {
 		return errors.New("site.min_dispatch_interval_s must be >= 0")
 	}
-	if c.Fuse.MaxAmps <= 0 {
+	if c.Fuse.MaxAmps < 0 || c.Fuse.MaxAmps == 0 && !c.MeasurementOnly() {
 		return errors.New("fuse.max_amps must be > 0")
 	}
 	if c.Fuse.Phases <= 0 {

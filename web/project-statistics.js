@@ -46,9 +46,11 @@
     }
     var panel=node("fieldset",null,host);
     panel.className="project-statistics-panel";
+    var assistant=host.id === "access-cloud-settings";
     var cloud=status.link==="on" && !status.statisticsOnly;
-    node("legend",cloud?(status.cloudTermsAccepted?"FTW Cloud":"Review FTW Cloud terms"):"Contribute to FTW statistics?",panel);
-    if(cloud) say(panel,status.cloudTermsAccepted?"The current Cloud terms are accepted. FTW Cloud includes project statistics.":"FTW Cloud includes project statistics. Sourceful can read its copy of your energy data. Accept the updated terms for the app and remote access, or turn Cloud off and keep using the box locally.");
+    node("legend",assistant?"FTW Cloud for assistants":cloud?(status.cloudTermsAccepted?"FTW Cloud":"Review FTW Cloud terms"):"Contribute to FTW statistics?",panel);
+    if(assistant && !cloud) say(panel,"FTW Cloud lets your assistant reach this box. Sourceful can read its Cloud copy of your energy data. Cloud includes project statistics. Review the terms below before accepting.");
+    else if(cloud) say(panel,status.cloudTermsAccepted?"The current Cloud terms are accepted. FTW Cloud includes project statistics.":"FTW Cloud includes project statistics. Sourceful can read its copy of your energy data. Accept the updated terms for the app and remote access, or turn Cloud off and keep using the box locally.");
     else say(panel,"For local FTW use, sharing is your choice. Yes is the suggested choice. Nothing starts until you answer, and saying no leaves local operation working. Statistics-only sharing gives no app, phone or assistant remote access.");
     say(panel,"Shares recorded hourly energy and configured system capacities. Reports stay for 48 hours; public totals require at least 20 homes.");
     var disclosure=node("details",null,panel);
@@ -74,6 +76,12 @@
         if(!window.confirm("Turn FTW Cloud off? The app and assistants lose remote access. The box keeps working locally. You may need to pair phones again if you turn Cloud back on."))return;
         return write("DELETE","/api/cloud");
       },false,feedback);
+    } else if(assistant) {
+      button(actions,"Accept Cloud terms and turn it on",function(){return write("POST","/api/cloud/grant",{scopes:policy.cloud_scopes,policy:policy.cloud_policy});},true,feedback);
+      var local=node("details",null,panel);node("summary","Statistics without assistant remote access",local);
+      say(local,"Statistics-only sharing gives no app, phone or assistant remote access.");
+      if(status.statisticsOnly) button(local,"Stop sharing statistics",function(){return write("DELETE","/api/cloud/stats");},false,feedback);
+      else {button(local,"Yes, contribute",function(){return write("POST","/api/cloud/stats",{policy:policy.policy});},false,feedback);}
     } else if(status.statisticsOnly) {
       say(panel,"Local statistics sharing is on. Remote Cloud functions are off.");
       button(actions,"Stop sharing statistics",function(){return write("DELETE","/api/cloud/stats");},false,feedback);
@@ -82,8 +90,9 @@
       if(status.statisticsDecisionRequired) button(actions,"No, keep it local",function(){return write("DELETE","/api/cloud/stats");},false,feedback);
       else say(panel,"Local statistics sharing is off.");
     }
-    if(settings && !cloud) {
-      var more=node("details",null,panel);node("summary","Use FTW Cloud and the app",more);
+    if(settings && !cloud && !assistant) {
+      var more=node("details",null,panel);
+      node("summary","Use FTW Cloud and the app",more);
       say(more,"FTW Cloud adds app and assistant remote access and a readable state copy. Statistics are included for every Cloud user. Read the information above before accepting.");
       button(more,"Accept Cloud terms and turn it on",function(){return write("POST","/api/cloud/grant",{scopes:policy.cloud_scopes,policy:policy.cloud_policy});},true,feedback);
     }
@@ -95,6 +104,7 @@
     }).then(function(v){
       if(current!==refreshNumber || saving || !v[0] || !v[1])return;
       status=v[0];policy=v[1];authStatus=v[2];
+      if(window.dispatchEvent && typeof CustomEvent === "function") window.dispatchEvent(new CustomEvent("ftw-cloud-choice-changed", {detail:status}));
       if(!policy.cloud_includes_statistics || !policy.standalone)return;
       var prompt=document.getElementById("project-statistics-prompt");
       if(!prompt){

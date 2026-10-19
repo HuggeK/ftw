@@ -304,7 +304,7 @@ describe("a request waiting for the owner", () => {
     assert.deepEqual(rows, [
       { label: "Car", value: "car_7f3a" },
       { label: "The level to reach", value: "80 %" },
-      { label: "Ready by", value: "07:00" },
+      { label: "Ready by", value: "07:00 (box local time)" },
       { label: "Charge from solar only", value: "no" },
       { label: "extra", value: "x" },
     ]);

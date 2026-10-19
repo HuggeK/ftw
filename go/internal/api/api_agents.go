@@ -21,6 +21,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"github.com/srcfl/ftw/go/internal/localzone"
 	"net/http"
 	"slices"
 	"strconv"
@@ -71,6 +72,7 @@ type AgentRequest struct {
 // AgentFacts say whether this box can take a grant now, and where the owner's
 // browser looks a code up.
 type AgentFacts struct {
+	Timezone string `json:"timezone"`
 	// Offers says this build pins an FTW Cloud offer key. A build that pins
 	// none opens no offer.
 	Offers bool `json:"offers"`
@@ -242,6 +244,7 @@ func (s *Server) handleAgentsList(w http.ResponseWriter, r *http.Request) {
 	}
 	a := s.deps.Agents
 	facts := a.Facts()
+	facts.Timezone = localzone.Name()
 	facts.Widen, _ = lanSecretFrom(r.Context())
 	writeJSON(w, http.StatusOK, agentsPage{
 		Agents: nonNil(a.Agents()), Requests: nonNil(a.Requests()), Keys: nonNil(a.ApprovalKeys()),

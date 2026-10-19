@@ -231,6 +231,17 @@ func (s *Server) handleDriverTest(w http.ResponseWriter, r *http.Request) {
 		cfg = wrapped.Drivers[0]
 	}
 
+	s.runDriverTest(w, r, cfg, nil)
+}
+
+// runDriverTest also serves setup drafts. A setup caller supplies credentials
+// from its exact draft and a private rotation sink; it never borrows or writes
+// the live Settings document.
+func (s *Server) runDriverTest(w http.ResponseWriter, r *http.Request, cfg config.Driver, prepareProbe func(*drivers.Registry, string)) {
+	if strings.TrimSpace(cfg.Lua) == "" {
+		writeJSON(w, 400, map[string]string{"error": "missing driver lua path"})
+		return
+	}
 	// Resolve UI-relative Lua paths the same way config.Load does.
 	baseDir := "."
 	if s.deps.ConfigPath != "" {
@@ -287,7 +298,12 @@ func (s *Server) handleDriverTest(w http.ResponseWriter, r *http.Request) {
 	reg.MQTTFactory = s.deps.DriverMQTTFactory
 	reg.ModbusFactory = s.deps.DriverModbusFactory
 	reg.ARPLookup = s.deps.DriverARPLookup
-	probeChangedSharedSecret := s.wireDriverProbeSecrets(reg, testName, probe)
+	probeChangedSharedSecret := func() string { return "" }
+	if prepareProbe != nil {
+		prepareProbe(reg, testName)
+	} else {
+		probeChangedSharedSecret = s.wireDriverProbeSecrets(reg, testName, probe)
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
 	defer cancel()

@@ -78,6 +78,7 @@ type oauthPending struct {
 	// B2C can). Bound to the state so it never leaves the Pi.
 	codeVerifier string
 	expires      time.Time
+	setup        *setupOAuthPending
 }
 
 // newPKCEPair returns a high-entropy code_verifier and its S256
@@ -251,7 +252,11 @@ func (s *Server) handleMyUplinkOAuthCallback(w http.ResponseWriter, r *http.Requ
 		renderOAuthResult(w, false, err.Error())
 		return
 	}
-	renderOAuthResult(w, true, "MyUplink connected for driver \""+driver+"\". You can close this tab and return to FTW.")
+	if driver.Draft {
+		renderOAuthResultTitle(w, true, "Sign-in saved to setup draft", "MyUplink sign-in is saved for "+driver.Driver+" in the setup draft. These settings are not running yet. Return to your assistant to review and continue.")
+		return
+	}
+	renderOAuthResult(w, true, "MyUplink connected for driver \""+driver.Driver+"\". You can close this tab and return to FTW.")
 }
 
 // handleMyUplinkOAuthExchange: POST /api/oauth/myuplink/exchange
@@ -289,14 +294,23 @@ func (s *Server) handleMyUplinkOAuthExchange(w http.ResponseWriter, r *http.Requ
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, 200, map[string]string{"status": "connected", "driver": driver})
+	if driver.Draft {
+		writeJSON(w, 200, map[string]any{"status": "saved_to_draft", "driver": driver.Driver, "applied": false})
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "connected", "driver": driver.Driver})
 }
 
 // completeMyUplinkConsent validates+consumes the pending state, exchanges the
 // authorization code for a refresh_token, and persists it (config + KV) with a
 // driver restart. Shared by the auto-callback (GET) and the manual exchange
 // (POST). Returns the driver name on success. Errors are operator-facing.
-func (s *Server) completeMyUplinkConsent(r *http.Request, stateTok, code string) (string, error) {
+type myUplinkConsentResult struct {
+	Driver string
+	Draft  bool
+}
+
+func (s *Server) completeMyUplinkConsent(r *http.Request, stateTok, code string) (myUplinkConsentResult, error) {
 	oauthMu.Lock()
 	pruneOAuthStateLocked(time.Now())
 	pending, found := oauthPending_[stateTok]
@@ -306,26 +320,30 @@ func (s *Server) completeMyUplinkConsent(r *http.Request, stateTok, code string)
 	oauthMu.Unlock()
 
 	if !found {
-		return "", fmt.Errorf("invalid or expired state — start the connect again from Settings → Devices")
+		return myUplinkConsentResult{}, fmt.Errorf("invalid or expired sign-in state; start again with setup_connect or Settings → Devices. Your setup draft is retained")
 	}
 	if code == "" {
-		return "", fmt.Errorf("no authorization code found")
+		return myUplinkConsentResult{}, fmt.Errorf("no authorization code found")
+	}
+	if pending.setup != nil {
+		driver, err := s.completeSetupMyUplink(r, pending, code)
+		return myUplinkConsentResult{Driver: driver, Draft: true}, err
 	}
 
 	clientID, _ := s.driverConfigValue(pending.driver, "client_id")
 	clientSecret, _ := s.driverConfigValue(pending.driver, "client_secret")
 	if clientID == "" || clientSecret == "" {
-		return "", fmt.Errorf("missing Client ID / Secret for driver %q", pending.driver)
+		return myUplinkConsentResult{}, fmt.Errorf("missing Client ID / Secret for driver %q", pending.driver)
 	}
 
 	refreshToken, err := s.exchangeMyUplinkCode(code, clientID, clientSecret, pending.redirectURI, pending.codeVerifier)
 	if err != nil {
-		return "", fmt.Errorf("token exchange failed: %w", err)
+		return myUplinkConsentResult{}, fmt.Errorf("token exchange failed: %w", err)
 	}
 	if err := s.persistMyUplinkRefreshToken(r, pending.driver, refreshToken); err != nil {
-		return "", fmt.Errorf("could not save the token: %w", err)
+		return myUplinkConsentResult{}, fmt.Errorf("could not save the token: %w", err)
 	}
-	return pending.driver, nil
+	return myUplinkConsentResult{Driver: pending.driver}, nil
 }
 
 // exchangeMyUplinkCode swaps an authorization code for a refresh_token.
@@ -421,8 +439,11 @@ func (s *Server) persistMyUplinkRefreshToken(r *http.Request, driver, refreshTok
 // renderOAuthResult writes a minimal self-contained result page. The browser
 // lands here from the MyUplink redirect, so it cannot rely on the SPA chrome.
 func renderOAuthResult(w http.ResponseWriter, ok bool, msg string) {
+	renderOAuthResultTitle(w, ok, "MyUplink connected", msg)
+}
+
+func renderOAuthResultTitle(w http.ResponseWriter, ok bool, title, msg string) {
 	status := http.StatusOK
-	title := "MyUplink connected"
 	accent := "#1f9d57"
 	if !ok {
 		status = http.StatusBadRequest

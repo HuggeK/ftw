@@ -7,6 +7,46 @@
   var TOTAL_STEPS = 8;
   var currentStep = 1;
 
+  window.startAssistantSetup = async function () {
+    var btn = document.getElementById('assistant-start');
+    var note = document.getElementById('assistant-status');
+	var password = document.getElementById('assistant-password').value;
+	if (password.length < 10 || password !== document.getElementById('assistant-password-confirm').value) {
+	  note.textContent = 'Use at least 10 characters and enter the same house password twice.';
+	  return;
+	}
+    btn.disabled = true;
+    note.textContent = 'Starting the box in measurement mode…';
+    try {
+      var reply = await fetch('/api/setup/assistant', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({confirmed: true, password: password})});
+      if (!reply.ok) {
+        var problem = await reply.json();
+        note.textContent = problem.error || 'Could not start setup.';
+        btn.disabled = false;
+        return;
+      }
+	  document.getElementById('assistant-password').value = '';
+	  document.getElementById('assistant-password-confirm').value = '';
+	  password = '';
+    } catch (error) {
+      // The process can restart before its reply arrives. Find the saved
+      // setup before allowing another first-run write.
+      note.textContent = error.message + ' Checking whether the box started…';
+    }
+    for (var attempt = 0; attempt < 30; attempt++) {
+      await new Promise(function (resolve) { setTimeout(resolve, 1000); });
+      try {
+        var status = await fetch('/api/auth/status', {cache: 'no-store'});
+        if (status.ok) {
+          window.location.href = '/?setup=assistant';
+          return;
+        }
+      } catch (_) { /* Wait for the same box to restart. */ }
+    }
+    note.textContent = 'The box has not answered yet. Open it to check the saved setup before trying again. Your equipment has not been configured by this step.';
+    document.getElementById('assistant-resume').hidden = false;
+  };
+
   // Collected state
   var configuredDrivers = [];    // array of driver objects ready for config.drivers
   var selectedDevice = null;     // { ip, port, protocol, hostname } from scan or manual entry

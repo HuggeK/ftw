@@ -71,19 +71,20 @@ type Bucket struct {
 }
 
 type Model struct {
-	ConfigRevision    string          `json:"config_revision,omitempty"`
-	LearningStartedMS int64           `json:"learning_started_ms,omitempty"`
-	Timezone          string          `json:"timezone,omitempty"`
-	LastTemperatureC  float64         `json:"last_temperature_c"`
-	HasTemperature    bool            `json:"has_temperature"`
-	Bucket            [Buckets]Bucket `json:"bucket"`
-	HeatingW_per_degC float64         `json:"heating_w_per_degc"`
-	PeakW             float64         `json:"peak_w"`
-	Samples           int64           `json:"samples"`
-	LastMs            int64           `json:"last_ms"`
-	MAE               float64         `json:"mae"`
-	Alpha             float64         `json:"alpha"` // Retained for state compatibility
-	PriorScale        float64         `json:"prior_scale,omitempty"`
+	ConfigRevision       string          `json:"config_revision,omitempty"`
+	LearningStartedMS    int64           `json:"learning_started_ms,omitempty"`
+	Timezone             string          `json:"timezone,omitempty"`
+	LastTemperatureC     float64         `json:"last_temperature_c"`
+	HasTemperature       bool            `json:"has_temperature"`
+	Bucket               [Buckets]Bucket `json:"bucket"`
+	HeatingW_per_degC    float64         `json:"heating_w_per_degc"`
+	PeakW                float64         `json:"peak_w"`
+	Samples              int64           `json:"samples"`
+	LastMs               int64           `json:"last_ms"`
+	MAE                  float64         `json:"mae"`
+	Alpha                float64         `json:"alpha"` // Retained for state compatibility
+	PriorIncludesHeating bool            `json:"prior_includes_heating,omitempty"`
+	PriorScale           float64         `json:"prior_scale,omitempty"`
 
 	// MaxPlausibleW remains for stored-state/API compatibility. Grid limits do not cap gross household load.
 	MaxPlausibleW float64 `json:"max_plausible_w,omitempty"`
@@ -222,7 +223,13 @@ func (m Model) Predict(t time.Time, tempC float64) float64 {
 			tempC = HeatingReferenceC
 		}
 	}
-	y := base + heatingGain(m.HeatingW_per_degC, tempC)
+	heat := heatingGain(m.HeatingW_per_degC, tempC)
+	y := base + heat
+	if m.PriorIncludesHeating {
+		// The annual estimate already includes average heating. Only the
+		// measured part gains the learned temperature-sensitive component.
+		y = trust*(b.Mean+heat) + (1-trust)*prior
+	}
 	if math.IsNaN(y) || math.IsInf(y, 0) {
 		y = prior
 	}

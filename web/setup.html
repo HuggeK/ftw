@@ -106,6 +106,10 @@
       line-height: 1.58;
     }
 
+    .assistant-setup {text-align:left;margin-top:2rem;padding:1.5rem;border:1px solid var(--line);border-radius:12px}
+    .assistant-setup p {margin:0.8rem 0 1.1rem}
+    .assistant-setup h3 {font-size:1rem}
+    .assistant-setup button {width:100%}
     /* ---- Form elements ---- */
     .form-group {
       margin-bottom: 1.1rem;
@@ -529,6 +533,18 @@
       <h2>Welcome to FTW</h2>
       <p>Let's set up your home energy system in a few steps.</p>
       <button class="btn-primary" onclick="goStep(2)">Get started</button>
+      <section class="assistant-setup" aria-labelledby="assistant-title">
+      <h3 id="assistant-title">Set up with your AI assistant</h3>
+      <p>Use ChatGPT or another MCP client to configure this box. FTW starts with no equipment and keeps control off while you set it up.</p>
+      <p>Set a house password to claim this new box. After it starts, sign in and approve the assistant here. Remote assistants use FTW Cloud; you choose whether to accept its terms.</p>
+      <div class="form-group"><label for="assistant-password">House password (at least 10 characters)</label>
+      <input id="assistant-password" type="password" minlength="10" maxlength="512" autocomplete="new-password"></div>
+      <div class="form-group"><label for="assistant-password-confirm">Repeat house password</label>
+      <input id="assistant-password-confirm" type="password" minlength="10" maxlength="512" autocomplete="new-password"></div>
+      <button class="btn-primary" id="assistant-start" onclick="startAssistantSetup()">Start assistant setup</button>
+      <p id="assistant-status" role="status" aria-live="polite"></p>
+      <a id="assistant-resume" href="/?setup=assistant" hidden>Open the box and continue setup</a>
+      </section>
     </div>
   </div>
 

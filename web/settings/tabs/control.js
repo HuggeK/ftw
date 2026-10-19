@@ -20,7 +20,16 @@
         config.site.pv_surplus_absorb_soc_cap = config.site.pv_surplus_absorb_soc_cap_pct / 100;
       }
       delete config.site.pv_surplus_absorb_soc_cap_pct;
-      return '<fieldset><legend>Site</legend>' +
+      var setup = config.setup ? '<fieldset><legend>Equipment control</legend>' +
+        '<p id="setup-control-status" role="status">Checking the active mode…</p>' +
+        '<label class="checkbox-row"><input type="checkbox" data-checkbox-path="setup.measurement_only"' + (config.setup.measurement_only ? ' checked' : '') + '> Measurement mode after the next restart</label>' +
+        '<p>Mode changes need a save and restart. Until then the current mode stays active. Measurement mode keeps equipment writes off.</p>' +
+        '<p>Before enabling control or changing A, phases or voltage: check the connection below against your network contract, and check the selected equipment and grid-boundary meter.</p>' +
+        '<label class="checkbox-row"><input id="setup-confirm-connection" type="checkbox"> I checked this connection and the selected equipment</label>' +
+        '<p id="setup-connection-note" role="status"></p>' +
+        '<button type="button" id="setup-refresh-status" class="btn-ghost">Refresh active mode</button>' +
+        '</fieldset>' : '';
+      return setup + '<fieldset><legend>Site</legend>' +
         field("Name", "site.name", "text", "Home") +
         '<div class="field-row"><div>' +
         field("Grid target (W)", "site.grid_target_w", "number", 0) +
@@ -120,6 +129,47 @@
       phases.addEventListener("input", sync);
       voltage.addEventListener("input", sync);
       sync();
+
+      var confirmation = root.querySelector("#setup-confirm-connection");
+      if (!confirmation) return;
+      var note = root.querySelector("#setup-connection-note");
+      var mode = root.querySelector("#setup-control-status");
+      function readMode() {
+        return ctx.apiFetch("/api/setup/draft").then(function (r) { if (!r.ok) throw new Error("Could not read active mode."); return r.json(); }).then(function (body) {
+          var c = body.commissioning;
+          if (!c) throw new Error("Active mode is unavailable on this box version.");
+          if (c.measurement_only && !c.configured_measurement_only) mode.textContent = "Measurement mode is active. Control is saved and waits for a restart.";
+          else if (!c.measurement_only && c.configured_measurement_only) mode.textContent = "Control is still active. Measurement mode is saved and waits for a restart.";
+          else mode.textContent = c.measurement_only ? "Measurement mode is active. Equipment writes are off." : "Control mode is active. Hardware tests remain separate.";
+          if (c.control_blocked_reason && !c.measurement_only) mode.textContent += " Dispatch is blocked: " + c.control_blocked_reason + ".";
+        }).catch(function (e) { mode.textContent = e.message; });
+      }
+      root.querySelector("#setup-refresh-status").addEventListener("click", readMode);
+      readMode();
+      confirmation.addEventListener("change", function () {
+        if (!confirmation.checked) return;
+        ctx.captureCurrentTab();
+        if (!(ctx.config.fuse.max_amps > 0)) {
+          confirmation.checked = false;
+          note.textContent = "Enter the main fuse rating from your network contract below before confirming. Keep measurement mode on if it is unknown.";
+          return;
+        }
+        var snapshot = JSON.stringify(ctx.config.fuse);
+        confirmation.disabled = true;
+        note.textContent = "Checking this connection and the live meter…";
+        ctx.apiFetch("/api/setup/connection", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({fuse: ctx.config.fuse})})
+          .then(function (r) { return r.json().then(function (body) { if (!r.ok) throw new Error(body.error || "Connection check failed."); return body; }); })
+          .then(function (review) {
+            ctx.captureCurrentTab();
+            if (JSON.stringify(ctx.config.fuse) !== snapshot) throw new Error("The connection changed. Check the new values and confirm again.");
+            ctx.config.setup.connection_digest = review.connection_digest;
+            ctx.config.setup.connection_confirmed = true;
+            ctx.config.setup.equipment_reviewed = true;
+            if (review.meter_identity) ctx.config.setup.meter_identity = review.meter_identity;
+            note.textContent = review.can_enable_control ? "Connection confirmed for this save. Save and restart to change mode." : "Connection confirmed. Keep measurement mode on: " + review.blocked_reason;
+          }).catch(function (e) { confirmation.checked = false; note.textContent = e.message; })
+          .finally(function () { confirmation.disabled = false; });
+      });
     },
   };
 })();

@@ -43,6 +43,23 @@ func TestForecastSiteSeparatesLearningAndEvaluationRevisions(t *testing.T) {
 	if build.LearningRevision != first.LearningRevision || build.Revision == first.Revision {
 		t.Fatal("worker build must change evaluation cohort, not learned site binding")
 	}
+
+	annual := 14000.0
+	noEV := false
+	cfg.ForecastPriors = &config.ForecastPriors{AnnualKWh: &annual, AnnualBasis: "total_consumption", IncludesEV: &noEV}
+	cfg.Weather.PVTiltDeg = 30
+	cfg.Weather.HeatingWPerDegC = 180
+	cfg.ForecastPriors.IncludesHeating = &noEV
+	s.Configure(cfg, nil)
+	prior := s.Snapshot()
+	if prior.LearningRevision != build.LearningRevision || prior.Revision == build.Revision || s.AnnualBase() != annual {
+		t.Fatal("owner estimates must change predictions without discarding measured learning")
+	}
+	cfg.ForecastPriors.Source = "corrected source label"
+	s.Configure(cfg, nil)
+	if s.Snapshot().Revision != prior.Revision {
+		t.Fatal("source note reset prediction calibration")
+	}
 	cfg.Drivers[0].Config["scale"] = 2.0
 	s.Configure(cfg, nil)
 	scaled := s.Snapshot()
@@ -471,5 +488,33 @@ func TestForecastEvaluationCohortSurvivesCoreUpdate(t *testing.T) {
 	s.Configure(cfg, nil)
 	if s.Snapshot().Revision == before.Revision {
 		t.Fatal("a new forecast worker kept the old evaluation cohort")
+	}
+}
+
+func TestForecastSolarPriorKeepsExistingMeasurementLearning(t *testing.T) {
+	st, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cfg := &config.Config{Drivers: []config.Driver{{Name: "meter", Lua: "meter.lua", IsSiteMeter: true}, {Name: "pv", Lua: "pv.lua"}}, Weather: &config.Weather{Provider: "open_meteo", Latitude: 59, Longitude: 18, PVRatedW: 6000}}
+	catalog := []drivers.CatalogEntry{{Filename: "meter.lua", Capabilities: []string{"meter"}}, {Filename: "pv.lua", Capabilities: []string{"pv"}}}
+	s := newForecastSiteConfig(st)
+	s.identity = func(name string) (string, bool) { return name + ":serial", true }
+	s.Configure(cfg, catalog)
+	before := s.Snapshot()
+	cfg.Weather.PVRatedW = 9000
+	cfg.Weather.PVTiltDeg = 35
+	cfg.Weather.PVAzimuthDeg = 180
+	s.Configure(cfg, catalog)
+	after := s.Snapshot()
+	if after.IdentityPending || before.LearningRevision != after.LearningRevision || before.Revision == after.Revision {
+		t.Fatal("solar estimates reset measured learning or retained old evaluation cohort")
+	}
+	restarted := newForecastSiteConfig(st)
+	restarted.identity = s.identity
+	restarted.Configure(cfg, catalog)
+	if restarted.Snapshot().LearningRevision != before.LearningRevision {
+		t.Fatal("solar prior discarded learning after restart")
 	}
 }
