@@ -56,28 +56,6 @@ func TestReconfigureBindsEveryProfileAndSurvivesRestart(t *testing.T) {
 	}
 }
 
-func TestReconfigureRejectsTrainingCapturedAtPriorBoundary(t *testing.T) {
-	tel := telemetry.NewStore()
-	tel.Update("site", telemetry.DerMeter, 1000, nil, nil)
-	tel.RecordDriverSuccess("site")
-	s := NewService(nil, tel, "site", 4000, 0)
-	if err := s.Reconfigure("site", telemetry.ForecastOptions{}, "UTC", "a"); err != nil {
-		t.Fatal(err)
-	}
-	captured, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
-	s.Temp = func(time.Time) (float64, bool) { close(captured); <-release; return 5, true }
-	go func() { defer close(done); s.sampleAt(time.Now()) }()
-	<-captured
-	if err := s.Reconfigure("site", telemetry.ForecastOptions{HouseholdInvalidReason: "changed topology"}, "UTC", "b"); err != nil {
-		t.Fatal(err)
-	}
-	close(release)
-	<-done
-	if s.Model().Samples != 0 {
-		t.Fatal("old balance trained new topology")
-	}
-}
-
 func TestResetKeepsConfigBinding(t *testing.T) {
 	s := NewService(nil, telemetry.NewStore(), "site", 4000, 0)
 	if err := s.Reconfigure("site", telemetry.ForecastOptions{}, "UTC", "a"); err != nil {

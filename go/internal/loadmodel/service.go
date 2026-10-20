@@ -29,8 +29,12 @@ const (
 	profileStateKey = "loadmodel/profile"
 )
 
-// defaultSampleInterval is how often the service trains the active model.
+// defaultSampleInterval is how often the service looks for closed intervals.
 const defaultSampleInterval = time.Minute
+
+// TrainingInterval is the width of one training label: the household mean
+// over a closed quarter-hour of the same source energy as daily Home use.
+const TrainingInterval = 15 * time.Minute
 
 // legacyFeatureHash is the fingerprint of the feature space in force when the
 // envelope was introduced. State written before then — both the per-profile
@@ -59,8 +63,10 @@ type Snapshot struct {
 	Profiles      map[Profile]Model `json:"profiles"`
 }
 
-// Service trains the load model online from telemetry. Mirrors
-// pvmodel.Service so operators + future code have one pattern.
+// Service trains the load model online from closed household intervals in
+// Store, the same evidence as daily Home use. Mirrors pvmodel.Service so
+// operators + future code have one pattern. Tele and the forecast options are
+// kept for callers; training no longer reads instantaneous telemetry.
 type Service struct {
 	Store          *state.Store
 	Tele           *telemetry.Store
@@ -76,7 +82,7 @@ type Service struct {
 	models            map[Profile]*Model
 	forecastOptions   telemetry.ForecastOptions
 	timezone          string
-	lastForecastInput time.Time
+	nextIntervalMS    int64 // first interval not yet trained; 0 waits for the next whole one
 	configuredHeating *float64
 
 	stop chan struct{}
@@ -90,7 +96,7 @@ func NewService(st *state.Store, tel *telemetry.Store, siteMeter string, peakW, 
 		Tele:           tel,
 		SiteMeter:      siteMeter,
 		SampleInterval: defaultSampleInterval,
-		PersistEvery:   10,
+		PersistEvery:   1,
 		stop:           make(chan struct{}),
 		done:           make(chan struct{}),
 		active:         ProfileHome,
@@ -178,7 +184,7 @@ func (s *Service) SetSiteMeter(name string) {
 	s.mu.Lock()
 	s.SiteMeter = name
 	s.generation++
-	s.lastForecastInput = time.Time{}
+	s.nextIntervalMS = 0
 	s.mu.Unlock()
 }
 
@@ -266,6 +272,10 @@ func (s *Service) SetProfile(profile Profile) error {
 	if _, ok := s.models[profile]; !ok {
 		peak := s.activeModelLocked().PeakW
 		s.models[profile] = newProfileModel(peak, profile)
+	}
+	if s.active != profile {
+		// An interval that spans the switch belongs to neither profile.
+		s.nextIntervalMS = 0
 	}
 	s.active = profile
 	s.mu.Unlock()
@@ -431,7 +441,7 @@ func (s *Service) Reconfigure(siteMeter string, opts telemetry.ForecastOptions, 
 	}
 	s.SiteMeter, s.timezone, s.forecastOptions = siteMeter, zone, opts
 	s.generation++
-	s.lastForecastInput = time.Time{}
+	s.nextIntervalMS = 0
 	if changed {
 		peak := s.activeModelLocked().PeakW
 		epoch := s.learningStartedMSLocked()
@@ -477,34 +487,55 @@ func (s *Service) SetTimezone(zone string) error {
 	return nil
 }
 func (s *Service) sample() { s.sampleAt(time.Now()) }
+
+// sampleAt trains on every interval closed since the last call. Training
+// starts at the first whole interval after start or reconfiguration, so an
+// interval observed under an older configuration never becomes a label.
 func (s *Service) sampleAt(now time.Time) {
-	if s.Tele == nil {
+	if s.Store == nil {
 		return
 	}
-	s.mu.RLock()
-	site, opts, profile, generation, learningStartedMS := s.SiteMeter, s.forecastOptions, s.active, s.generation, s.learningStartedMSLocked()
-	s.mu.RUnlock()
-	reading := s.Tele.ForecastMeasurement(now, site, opts)
-	temp := math.NaN()
-	if s.Temp != nil {
-		if value, ok := s.Temp(now); ok {
-			temp = value
+	width := TrainingInterval.Milliseconds()
+	s.mu.Lock()
+	if s.nextIntervalMS == 0 {
+		s.nextIntervalMS = (now.UnixMilli() + width - 1) / width * width
+	}
+	profile, generation, learningStartedMS, from := s.active, s.generation, s.learningStartedMSLocked(), s.nextIntervalMS
+	s.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	intervals, closed, err := s.Store.HouseholdIntervals(ctx, from, now.UnixMilli(), width)
+	cancel()
+	if err != nil {
+		slog.Warn("loadmodel: household intervals unavailable", "err", err)
+		return
+	}
+	temps := make([]float64, len(intervals))
+	for i, v := range intervals {
+		temps[i] = math.NaN()
+		if s.Temp != nil {
+			if value, ok := s.Temp(time.UnixMilli(v.StartMS + width/2)); ok {
+				temps[i] = value
+			}
 		}
 	}
 	s.mu.Lock()
-	if s.active != profile || s.SiteMeter != site || s.generation != generation {
+	// A profile switch or reconfiguration during the read discards it; the
+	// cursor stays, so the next call reads the same closed intervals again.
+	if s.active != profile || s.generation != generation || s.nextIntervalMS != from {
 		s.mu.Unlock()
 		return
 	}
 	model := s.activeModelLocked()
-	updated := false
-	if reading.Valid && reading.Earliest.UnixMilli() >= learningStartedMS && reading.Latest.After(s.lastForecastInput) {
-		s.lastForecastInput = reading.Latest
-		updated = model.Update(now, reading.HouseholdW, temp)
+	trained := 0
+	for i, v := range intervals {
+		if v.StartMS >= learningStartedMS && model.Update(time.UnixMilli(v.StartMS+width/2), v.LoadW, temps[i]) {
+			trained++
+		}
 	}
+	s.nextIntervalMS = max(from, closed)
 	samples := model.Samples
 	s.mu.Unlock()
-	if updated && s.PersistEvery > 0 && samples%s.PersistEvery == 0 {
+	if trained > 0 && s.PersistEvery > 0 && samples%s.PersistEvery < int64(trained) {
 		if err := s.persist(); err != nil {
 			slog.Warn("loadmodel persist", "err", err)
 		}
@@ -625,7 +656,7 @@ func (s *Service) Reset() {
 	s.models[profile].LearningStartedMS = old.LearningStartedMS
 	s.models[profile].MaxPlausibleW = old.MaxPlausibleW
 	s.generation++
-	s.lastForecastInput = time.Time{}
+	s.nextIntervalMS = 0
 	s.mu.Unlock()
 	if err := s.persist(); err != nil {
 		slog.Warn("loadmodel persist", "err", err)
@@ -651,7 +682,7 @@ func (s *Service) RestartLearning(at time.Time) error {
 			s.models[profile] = freshProfile(s.models[profile], profile, s.timezone, startedMS, s.configuredHeating)
 		}
 		s.generation++
-		s.lastForecastInput = time.Time{}
+		s.nextIntervalMS = 0
 	}
 	s.mu.Unlock()
 	return s.persistLocked()

@@ -203,24 +203,27 @@ func TestForecastOriginFollowsCandidateCapture(t *testing.T) {
 	}
 }
 func TestForecastIndependentPVIntervalsAndCurtailment(t *testing.T) {
+	ctx := context.Background()
 	f := &forecastTracker{}
 	site := trackerSite()
 	start := time.Date(2026, 1, 5, 12, 0, 0, 0, time.UTC)
 	var out []forecasting.Observation
 	for i := 0; i <= 15; i++ {
 		at := start.Add(time.Duration(i) * time.Minute)
-		out = append(out, f.observationIntervals(telemetry.ForecastReading{At: at, Latest: at, PVLatest: at, Valid: false, PVValid: true, PVW: -2000}, site, at)...)
+		out = append(out, f.observationIntervals(ctx, telemetry.ForecastReading{At: at, Latest: at, PVLatest: at, Valid: false, PVValid: true, PVW: -2000}, site, at)...)
 	}
 	if len(out) != 1 || !out[0].PVKnown || out[0].LoadKnown || out[0].PVW != 2000 {
 		t.Fatalf("missing battery blocked PV: %+v", out)
 	}
-	f = &forecastTracker{}
+	st := householdHistoryStore(t)
+	recordSiteHistory(t, st, start, start.Add(15*time.Minute), -1000, -2000)
+	f = &forecastTracker{store: st}
 	out = nil
 	for i := 0; i <= 15; i++ {
 		at := start.Add(time.Duration(i) * time.Minute)
-		out = append(out, f.observationIntervals(telemetry.ForecastReading{At: at, Latest: at, PVLatest: at, Valid: true, PVValid: i != 7, PVW: -2000, HouseholdW: 1000}, site, at)...)
+		out = append(out, f.observationIntervals(ctx, telemetry.ForecastReading{At: at, Latest: at, PVLatest: at, Valid: true, PVValid: i != 7, PVW: -2000}, site, at)...)
 	}
-	if len(out) != 1 || out[0].PVKnown || !out[0].LoadKnown {
+	if len(out) != 1 || out[0].PVKnown || !out[0].LoadKnown || math.Abs(out[0].LoadW-1000) > 1e-6 {
 		t.Fatalf("curtailment became available PV or hid house: %+v", out)
 	}
 }
@@ -373,17 +376,24 @@ func TestForecastFullHorizonRecordFitsArchive(t *testing.T) {
 	t.Logf("stored full horizon JSON bytes=%d", len(raw))
 }
 func TestForecastConfigChangeBreaksInterval(t *testing.T) {
-	f := &forecastTracker{}
+	// History itself is complete across the change; the revision alone must
+	// keep the quarter from becoming a label for the new configuration.
+	st := householdHistoryStore(t)
+	f := &forecastTracker{store: st}
 	site := trackerSite()
 	start := time.Date(2026, 1, 5, 12, 0, 0, 0, time.UTC)
-	for i := 0; i <= 15; i++ {
+	recordSiteHistory(t, st, start, start.Add(31*time.Minute), -1000, -2000)
+	for i := 0; i <= 31; i++ {
 		if i == 8 {
 			site.Revision = "changed"
 		}
 		at := start.Add(time.Duration(i) * time.Minute)
-		out := f.observationIntervals(telemetry.ForecastReading{At: at, Latest: at, PVLatest: at, Valid: true, PVValid: true, HouseholdW: 1000, PVW: -2000}, site, at)
-		if len(out) > 0 {
-			t.Fatal("interval crosses config revision")
+		out := f.observationIntervals(context.Background(), telemetry.ForecastReading{At: at, Latest: at, PVLatest: at, Valid: true, PVValid: true, PVW: -2000}, site, at)
+		switch {
+		case i < 30 && len(out) > 0:
+			t.Fatalf("interval crosses config revision: %+v", out)
+		case i == 30 && (len(out) != 1 || out[0].StartMS != start.Add(15*time.Minute).UnixMilli() || out[0].ConfigVersion != "changed" || !out[0].LoadKnown):
+			t.Fatalf("first whole quarter under the new revision: %+v", out)
 		}
 	}
 }

@@ -53,34 +53,6 @@ func TestSeedHeatingCoefAppliesOnColdStart(t *testing.T) {
 	}
 }
 
-func TestProfileSwitchTrainsOnlyActiveProfile(t *testing.T) {
-	tel := telemetry.NewStore()
-	tel.Update("site", telemetry.DerMeter, 1000, nil, nil)
-	tel.RecordDriverSuccess("site")
-
-	s := NewService(nil, tel, "site", 4000, 17250)
-	now := time.Now()
-	s.sampleAt(now)
-
-	if err := s.SetProfile(ProfileAway); err != nil {
-		t.Fatalf("set profile: %v", err)
-	}
-	tel.Update("site", telemetry.DerMeter, 200, nil, nil)
-	tel.RecordDriverSuccess("site")
-	s.sampleAt(time.Now())
-
-	snap := s.Snapshot()
-	if snap.ActiveProfile != ProfileAway {
-		t.Fatalf("active profile = %q, want %q", snap.ActiveProfile, ProfileAway)
-	}
-	if got := snap.Profiles[ProfileHome].Samples; got != 1 {
-		t.Fatalf("home samples = %d, want 1", got)
-	}
-	if got := snap.Profiles[ProfileAway].Samples; got != 1 {
-		t.Fatalf("away samples = %d, want 1", got)
-	}
-}
-
 func TestProfileAndModelsPersist(t *testing.T) {
 	st, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
@@ -108,37 +80,5 @@ func TestProfileAndModelsPersist(t *testing.T) {
 	}
 	if got := restored.Model().Samples; got != 8 {
 		t.Fatalf("restored away samples = %d, want 8", got)
-	}
-}
-
-func TestSampleRequiresOnlineSiteMeter(t *testing.T) {
-	tel := telemetry.NewStore()
-	tel.Update("site", telemetry.DerMeter, 1000, nil, nil)
-
-	s := NewService(nil, tel, "site", 4000, 17250)
-	s.sampleAt(time.Date(2026, 1, 5, 12, 0, 0, 0, time.UTC))
-
-	if got := s.Model().Samples; got != 0 {
-		t.Fatalf("samples = %d, want 0 when site meter has no online health", got)
-	}
-}
-
-func TestSampleRejectsMissingDERs(t *testing.T) {
-	tel := telemetry.NewStore()
-	tel.Update("site", telemetry.DerMeter, 4000, nil, nil)
-	tel.RecordDriverSuccess("site")
-	tel.Update("battery", telemetry.DerBattery, 3000, nil, nil)
-	tel.DriverHealthMut("battery").SetOffline()
-	s := NewService(nil, tel, "site", 4000, 11000)
-	s.sampleAt(time.Now())
-	if s.Model().Samples != 0 {
-		t.Fatal("missing battery trained 4kW as house load")
-	}
-	tel.RecordDriverSuccess("battery")
-	tel.SetDriverCommandFault("battery", true, "refused")
-	s.sampleAt(time.Now())
-	m := s.Model()
-	if m.Samples != 1 || m.Bucket[m.hourOfWeek(time.Now())].Mean != 1000 {
-		t.Fatalf("fresh command fault dropped real battery flow: %+v", m)
 	}
 }

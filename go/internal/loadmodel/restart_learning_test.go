@@ -1,7 +1,6 @@
 package loadmodel
 
 import (
-	"encoding/json"
 	"testing"
 	"time"
 
@@ -48,87 +47,6 @@ func TestRestartLearningClearsEveryLoadProfileAndRestoresConfiguredPrior(t *test
 		if got.LearningStartedMS != cutoff.UnixMilli() {
 			t.Fatalf("%s cutoff = %d", profile, got.LearningStartedMS)
 		}
-	}
-}
-
-func TestRestartLearningRejectsLoadSampleCapturedBeforeCutoff(t *testing.T) {
-	tel := telemetry.NewStore()
-	tel.Update("site", telemetry.DerMeter, 1000, nil, nil)
-	tel.RecordDriverSuccess("site")
-	s := NewService(nil, tel, "site", 4000, 0)
-	cutoff := time.Now().Add(time.Millisecond)
-	if err := s.RestartLearning(cutoff); err != nil {
-		t.Fatal(err)
-	}
-
-	s.sampleAt(cutoff.Add(10 * time.Millisecond))
-
-	if got := s.Model().Samples; got != 0 {
-		t.Fatalf("pre-cutoff telemetry trained load model: %d samples", got)
-	}
-}
-
-func TestRestartLearningRejectsMixedLoadBalanceWithOldInput(t *testing.T) {
-	tel := telemetry.NewStore()
-	now := time.Now()
-	cutoff := now.Add(-time.Second)
-	powerData := func(watts float64, measured time.Time) []byte {
-		data, err := json.Marshal(map[string]telemetry.ForecastPowerSample{
-			"forecast_power": {
-				Version:      1,
-				Known:        true,
-				Watts:        watts,
-				MeasuredAtMS: measured.UnixMilli(),
-				ReceivedAtMS: now.UnixMilli(),
-			},
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return data
-	}
-	tel.Update("site", telemetry.DerMeter, 1000, nil, powerData(1000, cutoff.Add(-time.Second)))
-	tel.RecordDriverSuccess("site")
-	tel.Update("battery", telemetry.DerBattery, 500, nil, powerData(500, cutoff.Add(time.Second)))
-	tel.RecordDriverSuccess("battery")
-	s := NewService(nil, tel, "site", 4000, 0)
-	if err := s.RestartLearning(cutoff); err != nil {
-		t.Fatal(err)
-	}
-
-	s.sampleAt(now.Add(time.Second))
-
-	if got := s.Model().Samples; got != 0 {
-		t.Fatalf("balance with pre-cutoff meter trained load model: %d samples", got)
-	}
-}
-
-func TestRestartLearningInvalidatesLoadSampleInFlight(t *testing.T) {
-	tel := telemetry.NewStore()
-	tel.Update("site", telemetry.DerMeter, 1000, nil, nil)
-	tel.RecordDriverSuccess("site")
-	s := NewService(nil, tel, "site", 4000, 0)
-	entered := make(chan struct{})
-	release := make(chan struct{})
-	s.Temp = func(time.Time) (float64, bool) {
-		close(entered)
-		<-release
-		return 5, true
-	}
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		s.sampleAt(time.Now())
-	}()
-	<-entered
-	if err := s.RestartLearning(time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	close(release)
-	<-done
-
-	if got := s.Model().Samples; got != 0 {
-		t.Fatalf("in-flight sample survived restart: %d", got)
 	}
 }
 

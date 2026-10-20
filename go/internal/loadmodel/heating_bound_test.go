@@ -15,7 +15,7 @@ import (
 
 // feed trains m once per service interval in [from, to).
 func feed(m *Model, from, to time.Time, sample func(time.Time) (loadW, tempC float64)) {
-	for at := from; at.Before(to); at = at.Add(defaultSampleInterval) {
+	for at := from; at.Before(to); at = at.Add(TrainingInterval) {
 		loadW, tempC := sample(at)
 		m.Update(at, loadW, tempC)
 	}
@@ -43,7 +43,7 @@ func TestHeatingBoundLowersAnOverstatedPrior(t *testing.T) {
 	}
 
 	var steps []string
-	for at := monday; !at.After(saturday); at = at.Add(defaultSampleInterval) {
+	for at := monday; !at.After(saturday); at = at.Add(TrainingInterval) {
 		before := m.HeatingW_per_degC
 		m.Update(at, houseW, outdoorC)
 		if m.HeatingW_per_degC != before {
@@ -77,7 +77,7 @@ func TestHeatingBoundKeepsRealHeating(t *testing.T) {
 		m := NewModel(8000)
 		m.HeatingW_per_degC = coef
 		lowest := coef
-		for at := start; !at.After(end); at = at.Add(defaultSampleInterval) {
+		for at := start; !at.After(end); at = at.Add(TrainingInterval) {
 			loadW, tempC := house(at)
 			m.Update(at, loadW, tempC)
 			lowest = math.Min(lowest, m.HeatingW_per_degC)
@@ -117,7 +117,7 @@ func TestHeatingBoundIgnoresMildDays(t *testing.T) {
 	m := NewModel(5520)
 	m.HeatingW_per_degC = 300
 	start := time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)
-	feed(m, start, start.AddDate(0, 0, 3).Add(defaultSampleInterval), func(at time.Time) (float64, float64) {
+	feed(m, start, start.AddDate(0, 0, 3).Add(TrainingInterval), func(at time.Time) (float64, float64) {
 		return 400, 15 + float64(at.Hour())/2 // 15 °C to 26.5 °C
 	})
 	if m.HeatingW_per_degC != 300 {
@@ -140,7 +140,7 @@ func TestHeatingBoundNeedsSixColdHours(t *testing.T) {
 	sample := func(at time.Time) (float64, float64) {
 		sinceMidnight := at.Sub(time.Date(at.Year(), at.Month(), at.Day(), 0, 0, 0, 0, time.UTC))
 		switch {
-		case at.Weekday() == time.Monday && sinceMidnight < 6*time.Hour-defaultSampleInterval:
+		case at.Weekday() == time.Monday && sinceMidnight < 6*time.Hour-TrainingInterval:
 			return 400, 10
 		case at.Weekday() != time.Monday && sinceMidnight < 6*time.Hour:
 			return 800, 10
@@ -150,12 +150,12 @@ func TestHeatingBoundNeedsSixColdHours(t *testing.T) {
 
 	// The first sample of a day closes the day before. Had Monday counted,
 	// Thursday's first sample would close a third cold day.
-	feed(m, monday, thursday.Add(defaultSampleInterval), sample)
+	feed(m, monday, thursday.Add(TrainingInterval), sample)
 	if m.HeatingW_per_degC != 300 || m.HeatingBoundRecentN != 2 {
 		t.Fatalf("%d cold samples counted as a day: coefficient %.2f, %d days",
-			heatingBoundMinSamples-1, m.HeatingW_per_degC, m.HeatingBoundRecentN)
+			heatingBoundMinSamples-heatingBoundSampleWeight, m.HeatingW_per_degC, m.HeatingBoundRecentN)
 	}
-	feed(m, thursday.Add(defaultSampleInterval), friday.Add(defaultSampleInterval), sample)
+	feed(m, thursday.Add(TrainingInterval), friday.Add(TrainingInterval), sample)
 	// Each bound is 800 W / 8 °C = 100 W/°C.
 	if m.HeatingW_per_degC != 200 {
 		t.Fatalf("three days of %d cold samples left the coefficient at %.2f, want 200", heatingBoundMinSamples, m.HeatingW_per_degC)
@@ -177,8 +177,9 @@ func TestHeatingBoundSumsSurviveRestart(t *testing.T) {
 
 	got := NewService(st, telemetry.NewStore(), "site", 4000, 0).Model()
 
-	if got.HeatingBoundDay != "2026-01-07" || got.HeatingBoundSamples != 420 ||
-		got.HeatingBoundLoadSumW != 420*400 || got.HeatingBoundDeltaSumC != 420*8 ||
+	n := int64(7 * time.Hour / time.Minute)
+	if got.HeatingBoundDay != "2026-01-07" || got.HeatingBoundSamples != n ||
+		got.HeatingBoundLoadSumW != float64(n)*400 || got.HeatingBoundDeltaSumC != float64(n)*8 ||
 		got.HeatingBoundRecentN != 2 || got.HeatingBoundRecent != [heatingBoundDays]float64{0, 50, 50} {
 		t.Fatalf("day sums after restart: day %q, %d samples, %.0f W, %.0f °C, bounds %v (%d)",
 			got.HeatingBoundDay, got.HeatingBoundSamples, got.HeatingBoundLoadSumW, got.HeatingBoundDeltaSumC,

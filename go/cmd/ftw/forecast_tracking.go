@@ -71,9 +71,10 @@ type forecastTracker struct {
 	mu                   sync.RWMutex
 	errors               []forecasting.ErrorSample
 	observations         []forecasting.Observation
-	accumulator          telemetry.ForecastAccumulator
 	lastRevision         string
 	pvAccumulator        telemetry.ForecastAccumulator
+	pendingPV            map[int64]forecasting.Observation // PV quarters waiting for their household decision
+	loadNextMS           int64                             // first quarter whose household load is undecided
 	stopped              bool
 	clock                func() time.Time
 	learningMu           sync.RWMutex
@@ -249,8 +250,8 @@ func (f *forecastTracker) observe(ctx context.Context) {
 		if f.configMu != nil {
 			f.configMu.RUnlock()
 		}
-		f.accumulator = telemetry.ForecastAccumulator{}
 		f.pvAccumulator = telemetry.ForecastAccumulator{}
+		f.pendingPV, f.loadNextMS = nil, 0
 		f.lastRevision = ""
 		return
 	}
@@ -271,7 +272,7 @@ func (f *forecastTracker) observe(ctx context.Context) {
 	f.observationPVValid, f.observationLoadValid = r.PVValid, r.Valid
 	f.mu.Unlock()
 	var jobs []forecastObservationJob
-	for _, o := range f.observationIntervals(r, site, now) {
+	for _, o := range f.observationIntervals(ctx, r, site, now) {
 		job := forecastObservationJob{observation: o, site: site, away: f.away != nil && f.away(time.UnixMilli(o.StartMS))}
 		rows, _ := f.store.LoadForecasts(o.StartMS-time.Hour.Milliseconds(), o.EndMS)
 		if weather := forecastRow(usableTrackingWeather(rows, o.AvailableAtMS), o.StartMS, o.AvailableAtMS); weather != nil && weather.FetchedAtMs >= site.WeatherSinceMS {
@@ -286,34 +287,64 @@ func (f *forecastTracker) observe(ctx context.Context) {
 	f.acceptObservations(flushCtx, jobs, f.flushObservations)
 }
 
+// maxHouseholdDecisionWait bounds how long a PV quarter waits for history to
+// close the same quarter. Past it, PV goes alone and that load is given up.
+const maxHouseholdDecisionWait = 2 * time.Minute
+
 // observationIntervals keeps the two measurement claims independent. Unknown
 // battery power invalidates household load, but cannot erase valid PV evidence.
-func (f *forecastTracker) observationIntervals(r telemetry.ForecastReading, site forecastSite, now time.Time) []forecasting.Observation {
-	if site.Revision != f.lastRevision {
-		f.accumulator = telemetry.ForecastAccumulator{}
+// Household load comes from closed history intervals, the evidence behind
+// daily Home use. Observations are immutable, so PV waits until history has
+// decided its quarter and each quarter is emitted once.
+func (f *forecastTracker) observationIntervals(ctx context.Context, r telemetry.ForecastReading, site forecastSite, now time.Time) []forecasting.Observation {
+	const quarter = int64(15 * time.Minute / time.Millisecond)
+	nowMS := now.UnixMilli()
+	if site.Revision != f.lastRevision || f.loadNextMS == 0 {
+		// Start at the next whole quarter: one observed under an earlier
+		// revision, or before this process, never becomes a label.
 		f.pvAccumulator = telemetry.ForecastAccumulator{}
+		f.pendingPV = map[int64]forecasting.Observation{}
+		f.loadNextMS = (nowMS + quarter - 1) / quarter * quarter
 		f.lastRevision = site.Revision
-	}
-	byStart := map[int64]forecasting.Observation{}
-	for _, v := range f.accumulator.Observe(r) {
-		byStart[v.Start.UnixMilli()] = forecasting.Observation{StartMS: v.Start.UnixMilli(), EndMS: v.End.UnixMilli(), AvailableAtMS: now.UnixMilli(), LoadW: v.HouseholdW, LoadKnown: true, Quality: v.Quality, ConfigVersion: site.Revision}
 	}
 	pv := r
 	pv.Valid = r.PVValid
 	pv.HouseholdW = 0
 	pv.Latest = r.PVLatest
 	for _, v := range f.pvAccumulator.Observe(pv) {
-		key := v.Start.UnixMilli()
-		o, ok := byStart[key]
-		if !ok {
-			o = forecasting.Observation{StartMS: key, EndMS: v.End.UnixMilli(), AvailableAtMS: now.UnixMilli(), Quality: "complete_pv_v1", ConfigVersion: site.Revision}
+		if v.End.UnixMilli() <= f.loadNextMS {
+			continue // its quarter is decided and may already be archived
 		}
-		o.PVW = math.Max(0, -v.PVW)
-		o.PVKnown = v.PVValid
+		key := v.Start.UnixMilli()
+		f.pendingPV[key] = forecasting.Observation{StartMS: key, EndMS: v.End.UnixMilli(), Quality: "complete_pv_v1", ConfigVersion: site.Revision, PVW: math.Max(0, -v.PVW), PVKnown: v.PVValid}
+	}
+	byStart := map[int64]forecasting.Observation{}
+	if f.store != nil {
+		loads, closed, err := f.store.HouseholdIntervals(ctx, f.loadNextMS, nowMS, quarter)
+		if err != nil {
+			slog.Warn("forecast: household intervals unavailable", "err", err)
+		}
+		for _, v := range loads {
+			byStart[v.StartMS] = forecasting.Observation{StartMS: v.StartMS, EndMS: v.EndMS, LoadW: v.LoadW, LoadKnown: true, Quality: state.HouseholdIntervalQuality, ConfigVersion: site.Revision}
+		}
+		f.loadNextMS = max(f.loadNextMS, closed)
+	}
+	for key, o := range f.pendingPV {
+		if o.EndMS > f.loadNextMS && f.store != nil && nowMS-o.EndMS < maxHouseholdDecisionWait.Milliseconds() {
+			continue
+		}
+		// A released quarter is decided: history cannot add its load later.
+		f.loadNextMS = max(f.loadNextMS, o.EndMS)
+		if load, ok := byStart[key]; ok {
+			load.PVW, load.PVKnown = o.PVW, o.PVKnown
+			o = load
+		}
 		byStart[key] = o
+		delete(f.pendingPV, key)
 	}
 	out := make([]forecasting.Observation, 0, len(byStart))
 	for _, o := range byStart {
+		o.AvailableAtMS = nowMS
 		out = append(out, o)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].StartMS < out[j].StartMS })

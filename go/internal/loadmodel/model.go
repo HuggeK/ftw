@@ -31,9 +31,11 @@ const heatingBoundStep = 0.5
 // heating off must not pull a correct coefficient down.
 const heatingBoundDays = 3
 
-// heatingBoundMinSamples is six hours of cold samples at the service's rate.
-// A day with less cold data does not bound the coefficient.
-const heatingBoundMinSamples = int64(6 * time.Hour / defaultSampleInterval)
+// Cold-day totals keep the old minute sampler's units on disk. A new quarter
+// contributes fifteen minutes, so restored partial days retain their meaning.
+// A day with less than six cold hours does not bound the coefficient.
+const heatingBoundMinSamples = int64(6 * time.Hour / time.Minute)
+const heatingBoundSampleWeight = int64(TrainingInterval / time.Minute)
 
 const PlausibleLoadHeadroom = 1.25
 
@@ -89,9 +91,9 @@ type Model struct {
 	// MaxPlausibleW remains for stored-state/API compatibility. Grid limits do not cap gross household load.
 	MaxPlausibleW float64 `json:"max_plausible_w,omitempty"`
 
-	// Sums over the cold samples of the current local day, and the bounds
-	// of the last cold days, newest last. They cap the heating coefficient;
-	// see closeHeatingBoundDay.
+	// Cold-minute sums for the current local day, and the bounds of the last
+	// cold days, newest last. Keep minute units for stored-state compatibility.
+	// They cap the heating coefficient; see closeHeatingBoundDay.
 	HeatingBoundDay       string                    `json:"heating_bound_day,omitempty"`
 	HeatingBoundLoadSumW  float64                   `json:"heating_bound_load_sum_w,omitempty"`
 	HeatingBoundDeltaSumC float64                   `json:"heating_bound_delta_sum_c,omitempty"`
@@ -271,9 +273,9 @@ func (m *Model) Update(t time.Time, actualLoadW, tempC float64) (updated bool) {
 
 	cold := knownTemp && tempC < HeatingReferenceC-HeatingMinDeltaT
 	if cold {
-		m.HeatingBoundLoadSumW += actualLoadW
-		m.HeatingBoundDeltaSumC += HeatingReferenceC - tempC
-		m.HeatingBoundSamples++
+		m.HeatingBoundLoadSumW += actualLoadW * float64(heatingBoundSampleWeight)
+		m.HeatingBoundDeltaSumC += (HeatingReferenceC - tempC) * float64(heatingBoundSampleWeight)
+		m.HeatingBoundSamples += heatingBoundSampleWeight
 	}
 	if cold && b.Days >= MinTrustSamples {
 		deltaT := HeatingReferenceC - tempC
