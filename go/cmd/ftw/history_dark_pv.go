@@ -58,6 +58,33 @@ func darkPV(p *state.HistorySources, sun historySun) bool {
 	return true
 }
 
+// optionalPVUnread marks a snapshot as an estimate while an optional PV
+// source has no live reading. History leaves that flow out of Home use, but
+// unseen PV would make a training label under-count the house. Past civil
+// dusk the PV is 0 W by physics, so the night stays measured.
+func optionalPVUnread(p *state.HistorySources, tel *telemetry.Store, flows []telemetry.ForecastFlow, sun historySun) bool {
+	if p == nil || tel == nil {
+		return false
+	}
+	unread := false
+	for _, f := range flows {
+		if f.DerType != telemetry.DerPV {
+			continue
+		}
+		if h := tel.DriverHealth(f.Driver); tel.Get(f.Driver, telemetry.DerPV) == nil || h == nil || !h.TelemetryLive() {
+			unread = true
+		}
+	}
+	if !unread {
+		return false
+	}
+	if z, placed := sun.zenith(p.AtMS); placed && z > civilDuskZenithDeg {
+		return false
+	}
+	p.Missing |= state.EstimatedLoad
+	return true
+}
+
 // historyDevices names the hardware behind a history snapshot, as the
 // topology's devices line. The watchdog drops an offline driver from the
 // energy record. After sunset a silent inverter is asleep, not replaced, so it

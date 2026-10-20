@@ -26,7 +26,9 @@ func historyMeasurementOptions(cfg *config.Config, catalog []drivers.CatalogEntr
 	opts, _, optional := forecastMeasurementTopology(cfg, catalog)
 	flows := opts.ExpectedFlows[:0:0]
 	for _, flow := range opts.ExpectedFlows {
-		if !optional[flow] {
+		if optional[flow] {
+			opts.OptionalFlows = append(opts.OptionalFlows, flow)
+		} else {
 			flows = append(flows, flow)
 		}
 	}

@@ -4008,6 +4008,7 @@ func persistTelemetryTick(st *state.Store, tel *telemetry.Store, ctrl tickPersis
 	}
 	hp, historyAvailable := buildHistoryPoint(tel, ctrl, nowMs, historyMaxAge, options)
 	dark := darkPV(hp.Sources, sun)
+	optionalPVUnread(hp.Sources, tel, options.OptionalFlows, sun)
 	if hp.Sources != nil {
 		// Live Load is not an energy observation. The source interval writer
 		// owns historical Load; the chart placeholder stays explicitly unknown.

@@ -35,9 +35,13 @@ type ForecastOptions struct {
 	HouseholdInvalidReason string
 	PVInvalidReason        string
 	ExpectedFlows          []ForecastFlow
-	MaxAge                 time.Duration
-	MaxSkew                time.Duration
-	UseWatchdogTimeout     bool `json:",omitempty"`
+	// OptionalFlows are flows History does not require but a training label
+	// does, such as PV on a hybrid inverter that may have no panels. Omitted
+	// when empty, so forecast revisions keep their stored identity.
+	OptionalFlows      []ForecastFlow `json:",omitempty"`
+	MaxAge             time.Duration
+	MaxSkew            time.Duration
+	UseWatchdogTimeout bool `json:",omitempty"`
 	// Live display may use the driver's measured site-side control power
 	// (for example Pixii AC instead of battery DC). Raw history stays separate.
 	UseControlPower bool `json:",omitempty"`
