@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { flowReadingsFromStatus, fmtKwhShort, homeEstimateNote } from "./components/energy-flow-readings.js";
+import { flowReadingsFromStatus, fmtKwhShort } from "./components/energy-flow-readings.js";
 
-it("shows current household power and keeps the energy mean with its own period and age", () => {
+it("shows current household power without a note about the past energy mean", () => {
   const estimate = {watts: 886, from_ms: Date.UTC(2026,9,18,10), to_ms: Date.UTC(2026,9,18,10,1), age_ms: 90000, end_age_ms:60000, energy_basis:'mixed', timing_basis: 'mixed'};
   const status = {load_w: 1800, load_estimate: estimate, energy:{today:{load_wh:2000,import_wh:500,history_quality:'estimated'}}};
   const result = flowReadingsFromStatus(status);
@@ -11,18 +11,7 @@ it("shows current household power and keeps the energy mean with its own period 
   assert.equal(result.loadEstimated, true);
   assert.equal(status.load_w, 1800);
   assert.equal(result.selfPoweredPctToday, null);
-  assert.match(result.homeEstimateNote, /Estimated home use 1.8 kW/);
-  assert.match(result.homeEstimateNote, /Energy mean 0.9 kW/);
-  assert.match(result.homeEstimateNote, /60 s window/);
-  assert.match(result.homeEstimateNote, /\d{2}:00:00.+\d{2}:01:00/);
-  assert.match(result.homeEstimateNote, /ended 60 s ago/);
-  assert.match(result.homeEstimateNote, /charger energy \+ sampled power/);
-  assert.match(result.homeEstimateNote, /Includes arrival times/);
-  assert.match(homeEstimateNote(estimate, false), /paused/);
-  assert.match(homeEstimateNote({...estimate, end_age_ms: 181000}), /too old/);
-  assert.match(homeEstimateNote({...estimate, from_ms:estimate.to_ms-300000,age_ms:210000}), /300 s window/);
-  assert.match(homeEstimateNote({watts:null,reason:'charger_source_time_unavailable'}), /source time unknown/);
-  assert.match(homeEstimateNote({watts: null}), /unavailable/);
+  assert.equal("homeEstimateNote" in result, false);
   assert.equal(flowReadingsFromStatus({...status,load_estimate:{watts:null}}).load, 1.8);
   assert.equal(flowReadingsFromStatus({...status,load_estimate:{...estimate,end_age_ms:181000}}).load, 1.8);
   assert.equal(flowReadingsFromStatus({...status,load_w:null}).load, null);
@@ -32,13 +21,8 @@ it("never lets a past zero mean overwrite a positive current Load", () => {
   const status={load_w:1234,history_quality:"complete",load_estimate:{watts:0,from_ms:1000,to_ms:11000,end_age_ms:60000}};
   const result=flowReadingsFromStatus(status);
   assert.equal(result.load,1.234);
-  assert.match(result.homeEstimateNote,/Estimated home use 1.2 kW/);
-  assert.match(result.homeEstimateNote,/Energy mean 0.0 kW/);
-  assert.match(result.homeEstimateNote,/ended 60 s ago/);
   const missing=flowReadingsFromStatus({...status,load_w:null,history_quality:"incomplete"});
   assert.equal(missing.load,null);
-  assert.match(missing.homeEstimateNote,/no current power balance/);
-  assert.match(missing.homeEstimateNote,/Energy mean 0.0 kW/);
 });
 
 it("keeps a qualified power balance visible while the energy interval is unavailable", () => {
@@ -47,10 +31,6 @@ it("keeps a qualified power balance visible while the energy interval is unavail
     const result = flowReadingsFromStatus(status);
     assert.equal(result.load, 1.234);
     assert.equal(result.loadEstimated, true);
-    assert.match(result.homeEstimateNote, /latest power readings/);
-    assert.match(result.homeEstimateNote, /device delays may differ/);
-    assert.doesNotMatch(result.homeEstimateNote, /\d+ s mean|unavailable|ended now/);
-    assert.match(flowReadingsFromStatus(status,{live:false}).homeEstimateNote, /paused/);
     assert.equal(status.load_estimate.watts, null);
   }
 });
@@ -61,7 +41,6 @@ it("distinguishes a real zero balance from missing, invalid or stale inputs", ()
   for (const value of [undefined, null, "0", NaN, Infinity, -1]) {
     const result = flowReadingsFromStatus({...base,load_w:value});
     assert.equal(result.load,null);
-    assert.match(result.homeEstimateNote,/unavailable/);
   }
 });
 

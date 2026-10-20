@@ -565,15 +565,6 @@
     }
     var opts = energyFlowOpts(data); opts.live = lastFlowLive;
     lastFlowReadings = window.ftwFlowReadingsFromStatus(data, opts);
-    var homeNote = document.getElementById("home-use-estimate");
-    if (!homeNote) {
-      homeNote = document.createElement("p");
-      homeNote.id = "home-use-estimate";
-      homeNote.className = "muted";
-      flowEl.insertAdjacentElement("afterend", homeNote);
-    }
-    homeNote.textContent = lastFlowReadings.homeEstimateNote || "";
-    homeNote.hidden = !homeNote.textContent;
     (lastFlowReadings.planets || []).forEach(function (p) {
       if (p.role !== "ev" || p.placeholder || !p.name) return;
       var lpEv = loadpointsByDriver && loadpointsByDriver[p.name];
