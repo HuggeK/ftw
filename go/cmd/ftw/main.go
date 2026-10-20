@@ -4161,8 +4161,9 @@ func historySources(reading telemetry.ForecastReading) *state.HistorySources {
 		}
 	}
 	// A negative instantaneous residual does not invalidate its independent
-	// sources. Missing configuration and duplicate electrical flows do.
-	if reading.Reason != "" && reading.Reason != "invalid_balance" {
+	// sources. Missing configuration and duplicate electrical flows do. A
+	// failed source is unknown on its own flag, so history may hold it.
+	if reading.Reason != "" && reading.Reason != "invalid_balance" && !telemetry.SourceFailure(reading.Reason) {
 		p.Missing |= state.MissingLoad
 	}
 	for flag, w := range map[state.HistoryMissing]*float64{state.MissingGrid: &p.GridW, state.MissingPV: &p.PVW, state.MissingBattery: &p.BatteryW, state.MissingEV: &p.EVW, state.MissingV2X: &p.V2XW} {

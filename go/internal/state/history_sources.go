@@ -29,20 +29,37 @@ const sourceCursorSchema = `CREATE TABLE IF NOT EXISTS history_source_cursor(key
 const sourceEnergyTable = "history_source_energy"
 const maxSourceEnergyWidth int64 = 900000
 
+// maxSourceBridgeMS bounds how long the site meter's last value, or a
+// snapshot across a writer pause or process restart, may stand in for
+// missing evidence. It shares the history estimate budget of a recovered
+// balance episode. A longer gap stays uncovered.
+const maxSourceBridgeMS = maxLoadEstimateEpisodeMS
+
+// sourceReceipt is one snapshot. Stopped marks the first one after a
+// process stop.
+type sourceReceipt struct {
+	HistorySources
+	Stopped bool `json:",omitempty"`
+}
+
+type sourceCursor struct {
+	At      int64
+	Start   int64
+	Sources HistorySources
+	// Held is each source's last known value. Its Missing names the sources
+	// not yet known since the cursor began. GridAt is when the site meter
+	// was last known.
+	Held   *HistorySources `json:",omitempty"`
+	GridAt int64           `json:",omitempty"`
+}
+
+// sourceFlows pairs each source's flag with its value.
+func sourceFlows(v *HistorySources) map[HistoryMissing]*float64 {
+	return map[HistoryMissing]*float64{MissingGrid: &v.GridW, MissingPV: &v.PVW, MissingBattery: &v.BatteryW, MissingEV: &v.EVW, MissingV2X: &v.V2XW}
+}
+
 func (s *Store) recordSourceEnergyTx(ctx context.Context, tx *sql.Tx, p *HistoryPoint) error {
-	if p == nil || p.Sources == nil {
-		_, err := tx.ExecContext(ctx, `DELETE FROM history_source_cursor WHERE key='last'`)
-		return err
-	}
-	at := p.Sources.AtMS
-	if at <= 0 {
-		return errors.New("history source snapshot has no observation time")
-	}
-	var last struct {
-		At      int64
-		Start   int64
-		Sources HistorySources
-	}
+	var last sourceCursor
 	var raw string
 	err := tx.QueryRowContext(ctx, `SELECT value FROM history_source_cursor WHERE key='last'`).Scan(&raw)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -53,14 +70,23 @@ func (s *Store) recordSourceEnergyTx(ctx context.Context, tx *sql.Tx, p *History
 			return err
 		}
 	}
+	if p == nil || p.Sources == nil {
+		_, err := tx.ExecContext(ctx, `DELETE FROM history_source_cursor WHERE key IN ('last','stopped')`)
+		return err
+	}
+	at := p.Sources.AtMS
+	if at <= 0 {
+		return errors.New("history source snapshot has no observation time")
+	}
 	var through int64
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM history_source_cursor WHERE key='through'),0)`).Scan(&through); err != nil {
 		return err
 	}
 	if at <= through {
-		if at < through {
-			_, err = tx.ExecContext(ctx, `DELETE FROM history_source_cursor WHERE key='last'`)
+		if at == through {
+			return nil
 		}
+		_, err := tx.ExecContext(ctx, `DELETE FROM history_source_cursor WHERE key IN ('last','stopped')`)
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO history_source_cursor VALUES('from',?)`, at); err != nil {
@@ -72,49 +98,44 @@ func (s *Store) recordSourceEnergyTx(ctx context.Context, tx *sql.Tx, p *History
 			return err
 		}
 	}
-	if last.At == 0 {
+	cur := sourceReceipt{HistorySources: *p.Sources}
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM history_source_cursor WHERE key='stopped')`).Scan(&cur.Stopped); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM history_source_cursor WHERE key='stopped'`); err != nil {
+		return err
+	}
+	switch {
+	case last.At == 0:
 		last.Start = at
+	case at-last.At > maxSourceBridgeMS:
+		// The gap stays uncovered. A long stop starts a new period, as an
+		// older writer may have run.
+		if cur.Stopped {
+			last.Start = at
+		}
+	default:
+		if err := holdSourceIntervalTx(ctx, tx, last, cur); err != nil {
+			return err
+		}
+	}
+	if last.Held == nil {
+		last.Held = &HistorySources{Missing: MissingPower &^ MissingLoad}
+	}
+	known := sourceFlows(last.Held)
+	for flag, w := range sourceFlows(&cur.HistorySources) {
+		if cur.Missing&flag == 0 {
+			*known[flag] = *w
+			last.Held.Missing &^= flag
+		}
+	}
+	if cur.Missing&MissingGrid == 0 {
+		last.GridAt = at
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO history_source_periods VALUES(?,?) ON CONFLICT(start_ms) DO UPDATE SET last_ms=excluded.last_ms`, last.Start, at); err != nil {
 		return err
 	}
-	// Hold the previous receipt forward, bounded by the next safe tick. Do
-	// not assign a newly arrived charger value to time before its receipt.
-	if last.At > 0 && at-last.At <= maxLoadEstimateTickMS && last.Sources.Topology == p.Sources.Topology {
-		// A delayed writer may finish a just-closed local day. Invalidate only
-		// the nearby cached dates; source rows and old history stay intact.
-		low := time.UnixMilli(last.At).UTC().AddDate(0, 0, -1).Format("2006-01-02")
-		high := time.UnixMilli(at).UTC().AddDate(0, 0, 1).Format("2006-01-02")
-		for _, table := range []string{"energy_daily", "energy_daily_partial", "history_daily_quality"} {
-			if _, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE day>=? AND day<=?`, low, high); err != nil {
-				return err
-			}
-		}
-		v := last.Sources
-		missing := (v.Missing | p.Sources.Missing) & MissingPower
-		if missing != 0 {
-			missing |= MissingLoad
-		}
-		for from := last.At; from < at; {
-			start := bucketStart(from, ArchiveResolutionMS)
-			to := min(at, start+ArchiveResolutionMS)
-			ms := to - from
-			h := float64(ms) / 3600000
-			if _, err := tx.ExecContext(ctx, `INSERT INTO history_source_energy VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
- ON CONFLICT(start_ms,resolution_ms) DO UPDATE SET first_ms=MIN(first_ms,excluded.first_ms),last_ms=MAX(last_ms,excluded.last_ms),covered_ms=covered_ms+excluded.covered_ms,n=n+excluded.n,
- import_wh=import_wh+excluded.import_wh,export_wh=export_wh+excluded.export_wh,pv_wh=pv_wh+excluded.pv_wh,bat_charge_wh=bat_charge_wh+excluded.bat_charge_wh,bat_discharge_wh=bat_discharge_wh+excluded.bat_discharge_wh,ev_wh=ev_wh+excluded.ev_wh,ev_charge_wh=ev_charge_wh+excluded.ev_charge_wh,ev_discharge_wh=ev_discharge_wh+excluded.ev_discharge_wh`,
-				start, ArchiveResolutionMS, from, to, ms, 1,
-				math.Max(0, v.GridW)*h, math.Max(0, -v.GridW)*h, -v.PVW*h,
-				math.Max(0, v.BatteryW)*h, math.Max(0, -v.BatteryW)*h, 0, (v.EVW+v.V2XW)*h, (math.Max(0, v.EVW)+math.Max(0, v.V2XW))*h, (math.Max(0, -v.EVW)+math.Max(0, -v.V2XW))*h); err != nil {
-				return err
-			}
-			if err := putHistoryQuality(ctx, tx, "source_energy", start, ArchiveResolutionMS, missing); err != nil {
-				return err
-			}
-			from = to
-		}
-	}
-	last.At, last.Sources = at, *p.Sources
+	last.At, last.Sources = at, cur.HistorySources
 	b, err := json.Marshal(last)
 	if err != nil {
 		return err
@@ -124,6 +145,76 @@ func (s *Store) recordSourceEnergyTx(ctx context.Context, tx *sql.Tx, p *History
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO history_source_cursor VALUES('through',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, at)
 	return err
+}
+
+// holdSourceIntervalTx holds the previous snapshot forward to this one. Do
+// not assign a newly arrived charger value to time before its receipt. A
+// source unknown in the snapshot keeps its last known value, the site meter
+// for at most the bridge budget. Only two fully measured snapshots a safe
+// tick apart, of one topology and one process, make a measured interval;
+// every other interval carries EstimatedLoad, which readers never clear.
+func holdSourceIntervalTx(ctx context.Context, tx *sql.Tx, last sourceCursor, cur sourceReceipt) error {
+	v := last.Sources
+	var missing, held HistoryMissing
+	flows := sourceFlows(&v)
+	for flag, w := range flows {
+		switch {
+		case v.Missing&flag == 0:
+		case last.Held == nil || last.Held.Missing&flag != 0 || flag == MissingGrid && cur.AtMS-last.GridAt > maxSourceBridgeMS:
+			missing, *w = missing|flag, 0
+		default:
+			*w = *sourceFlows(last.Held)[flag]
+			held |= flag
+		}
+	}
+	// A household never feeds the site. If a held value says it does, the
+	// source changed while unknown, such as a charger that finished.
+	if held != 0 && v.GridW-v.PVW-v.BatteryW-v.EVW-v.V2XW < 0 {
+		for flag, w := range flows {
+			if held&flag != 0 {
+				missing, *w = missing|flag, 0
+			}
+		}
+	}
+	// A snapshot with an invalid configuration has no household balance.
+	if missing != 0 || v.Missing&MissingLoad != 0 {
+		missing |= MissingLoad
+	}
+	if (v.Missing|cur.Missing)&(MissingPower|EstimatedLoad) != 0 || cur.Stopped || cur.AtMS-v.AtMS > maxLoadEstimateTickMS || v.Topology != cur.Topology {
+		missing |= EstimatedLoad
+	}
+	return writeSourceIntervalTx(ctx, tx, v.AtMS, cur.AtMS, v, missing)
+}
+
+func writeSourceIntervalTx(ctx context.Context, tx *sql.Tx, from, until int64, v HistorySources, missing HistoryMissing) error {
+	// A delayed writer may finish a just-closed local day. Invalidate only
+	// the nearby cached dates; source rows and old history stay intact.
+	low := time.UnixMilli(from).UTC().AddDate(0, 0, -1).Format("2006-01-02")
+	high := time.UnixMilli(until).UTC().AddDate(0, 0, 1).Format("2006-01-02")
+	for _, table := range []string{"energy_daily", "energy_daily_partial", "history_daily_quality"} {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE day>=? AND day<=?`, low, high); err != nil {
+			return err
+		}
+	}
+	for from < until {
+		start := bucketStart(from, ArchiveResolutionMS)
+		to := min(until, start+ArchiveResolutionMS)
+		ms := to - from
+		h := float64(ms) / 3600000
+		if _, err := tx.ExecContext(ctx, `INSERT INTO history_source_energy VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+ ON CONFLICT(start_ms,resolution_ms) DO UPDATE SET first_ms=MIN(first_ms,excluded.first_ms),last_ms=MAX(last_ms,excluded.last_ms),covered_ms=covered_ms+excluded.covered_ms,n=n+excluded.n,
+ import_wh=import_wh+excluded.import_wh,export_wh=export_wh+excluded.export_wh,pv_wh=pv_wh+excluded.pv_wh,bat_charge_wh=bat_charge_wh+excluded.bat_charge_wh,bat_discharge_wh=bat_discharge_wh+excluded.bat_discharge_wh,ev_wh=ev_wh+excluded.ev_wh,ev_charge_wh=ev_charge_wh+excluded.ev_charge_wh,ev_discharge_wh=ev_discharge_wh+excluded.ev_discharge_wh`,
+			start, ArchiveResolutionMS, from, to, ms, 1,
+			math.Max(0, v.GridW)*h, math.Max(0, -v.GridW)*h, -v.PVW*h,
+			math.Max(0, v.BatteryW)*h, math.Max(0, -v.BatteryW)*h, 0, (v.EVW+v.V2XW)*h, (math.Max(0, v.EVW)+math.Max(0, v.V2XW))*h, (math.Max(0, -v.EVW)+math.Max(0, -v.V2XW))*h); err != nil {
+			return err
+		}
+		if err := putHistoryQuality(ctx, tx, "source_energy", start, ArchiveResolutionMS, missing); err != nil {
+			return err
+		}
+		from = to
+	}
+	return nil
 }
 
 func (s *Store) sourceEnergyFrom(ctx context.Context) (int64, bool, error) {
@@ -146,11 +237,32 @@ func (s *Store) HistorySourceProgress(ctx context.Context) (int64, bool, error) 
 	return through, err == nil, err
 }
 
-func (s *Store) sourcePeriodCoverage(ctx context.Context, from, to int64) (int64, error) {
-	var ms int64
-	err := s.history.QueryRowContext(ctx, `SELECT COALESCE(SUM(MIN(last_ms,?)-MAX(start_ms,?)),0) FROM history_source_periods WHERE last_ms>? AND start_ms<?`, to, from, from, to).Scan(&ms)
-	return ms, err
+// sourceDayCoverageMigration recomputes closed source-era days once. They
+// were cached under the rule that any unknown interval voids the whole day.
+const sourceDayCoverageMigration = "source-day-coverage-v1"
+
+func (s *Store) refreshSourceDayCache(ctx context.Context) error {
+	tx, err := s.history.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var done bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM history_migrations WHERE name=?)`, sourceDayCoverageMigration).Scan(&done); err != nil || done {
+		return err
+	}
+	// Day keys are local dates; a day of margin covers any time zone.
+	for _, table := range []string{"energy_daily", "energy_daily_partial", "history_daily_quality"} {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE day>=(SELECT date(CAST(value AS INTEGER)/1000,'unixepoch','-1 day') FROM history_source_cursor WHERE key='from')`); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO history_migrations(name) VALUES(?)`, sourceDayCoverageMigration); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
+
 func (s *Store) sourcePeriods(ctx context.Context, from, to int64) ([][2]int64, error) {
 	rows, err := s.history.QueryContext(ctx, `SELECT start_ms,last_ms FROM history_source_periods WHERE start_ms<=? AND last_ms>=? ORDER BY start_ms`, to, from)
 	if err != nil {

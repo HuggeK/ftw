@@ -56,8 +56,16 @@ holds each qualified snapshot forward until the next safe snapshot, at most
 the sums when reading a chart interval, day or tariff period. A negative
 minute may contribute to a valid longer interval; it is never clipped first.
 Chart means need complete interval coverage. Missing sources, writer gaps,
-process stops and topology changes cannot become measured zero. This is an
-estimate from received measurements, not a correction of device clocks.
+process stops and topology changes cannot become measured zero.
+
+History has two layers. Display is forgiving: an unknown PV, battery or EV
+source holds its last known value, and the site meter, a writer pause or a
+Core restart holds for at most two minutes. Every such minute is marked
+`EstimatedLoad`, and readers never clear the mark. A day's flow is unknown only
+when it is unknown or unrecorded for more than a tenth of the range;
+unrecorded time counts as nothing. Training is strict: it uses only minutes
+without the mark. This is an estimate from received measurements, not a
+correction of device clocks.
 
 In self-consumption mode, the controller drives the site meter toward the
 grid target (normally 0 W): it charges from live surplus and may discharge

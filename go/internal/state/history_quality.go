@@ -70,4 +70,4 @@ func putHistoryQuality(ctx context.Context, tx *sql.Tx, kind string, start, widt
 
 // SQL has no bitwise-OR aggregate. MAX per bit preserves unknown evidence
 // across every source row, including mixed complete/incomplete buckets.
-const historyMissingAggregate = `MAX(missing&1)|MAX(missing&2)|MAX(missing&4)|MAX(missing&8)|MAX(missing&16)|MAX(missing&32)|MAX(missing&64)|MAX(missing&128)`
+const historyMissingAggregate = `MAX(missing&1)|MAX(missing&2)|MAX(missing&4)|MAX(missing&8)|MAX(missing&16)|MAX(missing&32)|MAX(missing&64)|MAX(missing&128)|MAX(missing&256)`

@@ -154,11 +154,15 @@ func (s *Store) openHistory() error {
 		}
 	}
 	// A process stop has no continuous sampling proof, even when it was brief.
-	// Keep completed energy and quality, but never bridge the stopped process.
+	// Keep completed energy and quality. Source history may bridge a brief
+	// stop only as a marked estimate; the older paths never bridge it.
 	if _, err := s.history.Exec(`DELETE FROM history_load_estimate_pending;
- DELETE FROM history_source_cursor WHERE key='last';
+ INSERT INTO history_source_cursor VALUES('stopped','1') ON CONFLICT(key) DO UPDATE SET value=excluded.value;
  UPDATE history_partial_cursor SET value=0 WHERE key IN ('last','residual_eligible');
  UPDATE history_site_cursor SET value=0 WHERE key='last'`); err != nil {
+		return err
+	}
+	if err := s.refreshSourceDayCache(context.Background()); err != nil {
 		return err
 	}
 	ok = true

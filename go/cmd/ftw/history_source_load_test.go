@@ -57,6 +57,48 @@ func TestHistoryLoadIndependentReportingCadence(t *testing.T) {
 	}
 }
 
+// A silent inverter is unknown on its own. Its balance with the meter is
+// held, not voided, so the household keeps its estimated energy.
+func TestHistoryHoldsASilentSourceThroughTheBalance(t *testing.T) {
+	st, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.EnableHistoryAggregation(); err != nil {
+		t.Fatal(err)
+	}
+	tel := telemetry.NewStore()
+	tel.Update("grid", telemetry.DerMeter, 1000, nil, nil)
+	tel.RecordDriverSuccess("grid")
+	tel.Update("sma", telemetry.DerPV, 0, nil, nil)
+	tel.RecordDriverSuccess("sma")
+	base := time.Now().Add(-20 * time.Minute).Truncate(5 * time.Minute).UnixMilli()
+	for i := int64(0); i <= 60; i++ {
+		if i == 6 {
+			tel.Get("sma", telemetry.DerPV).UpdatedAt = time.Now().Add(-10 * time.Minute)
+		}
+		p, _ := buildHistoryPoint(tel, tickPersistControl{SiteMeterDriver: "grid"}, base+i*10000, 90*time.Second)
+		if i >= 6 && p.Sources.Missing != state.MissingPV {
+			t.Fatalf("silent inverter marked %b, want only its own flow", p.Sources.Missing)
+		}
+		p.Sources.AtMS = base + i*10000
+		if err := st.RecordTickWithEnergy(p, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.FlushHistory(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	d, err := st.DailyEnergy(base, base+600000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Missing&state.MissingLoad != 0 || math.Abs(d.LoadWh-1000.0/6) > 0.001 {
+		t.Fatalf("household lost through a silent inverter: %v Wh, quality %s", d.LoadWh, d.Missing.Quality())
+	}
+}
+
 func TestHistorySourceQualificationDoesNotInventMissingFlows(t *testing.T) {
 	for _, tc := range []struct {
 		reason string
@@ -65,8 +107,11 @@ func TestHistorySourceQualificationDoesNotInventMissingFlows(t *testing.T) {
 		want   state.HistoryMissing
 	}{
 		{"missing_config", 0, true, state.MissingLoad},
+		{"duplicate_charger:easee", 0, true, state.MissingLoad},
 		{"invalid_balance", 1000, true, 0},
 		{"nonfinite_sum", math.Inf(1), false, state.MissingLoad | state.MissingEV},
+		{"stale:easee:ev", 0, false, state.MissingEV},
+		{"offline:easee:ev", 0, false, state.MissingEV},
 	} {
 		known := map[telemetry.DerType]bool{telemetry.DerMeter: true, telemetry.DerPV: true, telemetry.DerBattery: true, telemetry.DerEV: tc.known, telemetry.DerV2X: true}
 		p := historySources(telemetry.ForecastReading{At: time.Now(), Known: known, Reason: tc.reason, EVW: tc.watts})

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -94,6 +95,19 @@ func (s *Store) LiveMeasurementNow(siteMeter string, opts ForecastOptions) Forec
 		defer s.mu.RUnlock()
 	}
 	return s.measurementLocked(time.Now(), siteMeter, opts, false)
+}
+
+// SourceFailure reports whether a reading's Reason names one failed source.
+// That source is already unknown in Known; the balance of the others still
+// holds. Configuration and duplicate-flow reasons are not source failures.
+// Keep in step with the reasons measurementLocked gives.
+func SourceFailure(reason string) bool {
+	for _, prefix := range []string{"missing:", "offline:", "unknown_power:", "nonfinite:", "stale:", "future:", "invalid_sign:"} {
+		if strings.HasPrefix(reason, prefix) {
+			return true
+		}
+	}
+	return reason == "nonfinite_pv_sum"
 }
 
 func (s *Store) forecastMeasurementLocked(now time.Time, siteMeter string, opts ForecastOptions) ForecastReading {

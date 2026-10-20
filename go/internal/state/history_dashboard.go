@@ -273,18 +273,23 @@ func (s *Store) walkSiteEnergy(ctx context.Context, from, to int64, visit func(s
 	return rows.Err()
 }
 
+// maxSourceDayUnknownShare is the share of a source-era range a flow may be
+// unknown or unrecorded before its total is unknown. Below it the total is
+// an estimate of what was recorded; unrecorded time counts as nothing.
+const maxSourceDayUnknownShare = 10 // percent
+
 func (s *Store) aggregateDayEnergy(ctx context.Context, from, to int64) (DayEnergy, error) {
+	cut, hasSources, err := s.sourceEnergyFrom(ctx)
+	if err != nil {
+		return DayEnergy{}, err
+	}
 	var out DayEnergy
 	var originalLoad float64
 	var originalMissing HistoryMissing
 	var estimatedMS, coveredMS int64
-	var sourceMS int64
-	var first, last int64
-	err := s.walkSiteEnergy(ctx, from, to, func(r siteEnergyRow) error {
-		if first == 0 || r.first < first {
-			first = r.first
-		}
-		last = max(last, r.last)
+	var sourceMS, sourceEraMS int64
+	unknownMS := map[HistoryMissing]int64{}
+	err = s.walkSiteEnergy(ctx, from, to, func(r siteEnergyRow) error {
 		out.ImportWh += r.imp
 		out.ExportWh += r.exp
 		out.PVWh += r.pv
@@ -293,8 +298,8 @@ func (s *Store) aggregateDayEnergy(ctx context.Context, from, to int64) (DayEner
 		originalLoad += r.load
 		originalMissing |= r.missing
 		coveredMS += r.covered
-		if r.source {
-			sourceMS += r.covered
+		if hasSources && r.first >= cut {
+			sourceEraMS += r.covered
 		}
 		if r.missing&^MissingSoC == MissingLoad|BalanceMismatch || r.missing&^MissingSoC == MissingLoad|MissingEV {
 			if r.estimateCovered > 0 && r.estimateCovered == r.covered {
@@ -304,12 +309,25 @@ func (s *Store) aggregateDayEnergy(ctx context.Context, from, to int64) (DayEner
 		}
 		out.LoadWh += r.load
 		out.Intervals += r.n
-		out.Missing |= r.missing
 		if r.covered > 0 {
 			out.observed |= MissingPower &^ r.missing
 		}
+		if r.source {
+			// Source rows decide each flow by its unknown time below.
+			sourceMS += r.covered
+			for _, flag := range []HistoryMissing{MissingGrid, MissingPV, MissingBattery, MissingLoad, MissingEV, MissingV2X} {
+				if r.missing&flag != 0 {
+					unknownMS[flag] += r.covered
+				}
+			}
+			r.missing &^= MissingPower
+		}
+		out.Missing |= r.missing
 		return nil
 	})
+	if err != nil {
+		return out, err
+	}
 	if sourceMS == 0 && (out.LoadWh < 0 || (estimatedMS > 120000 && estimatedMS > coveredMS/20)) {
 		out.LoadWh = originalLoad
 		out.Missing = originalMissing
@@ -318,21 +336,21 @@ func (s *Store) aggregateDayEnergy(ctx context.Context, from, to int64) (DayEner
 		out.LoadWh = 0
 		out.Missing |= MissingLoad
 	}
-	cut, hasSources, coverageErr := s.sourceEnergyFrom(ctx)
-	if coverageErr != nil {
-		return out, coverageErr
-	}
 	if hasSources && to > cut {
-		expected, err := s.sourcePeriodCoverage(ctx, max(from, cut), to)
+		// The writer's last receipt ends the range, so a live tail is not a gap.
+		through, _, err := s.HistorySourceProgress(ctx)
 		if err != nil {
 			return out, err
 		}
-		if sourceMS < expected {
-			out.Missing |= MissingLoad
-		}
-		if coveredMS < last-first {
-			out.Missing |= MissingLoad
+		span := max(0, min(to, through)-max(from, cut))
+		// Unrecorded time leaves the other totals as recorded, as before;
+		// the household balance needs it covered.
+		unknownMS[MissingLoad] += max(0, span-sourceEraMS)
+		for flag, ms := range unknownMS {
+			if ms*100 > span*maxSourceDayUnknownShare {
+				out.Missing |= flag
+			}
 		}
 	}
-	return out, err
+	return out, nil
 }
