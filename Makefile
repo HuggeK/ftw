@@ -95,6 +95,7 @@ compose-migration-test:
 
 container-boundary-test: release-workflow-test
 	bash scripts/test-container-boundaries.sh
+	bash scripts/test-balena-mdns.sh
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_install_docs.py'
 	bash scripts/test-release-docker-context.sh
 

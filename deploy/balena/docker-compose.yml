@@ -1,0 +1,55 @@
+# FTW 0.x on balenaOS, for Sourceful's openBalena fleets.
+#
+# Deploy from the repository root:
+#   balena deploy <org>/<fleet> --source deploy/balena --build
+#
+# Core is the same checksummed release package as deploy/docker, without the
+# launcher: balena replaces the release, so `ftw update` does not apply.
+# Update or go back by changing FTW_VERSION below and deploying again.
+#
+# Data lives in the ftw-data volume and survives releases. Open
+# http://ftw.local:8080/setup on a new device.
+version: "2.4"
+
+services:
+  ftw:
+    build:
+      context: ./ftw
+      args:
+        FTW_VERSION: v0.154.1-beta.1
+    restart: unless-stopped
+    # Core saves its state on a clean stop.
+    stop_grace_period: 60s
+    # Modbus, MQTT and mDNS devices on the LAN need the host's network.
+    network_mode: host
+    volumes:
+      - ftw-data:/app/data
+    # balenaEngine restarts an unhealthy container. A new device serves only
+    # the setup wizard, where /api/health is 404 and /setup answers; `ftw
+    # status` tells the two apart the same way. Without that case the engine
+    # would restart Core in the middle of setup.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          curl -fsS -o /dev/null -m 3 http://127.0.0.1:8080/api/health ||
+          { curl -sS -o /dev/null -m 3 -w '%{http_code}' http://127.0.0.1:8080/api/health | grep -qx 404 &&
+          curl -fsS -o /dev/null -m 3 http://127.0.0.1:8080/setup; }
+      interval: 10s
+      timeout: 10s
+      start_period: 30s
+      retries: 6
+
+  # Answers ftw.local with the device's LAN address. It asks the host's
+  # avahi-daemon over D-Bus; the host network shows it that address.
+  mdns:
+    build: ./mdns
+    restart: unless-stopped
+    network_mode: host
+    labels:
+      io.balena.features.dbus: "1"
+    environment:
+      DBUS_SYSTEM_BUS_ADDRESS: unix:path=/host/run/dbus/system_bus_socket
+
+volumes:
+  ftw-data:
