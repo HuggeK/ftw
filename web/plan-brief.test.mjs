@@ -192,10 +192,14 @@ describe("plan brief normalization", () => {
     });
 
     assert.equal(brief.state.key, "caution_off");
+    assert.equal(brief.state.label, "Plan without extra forecast margin");
     assert.equal(brief.state.tone, "warn");
-    assert.equal(brief.forecast.label, "Point forecast");
-    assert.match(brief.forecast.detail, /^No margin for forecast error in this plan\. Plan until /);
-    assert.match(brief.constraint, /point forecast/);
+    assert.equal(brief.forecast.label, "Expected solar and home use");
+    assert.match(brief.forecast.detail, /try to include the extra margin when it replans\. Plan until /);
+    assert.match(brief.constraint, /without an extra margin for forecast errors/);
+    assert.match(brief.constraint, /Battery and grid limits still apply/);
+    assert.doesNotMatch(brief.constraint, /pv_uncertainty_w|point forecast/);
+    assert.equal(brief.warningDetails, warning);
 
     const kept = derivePlanBrief({
       enabled: true,
@@ -205,6 +209,36 @@ describe("plan brief normalization", () => {
     });
     assert.equal(kept.state.key, "active");
     assert.equal(kept.forecast.label, "Published prices");
+    assert.equal(kept.warningDetails, "");
+  });
+
+  it("keeps charger limits and live safety adjustments visible beside forecast details", () => {
+    const caution = "Forecast caution could not retain the point plan's limits and departure goals; using the point forecast: slot 2 violates mode passive_arbitrage: baseline_grid_w=1250.331892180 grid_w=-437.616126263 battery_w=-1687.948054443";
+    const charger = 'Charger "Easee": charging steps above the 11000 W limit were reduced to 11000 W.';
+    const brief = derivePlanBrief({
+      enabled: true,
+      plan: { actions: [slot(-7)], caution_off: true },
+      planning: { warnings: [caution, charger] },
+      status: { mode: "planner_passive_arbitrage", dispatch: [{ driver: "battery", clamped: true, target_w: 1800 }] },
+      now,
+    });
+    assert.match(brief.constraint, /Easee.*11000 W/);
+    assert.match(brief.constraint, /Safety adjusted battery to 1.8 kW/);
+    assert.doesNotMatch(brief.constraint, /slot 2|baseline_grid_w|battery_w/);
+    assert.equal(brief.warningDetails, caution);
+  });
+
+  it("explains the missing margin even when Core supplies no technical warning", () => {
+    const brief = derivePlanBrief({
+      enabled: true,
+      plan: { actions: [slot(-7)], caution_off: true },
+      status: { mode: "planner_arbitrage", plan_stale: true },
+      now,
+    });
+    assert.equal(brief.state.key, "stale");
+    assert.match(brief.constraint, /without an extra margin/);
+    assert.match(brief.constraint, /schedule is old/);
+    assert.equal(brief.warningDetails, "");
   });
 
   it("surfaces active safety clamps and how far the published prices reach", () => {

@@ -1839,6 +1839,32 @@ body.ftw-app .plan-state-badge.is-warn {
   color: var(--accent-e);
 }
 body.ftw-app .plan-state-badge.is-idle { color: var(--fg-muted); }
+body.ftw-app .plan-state-badge[data-state="caution_off"] {
+  max-width: 100%;
+  flex-shrink: 1;
+  white-space: normal;
+}
+body.ftw-app .plan-warning-details {
+  min-width: 0;
+  padding: 10px 16px;
+  border-top: 1px solid var(--line);
+  font-family: var(--sans);
+  font-size: 12px;
+}
+body.ftw-app .plan-warning-details > summary {
+  min-height: 24px;
+  line-height: 24px;
+  cursor: pointer;
+}
+body.ftw-app .plan-warning-details > pre {
+  margin: 8px 0 0;
+  color: var(--fg-dim);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 body.ftw-app .plan-help {
   font-family: var(--sans);
   font-size: 12px;
