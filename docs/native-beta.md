@@ -42,8 +42,9 @@ Choose **one** path. These are alternatives, not steps to run in order:
 | The old ready-made FTW Raspberry Pi image | It runs old Docker. Use a second card with Raspberry Pi OS Lite 64-bit; keep the old card. |
 | New 0.x native with launcher/release slots | [Update the native box](#update-a-native-box). Do not reinstall. |
 | New 0.x Docker built from the release package | [Change `FTW_VERSION` and rebuild](#update-new-docker). `ftw update` does not apply. |
+| FTW (0.x beta) Home Assistant app | Update and back up through Home Assistant. See [the app guide](home-assistant-app.md). |
 | Older direct native service without release slots | Identify its unit and data paths first. Use a separate host/card, or a checked migration for that site. The [native migration pilot](self-update.md#pilot-an-older-native-systemd-site) is not a general installer. |
-| Home Assistant app on the old line | Run new FTW on another Linux host. Stop the old app and its automatic start/watchdog before new Core controls the equipment. The app does not provide new 0.x yet. |
+| Home Assistant app on the old line | Install the **FTW (0.x beta)** app (pilot, [FTW on Home Assistant](home-assistant-app.md)) or run new FTW on another Linux host. Either way, stop the old app and its automatic start/watchdog before new Core controls the equipment. |
 | Custom build, manual binary, macOS or Windows | Identify the process and data first. The release install paths here require 64-bit Linux. |
 
 </details>

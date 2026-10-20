@@ -270,6 +270,50 @@ jobs:
         if: ${{ inputs.dry_run }}
         run: echo "Verified native packages without creating a tag or release."
 
+  ha-addon:
+    name: Offer the published beta to the Home Assistant app
+    needs: publish
+    if: ${{ !inputs.dry_run && inputs.channel == 'beta' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Verify publication and request a pin PR
+        env:
+          TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+          HA_ADDON_DISPATCH_TOKEN: ${{ secrets.HA_ADDON_DISPATCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HA_ADDON_DISPATCH_TOKEN}" ]; then
+            echo "::notice::HA_ADDON_DISPATCH_TOKEN is absent; pin the Home Assistant app manually."
+            exit 0
+          fi
+          [[ "${TAG}" =~ ^v0\.[0-9]+\.[0-9]+-beta\.[0-9]+$ ]]
+          gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --json tagName,isDraft,isPrerelease,assets | \
+            jq -e --arg tag "${TAG}" '
+              .tagName == $tag and .isDraft == false and .isPrerelease == true and
+              ([.assets[].name] | . as $names |
+                ["ftw-linux-amd64.tar.gz", "ftw-linux-amd64.tar.gz.sha256",
+                 "ftw-linux-arm64.tar.gz", "ftw-linux-arm64.tar.gz.sha256",
+                 "ftw-native-release.json"] | all(. as $name | $names | index($name) != null))
+            ' >/dev/null
+          receipt_dir=$(mktemp -d)
+          trap 'rm -rf "${receipt_dir}"' EXIT
+          gh release download "${TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --pattern ftw-native-release.json --dir "${receipt_dir}"
+          jq -e --arg tag "${TAG}" '
+            .schema == 1 and .channel == "beta" and .tag == $tag and
+            (.sha256.amd64 | test("^[0-9a-f]{64}$")) and
+            (.sha256.arm64 | test("^[0-9a-f]{64}$"))
+          ' "${receipt_dir}/ftw-native-release.json" >/dev/null
+          jq -n --arg tag "${TAG}" \
+            '{event_type:"ftw-native-release", client_payload:{tag:$tag, channel:"beta"}}' \
+            > "${receipt_dir}/dispatch.json"
+          GH_TOKEN="${HA_ADDON_DISPATCH_TOKEN}" gh api --method POST \
+            repos/srcfl/home-assistant-addons/dispatches --input "${receipt_dir}/dispatch.json"
+
   discord:
     needs: publish
     if: ${{ !inputs.dry_run && needs.publish.outputs.newly_published == 'true' }}

@@ -124,15 +124,20 @@ session and blind relay; relay loss does not stop local control.
 
 ## Install on Home Assistant
 
-The existing [Home Assistant app](https://github.com/srcfl/home-assistant-addons)
-is on the retired 3.x line. It does not follow new 0.x releases. Do not install
-that beta to get current FTW. Run new FTW on a separate Linux host and use the
-[MQTT integration](docs/ha-integration.md) with Home Assistant.
+**Beta / pilot:** the new **FTW (0.x beta)** Home Assistant app runs new FTW
+directly on Home Assistant OS, for example a Home Assistant Green. Follow
+[FTW on Home Assistant](docs/home-assistant-app.md) step by step
+([svenska](docs/setup-guide/home-assistant-sv.md)).
 
-Follow [the switch guide](docs/native-beta.md#coming-from-an-older-ftw), including
-backup and stopping the old app's Core, Start on boot and Watchdog. Supervisor
-still owns recovery of the old app; its update controls do not migrate to 0.x.
-Report old app or Supervisor faults in its
+The older **FTW (beta)** app is on the retired 3.x line and does not follow new
+0.x releases; do not install it to get current FTW. The tested alternative is
+still to run FTW on a separate Linux host and use the
+[MQTT integration](docs/ha-integration.md).
+
+Switching from the old app: follow
+[the switch guide](docs/native-beta.md#coming-from-an-older-ftw), including
+backup and stopping the old app's Core, Start on boot and Watchdog. Report app
+or Supervisor faults in its
 [issue tracker](https://github.com/srcfl/home-assistant-addons/issues), and Core
 faults in this repository.
 
