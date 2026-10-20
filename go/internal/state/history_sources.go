@@ -117,8 +117,13 @@ func (s *Store) recordSourceEnergyTx(ctx context.Context, tx *sql.Tx, p *History
 			last.Start = at
 		}
 	default:
-		if err := holdSourceIntervalTx(ctx, tx, last, cur); err != nil {
+		rejected, err := holdSourceIntervalTx(ctx, tx, last, cur)
+		if err != nil {
 			return err
+		}
+		// A rejected value stays unknown until its source reports again.
+		if last.Held != nil {
+			last.Held.Missing |= rejected
 		}
 	}
 	if last.Held == nil {
@@ -155,9 +160,10 @@ func (s *Store) recordSourceEnergyTx(ctx context.Context, tx *sql.Tx, p *History
 // for at most the bridge budget. Only two fully measured snapshots a safe
 // tick apart, of one topology and one process, make a measured interval;
 // every other interval carries EstimatedLoad, which readers never clear.
-func holdSourceIntervalTx(ctx context.Context, tx *sql.Tx, last sourceCursor, cur sourceReceipt) error {
+// It returns the held sources the balance rejected.
+func holdSourceIntervalTx(ctx context.Context, tx *sql.Tx, last sourceCursor, cur sourceReceipt) (HistoryMissing, error) {
 	v := last.Sources
-	var missing, held HistoryMissing
+	var missing, held, rejected HistoryMissing
 	flows := sourceFlows(&v)
 	for flag, w := range flows {
 		switch {
@@ -172,6 +178,7 @@ func holdSourceIntervalTx(ctx context.Context, tx *sql.Tx, last sourceCursor, cu
 	// A household never feeds the site. If a held value says it does, the
 	// source changed while unknown, such as a charger that finished.
 	if held != 0 && v.GridW-v.PVW-v.BatteryW-v.EVW-v.V2XW < 0 {
+		rejected = held
 		for flag, w := range flows {
 			if held&flag != 0 {
 				missing, *w = missing|flag, 0
@@ -185,7 +192,7 @@ func holdSourceIntervalTx(ctx context.Context, tx *sql.Tx, last sourceCursor, cu
 	if (v.Missing|cur.Missing)&(MissingPower|EstimatedLoad) != 0 || cur.Stopped || cur.AtMS-v.AtMS > maxLoadEstimateTickMS || v.Topology != cur.Topology {
 		missing |= EstimatedLoad
 	}
-	return writeSourceIntervalTx(ctx, tx, v.AtMS, cur.AtMS, v, missing)
+	return rejected, writeSourceIntervalTx(ctx, tx, v.AtMS, cur.AtMS, v, missing)
 }
 
 func writeSourceIntervalTx(ctx context.Context, tx *sql.Tx, from, until int64, v HistorySources, missing HistoryMissing) error {

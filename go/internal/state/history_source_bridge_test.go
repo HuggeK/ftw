@@ -109,6 +109,41 @@ func TestSourceLoadDayForgivesShortGaps(t *testing.T) {
 	}
 }
 
+// A held value the balance rejects stays rejected until its source reports
+// again. A later rise in house use must not revive it as a phantom charge.
+func TestSourceLoadForgetsARejectedHold(t *testing.T) {
+	const minute = int64(60000)
+	s := sourceStore(t)
+	base := time.Now().UTC().Truncate(24*time.Hour).UnixMilli() - 24*3600000
+	for at := base; at <= base+60*minute; at += 5000 {
+		off := at - base
+		// A 1 kW house and a 2 kW charge. The charger falls silent at 10
+		// minutes, the car finishes at 20, a heater adds 3 kW at 30, and the
+		// charger reports again, at 0 W, after 50.
+		v := HistorySources{GridW: 3000, EVW: 2000}
+		switch {
+		case off >= 30*minute:
+			v.GridW, v.EVW = 4000, 0
+		case off >= 20*minute:
+			v.GridW, v.EVW = 1000, 0
+		}
+		if off > 10*minute && off <= 50*minute {
+			v.Missing, v.EVW = MissingEV, 0
+		}
+		sourceTick(t, s, at, v)
+	}
+	var phantomWh float64
+	var unknownMinutes int
+	if err := s.history.QueryRow(`SELECT COALESCE(SUM(e.ev_charge_wh),0),COALESCE(SUM(COALESCE(q.missing,0)&?<>0),0) FROM history_source_energy e
+ LEFT JOIN history_quality q ON q.kind='source_energy' AND q.start_ms=e.start_ms AND q.resolution_ms=e.resolution_ms
+ WHERE e.start_ms>=? AND e.start_ms<?`, MissingEV, base+21*minute, base+50*minute).Scan(&phantomWh, &unknownMinutes); err != nil {
+		t.Fatal(err)
+	}
+	if phantomWh != 0 || unknownMinutes != 29 {
+		t.Fatalf("rejected charge revived: %v Wh charged, %d of 29 minutes unknown", phantomWh, unknownMinutes)
+	}
+}
+
 // Training reads only measured minutes, so every minute the display holds
 // or bridges keeps its marker, also after retention merges minutes.
 func TestSourceLoadMarksEveryEstimatedMinute(t *testing.T) {
