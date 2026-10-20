@@ -36,6 +36,7 @@ type forecastSite struct {
 	Timezone              string
 	Options               telemetry.ForecastOptions
 	HistoryOptions        telemetry.ForecastOptions // chart and site energy; outside every revision
+	HistorySun            historySun                // where unknown PV reads as 0 W after sunset; outside every revision
 	PVLearningStartedMS   int64
 	LoadLearningStartedMS int64
 }

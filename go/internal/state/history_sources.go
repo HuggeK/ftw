@@ -12,6 +12,8 @@ import (
 
 // HistorySources carries independently fresh site-side powers, never the live
 // Load result. Topology identifies the electrical flows included in the sum.
+// EstimatedLoad in Missing marks a snapshot that holds an inferred value, such
+// as PV read as 0 W in twilight; every interval it bounds keeps the marker.
 type HistorySources struct {
 	AtMS                            int64
 	Topology                        string

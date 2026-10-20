@@ -67,6 +67,12 @@ unrecorded time counts as nothing. Training is strict: it uses only minutes
 without the mark. This is an estimate from received measurements, not a
 correction of device clocks.
 
+While the sun is below the horizon at the site's map pin, an unknown PV source
+counts as 0 W instead of its last value, and an inverter the watchdog took
+offline keeps its place in the topology. Past civil dusk (sun 6° down) the
+0 W is physics and carries no mark, so the night also trains the load models.
+In twilight it is marked. Without a pin nothing is inferred.
+
 In self-consumption mode, the controller drives the site meter toward the
 grid target (normally 0 W): it charges from live surplus and may discharge
 to cover local load. It must not intentionally export via the battery; export

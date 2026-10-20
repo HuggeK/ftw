@@ -144,6 +144,31 @@ func TestSourceLoadKeepsUnknownDistinctFromZero(t *testing.T) {
 	}
 }
 
+// A snapshot holding an inferred value, such as PV read as 0 W in twilight,
+// marks every interval it bounds and no other, so storage keeps it apart from
+// measurement.
+func TestSourceLoadMarksIntervalsOfAnEstimatedSnapshot(t *testing.T) {
+	s := sourceStore(t)
+	base := time.Now().UTC().Truncate(24 * time.Hour).UnixMilli()
+	for at := base; at <= base+180000; at += 5000 {
+		v := HistorySources{GridW: 1000}
+		if at > base+60000 && at <= base+120000 {
+			v.Missing = EstimatedLoad
+		}
+		sourceTick(t, s, at, v)
+	}
+	b, err := s.sourceLoadBuckets(context.Background(), base, base+180000, 60000)
+	if err != nil || len(b) != 3 {
+		t.Fatal(err, len(b))
+	}
+	for i, estimated := range []bool{false, true, true} {
+		if b[i].missing&MissingPower != 0 || (b[i].missing&EstimatedLoad != 0) != estimated {
+			t.Fatalf("minute %d missing %b, want estimated=%v", i, b[i].missing, estimated)
+		}
+		near(t, "minute Wh", b[i].wh, 1000.0/60)
+	}
+}
+
 func TestSourceLoadUsesSnapshotTimeAndMarksRestartBridge(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
 	s, err := Open(path)
