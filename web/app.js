@@ -722,7 +722,8 @@
     loadW.textContent = formatW(data.load_w);
     var loadDir = document.getElementById("load-dir");
     if (loadDir) {
-      loadDir.textContent = data.load_w == null || !isFinite(data.load_w) ? "no data" : "using now";
+      loadDir.textContent = data.load_w == null || !isFinite(data.load_w) ? "no data"
+        : data.load_quality === "estimated" ? "estimated" : "using now";
     }
 
     // EV tile (tile-mode parity with the energy-flow's EV planet).

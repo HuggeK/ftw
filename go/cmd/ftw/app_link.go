@@ -81,7 +81,7 @@ func (a *appSite) Snapshot() appproto.Snapshot {
 	live := a.tel.LiveMeasurementNow(siteMeterDriver, opts)
 	snap := appproto.Snapshot{Mode: mode, ControlRev: rev, FuseA: fuseA,
 		GridW: live.GridW, PVW: live.PVW, BatteryW: live.BatteryW, EVW: live.EVW,
-		LoadW: live.HouseholdW, LoadWKnown: live.Valid}
+		LoadW: live.LoadW, LoadWKnown: live.LoadKnown}
 
 	uptimeMs := time.Since(a.started).Milliseconds()
 	seen := map[string]bool{}

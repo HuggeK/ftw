@@ -38,7 +38,9 @@ it("keeps a qualified power balance visible while the energy interval is unavail
 it("distinguishes a real zero balance from missing, invalid or stale inputs", () => {
   const base = {history_quality:"complete",load_estimate:{watts:null,reason:"incomplete_source_window"}};
   assert.equal(flowReadingsFromStatus({...base,load_w:0}).load,0);
-  for (const value of [undefined, null, "0", NaN, Infinity, -1]) {
+  // A negative balance is shown: it points at production Core cannot see.
+  assert.equal(flowReadingsFromStatus({...base,load_w:-300}).load,-0.3);
+  for (const value of [undefined, null, "0", NaN, Infinity]) {
     const result = flowReadingsFromStatus({...base,load_w:value});
     assert.equal(result.load,null);
   }
@@ -225,4 +227,12 @@ it('marks only devices that need attention and keeps an offline sibling visible 
   assert.equal(failed.kw,0);
   assert.equal(failed.clickable,true);
   assert.equal(flowReadingsFromStatus(status,{live:false}).planets.find(p=>p.name==='b').controlMark,undefined);
+});
+
+it("draws Core's estimated Home use as an estimate, not a blank", () => {
+  const status = {load_w: 980, load_quality: "estimated", load_reason: "offline:growatt:pv", history_quality: "incomplete"};
+  const result = flowReadingsFromStatus(status);
+  assert.equal(result.load, 0.98);
+  assert.equal(result.loadEstimated, true);
+  assert.equal(flowReadingsFromStatus({load_w: 980, load_quality: "measured"}).loadEstimated, false);
 });
