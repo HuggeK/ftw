@@ -46,6 +46,9 @@ type simSite struct {
 	defaulted           bool
 	commands            []simCommand
 
+	hourStart time.Time // the plant's clock hour
+	hourWh    float64   // its import, as the plant measured it
+
 	heat                 [3]float64 // the phases' I², filtered as Core's heat model does
 	heatSet              bool
 	overSince, needSince time.Time
@@ -91,6 +94,7 @@ func (s *simSite) boot() {
 		return EVFuseBudget(s.store, s.state, s.mgr.States(), s.ctrl.FuseConfigs(), s.fuseMaxW())
 	})
 	s.ctrl.SetFusePhaseRoomA(func() (float64, bool) { return EVFusePhaseRoomA(s.state) })
+	s.ctrl.SetFuseLimitReason(func() string { return EVLimitReason(s.state) })
 	s.ctrl.SetSiteSurplusForEV(func() (float64, bool) {
 		if !s.meterFresh() {
 			return 0, false
@@ -287,6 +291,10 @@ func (s *simSite) responseTime(slowest bool) time.Duration {
 // check holds the invariants for this second.
 func (s *simSite) check() {
 	p, now := s.p, s.p.Now
+	if hour := ImportHourStart(now.Add(-sitesim.Step)); !hour.Equal(s.hourStart) {
+		s.hourStart, s.hourWh = hour, 0
+	}
+	s.hourWh += math.Max(0, (p.A[0]+p.A[1]+p.A[2])*p.Voltage) * sitesim.Step.Hours()
 	if p.Fuse.AnyBlown() {
 		s.fail("the main fuse blew: damage %.2f", p.Fuse.Damage)
 	}
@@ -346,8 +354,9 @@ func (s *simSite) check() {
 
 // wantsCharge reports whether the car should charge now: it is plugged
 // and asks, Core and the meter are running, and the uncontrolled load
-// leaves room for the car's minimum on its phases (and, for surplus
-// charging, exports at least that much).
+// leaves room for the car's minimum on its phases and under the hour's
+// import ceiling (and, for surplus charging, exports at least that much).
+// Under the ceiling Core starts nothing in an hour's last quarter.
 func (s *simSite) wantsCharge() bool {
 	p, e := s.p, s.p.EVSE
 	if p.Car == nil || !p.Car.Plugged || p.Offline("evse") || !s.downUntil.IsZero() || p.Now.Sub(s.meterAt) > max(p.Meter.Every, sitesim.Step)+sitesim.Step {
@@ -362,7 +371,14 @@ func (s *simSite) wantsCharge() bool {
 			return false
 		}
 	}
-	return !s.surplus || -baseW >= e.MinA*p.Voltage*float64(phases)
+	minW := e.MinA * p.Voltage * float64(phases)
+	if ceilingW := s.state.PeakImportCeilingW; ceilingW > 0 {
+		left := s.hourStart.Add(time.Hour).Sub(p.Now)
+		if left < 15*time.Minute || baseW+minW > (ceilingW-s.hourWh)/left.Hours() {
+			return false
+		}
+	}
+	return !s.surplus || -baseW >= minW
 }
 
 func (s *simSite) fail(format string, args ...any) {
@@ -398,7 +414,7 @@ type simScenario struct {
 
 type simExpect struct {
 	at    time.Duration
-	check func(*sitesim.Plant) error
+	check func(*simSite) error
 }
 
 var simStart = time.Date(2026, 10, 21, 12, 0, 0, 0, time.Local)
@@ -510,7 +526,8 @@ func simScenarios() []simScenario {
 				c.MaxChargeW, c.AllowedStepsW = 10350, c.AllowedStepsW[:len(c.AllowedStepsW)-1]
 			},
 			setup: planBatteryCharge(9400),
-			expect: []simExpect{{9*time.Minute + 50*time.Second, func(p *sitesim.Plant) error {
+			expect: []simExpect{{9*time.Minute + 50*time.Second, func(s *simSite) error {
+				p := s.p
 				offerW := p.EVSE.OfferA * p.Voltage * float64(p.EVSE.OfferPhases)
 				if offerW != 10350 || math.Abs(p.EVSE.DrawW-4200) > 50 || math.Abs(p.Battery.W-9400) > 200 {
 					return fmt.Errorf("not the #1761 state before the car takes its offer: offer %.0f W, car %.0f W, battery %.0f W", offerW, p.EVSE.DrawW, p.Battery.W)
@@ -547,6 +564,23 @@ func simScenarios() []simScenario {
 				p.HouseW = houseA(13.7, 12, 12)
 				p.Battery = &sitesim.Battery{Phases: 3, MaxChargeW: 5000, MaxDischargeW: 5000, CapacityWh: 10000, SoC: .07, Latency: 2 * time.Second}
 			}},
+		{name: "end of a heavy hour, low phases",
+			start: time.Date(2026, 10, 21, 2, 0, 0, 0, time.Local), run: 65 * time.Minute,
+			plant: func(p *sitesim.Plant) {
+				p.HouseW = houseA(10, 10, 10)
+				p.Events = []sitesim.Event{
+					{At: 9 * time.Minute, Kind: sitesim.CoreRestart, For: 20 * time.Second},
+					{At: 50 * time.Minute, Do: func(p *sitesim.Plant) { p.HouseW = houseA(1.5, 1.5, 1.5) }},
+				}
+			},
+			setup: func(s *simSite) { s.state.PeakImportCeilingW = 6000 },
+			expect: []simExpect{{57 * time.Minute, func(s *simSite) error {
+				st, _ := s.mgr.State(s.lp.ID)
+				if s.p.EVSE.DrawW > 0 || st.CommandedReason != "import_limit" {
+					return fmt.Errorf("near the end of the hour: car draws %.0f W, reason %q, want idle on import_limit", s.p.EVSE.DrawW, st.CommandedReason)
+				}
+				return nil
+			}}}},
 		{name: "a day", start: time.Date(2026, 10, 21, 0, 0, 0, 0, time.Local), run: 24 * time.Hour, plant: simDay},
 	}
 }
@@ -566,7 +600,7 @@ func runSimScenario(sc simScenario, start time.Time) *simSite {
 	s.boot()
 	for _, e := range sc.expect {
 		s.run(start.Add(e.at).Sub(p.Now))
-		if err := e.check(p); err != nil {
+		if err := e.check(s); err != nil {
 			s.fail("%v", err)
 		}
 	}

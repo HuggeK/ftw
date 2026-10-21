@@ -127,6 +127,7 @@ func (s *evMeterSite) boot() {
 		return EVFuseBudget(s.store, s.state, s.mgr.States(), s.mgr.Configs(), 17250)
 	})
 	s.ctrl.SetFusePhaseRoomA(func() (float64, bool) { return EVFusePhaseRoomA(s.state) })
+	s.ctrl.SetFuseLimitReason(func() string { return EVLimitReason(s.state) })
 	s.ctrl.SetManualHold(cfg.ID, loadpoint.ManualHold{PowerW: 10350, PhaseMode: "3p", Persistent: true})
 	if s.onBoot != nil {
 		s.onBoot()

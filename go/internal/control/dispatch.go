@@ -551,6 +551,9 @@ type State struct {
 	// loadpoint controller's read of FuseEVMaxW and as the trigger for
 	// an MPC reactive replan from main.go.
 	FuseSaturated bool
+	// FuseSaturatedByImport says the clock hour's import limit, not the
+	// fuse, set the ceiling FuseSaturated hit.
+	FuseSaturatedByImport bool
 
 	// DriverLimits maps driver name → per-battery charge/discharge cap.
 	// Missing entries and unset fields fall through to the global
@@ -2040,7 +2043,7 @@ func ComputeDispatch(
 	// The ceiling gives up the worst phase's imbalance: a charger's own load
 	// balancer cuts the car on that phase while the total still fits.
 	state.FuseEVMaxW = 0
-	state.FuseSaturated = false
+	state.FuseSaturated, state.FuseSaturatedByImport = false, false
 	plannedEVW := scheduledEVPowerW(state)
 	evInMeterW := state.evInMeterW()
 	if fuseMaxW > 0 && math.Max(evInMeterW, plannedEVW) > 0 {
@@ -2069,7 +2072,7 @@ func ComputeDispatch(
 				totalCorrection = Bn + B*scale - currentTotal
 				state.FuseEVMaxW = E * scale
 			}
-			state.FuseSaturated = true
+			state.FuseSaturated, state.FuseSaturatedByImport = true, state.importLimitSets(ceilingW)
 		}
 	}
 
@@ -3770,6 +3773,13 @@ func (s *State) fuseSafetyMarginW() float64 {
 		return 0
 	}
 	return s.SiteFuseSafetyA * s.SiteFuseVoltage * float64(s.SiteFusePhases)
+}
+
+// importLimitSets reports whether the clock hour's import limit is the
+// ceiling ceilingW, rather than the fuse.
+func (s *State) importLimitSets(ceilingW float64) bool {
+	limitW, _, ok := s.importHourLimitsW()
+	return ok && limitW <= ceilingW
 }
 
 // effectiveImportCeilingW returns the binding ceiling for grid import in

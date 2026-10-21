@@ -1656,8 +1656,8 @@ func TestJointFuseAllocatorScalesBothBatteryAndEV(t *testing.T) {
 	if got < 0 {
 		t.Errorf("TargetW = %.0f W — battery shouldn't be discharging here", got)
 	}
-	if !st.FuseSaturated {
-		t.Errorf("FuseSaturated = false; want true after joint scaling")
+	if !st.FuseSaturated || st.FuseSaturatedByImport {
+		t.Errorf("FuseSaturated = %v, by import %v; want the fuse after joint scaling", st.FuseSaturated, st.FuseSaturatedByImport)
 	}
 	// EV cap is the post-republish verdict: after applyFuseGuard +
 	// forceFuseDischarge constrain battery further (and may swing it
@@ -1673,6 +1673,23 @@ func TestJointFuseAllocatorScalesBothBatteryAndEV(t *testing.T) {
 	projected := 8200.0 + got
 	if projected > fuseMaxW+50 {
 		t.Errorf("projected grid %.0f W > fuse %.0f after dispatch", projected, float64(fuseMaxW))
+	}
+}
+
+// The same site under a 9 kW hourly import ceiling: the hour's limit, not
+// the fuse, sets the ceiling the allocator hits, and says so.
+func TestJointFuseAllocatorNamesTheHoursImportLimit(t *testing.T) {
+	now := time.Now()
+	dir := SlotDirective{SlotStart: now, SlotEnd: now.Add(15 * time.Minute), BatteryEnergyWh: 1250, Strategy: "arbitrage"}
+	store := seedStore(8200, []struct {
+		name          string
+		currentW, soc float64
+	}{{"ferroamp", 0, 0.5}})
+	st := newStateWithEnergyDispatch(dir, "ferroamp")
+	st.EVChargingW, st.BatteryCoversEV, st.PeakImportCeilingW = 8000, true, 9000
+	ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11000)
+	if !st.FuseSaturated || !st.FuseSaturatedByImport {
+		t.Fatalf("FuseSaturated = %v, by import %v; want the hour's import limit", st.FuseSaturated, st.FuseSaturatedByImport)
 	}
 }
 

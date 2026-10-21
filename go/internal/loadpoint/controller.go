@@ -49,9 +49,12 @@ type Controller struct {
 	// fusePhaseRoomA is the current chargers may still add on the busiest
 	// phase. nil, or false, leaves the cap alone to limit them.
 	fusePhaseRoomA func() (float64, bool)
+	// fuseLimitReason names the site limit behind the cap.
+	fuseLimitReason func() string
 
 	// tickFuseCaps belongs to the serial tick, after one shared budget read.
 	tickFuseCaps        map[string]float64
+	tickFuseReason      string
 	tickChoices         map[string]tickChoice // serial tick
 	tickDirectiveActive bool
 	tickDirectiveOK     bool
@@ -527,6 +530,29 @@ func (c *Controller) SetFusePhaseRoomA(f func() (float64, bool)) {
 	c.fusePhaseRoomA = f
 }
 
+// SetFuseLimitReason wires control.EVLimitReason: "import_limit" when the
+// clock hour's import ceiling holds the cap, else "fuse_limit". Read once
+// per tick, after the cap.
+func (c *Controller) SetFuseLimitReason(f func() string) {
+	if c == nil {
+		return
+	}
+	c.fuseLimitReason = f
+}
+
+// capReason is the reason a command the cap lowered carries.
+func (c *Controller) capReason() string {
+	if c.tickFuseReason != "" {
+		return c.tickFuseReason
+	}
+	if c.fuseLimitReason != nil {
+		if r := c.fuseLimitReason(); r != "" {
+			return r
+		}
+	}
+	return "fuse_limit"
+}
+
 // SetPerPhaseMeterAmps does nothing. Deprecated: control.EVFuseBudget reads
 // the phase currents; this stays until the last test caller is gone.
 func (c *Controller) SetPerPhaseMeterAmps(func() (l1, l2, l3 float64, ok bool)) {}
@@ -618,12 +644,12 @@ func (c *Controller) applyFuseClamp(lpCfg Config, wantW float64, phaseMode strin
 	if snapped > 0 && snapped >= lpCfg.MinChargeW {
 		slog.Info("loadpoint fuse-clamp: ramped down",
 			"lp", lpCfg.ID, "want_w", wantW, "fuse_cap_w", cap, "snapped_w", snapped)
-		return snapped, "fuse_limit"
+		return snapped, c.capReason()
 	}
 	slog.Info("loadpoint fuse-clamp: below minimum step",
 		"lp", lpCfg.ID, "want_w", wantW, "fuse_cap_w", cap,
 		"min_step_w", lpCfg.MinChargeW)
-	return 0, "fuse_limit"
+	return 0, c.capReason()
 }
 
 // SetNearTermPeakSurplusW wires the short-horizon "peak surplus over
@@ -1207,7 +1233,7 @@ func (c *Controller) TickWithDispatch(ctx context.Context, now time.Time, dispat
 	if dispatchAllowed {
 		c.tickDirective, c.tickDirectiveOK = c.currentDirective(now)
 		c.tickDirectiveActive = true
-		defer func() { c.tickFuseCaps = nil; c.tickChoices = nil; c.tickDirectiveActive = false }()
+		defer func() { c.tickFuseCaps, c.tickFuseReason = nil, ""; c.tickChoices = nil; c.tickDirectiveActive = false }()
 	}
 	choices := make(map[string]tickChoice, len(observations))
 	for _, observed := range observations {

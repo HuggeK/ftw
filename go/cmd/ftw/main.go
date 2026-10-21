@@ -2010,13 +2010,18 @@ func main() {
 			defer ctrlMu.Unlock()
 			return control.EVFusePhaseRoomA(ctrl)
 		})
+		lpController.SetFuseLimitReason(func() string {
+			ctrlMu.Lock()
+			defer ctrlMu.Unlock()
+			return control.EVLimitReason(ctrl)
+		})
 		// Every lease is preflighted and re-evaluated on each loadpoint tick.
 		// This closure owns site/battery health because those concepts belong
 		// to core, not to the protocol-neutral loadpoint package.
 		lpController.SetBatteryBoostSafety(func(id string, lease loadpoint.BatteryBoostLease) loadpoint.BatteryBoostStopReason {
 			ctrlMu.Lock()
 			mode := ctrl.Mode
-			fuseBlocked := ctrl.FuseSaturated
+			fuseBlocked, importBlocked := ctrl.FuseSaturated, ctrl.FuseSaturatedByImport
 			_, batteryHeld := ctrl.GetBatteryManualHold(time.Now())
 			siteMeter := ctrl.SiteMeterDriver
 			ctrlMu.Unlock()
@@ -2025,6 +2030,9 @@ func main() {
 			}
 			if batteryHeld {
 				return loadpoint.BatteryBoostStoppedBatteryHold
+			}
+			if fuseBlocked && importBlocked {
+				return loadpoint.BatteryBoostStoppedImportLimit
 			}
 			if fuseBlocked {
 				return loadpoint.BatteryBoostStoppedFuseSafety
