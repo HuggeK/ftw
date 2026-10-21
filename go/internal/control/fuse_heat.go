@@ -71,12 +71,13 @@ func (h *fuseHeat) overA(amps []float64, limitA, instantA float64) float64 {
 }
 
 // levelA is the highest phase current, taking each phase at the higher of
-// the reading and its heat. Rises and starts read it, so a rise never spends
-// heat the last minute has already used.
-func (h *fuseHeat) levelA(amps []float64) float64 {
+// the reading and its heat, plus what we sent that it may not show yet.
+// Rises and starts read it, so a rise never spends heat the last minute has
+// already used, nor room an earlier rise will take.
+func (h *fuseHeat) levelA(amps []float64, pendingA [3]float64) float64 {
 	level := 0.0
 	for i, a := range amps {
-		level = math.Max(level, math.Max(a, math.Sqrt(h.sq[i])))
+		level = math.Max(level, math.Max(a, math.Sqrt(h.sq[i]))+pendingA[i])
 	}
 	return level
 }

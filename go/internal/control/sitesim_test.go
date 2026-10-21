@@ -90,6 +90,7 @@ func (s *simSite) boot() {
 	s.ctrl.SetFuseEVMax(func() (float64, bool) {
 		return EVFuseBudget(s.store, s.state, s.mgr.States(), s.ctrl.FuseConfigs(), s.fuseMaxW())
 	})
+	s.ctrl.SetFusePhaseRoomA(func() (float64, bool) { return EVFusePhaseRoomA(s.state) })
 	s.ctrl.SetSiteSurplusForEV(func() (float64, bool) {
 		if !s.meterFresh() {
 			return 0, false
@@ -495,9 +496,9 @@ func simScenarios() []simScenario {
 					{At: 15 * time.Minute, Do: func(p *sitesim.Plant) { p.HouseW = houseA(20, 20, 20) }},
 				}
 			}},
-		{name: "slow cloud charger 60 s", known: "rises stack on a charger slower than evSettle, ev_fuse_budget.go:204", run: 15 * time.Minute,
+		{name: "slow cloud charger 60 s", run: 15 * time.Minute,
 			plant: slowCharger(time.Minute)},
-		{name: "slow cloud charger 120 s", known: "rises stack on a charger slower than evSettle, ev_fuse_budget.go:204", run: 15 * time.Minute,
+		{name: "slow cloud charger 120 s", run: 15 * time.Minute,
 			plant: slowCharger(2 * time.Minute)},
 		{name: "#1761 replay", run: 20 * time.Minute,
 			plant: func(p *sitesim.Plant) {
@@ -541,7 +542,7 @@ func simScenarios() []simScenario {
 				planBatteryCharge(0)(s)
 				s.mgr.SetSchedule(s.lp.ID, loadpoint.Schedule{SurplusUnlockBatSoC: .9})
 			}},
-		{name: "battery reaches its floor under Charge now", known: "the battery stops at its 5 % floor with no room for that, dispatch.go:3540", run: 5 * time.Minute,
+		{name: "battery reaches its floor under Charge now", run: 5 * time.Minute,
 			plant: func(p *sitesim.Plant) {
 				p.HouseW = houseA(13.7, 12, 12)
 				p.Battery = &sitesim.Battery{Phases: 3, MaxChargeW: 5000, MaxDischargeW: 5000, CapacityWh: 10000, SoC: .07, Latency: 2 * time.Second}

@@ -2005,6 +2005,11 @@ func main() {
 			// The cap is measured for the phases this tick's commands name.
 			return control.EVFuseBudget(tel, ctrl, lpMgr.States(), lpController.FuseConfigs(), ctrl.SiteFuseAmps*ctrl.SiteFuseVoltage*float64(ctrl.SiteFusePhases))
 		})
+		lpController.SetFusePhaseRoomA(func() (float64, bool) {
+			ctrlMu.Lock()
+			defer ctrlMu.Unlock()
+			return control.EVFusePhaseRoomA(ctrl)
+		})
 		// Every lease is preflighted and re-evaluated on each loadpoint tick.
 		// This closure owns site/battery health because those concepts belong
 		// to core, not to the protocol-neutral loadpoint package.

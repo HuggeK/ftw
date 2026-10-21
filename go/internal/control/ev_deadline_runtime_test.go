@@ -76,6 +76,7 @@ func TestJoinedNoBatteryNoPlanGoalContinuity(t *testing.T) {
 		})
 	controller.SetSiteFuse(loadpoint.SiteFuse{MaxAmps: 25, Voltage: 230, PhaseCnt: 3})
 	controller.SetFuseEVMax(func() (float64, bool) { return EVFuseBudget(tel, st, mgr.States(), controller.FuseConfigs(), 17250) })
+	controller.SetFusePhaseRoomA(func() (float64, bool) { return EVFusePhaseRoomA(st) })
 	controller.TickWithDispatch(ctx, now, true)
 	if len(commands) == 0 || commands[len(commands)-1] <= 0 {
 		t.Fatalf("goal stopped at integration boundary: %v", commands)
@@ -172,6 +173,7 @@ func TestJoinedMixedPhaseNoCreditBeforeMeasuredReduction(t *testing.T) {
 		})
 	controller.SetSiteFuse(loadpoint.SiteFuse{MaxAmps: 25, Voltage: 230, PhaseCnt: 3})
 	controller.SetFuseEVMax(func() (float64, bool) { return EVFuseBudget(tel, st, mgr.States(), controller.FuseConfigs(), 17250) })
+	controller.SetFusePhaseRoomA(func() (float64, bool) { return EVFusePhaseRoomA(st) })
 	emit := func(driver string, kind telemetry.DerType, at time.Time, w float64, amps bool) {
 		d := map[string]any{"control_power_observed_at": at.Format(time.RFC3339Nano), "control_power_available": true}
 		if amps {

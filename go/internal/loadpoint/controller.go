@@ -46,6 +46,9 @@ type Controller struct {
 
 	// fuseEVMax is this tick's EV share of the site fuse. nil means no cap.
 	fuseEVMax func() (float64, bool)
+	// fusePhaseRoomA is the current chargers may still add on the busiest
+	// phase. nil, or false, leaves the cap alone to limit them.
+	fusePhaseRoomA func() (float64, bool)
 
 	// tickFuseCaps belongs to the serial tick, after one shared budget read.
 	tickFuseCaps        map[string]float64
@@ -512,6 +515,16 @@ func (c *Controller) SetFuseEVMax(f func() (float64, bool)) {
 		return
 	}
 	c.fuseEVMax = f
+}
+
+// SetFusePhaseRoomA wires control.EVFusePhaseRoomA: the current the
+// chargers may still add on the busiest phase, net of every charger's
+// commands the meter may not show yet. Read once per tick, with the cap.
+func (c *Controller) SetFusePhaseRoomA(f func() (float64, bool)) {
+	if c == nil {
+		return
+	}
+	c.fusePhaseRoomA = f
 }
 
 // SetPerPhaseMeterAmps does nothing. Deprecated: control.EVFuseBudget reads
@@ -1593,6 +1606,8 @@ func (c *Controller) tickOne(ctx context.Context, now time.Time, lpCfg Config, s
 		offerW, haveOffer = w, true
 		c.manager.setCommandedForManual(lpCfg.ID, w, cmdReason, manualCommandUpdatedAt)
 		mode, _ := cmd["phase_mode"].(string)
+		split, _ := cmd["phase_split_w"].(float64)
+		c.manager.setCommandedPhases(lpCfg.ID, c.commandPhases(mode, w, split))
 		c.saveOffer(now, lpCfg, sample, w, fusePhase(mode), cmdReason)
 	}
 	payload, err := json.Marshal(cmd)

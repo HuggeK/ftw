@@ -70,13 +70,87 @@ func (c *Controller) freezeFuseBudget(now time.Time, samples map[string]EVSample
 		}
 		return a.cfg.ID < b.cfg.ID
 	})
+	roomA, perPhase := 0.0, false
+	if c.fusePhaseRoomA != nil {
+		roomA, perPhase = c.fusePhaseRoomA()
+		perPhase = perPhase && finite(roomA)
+	}
 	c.tickFuseCaps = make(map[string]float64, len(requests))
 	remaining := total
 	for _, request := range requests {
-		cap := floorChargeW(math.Min(request.wantW, remaining), request.cfg.MinChargeW, request.cfg.MaxChargeW, request.cfg.AllowedStepsW)
+		want := math.Min(request.wantW, remaining)
+		mode := c.tickChoices[request.cfg.ID].phaseMode
+		split := c.commandSplitW(now, request.cfg)
+		if perPhase {
+			want = math.Min(want, c.phaseRoomCapW(request.cfg.ID, mode, want, split, roomA))
+		}
+		cap := floorChargeW(want, request.cfg.MinChargeW, request.cfg.MaxChargeW, request.cfg.AllowedStepsW)
 		c.tickFuseCaps[request.cfg.ID] = cap
 		remaining -= cap
+		if perPhase {
+			// A cut frees room only once the meter shows it.
+			roomA -= math.Max(0, c.phaseRiseA(request.cfg.ID, mode, cap, split))
+		}
 	}
+}
+
+// commandPhases is where a command of w lands: 1 or 3 phases, as the
+// driver resolves its phase_mode and split. A 1-phase site has one.
+func (c *Controller) commandPhases(mode string, w, split float64) int {
+	if c.siteFuse().Phases() == 1 {
+		return 1
+	}
+	if split <= 0 {
+		split = defaultPhaseSplitW
+	}
+	return PhaseFor(mode, w, split)
+}
+
+// commandSplitW is the 1p/3p split this tick's command names.
+func (c *Controller) commandSplitW(now time.Time, cfg Config) float64 {
+	if hold, held := c.GetManualHold(cfg.ID, now); held && hold.PhaseSplitW > 0 {
+		return hold.PhaseSplitW
+	}
+	return cfg.PhaseSplitW
+}
+
+// phaseRiseA is how much a command of w adds to the busiest phase over the
+// loadpoint's last command. A single-phase command may land on any phase,
+// so the last command's current comes off only where both use the same
+// phases or the last one used all three.
+func (c *Controller) phaseRiseA(id, mode string, w, split float64) float64 {
+	site := c.siteFuse()
+	if w <= 0 || site.Voltage <= 0 {
+		return 0
+	}
+	phases := c.commandPhases(mode, w, split)
+	return w/(site.Voltage*float64(phases)) - c.creditA(id, phases)
+}
+
+func (c *Controller) creditA(id string, phases int) float64 {
+	st, _ := c.manager.State(id)
+	site := c.siteFuse()
+	if !st.CommandedKnown || st.CommandedW <= 0 || site.Voltage <= 0 || (st.CommandedPhases != 3 && st.CommandedPhases != phases) {
+		return 0
+	}
+	return st.CommandedW / (site.Voltage * float64(min(st.CommandedPhases, site.Phases())))
+}
+
+// phaseRoomCapW is the most a command may offer when it can add at most
+// roomA to the busiest phase. It always keeps the last command's current.
+// An auto command below the split lands on one phase.
+func (c *Controller) phaseRoomCapW(id, mode string, wantW, split, roomA float64) float64 {
+	site := c.siteFuse()
+	if site.Voltage <= 0 {
+		return wantW
+	}
+	roomA = math.Max(0, roomA)
+	phases := c.commandPhases(mode, wantW, split)
+	capW := (c.creditA(id, phases) + roomA) * site.Voltage * float64(phases)
+	if phases == 3 && c.commandPhases(mode, capW, split) == 1 {
+		capW = math.Min(capW, (c.creditA(id, 1)+roomA)*site.Voltage)
+	}
+	return capW
 }
 
 // FuseConfigs returns the loadpoints with the phase mode each command names

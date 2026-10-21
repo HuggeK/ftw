@@ -56,6 +56,7 @@ func newPhaseSite(t *testing.T, cfg loadpoint.Config, houseA float64) *phaseSite
 	s.ctrl.SetFuseEVMax(func() (float64, bool) {
 		return EVFuseBudget(s.store, s.state, s.mgr.States(), s.ctrl.FuseConfigs(), 25*230*3)
 	})
+	s.ctrl.SetFusePhaseRoomA(func() (float64, bool) { return EVFusePhaseRoomA(s.state) })
 	return s
 }
 

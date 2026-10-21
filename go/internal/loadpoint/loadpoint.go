@@ -260,6 +260,9 @@ type State struct {
 	CommandedSinceMs int64 `json:"commanded_since_ms,omitempty"`
 	// Internal identity of the manual choice used to compute the order.
 	ManualCommandUpdatedAt time.Time `json:"-"`
+	// CommandedPhases is 1 or 3: the phases the last command lands on, from
+	// its phase_mode and split. Zero before the first command.
+	CommandedPhases int `json:"-"`
 
 	// CommandedReason names the dispatch branch that decided CommandedW:
 	// "plan", "no_plan_budget", "pv_surplus", "pv_surplus_pause",
@@ -507,6 +510,7 @@ type loadpointRuntime struct {
 	commandedW      float64
 	commandedKnown  bool
 	commandedReason string
+	commandedPhases int // 1 or 3: where the last command lands; 0 before it
 	// commandedSince is when the current (commandedW, commandedReason) pair
 	// was first ordered. The manual status counts elapsed time from it.
 	commandedSince         time.Time
@@ -583,6 +587,15 @@ func (m *Manager) setCommandedForManual(id string, w float64, reason string, upd
 		if changed {
 			lp.commandedSince = time.Now()
 		}
+	}
+}
+
+// setCommandedPhases records the phases the last command lands on.
+func (m *Manager) setCommandedPhases(id string, phases int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if lp, ok := m.byID[id]; ok {
+		lp.commandedPhases = phases
 	}
 }
 
@@ -1354,6 +1367,7 @@ func (lp *loadpointRuntime) snapshot() State {
 		CommandedW:               lp.commandedW,
 		CommandedReason:          lp.commandedReason,
 		CommandedKnown:           lp.commandedKnown,
+		CommandedPhases:          lp.commandedPhases,
 	}
 	if lp.VehicleCapacityWh <= 0 {
 		st.VehicleCapacityWh = 60000

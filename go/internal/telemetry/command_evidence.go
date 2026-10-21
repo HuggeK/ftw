@@ -379,7 +379,7 @@ func (s *Store) observeCommand(driver string, kind DerType, power float64, data 
 		s.commands[k] = c
 		return
 	}
-	c.MaxAge = controlPowerDeclaredMaxAge(data)
+	c.MaxAge = DeclaredPowerMaxAge(data)
 	if now.Sub(c.LastObservation) > max(time.Minute, c.MaxAge) {
 		c.ReadbackMismatchSince, c.PowerMismatchSince, c.PowerMatchSince = time.Time{}, time.Time{}, time.Time{}
 		c.PowerObservedSince = time.Time{}
