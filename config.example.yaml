@@ -192,7 +192,7 @@ ocpp:
   path: /
   username: ftw
   password: ""                     # required when enabled; use a long random string
-  heartbeat_interval_s: 60
+  heartbeat_interval_s: 30
   # Serve wss:// instead of ws://. client_ca_file additionally requires each
   # charger to present a certificate signed by that CA whose CN or DNS SAN
   # matches the identity in the URL — OCPP 2.0.1 security profile 3.
