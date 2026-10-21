@@ -31,8 +31,7 @@ func TestSharedFuseGuardUsesCommandPhase(t *testing.T) {
 			sender := &fakeSender{}
 			c := newTestController(t, []Config{cfg}, d, samples, sender)
 			c.SetSiteFuse(SiteFuse{MaxAmps: 25, Voltage: 230, PhaseCnt: 3})
-			c.SetPerPhaseMeterAmps(func() (float64, float64, float64, bool) { return tc.worstA, tc.worstA, tc.worstA, true })
-			c.SetFuseEVMax(func() (float64, bool) { return 20000, true })
+			c.SetFuseEVMax(meteredEVCap(c, func() float64 { return tc.worstA }))
 			if tc.schedule {
 				c.manager.SetSchedule(cfg.ID, Schedule{SoC: .8, TimeOfDayMinUTC: 13 * 60, Recurring: true})
 			}
@@ -67,8 +66,7 @@ func TestAutomaticManualReleasePrecedesSharedPhaseBudget(t *testing.T) {
 			sender := &fakeSender{}
 			c := newTestController(t, []Config{cfg}, d, samples, sender)
 			c.SetSiteFuse(SiteFuse{MaxAmps: 25, Voltage: 230, PhaseCnt: 3})
-			c.SetPerPhaseMeterAmps(func() (float64, float64, float64, bool) { return 20, 20, 20, true })
-			c.SetFuseEVMax(func() (float64, bool) { return 2070, true })
+			c.SetFuseEVMax(meteredEVCap(c, func() float64 { return 20 }))
 			c.manager.SetSchedule(cfg.ID, Schedule{SoC: .9, TimeOfDayMinUTC: 13 * 60, Recurring: true})
 			hold := ManualHold{PowerW: 4140, PhaseMode: "3p", Persistent: true}
 			if release == "soc" {
@@ -98,10 +96,11 @@ func TestManualPhaseChangeAfterSharedBudgetWaitsForNextTick(t *testing.T) {
 		name, beforeMode, afterMode       string
 		beforeW, afterW, worstA, commandW float64
 	}{
-		{"3p_to_1p", "3p", "1p", 4140, 1380, 20, 0},
-		{"3p_to_auto", "3p", "auto", 4140, 1380, 20, 0},
-		{"new_stop", "3p", "3p", 4140, 0, 20, 0},
-		{"1p_to_3p", "1p", "3p", 1380, 4140, 17, 1380},
+		{"3p_to_1p", "3p", "1p", 4140, 1380, 17, 0},
+		{"3p_to_auto", "3p", "auto", 4140, 1380, 17, 0},
+		{"new_stop", "3p", "3p", 4140, 0, 17, 0},
+		// 1,380 W on three phases is 2 A each: no legal 3p step.
+		{"1p_to_3p", "1p", "3p", 1380, 4140, 17, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
@@ -114,9 +113,7 @@ func TestManualPhaseChangeAfterSharedBudgetWaitsForNextTick(t *testing.T) {
 			sender := &fakeSender{}
 			c := newTestController(t, []Config{a, b}, d, samples, sender)
 			c.SetSiteFuse(SiteFuse{MaxAmps: 25, Voltage: 230, PhaseCnt: 3})
-			worstA := tc.worstA
-			c.SetPerPhaseMeterAmps(func() (float64, float64, float64, bool) { return worstA, worstA, worstA, true })
-			c.SetFuseEVMax(func() (float64, bool) { return 2070, true })
+			c.SetFuseEVMax(meteredEVCap(c, func() float64 { return tc.worstA }))
 			c.SetManualHold(a.ID, ManualHold{PhaseMode: "3p", Persistent: true})
 			c.SetManualHold(b.ID, ManualHold{PowerW: tc.beforeW, PhaseMode: tc.beforeMode, Persistent: true})
 			c.send = func(ctx context.Context, driver string, payload []byte) error {
@@ -137,7 +134,6 @@ func TestManualPhaseChangeAfterSharedBudgetWaitsForNextTick(t *testing.T) {
 				}
 			}
 			if tc.beforeMode == "3p" && tc.afterW > 0 {
-				worstA = 17
 				c.Tick(context.Background(), now.Add(5*time.Second))
 				command, known = lastSetCurrent(sender.calls)
 				if !known || command.power != 1380 || command.phaseMode != tc.afterMode {
@@ -145,31 +141,5 @@ func TestManualPhaseChangeAfterSharedBudgetWaitsForNextTick(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-// #1674, 05:49: the car drew 10,242 W at 15 A when one 0 W reading
-// arrived. Keeping the 10,350 W offer is not an increase; the phase gate
-// must not treat it as one and stop the charge at 2,449.5 W of room.
-func TestLoneZeroReadingKeepsOfferThroughPhaseGate(t *testing.T) {
-	now := time.Date(2026, 10, 17, 5, 49, 0, 0, time.UTC)
-	cfg := Config{ID: "garage", DriverName: "easee", MinChargeW: 4140, MaxChargeW: 10350, PhaseMode: "3p",
-		AllowedStepsW: []float64{0, 4140, 4830, 5520, 6210, 6900, 7590, 8280, 8970, 9660, 10350}}
-	samples := map[string]EVSample{cfg.DriverName: {Connected: true, RequestActive: true, PowerW: 10242}}
-	sender := &fakeSender{}
-	c := newTestController(t, []Config{cfg}, nil, samples, sender)
-	c.SetSiteFuse(SiteFuse{MaxAmps: 25, Voltage: 230, PhaseCnt: 3})
-	l1 := 5.0 // The car starts while L1 has room for it.
-	c.SetPerPhaseMeterAmps(func() (float64, float64, float64, bool) { return l1, 2.2, 1.0, true })
-	c.SetFuseEVMax(func() (float64, bool) { return 16905, true })
-	c.SetManualHold(cfg.ID, ManualHold{PowerW: 10350, PhaseMode: "3p", Persistent: true})
-	c.TickWithDispatch(context.Background(), now, true)
-	l1 = 20.45
-	for i, w := range []float64{10242, 0, 10242} {
-		samples[cfg.DriverName] = EVSample{Connected: true, RequestActive: true, PowerW: w}
-		c.TickWithDispatch(context.Background(), now.Add(time.Duration(5*(i+1))*time.Second), true)
-		if command, known := lastSetCurrent(sender.calls); !known || command.power != 10350 {
-			t.Fatalf("reading %.0f W changed the offer: %+v", w, command)
-		}
 	}
 }
