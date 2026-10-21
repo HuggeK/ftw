@@ -5,16 +5,25 @@ import { flowReadingsFromStatus, fmtKwhShort } from "./components/energy-flow-re
 
 it("shows current household power without a note about the past energy mean", () => {
   const estimate = {watts: 886, from_ms: Date.UTC(2026,9,18,10), to_ms: Date.UTC(2026,9,18,10,1), age_ms: 90000, end_age_ms:60000, energy_basis:'mixed', timing_basis: 'mixed'};
-  const status = {load_w: 1800, load_estimate: estimate, energy:{today:{load_wh:2000,import_wh:500,history_quality:'estimated'}}};
+  const status = {load_w: 1800, load_quality: "measured", load_estimate: estimate, energy:{today:{load_wh:2000,import_wh:500,history_quality:'estimated'}}};
   const result = flowReadingsFromStatus(status);
   assert.equal(result.load, 1.8);
-  assert.equal(result.loadEstimated, true);
+  // An older Core also sent an energy mean; it never marks live Home use.
+  assert.equal(result.loadEstimated, false);
   assert.equal(status.load_w, 1800);
   assert.equal(result.selfPoweredPctToday, null);
   assert.equal("homeEstimateNote" in result, false);
   assert.equal(flowReadingsFromStatus({...status,load_estimate:{watts:null}}).load, 1.8);
   assert.equal(flowReadingsFromStatus({...status,load_estimate:{...estimate,end_age_ms:181000}}).load, 1.8);
   assert.equal(flowReadingsFromStatus({...status,load_w:null}).load, null);
+});
+
+it("marks Home use estimated only when Core says so", () => {
+  for (const [quality, estimated] of [["measured", false], [undefined, false], ["estimated", true], ["unknown", false]]) {
+    const result = flowReadingsFromStatus({load_w: 640, load_quality: quality, history_quality: "complete"});
+    assert.equal(result.load, 0.64);
+    assert.equal(result.loadEstimated, estimated, String(quality));
+  }
 });
 
 it("never lets a past zero mean overwrite a positive current Load", () => {
@@ -27,7 +36,7 @@ it("never lets a past zero mean overwrite a positive current Load", () => {
 
 it("keeps a qualified power balance visible while the energy interval is unavailable", () => {
   for (const reason of ["incomplete_source_window", "charger_source_time_unavailable", "stale_source_window"]) {
-    const status = {load_w: 1234, history_quality: "complete", load_estimate:{watts:null, reason}};
+    const status = {load_w: 1234, history_quality: "complete", load_quality: "estimated", load_estimate:{watts:null, reason}};
     const result = flowReadingsFromStatus(status);
     assert.equal(result.load, 1.234);
     assert.equal(result.loadEstimated, true);

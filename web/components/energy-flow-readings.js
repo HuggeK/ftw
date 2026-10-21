@@ -208,7 +208,7 @@ export function flowReadingsFromStatus(status, opts) {
   }
 
   // Core says "estimated" when it left an unread device out of Home use.
-  const hasEstimate = status?.load_estimate != null || status?.load_quality === "estimated";
+  const hasEstimate = status?.load_quality === "estimated";
   // Core qualifies this balance, including missing flows and stale meters.
   // A past energy interval is separate from Power now: it must neither hide
   // nor overwrite current household power. Never derive another balance from

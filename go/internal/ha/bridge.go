@@ -492,10 +492,8 @@ func (b *Bridge) publishDiscovery() {
 		{"battery_power", "Battery Power", "W", "power", "measurement", b.stateTopic("bat_w")},
 		{"ev_power", "EV Power", "W", "power", "measurement", b.stateTopic("ev_w")},
 		{"v2x_power", "V2X Power", "W", "power", "measurement", b.stateTopic("v2x_w")},
-		// Live balance as the dashboard shows it, and the energy-based mean
-		// of the last closed window (the quality-assured Home use).
+		// Live balance as the dashboard shows it.
 		{"load_power", "Load Power", "W", "power", "measurement", b.stateTopic("load_w")},
-		{"load_energy_power", "Load Power (energy average)", "W", "power", "measurement", b.stateTopic("load_energy_w")},
 		{"battery_soc", "Battery SoC", "%", "battery", "measurement", b.stateTopic("bat_soc_pct")},
 		// Control setpoints
 		{"grid_target", "Grid Target", "W", "power", "", b.stateTopic("grid_target_w")},
@@ -958,13 +956,6 @@ func (b *Bridge) publishState() {
 		// HA's numeric MQTT sensors ignore an empty payload. The literal
 		// None replaces the previous value with unknown.
 		b.publishString("load_w", "None")
-	}
-	energyOpts := options
-	energyOpts.UseWatchdogTimeout, energyOpts.UseControlPower = true, true
-	if e := b.tel.HomeUseEstimate(time.Now(), siteMeter, energyOpts); e.Watts != nil {
-		b.publishValue("load_energy_w", *e.Watts)
-	} else {
-		b.publishString("load_energy_w", "None")
 	}
 	b.publishValue("bat_soc_pct", units.PercentFromFraction(avgSoC))
 	b.publishValue("grid_target_w", gridTarget)

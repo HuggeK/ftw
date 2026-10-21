@@ -2,7 +2,6 @@ package api
 
 import (
 	"encoding/json"
-	"math"
 	"testing"
 	"time"
 
@@ -10,7 +9,9 @@ import (
 	"github.com/srcfl/ftw/go/internal/telemetry"
 )
 
-func TestStatusHomeEstimateIsSeparateFromInstantaneousPower(t *testing.T) {
+// Status sends one Home use: the live balance and its quality. A second,
+// energy-averaged number made every client show the live value as an estimate.
+func TestStatusSendsOneHomeUse(t *testing.T) {
 	tel := telemetry.NewStore()
 	tel.EnsureDriverHealth("site")
 	base := time.Now().Add(-20 * time.Second)
@@ -22,17 +23,16 @@ func TestStatusHomeEstimateIsSeparateFromInstantaneousPower(t *testing.T) {
 	resp := map[string]any{}
 	for i := 0; i < 3; i++ {
 		srv.qualifyStatusHistory(resp, "site")
-		e, ok := resp["load_estimate"].(telemetry.HomeEstimate)
-		if !ok || e.Watts == nil || math.Abs(*e.Watts-1500) > 1e-6 || e.AgeMS < 15000 || e.AgeMS > 20000 || e.Method != "reported_energy_balance_v3" || e.TimingBasis != "source" || e.EnergyBasis != "power_integral" || e.EnergyWh == nil || e.EndAgeMS < 10000 {
-			t.Fatal(e)
+		if _, ok := resp["load_estimate"]; ok {
+			t.Fatal("status sent a second Home use")
 		}
-		if resp["load_w"] != float64(2000) || resp["grid_w"] != float64(2000) || resp["history_quality"] != "complete" {
+		if resp["load_w"] != float64(2000) || resp["load_quality"] != telemetry.LoadMeasured || resp["grid_w"] != float64(2000) || resp["history_quality"] != "complete" {
 			t.Fatal(resp)
 		}
 	}
 	tel.DriverHealthMut("site").SetOffline()
 	srv.qualifyStatusHistory(resp, "site")
-	if resp["load_w"] != nil || resp["load_estimate"].(telemetry.HomeEstimate).Watts != nil {
+	if resp["load_w"] != nil || resp["load_quality"] != telemetry.LoadUnknown {
 		t.Fatal(resp)
 	}
 }
@@ -60,14 +60,11 @@ func TestStatusKeepsPowerBalanceWhenSessionEnergyCannotFormAnInterval(t *testing
 	if resp["load_w"] != float64(1234) || resp["history_quality"] != "complete" {
 		t.Fatal("valid power balance disappeared")
 	}
-	if e := resp["load_estimate"].(telemetry.HomeEstimate); e.Watts != nil || e.Reason != "incomplete_source_window" {
-		t.Fatal("old session was presented as an energy interval")
-	}
 	tel.DriverHealthMut("charger").SetOffline()
 	srv.qualifyStatusHistory(resp, "site")
 	// The offline charger is left out of live Home use, which says so.
-	if resp["load_w"] != float64(1234) || resp["load_quality"] != "estimated" || resp["load_estimate"].(telemetry.HomeEstimate).Watts != nil {
-		t.Fatal("offline charger blanked Home use or became an energy interval")
+	if resp["load_w"] != float64(1234) || resp["load_quality"] != "estimated" {
+		t.Fatal("offline charger blanked Home use")
 	}
 	tel.RecordDriverSuccess("charger")
 	tel.Update("charger", telemetry.DerEV, 6000, nil, nil)

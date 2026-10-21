@@ -296,10 +296,6 @@ type Store struct {
 	health              map[string]*DriverHealth
 	commands            map[string]CommandEvidence
 	controlObservations map[string][]ControlObservation
-	homeObservations    map[string][]ControlObservation // display estimates only
-	homeSourceTime      map[string]bool                 // reported source time, otherwise receipt time
-	homeIdleState       map[string]time.Time            // disconnected state time; zero means unqualified
-	homeEnergy          map[string]*homeEnergySeries    // timestamped session counters, display only
 
 	processNoise     float64
 	measurementNoise float64
@@ -478,7 +474,6 @@ func (s *Store) Update(driver string, t DerType, rawW float64, soc *float64, dat
 
 	s.observeCommand(driver, t, rawW, data, now)
 	s.recordControlObservation(driver, t, rawW, data, now)
-	s.recordHomeObservation(driver, t, rawW, data, now)
 	s.freezeStepWindows(now)
 
 	// Auto-buffer the standard fields (raw, not smoothed — we store ground
@@ -785,10 +780,6 @@ func (s *Store) Remove(driver string) {
 	delete(s.health, driver)
 	for _, kind := range allDerTypes {
 		delete(s.controlObservations, key(driver, kind))
-		delete(s.homeObservations, key(driver, kind))
-		delete(s.homeSourceTime, key(driver, kind))
-		delete(s.homeIdleState, key(driver, kind))
-		delete(s.homeEnergy, key(driver, kind))
 	}
 	for k, c := range s.commands {
 		c.Baseline, c.StepAfter = nil, nil

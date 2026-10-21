@@ -121,9 +121,9 @@ func TestLoadPublishClearsUnknownAndRecovers(t *testing.T) {
 	check("0.00")
 }
 
-// HA gets two Home use series: the live balance as the dashboard shows it
-// (negative included) and the energy-based mean (unknown until a full window).
-func TestLoadPublishesDisplayAndEnergySeries(t *testing.T) {
+// HA gets one Home use: the live balance as the dashboard shows it,
+// negative included.
+func TestLoadPublishesOneHomeUse(t *testing.T) {
 	b, client := liveLoadBridge(nil)
 	for _, d := range []string{"meter", "battery"} {
 		b.tel.EnsureDriverHealth(d)
@@ -134,20 +134,17 @@ func TestLoadPublishesDisplayAndEnergySeries(t *testing.T) {
 	if got := client.last(t, b.stateTopic("load_w")); got != "-800.00" {
 		t.Fatalf("display load = %s, want the negative balance as is", got)
 	}
-	if got := client.last(t, b.stateTopic("load_energy_w")); got != "None" {
-		t.Fatalf("energy load without a window = %s, want None", got)
-	}
 	b.publishDiscovery()
 	var display, energy bool
 	client.mu.Lock()
 	for topic, payloads := range client.payloads {
 		for _, p := range payloads {
 			display = display || strings.Contains(topic, "load_power/config") && strings.Contains(p, b.stateTopic("load_w"))
-			energy = energy || strings.Contains(topic, "load_energy_power/config") && strings.Contains(p, b.stateTopic("load_energy_w"))
+			energy = energy || strings.Contains(topic, "load_energy_power/config")
 		}
 	}
 	client.mu.Unlock()
-	if !display || !energy {
+	if !display || energy {
 		t.Fatalf("discovery: display=%t energy=%t", display, energy)
 	}
 }
