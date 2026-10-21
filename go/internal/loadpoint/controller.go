@@ -1593,6 +1593,7 @@ func (c *Controller) tickOne(ctx context.Context, now time.Time, lpCfg Config, s
 	// A manual diagnostic may lower a site limit, but never replace the
 	// installation's voltage, phase count or fuse with a larger offer.
 	c.applyInstallationLimits(cmd)
+	applyChargerPhaseLimit(cmd, lpCfg, c.siteFuse())
 	if applyCurrentCeiling(cmd) {
 		cmdReason = "charger_limit"
 	}

@@ -205,7 +205,8 @@ func TestEVFuseRaisedCarTakesOnlyFreeRoom(t *testing.T) {
 // A 1p hold over a 3p loadpoint: each offer counts on the phases its own
 // command names, never the configured ones, even when the budget is read
 // with the configured phase mode. Before, 1p offers counted as 3p and L1
-// reached 39 A.
+// reached 39 A. The hold asks 24 A; the charger is 16 A per phase, so the
+// car climbs from 9 A beside 15 A to the charger's 16 A once L1 falls.
 func TestEVFuseOnePhaseOffersCountOnTheirPhase(t *testing.T) {
 	for _, delay := range []time.Duration{5 * time.Second, 90 * time.Second} {
 		t.Run(delay.String(), func(t *testing.T) {
@@ -219,7 +220,7 @@ func TestEVFuseOnePhaseOffersCountOnTheirPhase(t *testing.T) {
 			s.houseA[0] = 5
 			s.run(6 * time.Minute)
 			s.requireWithinLimit("after L1 fell")
-			if !c.onePhase || c.drawW < 4140 {
+			if !c.onePhase || c.drawW < 3680 {
 				t.Fatalf("the car draws %.0f W (1p %v), want it to climb on L1", c.drawW, c.onePhase)
 			}
 		})

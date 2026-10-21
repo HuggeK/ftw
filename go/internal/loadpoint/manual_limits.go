@@ -89,6 +89,45 @@ func (c *Controller) applyInstallationLimits(cmd map[string]any) {
 	}
 }
 
+// applyChargerPhaseLimit keeps a 1p order to a charger that can run three
+// phases within the current that charger takes on one phase; otherwise a
+// 25 A fuse lets 25 A onto one phase of a 16 A charger. It only lowers the
+// order's limit. A 1p charger's maximum already caps its one phase, and on
+// a one-phase site the maximum is the one-phase rating.
+func applyChargerPhaseLimit(cmd map[string]any, cfg Config, site SiteFuse) {
+	if mode, _ := cmd["phase_mode"].(string); mode != "1p" || cfg.PhaseMode == "1p" || site.Phases() != 3 {
+		return
+	}
+	a := chargerPhaseAmps(cfg, site.Voltage)
+	if a < 6 {
+		return // Not a rating any charger has; leave the order as it is.
+	}
+	limit, _ := cmd["max_amps_per_phase"].(float64)
+	if !finite(limit) || limit <= 0 || limit > a {
+		cmd["max_amps_per_phase"] = a
+	}
+}
+
+// chargerPhaseAmps is the most current the charger is known to take on one
+// phase: its maximum spread over three phases, or the split below which
+// auto puts it on one phase, whichever is larger. The maximum alone gives a
+// one-phase charger left on an empty mode a third of its current (3,680 W
+// is 5.3 A, so it never charges); the split alone gives a 32 A charger 16 A.
+func chargerPhaseAmps(cfg Config, voltage float64) float64 {
+	if !finite(voltage) || voltage <= 0 {
+		voltage = 230
+	}
+	split := cfg.PhaseSplitW
+	if !finite(split) || split <= 0 {
+		split = defaultPhaseSplitW
+	}
+	maxW := cfg.MaxChargeW
+	if !finite(maxW) || maxW < 0 {
+		maxW = 0
+	}
+	return math.Max(maxW/(3*voltage), split/voltage)
+}
+
 // The watt order must reflect the final current ceiling too. In particular,
 // drivers often interpret max_amps_per_phase=0 as an absent override; send an
 // explicit zero-power order when the fuse leaves less than the 6 A minimum.

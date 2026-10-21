@@ -175,3 +175,120 @@ func TestThreePhaseFuseCapNeverSnapsBelowSixAmps(t *testing.T) {
 		t.Fatalf("offer %+v, reason %q; want 0 W fuse_limit", command, st.CommandedReason)
 	}
 }
+
+// onePhaseSteps are whole amps from 6 to 16 A on one phase at 230 V.
+var onePhaseSteps = []float64{0, 1380, 1610, 1840, 2070, 2300, 2530, 2760, 2990, 3220, 3450, 3680}
+
+// commandAmps is the current per phase a driver draws for the command, as
+// the OCPP driver works it out: the watts over the phases the command
+// names, never above max_amps_per_phase.
+func commandAmps(cmd sentCommand) float64 {
+	if cmd.power <= 0 || cmd.voltage <= 0 {
+		return 0
+	}
+	a := cmd.power / (cmd.voltage * float64(PhaseFor(cmd.phaseMode, cmd.power, defaultPhaseSplitW)))
+	if cmd.maxAmpsPerPhase > 0 {
+		a = math.Min(a, cmd.maxAmpsPerPhase)
+	}
+	return a
+}
+
+// Simulatorprov 21 Oct 2026, case s5s: surplus only, 9.3 kW of surplus and
+// a plan that shows no PV. The day's 1p lock hands back every step, so 1p
+// went out at 5,750 W with the 25 A fuse as its only limit: 25 A on one
+// phase of a 16 A charger. A one-phase charger left on an empty mode gets
+// the same lock and must keep its full 16 A.
+func TestSurplusOnePhaseOfferStaysWithinTheCharger(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+	}{
+		{"16 A three-phase charger, auto", Config{MinChargeW: 4140, MaxChargeW: 11040, PhaseMode: "auto", AllowedStepsW: threePhaseSteps}},
+		{"16 A one-phase charger, empty mode", Config{MinChargeW: 1380, MaxChargeW: 3680, AllowedStepsW: onePhaseSteps}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.Local)
+			cfg := tc.cfg
+			cfg.ID, cfg.DriverName, cfg.SurplusOnly = "garage", "evse", true
+			samples := map[string]EVSample{cfg.DriverName: {Connected: true, RequestActive: true}}
+			sender := &fakeSender{}
+			c := newTestController(t, []Config{cfg}, nil, samples, sender)
+			c.SetSiteFuse(SiteFuse{MaxAmps: 25, Voltage: 230, PhaseCnt: 3})
+			c.SetSiteSurplusForEV(func() (float64, bool) { return 9310, true })
+			c.SetNearTermPeakSurplusW(func(time.Duration) (float64, bool) { return 0, true })
+			c.SetPeakRemainingSurplusW(func() (float64, bool) { return 0, true })
+			for tick := 0; tick < 10; tick++ {
+				c.Tick(context.Background(), now)
+				cmd, _ := lastSetCurrent(sender.calls)
+				samples[cfg.DriverName] = EVSample{Connected: true, RequestActive: true, PowerW: cmd.power}
+				now = now.Add(5 * time.Second)
+			}
+			onePhase := 0
+			for _, cmd := range sender.calls {
+				if cmd.action != "ev_set_current" {
+					continue
+				}
+				if a := commandAmps(cmd); a > 16+1e-9 {
+					t.Fatalf("offer %+v is %.1f A per phase to a 16 A charger", cmd, a)
+				}
+				if cmd.phaseMode == "1p" {
+					onePhase++
+					if cmd.maxAmpsPerPhase > 16+1e-9 {
+						t.Fatalf("1p offer %+v allows %.1f A per phase", cmd, cmd.maxAmpsPerPhase)
+					}
+				}
+			}
+			last, ok := lastSetCurrent(sender.calls)
+			if onePhase == 0 || !ok || last.phaseMode != "1p" || last.power != 3680 {
+				t.Fatalf("%d 1p offers, last %+v; want the 1p lock to charge at 3,680 W (16 A)", onePhase, last)
+			}
+		})
+	}
+}
+
+// Charge now on one phase gets the charger's own current on that phase,
+// and the fuse decides the rest. A 16 A charger that can run three phases
+// gets 16 A, not the 25 A fuse. A 32 A charger, whether it switches phases
+// or is a one-phase charger, keeps its 32 A when the fuse allows it.
+func TestChargeNowOnOnePhaseKeepsTheChargersCurrent(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cfg    Config
+		fuseA  float64
+		holdW  float64
+		wantW  float64
+		wantA  float64
+		reason string
+	}{
+		{"16 A three-phase charger, auto", Config{MinChargeW: 4140, MaxChargeW: 11040, PhaseMode: "auto", AllowedStepsW: threePhaseSteps}, 25, 7360, 3680, 16, "charger_limit"},
+		{"16 A three-phase charger, empty mode", Config{MinChargeW: 4140, MaxChargeW: 11040, AllowedStepsW: threePhaseSteps}, 25, 7360, 3680, 16, "charger_limit"},
+		{"32 A three-phase charger, auto", Config{MinChargeW: 1380, MaxChargeW: 22080, PhaseMode: "auto"}, 40, 7360, 7360, 32, "manual_hold"},
+		{"32 A one-phase charger", Config{MinChargeW: 1380, MaxChargeW: 7360, PhaseMode: "1p"}, 40, 7360, 7360, 32, "manual_hold"},
+		{"16 A one-phase charger, empty mode", Config{MinChargeW: 1380, MaxChargeW: 3680, AllowedStepsW: onePhaseSteps}, 25, 3680, 3680, 16, "manual_hold"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Date(2026, 10, 21, 19, 0, 0, 0, time.UTC)
+			cfg := tc.cfg
+			cfg.ID, cfg.DriverName = "garage", "evse"
+			samples := map[string]EVSample{cfg.DriverName: {Connected: true, RequestActive: true}}
+			sender := &fakeSender{}
+			c := newTestController(t, []Config{cfg}, nil, samples, sender)
+			c.SetSiteFuse(SiteFuse{MaxAmps: tc.fuseA, Voltage: 230, PhaseCnt: 3})
+			evW := 0.0 // 3 A of house load plus the car on one phase.
+			c.SetFuseEVMax(meteredEVCap(c, func() float64 { return 3 + evW/230 }))
+			c.SetManualHold(cfg.ID, ManualHold{PowerW: tc.holdW, PhaseMode: "1p", Persistent: true})
+			for tick := 0; tick < 12; tick++ {
+				c.Tick(context.Background(), now)
+				cmd, ok := lastSetCurrent(sender.calls)
+				st, _ := c.manager.State(cfg.ID)
+				if !ok || cmd.phaseMode != "1p" || cmd.power != tc.wantW || math.Abs(commandAmps(cmd)-tc.wantA) > 1e-9 || st.CommandedReason != tc.reason {
+					t.Fatalf("tick %d: offer %+v (%.1f A), reason %q; want %.0f W on 1p, %.0f A, %q",
+						tick, cmd, commandAmps(cmd), st.CommandedReason, tc.wantW, tc.wantA, tc.reason)
+				}
+				evW = cmd.power
+				samples[cfg.DriverName] = EVSample{Connected: true, RequestActive: true, PowerW: evW}
+				now = now.Add(5 * time.Second)
+			}
+		})
+	}
+}
