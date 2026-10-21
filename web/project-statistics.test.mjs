@@ -24,7 +24,7 @@ function page(cloud=false,authorised=true,options={}) {
   const window={addEventListener(){},confirm:()=>true,fetch:async(path,req)=>{
     if(path==='/api/auth/status') {
       if(options.authError)throw Error('status unavailable');
-      return {ok:true,json:async()=>({lan_auth:options.lanAuth===true})};
+      return {ok:true,json:async()=>({lan_auth:options.lanAuth===true,home_assistant:options.homeAssistant===true})};
     }
     if(req){
       writes.push({path,...req});
@@ -104,4 +104,11 @@ test('missing password status does not block the consent choice',async()=>{
 test('an unauthenticated page neither asks nor writes on behalf of an owner',async()=>{
   const p=page(false,false);await p.window.FTWStatistics.refresh();
   assert.equal(p.buttons().length,0);assert.equal(p.writes.length,0);
+});
+
+
+test('HA ingress explains the existing HA login instead of an open LAN',async()=>{
+  const p=page(true,true,{homeAssistant:true});await p.window.FTWStatistics.refresh();
+  assert.match(p.main.textContent,/Home Assistant manages sign-in/);
+  assert.doesNotMatch(p.main.textContent,/anyone who can reach/);
 });

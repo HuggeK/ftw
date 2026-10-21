@@ -60,7 +60,9 @@
     var link=node("a","Privacy and Cloud terms",panel);link.href="https://ftw.sourceful.energy/privacy#statistics";link.target="_blank";link.rel="noopener";
     if(!policy.available) say(panel,"You can save your choice now. Hourly reports wait for privacy review and activation.");
     if(!status.cloudTermsAccepted) {
-      say(panel,authStatus && authStatus.lan_auth
+      say(panel,authStatus && authStatus.home_assistant
+        ?"Home Assistant manages sign-in for this choice."
+        :authStatus && authStatus.lan_auth
         ?"Your house password protects this choice. The box will ask you to log in if needed."
         :authStatus && authStatus.lan_auth===false
           ?"No house password is required. With password protection off, anyone who can reach this box on your private network can save this choice."
