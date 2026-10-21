@@ -41,6 +41,7 @@ import (
 	"github.com/srcfl/ftw/go/internal/api"
 	"github.com/srcfl/ftw/go/internal/appuplink"
 	"github.com/srcfl/ftw/go/internal/arp"
+	"github.com/srcfl/ftw/go/internal/backup"
 	"github.com/srcfl/ftw/go/internal/battery"
 	"github.com/srcfl/ftw/go/internal/cars"
 	"github.com/srcfl/ftw/go/internal/components"
@@ -448,6 +449,9 @@ func main() {
 			backupDir = filepath.Join(dataDir, backupDir)
 		}
 	}
+	// A backup stopped with Core leaves its scratch; a large one in /dev/shm
+	// sends the next backup's copy to the data disk.
+	backup.RemoveStaleScratch(backupDir)
 	if abs, err := filepath.Abs(coldDir); err == nil {
 		coldDir = abs
 	}
