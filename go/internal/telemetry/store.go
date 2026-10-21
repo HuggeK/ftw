@@ -217,11 +217,13 @@ func (h *DriverHealth) RecordTick() {
 }
 
 // RecordError bumps the error counter and degrades the status after 3 in a row.
+// An offline driver stays offline: only fresh data brings it back. Lifting it
+// to degraded made its held readings live again until the next watchdog scan.
 func (h *DriverHealth) RecordError(err string) {
 	h.ConsecutiveErrors++
 	h.LastError = err
 	h.TickCount++
-	if h.ConsecutiveErrors >= 3 {
+	if h.ConsecutiveErrors >= 3 && h.Status != StatusOffline {
 		h.Status = StatusDegraded
 	}
 }
@@ -272,6 +274,13 @@ func (h *DriverHealth) IsOnline() bool {
 // see it. StatusOffline is the watchdog's word that the reading is stale.
 func (h *DriverHealth) TelemetryLive() bool {
 	return h != nil && h.Status != StatusOffline
+}
+
+// LastReadFailed reports whether the driver's latest poll failed, so its
+// readings are held from an earlier one. Only failed reads count: a refused
+// command sets DeviceFault and leaves this alone.
+func (h *DriverHealth) LastReadFailed() bool {
+	return h != nil && h.ConsecutiveErrors > 0
 }
 
 // MetricSample is one (driver, metric, ts, value) tuple buffered for the

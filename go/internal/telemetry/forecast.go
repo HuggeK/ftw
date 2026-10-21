@@ -63,8 +63,9 @@ const (
 	DarknessNight
 )
 
-// Live Home use quality. Measured: every flow read. Estimated: the site meter
-// is read and a flow is left out or assumed. Unknown: no usable site meter.
+// Live Home use quality. Measured: every flow read, each by its driver's latest
+// poll. Estimated: the site meter is read and a flow is left out, assumed or
+// held after a failed read. Unknown: no usable site meter.
 const (
 	LoadMeasured  = "measured"
 	LoadEstimated = "estimated"
@@ -327,6 +328,11 @@ func (s *Store) measurementLocked(now time.Time, siteMeter string, opts Forecast
 			fail(reason+k, pv)
 			out.Known[f.DerType] = false
 			continue
+		}
+		if s.health[f.Driver].LastReadFailed() {
+			// Held from an earlier read until the age limit: shown, not
+			// measured. History and forecasts keep their own policy.
+			note("read_failed:" + k)
 		}
 		source.PowerW = &powerW
 		if r.SoC != nil && !math.IsNaN(*r.SoC) && !math.IsInf(*r.SoC, 0) && *r.SoC >= 0 && *r.SoC <= 1 {

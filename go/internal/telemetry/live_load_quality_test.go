@@ -148,3 +148,101 @@ func TestLiveLoadDuplicateChargerIsNotSubtractedTwice(t *testing.T) {
 		t.Fatalf("duplicate charger: %v known=%t %q", r.LoadW, r.LoadKnown, r.LoadReason)
 	}
 }
+
+// Simulator run 21 Oct 2026, scenario 6: the inverter stops answering while
+// the site meter keeps reading. Its last PV and battery are held, so Home use
+// stays forgiving, but it is an estimate from the first failed read.
+func TestLiveLoadFailedReadHoldsValueAsEstimate(t *testing.T) {
+	s := NewStore()
+	for _, d := range []string{"sdm", "sungrow"} {
+		s.EnsureDriverHealth(d)
+	}
+	s.Update("sdm", DerMeter, 0, nil, nil)
+	s.RecordDriverSuccess("sdm")
+	s.Update("sungrow", DerPV, -1500, nil, nil)
+	s.Update("sungrow", DerBattery, -570, nil, nil)
+	s.RecordDriverSuccess("sungrow")
+	if r := s.LiveMeasurementNow("sdm", ForecastOptions{}); r.LoadW != 2070 || r.LoadQuality != LoadMeasured {
+		t.Fatalf("before: %v %s %q", r.LoadW, r.LoadQuality, r.LoadReason)
+	}
+
+	// Silent inverter: the house now draws from the grid.
+	s.RecordDriverError("sungrow", "modbus: timeout")
+	s.Update("sdm", DerMeter, 2070, nil, nil)
+	s.RecordDriverSuccess("sdm")
+	r := s.LiveMeasurementNow("sdm", ForecastOptions{})
+	if !r.LoadKnown || r.LoadW != 4140 || r.LoadQuality != LoadEstimated || r.LoadReason != "read_failed:sungrow:battery" {
+		t.Fatalf("first failed read: %v known=%t %s %q", r.LoadW, r.LoadKnown, r.LoadQuality, r.LoadReason)
+	}
+	if !r.PVLiveKnown || r.PVW != -1500 {
+		t.Fatalf("held PV not shown: known=%t pv=%v", r.PVLiveKnown, r.PVW)
+	}
+	// History keeps its own policy.
+	if f := s.ForecastMeasurementNow("sdm", ForecastOptions{}); !f.Valid || f.Reason != "" || f.HouseholdW != 4140 {
+		t.Fatalf("history qualification changed: valid=%t %q %v", f.Valid, f.Reason, f.HouseholdW)
+	}
+
+	// Errors go on past degraded, then the watchdog drops the held flows.
+	// Every later failed read keeps them dropped.
+	for range 5 {
+		s.RecordDriverError("sungrow", "modbus: timeout")
+		if r := s.LiveMeasurementNow("sdm", ForecastOptions{}); r.LoadW != 4140 || r.LoadQuality != LoadEstimated {
+			t.Fatalf("degraded: %v %s %q", r.LoadW, r.LoadQuality, r.LoadReason)
+		}
+	}
+	past := time.Now().Add(-2 * time.Minute)
+	s.DriverHealthMut("sungrow").LastSuccess = &past
+	if tr := s.WatchdogScan(time.Minute); len(tr) != 1 || tr[0].Name != "sungrow" || tr[0].Online {
+		t.Fatalf("watchdog transitions: %+v", tr)
+	}
+	for range 5 {
+		s.RecordDriverError("sungrow", "modbus: timeout")
+		if r := s.LiveMeasurementNow("sdm", ForecastOptions{}); r.LoadW != 2070 || r.LoadQuality != LoadEstimated || r.LoadReason != "offline:sungrow:battery" {
+			t.Fatalf("offline: %v %s %q", r.LoadW, r.LoadQuality, r.LoadReason)
+		}
+		if tr := s.WatchdogScan(time.Minute); len(tr) != 0 {
+			t.Fatalf("offline driver came back on a failed read: %+v", tr)
+		}
+	}
+
+	// Reads succeed again.
+	s.Update("sungrow", DerPV, -1500, nil, nil)
+	s.Update("sungrow", DerBattery, -570, nil, nil)
+	s.RecordDriverSuccess("sungrow")
+	s.Update("sdm", DerMeter, 0, nil, nil)
+	if r := s.LiveMeasurementNow("sdm", ForecastOptions{}); r.LoadW != 2070 || r.LoadQuality != LoadMeasured || r.LoadReason != "" {
+		t.Fatalf("after: %v %s %q", r.LoadW, r.LoadQuality, r.LoadReason)
+	}
+}
+
+// A failed read of the site meter holds its value too: an estimate, not blank.
+func TestLiveLoadFailedSiteMeterReadIsEstimate(t *testing.T) {
+	s := NewStore()
+	for _, d := range []string{"sdm", "solar"} {
+		s.EnsureDriverHealth(d)
+	}
+	s.Update("sdm", DerMeter, 500, nil, nil)
+	s.Update("solar", DerPV, -1000, nil, nil)
+	s.RecordDriverSuccess("solar")
+	s.RecordDriverError("sdm", "modbus: timeout")
+	if r := s.LiveMeasurementNow("sdm", ForecastOptions{}); !r.LoadKnown || r.LoadW != 1500 || r.LoadQuality != LoadEstimated || r.LoadReason != "read_failed:sdm:meter" {
+		t.Fatalf("failed meter read: %v known=%t %s %q", r.LoadW, r.LoadKnown, r.LoadQuality, r.LoadReason)
+	}
+}
+
+// A charger that refuses commands still reads: its draw is measured.
+func TestLiveLoadCommandFaultStaysMeasured(t *testing.T) {
+	s := NewStore()
+	for _, d := range []string{"meter", "easee"} {
+		s.EnsureDriverHealth(d)
+	}
+	s.Update("meter", DerMeter, 12000, nil, nil)
+	s.Update("easee", DerEV, 11000, nil, nil)
+	s.RecordDriverSuccess("meter")
+	s.RecordDriverSuccess("easee")
+	s.SetDriverCommandFault("easee", true, "refused 3 commands")
+	s.SetDriverDeviceFault("easee", true, "charger reports a fault")
+	if r := s.LiveMeasurementNow("meter", ForecastOptions{}); r.LoadW != 1000 || r.LoadQuality != LoadMeasured || r.LoadReason != "" {
+		t.Fatalf("command fault: %v %s %q", r.LoadW, r.LoadQuality, r.LoadReason)
+	}
+}
