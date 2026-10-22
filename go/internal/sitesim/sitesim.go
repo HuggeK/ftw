@@ -210,8 +210,16 @@ type EVSE struct {
 	DrawW         float64 // the car's draw now
 	DrawPhases    int
 	SessionWh     float64 // since the car plugged in
-	queue         []evCommand
-	draws         []timedW
+
+	// The Easee driver's own choice for "auto" (easee_cloud.lua pick_phases):
+	// without a phase_split_w it splits at the fuse's current on one phase,
+	// and it keeps a phase count PhaseHold before it changes it.
+	SplitAtA   float64       // > 0: auto with no split splits at voltage × SplitAtA
+	PhaseHold  time.Duration // > 0: an auto phase count stays this long
+	phasesSent int
+	phasesAt   time.Time
+	queue      []evCommand
+	draws      []timedW
 }
 
 type evCommand struct {
@@ -221,12 +229,21 @@ type evCommand struct {
 }
 
 // Command sends powerW in phaseMode ("1p", "3p", "auto" or empty). Auto
-// picks one phase below splitW, as the Easee driver does without its
+// picks one phase below splitW, as the Easee driver does; PhaseHold adds its
 // hysteresis. Below MinA the charger pauses.
 func (e *EVSE) Command(now time.Time, powerW float64, phaseMode string, splitW, voltage float64) {
 	phases := e.Phases
+	if phaseMode == "auto" && splitW <= 0 && e.SplitAtA > 0 {
+		splitW = voltage * e.SplitAtA
+	}
 	if phaseMode == "1p" || (phaseMode == "auto" && powerW < math.Max(splitW, 3*voltage*e.MinA)) {
 		phases = 1
+	}
+	if phaseMode == "auto" && e.PhaseHold > 0 && e.phasesSent > 0 && phases != e.phasesSent && now.Sub(e.phasesAt) < e.PhaseHold {
+		phases = e.phasesSent
+	}
+	if phases != e.phasesSent {
+		e.phasesSent, e.phasesAt = phases, now
 	}
 	a := math.Min(math.Floor(powerW/voltage/float64(phases)+.5), e.MaxA)
 	if a < e.MinA {
@@ -262,6 +279,16 @@ func (e *EVSE) step(now time.Time, car *Car, houseA [3]float64, voltage float64)
 		e.draws = append(e.draws, timedW{now, w})
 	}
 	return w
+}
+
+// Queued is the last order the charger has not applied yet, as current per
+// phase and phases; false when every order is in force.
+func (e *EVSE) Queued() (a float64, phases int, ok bool) {
+	if len(e.queue) == 0 {
+		return 0, 0, false
+	}
+	c := e.queue[len(e.queue)-1]
+	return c.a, c.phases, true
 }
 
 // readback is the draw as it was ReadbackLag ago.

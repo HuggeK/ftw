@@ -27,14 +27,18 @@ const simCoreEvery = 2 * time.Second
 type simSite struct {
 	p       *sitesim.Plant
 	lp      loadpoint.Config
-	surplus bool           // the car charges from surplus; otherwise Charge now while plugged
-	setup   func(*simSite) // after each boot
+	surplus bool               // the car charges from surplus; otherwise Charge now while plugged
+	plan    loadpoint.PlanFunc // nil: no plan, and the car charges on Charge now
+	setup   func(*simSite)     // after each boot
 
 	db    memConfigStore // state.db: survives a restart
 	store *telemetry.Store
 	state *State
 	mgr   *loadpoint.Manager
 	ctrl  *loadpoint.Controller
+
+	every time.Duration // control_interval_s; zero: simCoreEvery
+	field *fieldRun     // the field matrix's own checks; nil outside it
 
 	downUntil, nextTick time.Time
 	meter               sitesim.MeterReading
@@ -43,6 +47,7 @@ type simSite struct {
 	seen                map[string]time.Time // each driver's last reading
 	offerW, batteryCmdW float64              // our last commands
 	raisedAt            time.Time            // our last command that raised import
+	outsideAt           time.Time            // the last outside step a scenario marked
 	defaulted           bool
 	commands            []simCommand
 
@@ -87,7 +92,11 @@ func (s *simSite) boot() {
 		s.db = memConfigStore{}
 	}
 	s.mgr.SetSessionStore(s.db)
-	s.ctrl = loadpoint.NewController(s.mgr, func(time.Time) (loadpoint.Directive, bool) { return loadpoint.Directive{}, false }, s.evSample, s.send)
+	plan := s.plan
+	if plan == nil {
+		plan = func(time.Time) (loadpoint.Directive, bool) { return loadpoint.Directive{}, false }
+	}
+	s.ctrl = loadpoint.NewController(s.mgr, plan, s.evSample, s.send)
 	s.ctrl.SetDriverOnline(func(d string) bool { h := s.store.DriverHealth(d); return h != nil && h.IsOnline() })
 	s.ctrl.SetSiteFuse(loadpoint.SiteFuse{MaxAmps: s.p.Fuse.RatingA, Voltage: s.p.Voltage, PhaseCnt: 3})
 	s.ctrl.SetFuseEVMax(func() (float64, bool) {
@@ -132,7 +141,7 @@ func (s *simSite) evSample(string) (loadpoint.EVSample, bool) {
 	if s.evAt.IsZero() || s.p.Now.Sub(s.evAt) > time.Minute {
 		return loadpoint.EVSample{}, false
 	}
-	return loadpoint.EVSample{Connected: s.ev.Plugged, RequestActive: true, PowerW: s.ev.W, PowerAt: s.evAt,
+	return loadpoint.EVSample{Connected: s.ev.Plugged, RequestActive: true, PowerW: s.ev.W, PowerAt: s.evAt, PowerMaxAge: s.declaredMaxAge(),
 		DeviceID: "easee:SIM1", SessionWh: s.ev.SessionWh, EnergyAt: s.evAt}, true
 }
 
@@ -201,10 +210,10 @@ func (s *simSite) step() {
 		}
 		if e := tick.EV; e != nil {
 			s.ev, s.evAt = *e, now
-			s.emit(s.lp.DriverName, telemetry.DerEV, e.W, nil, nil)
+			s.emit(s.lp.DriverName, telemetry.DerEV, e.W, nil, s.evData())
 		}
 		if !now.Before(s.nextTick) {
-			s.nextTick = now.Add(simCoreEvery)
+			s.nextTick = now.Add(s.coreEvery())
 			s.control()
 		}
 	}
@@ -225,7 +234,7 @@ func (s *simSite) control() {
 			h.SetOffline() // The watchdog.
 		}
 	}
-	if _, held := s.ctrl.GetManualHold(s.lp.ID, now); !s.surplus && !held && s.ev.Plugged {
+	if _, held := s.ctrl.GetManualHold(s.lp.ID, now); !s.surplus && s.plan == nil && !held && s.ev.Plugged {
 		s.ctrl.SetManualHold(s.lp.ID, loadpoint.ManualHold{PowerW: s.lp.MaxChargeW, PhaseMode: s.lp.PhaseMode, Persistent: true, StartedAt: now, UpdatedAt: now})
 	}
 	allowed := s.meterFresh()
@@ -285,7 +294,7 @@ func (s *simSite) responseTime(slowest bool) time.Duration {
 			d = max(s.p.EVSE.Delay, b.Latency)
 		}
 	}
-	return d + max(s.p.Meter.Every, sitesim.Step) + simCoreEvery
+	return d + max(s.p.Meter.Every, sitesim.Step) + s.coreEvery()
 }
 
 // check holds the invariants for this second.
@@ -321,7 +330,7 @@ func (s *simSite) check() {
 	if overLimit {
 		s.overLimit += sitesim.Step
 		if s.limitSince.IsZero() {
-			s.limitSince, s.ownRaise = now, !s.raisedAt.IsZero() && now.Sub(s.raisedAt) <= s.responseTime(true)
+			s.limitSince, s.ownRaise = now, !s.raisedAt.IsZero() && now.Sub(s.raisedAt) <= s.responseTime(true) && !s.outsideAt.After(s.raisedAt)
 		}
 	} else {
 		s.limitSince = time.Time{}
@@ -350,6 +359,9 @@ func (s *simSite) check() {
 			s.fail("the car is idle after %v with room for it", wait)
 		}
 	}
+	if s.field != nil {
+		s.field.check(s)
+	}
 }
 
 // wantsCharge reports whether the car should charge now: it is plugged
@@ -377,6 +389,9 @@ func (s *simSite) wantsCharge() bool {
 		if left < 15*time.Minute || baseW+minW > (ceilingW-s.hourWh)/left.Hours() {
 			return false
 		}
+	}
+	if s.field != nil {
+		return s.field.wantsCharge(s, baseW)
 	}
 	return !s.surplus || -baseW >= minW
 }
