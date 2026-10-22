@@ -89,9 +89,11 @@ func (l commandLog) span(now time.Time) (low, high, latest float64, ok bool) {
 
 // unshown is how much more a charger may draw than a reading taken at `at`
 // shows, in watts and in current per phase: the highest offer sent since
-// settle before the reading, less the lowest offer the reading may show.
-// An offer set before that window is in the reading. A cut needs nothing:
-// the reading shows the draw until the cut lands. Before our first offer
+// settle before the reading and not replaced by a lower one, less the
+// lowest offer the reading may show. An offer set before that window is in
+// the reading. A cut needs nothing: the reading shows the draw until the
+// cut lands, and the charger moves to its latest order, so a cut also ends
+// the reservation of the higher offers before it. Before our first offer
 // the charger counts as 0.
 func (l commandLog) unshown(at time.Time, settle time.Duration) (w, a float64) {
 	from := at.Add(-settle)
@@ -101,6 +103,12 @@ func (l commandLog) unshown(at time.Time, settle time.Duration) (w, a float64) {
 		if !c.at.After(from) {
 			settledW, settledA = c.w, c.a
 			continue
+		}
+		if c.w < highW {
+			highW = c.w
+		}
+		if c.a < highA {
+			highA = c.a
 		}
 		highW, highA = math.Max(highW, c.w), math.Max(highA, c.a)
 		if !c.at.After(at) {
