@@ -178,3 +178,27 @@ func TestLastMeasuredResponseSurvivesNewCommandButNotRelease(t *testing.T) {
 		t.Fatal("intentional release kept loss alarm armed")
 	}
 }
+
+// Core sends a charger its order on every tick. A repeated order must not
+// push the one before it out of the response window: a cloud charger may
+// still show it for two minutes.
+func TestRepeatedOrderKeepsEarlierOrderInForce(t *testing.T) {
+	s := NewStore()
+	start := time.Now()
+	send := func(w string, at time.Time) {
+		c := s.BeginCommand("easee", []byte(`{"action":"ev_set_current","power_w":`+w+`}`), at)
+		s.CompleteCommand(c, "accepted")
+	}
+	send("7590", start)
+	for i := range 30 {
+		send("0", start.Add(time.Duration(10+2*i)*time.Second))
+	}
+	at := start.Add(70 * time.Second)
+	s.mu.Lock()
+	s.observeCommand("easee", DerEV, 3130, json.RawMessage(`{}`), at)
+	s.mu.Unlock()
+	got, _ := s.CommandEvidence("easee", "ev")
+	if got.LastGapW == nil || *got.LastGapW != 0 || !got.PowerMismatchSince.IsZero() {
+		t.Fatalf("1 min after a cut the earlier 7590 W order was out of force: gap %v, mismatch since %v", got.LastGapW, got.PowerMismatchSince)
+	}
+}

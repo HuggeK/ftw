@@ -37,6 +37,7 @@ type ControlFeedback struct {
 	State            string   `json:"-"`
 	VerificationTier *int     `json:"-"`
 	VerificationLost bool     `json:"-"`
+	Escalated        bool     `json:"-"` // not following long enough to be an alarm
 	Response         string   `json:"-"`
 	SiteBeforeW      *float64 `json:"-"`
 	SiteAfterW       *float64 `json:"-"`
@@ -360,6 +361,9 @@ func setControlStatus(f *ControlFeedback) {
 	if status == "following" && (f.VerificationTier == nil || *f.VerificationTier < 1) {
 		status = "waiting"
 	}
+	if status == "not_following" && f.Escalated {
+		severity = "alarm"
+	}
 	f.Status, f.Severity = status, severity
 	f.Evidence = "none"
 	if f.VerificationTier != nil {
@@ -390,6 +394,15 @@ func controlVerificationLost(f ControlFeedback, cmd telemetry.CommandEvidence, n
 	return !cmd.Since.IsZero() && now.Sub(cmd.Since) >= grace && now.Sub(cmd.LastMeasuredAt) >= grace
 }
 
+// evMismatchWait is how long a charger's fresh readings must disagree with
+// the orders in force before it is not following. evOverdrawAlarm is how
+// much longer one that draws more than ordered may go on before the warning
+// becomes an alarm.
+const (
+	evMismatchWait  = 2 * time.Minute
+	evOverdrawAlarm = 10 * time.Minute
+)
+
 func classifyControlFeedback(f *ControlFeedback, cmd telemetry.CommandEvidence, commanded, fresh bool, coreReason string, connected *bool, now time.Time) {
 	set := func(state, reason, severity string) { f.State, f.Reason, f.Severity = state, reason, severity }
 	if !fresh {
@@ -419,8 +432,8 @@ func classifyControlFeedback(f *ControlFeedback, cmd telemetry.CommandEvidence, 
 	}
 	// A positive clamp explains the lower offer, not prolonged zero delivery.
 	// Keep known safety pauses and unconfirmed/stale commands authoritative.
-	evMismatchObserved := !cmd.PowerMismatchSince.IsZero() && cmd.LastObservation.Sub(cmd.PowerMismatchSince) >= 2*time.Minute
-	noPowerObserved := evMismatchObserved || !cmd.NoPowerSince.IsZero() && cmd.NoPowerAt.Sub(cmd.NoPowerSince) >= 2*time.Minute
+	evMismatchObserved := !cmd.PowerMismatchSince.IsZero() && cmd.LastObservation.Sub(cmd.PowerMismatchSince) >= evMismatchWait
+	noPowerObserved := evMismatchObserved || !cmd.NoPowerSince.IsZero() && cmd.NoPowerAt.Sub(cmd.NoPowerSince) >= evMismatchWait
 	if f.Kind == "ev" && commanded && cmd.Result == "accepted" &&
 		coreReason != "site_meter_stale" && coreReason != "site_phase_currents_stale" && coreReason != "fuse_cooldown" &&
 		f.SentW != nil && *f.SentW > 100 && f.ActualW != nil && math.Abs(*f.ActualW) < 100 &&
@@ -432,7 +445,11 @@ func classifyControlFeedback(f *ControlFeedback, cmd telemetry.CommandEvidence, 
 		set("limited", "device_limit", "warning")
 		return
 	}
-	if coreReason == "site_meter_stale" || coreReason == "site_phase_currents_stale" || coreReason == "fuse_cooldown" || coreReason == "fuse_limit" || coreReason == "import_limit" || coreReason == "charger_limit" {
+	// A limit explains a lower order, not a draw that differs from it. A
+	// charger whose fresh readings have disagreed with the order past its
+	// response time is judged below, as under any other order.
+	limit := coreReason == "site_meter_stale" || coreReason == "site_phase_currents_stale" || coreReason == "fuse_cooldown" || coreReason == "fuse_limit" || coreReason == "import_limit" || coreReason == "charger_limit"
+	if limit && !(f.Kind == "ev" && evMismatchObserved) {
 		set("limited", coreReason, "warning")
 		return
 	}
@@ -501,6 +518,11 @@ func classifyControlFeedback(f *ControlFeedback, cmd telemetry.CommandEvidence, 
 			reason = "power_below_target"
 		}
 		set("warning", reason, "warning")
+		// FTW cannot stop a charger that draws more than it is told. A car
+		// that takes less only charges slower.
+		if f.Kind == "ev" && (reason == "power_while_idle" || reason == "power_above_target") {
+			f.Escalated = !cmd.PowerOverSince.IsZero() && cmd.LastObservation.Sub(cmd.PowerOverSince) >= evMismatchWait+evOverdrawAlarm
+		}
 		return
 	}
 	if coreReason == "core_limit" {
